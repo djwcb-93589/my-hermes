@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python s15_scheduled_tasks.py --test)",
+      "Bash(python -c ' *)",
+      "Bash(xargs cat *)"
+    ]
+  }
+}
