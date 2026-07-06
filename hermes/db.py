@@ -6,10 +6,12 @@ import json
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
     """Initialize the SQLite database with WAL mode and required tables."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""

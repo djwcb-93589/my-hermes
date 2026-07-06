@@ -1,8 +1,8 @@
 """
-Hermes entry point.
+Hermes 入口。
 
-Default mode: an interactive CLI REPL — input → run_conversation → output.
-Other modes are dispatched via argv: --gateway, --simulate, --test.
+默认模式：交互式 CLI REPL —— input → run_conversation → output。
+其它模式经 argv 分发：--gateway、--simulate、--test。
 """
 
 from __future__ import annotations
@@ -16,12 +16,13 @@ from hermes.conversation import run_conversation
 from hermes.cron import get_job_store, JobScheduler
 from hermes.cron.job import CronJob
 from hermes.db import init_db, create_session
+from hermes.backends import cleanup_all_backends
 from hermes.prompt import build_system_prompt
 from hermes.tools import register_all
 
 
 def cli_loop():
-    """Default mode: bare input → run_conversation REPL with scheduler."""
+    """默认模式：原始 input → run_conversation REPL，带 scheduler。"""
     register_all()
 
     print("=== s15: Scheduled Tasks (CLI mode) ===")
@@ -36,7 +37,7 @@ def cli_loop():
     store = get_job_store()
 
     def fire_cli(job: CronJob):
-        """Fire callback for CLI mode: run_conversation directly."""
+        """CLI 模式的 fire callback：直接调 run_conversation。"""
         print(f"\n  [cron] firing job {job.job_id}: {job.prompt[:60]}")
         result = run_conversation(job.prompt, conn, session_id, cached_prompt)
         print(f"\n  [cron] result: {result['final_response'][:200]}\n")
@@ -59,6 +60,7 @@ def cli_loop():
     finally:
         scheduler.stop()
         conn.close()
+        cleanup_all_backends()
 
 
 def main():

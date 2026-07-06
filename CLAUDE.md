@@ -98,3 +98,17 @@ entry modes     hermes/gateway_console.py     --gateway mode
 - `run_conversation` (CLI) and `run_child_conversation` (in `tools/delegate.py`) share structure but are deliberately not unified. Don't dedupe without checking that child-agent restrictions (no recursion, no memory writes, no skill edits via `DELEGATE_BLOCKED_TOOLS`) still hold.
 - The `--gateway` and `--simulate` modes use `asyncio.run(...)` at the top of `main.py`'s dispatch; the scheduler thread inside still uses synchronous callbacks.
 - `pyproject.toml` declares `fastapi`/`uvicorn` but no code imports them yet — they're forward-declared for a future HTTP adapter, not currently wired up.
+
+## Architecture and Code Quality
+
+When writing or modifying code, follow these principles:
+
+- Follow high cohesion and low coupling.
+- Keep each module focused on one clear responsibility.
+- Avoid mixing unrelated concerns in the same function, class, or file.
+- Avoid unnecessary cross-module dependencies.
+- Prefer explicit interfaces between modules instead of relying on hidden global state.
+- When making larger changes, briefly explain whether the design keeps module boundaries clear.
+- After code changes, check whether the change introduced unnecessary coupling.
+- 代码注释必须使用中文。
+- 不要把代码标识符翻译成中文。函数名、变量名、类名、文件名、API 名称、错误信息、命令行输出保持原文。

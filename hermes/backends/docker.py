@@ -1,4 +1,4 @@
-"""DockerBackend: execute commands inside a Docker container."""
+"""DockerBackend：在 Docker 容器内执行命令。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from hermes.backends import BaseExecutionEnvironment
 
 
 class DockerBackend(BaseExecutionEnvironment):
-    """Execute commands inside a Docker container."""
+    """在 Docker 容器内执行命令。"""
 
     def __init__(self, image: str = "python:3.11-slim", **kwargs):
         super().__init__(**kwargs)
@@ -16,7 +16,7 @@ class DockerBackend(BaseExecutionEnvironment):
         self._container_id: str | None = None
 
     def _ensure_container(self):
-        """Start a long-lived container (once)."""
+        """启动一个长驻容器（只启动一次）。"""
         if self._container_id:
             return
         result = subprocess.run(
@@ -48,11 +48,11 @@ class DockerBackend(BaseExecutionEnvironment):
         )
 
     def _update_cwd(self):
-        """Docker: CWD file is inside the container; read via docker exec."""
+        """Docker：CWD 文件在容器内，通过 docker exec 读取。"""
         if not self._container_id:
             return
         result = subprocess.run(
-            ["docker", "exec", self._container_id, "cat", self._cwd_file],
+            ["docker", "exec", self._container_id, "cat", self._cwd_shell],
             capture_output=True, text=True,
         )
         new_cwd = result.stdout.strip()

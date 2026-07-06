@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
         "memory_char_limit": 4000,
         "user_char_limit": 2000,
     },
-    "db_path": "state.db",
+    "db_path": "database/hermes.db",
     "terminal": {
         "backend": "local",          # local | docker | ssh
         "docker_image": "python:3.11-slim",
@@ -156,7 +156,10 @@ def save_config(config: dict, config_path=None):
 
 from pathlib import Path as _Path
 
-HERMES_HOME = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
+# Project root = parent of the hermes/ package directory. Falls back to
+# $HERMES_HOME if set; never touches the user's home directory.
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+HERMES_HOME = _Path(os.getenv("HERMES_HOME") or _PROJECT_ROOT)
 
 load_env()
 
@@ -168,7 +171,11 @@ MODEL = os.getenv("MODEL") or _config["model"]
 MAX_ITERATIONS = int(
     os.getenv("MAX_ITERATIONS") or _config["limits"]["max_iterations"]
 )
+# Resolve DB_PATH relative to HERMES_HOME so the database lives inside the
+# project (e.g. <root>/database/hermes.db) regardless of CWD.
 DB_PATH = os.getenv("DB_PATH") or _config["db_path"]
+if not _Path(DB_PATH).is_absolute():
+    DB_PATH = str(HERMES_HOME / DB_PATH)
 
 FALLBACK_MODEL = (
     os.getenv("FALLBACK_MODEL") or _config["fallback"]["model"]

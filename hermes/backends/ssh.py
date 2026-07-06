@@ -1,4 +1,4 @@
-"""SSHBackend: execute commands on a remote machine via SSH ControlMaster."""
+"""SSHBackend：通过 SSH ControlMaster 在远端机器上执行命令。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from hermes.backends import BaseExecutionEnvironment
 
 
 class SSHBackend(BaseExecutionEnvironment):
-    """Execute commands on a remote machine via SSH with ControlMaster."""
+    """通过 SSH ControlMaster 在远端机器上执行命令。"""
 
     def __init__(self, host: str, user: str, key_path: str | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -44,9 +44,9 @@ class SSHBackend(BaseExecutionEnvironment):
         )
 
     def _update_cwd(self):
-        """SSH: read CWD file on remote via ssh cat."""
+        """SSH：通过 ssh cat 读取远端的 CWD 文件。"""
         result = subprocess.run(
-            self._ssh_args() + ["cat", self._cwd_file],
+            self._ssh_args() + ["cat", self._cwd_shell],
             capture_output=True, text=True, timeout=5,
         )
         new_cwd = result.stdout.strip()
