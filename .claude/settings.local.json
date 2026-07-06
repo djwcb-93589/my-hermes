@@ -5,7 +5,8 @@
       "Bash(python -c ' *)",
       "Bash(xargs cat *)",
       "Bash(python terminal_e2e.py)",
-      "Bash(rm -f state.db state.db-wal state.db-shm terminal_e2e.db terminal_e2e.db-wal terminal_e2e.db-shm)"
+      "Bash(rm -f state.db state.db-wal state.db-shm terminal_e2e.db terminal_e2e.db-wal terminal_e2e.db-shm)",
+      "Bash(python main.py --test)"
     ]
   }
 }

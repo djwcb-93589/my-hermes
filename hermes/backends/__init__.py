@@ -38,6 +38,10 @@ _SECRET_BLOCKLIST = frozenset([
 ])
 
 
+class UnsupportedBackendError(Exception):
+    """后端未实现该文件操作（如 Docker/SSH 默认不暴露文件 IO）。"""
+
+
 class BaseExecutionEnvironment(ABC):
     """
     所有 terminal 后端必须满足的契约。
@@ -48,6 +52,7 @@ class BaseExecutionEnvironment(ABC):
 
     def __init__(self, cwd: str, timeout: int = 180):
         self.cwd = cwd
+        self.file_root = cwd
         self.timeout = timeout
         self._session_id = uuid.uuid4().hex[:12]
         # 默认：/tmp/hermes-* （POSIX 下 shell == host）。Windows 上的
@@ -140,6 +145,43 @@ class BaseExecutionEnvironment(ABC):
                 self.cwd = self._normalize_cwd(new_cwd)
         except FileNotFoundError:
             pass
+
+    # --- 文件 IO 抽象（terminal 工具之外的文件操作走这一组） ---
+
+    def resolve_path(self, rel_path: str) -> str:
+        """把（可能是相对的）路径解析成 host 形式的绝对路径。
+
+        相对路径以 ``self.cwd`` 为基准。子类可覆盖以处理路径形式转换
+        （如 Windows + Git Bash 把 MSYS 形式 ``/d/...`` 转成 Windows 形式）。
+        """
+        p = Path(rel_path)
+        if not p.is_absolute():
+            p = Path(self.cwd) / p
+        return str(p)
+
+    def read_file(self, path: str, offset: int = 0, limit: int | None = None) -> bytes:
+        """读取文件二进制内容。默认不支持，子类按需覆盖。"""
+        raise UnsupportedBackendError(
+            f"{type(self).__name__} does not implement read_file"
+        )
+
+    def write_file(self, path: str, content: bytes, mode: str = "write") -> None:
+        """写入文件。mode: "write" 覆盖，"append" 追加。默认不支持。"""
+        raise UnsupportedBackendError(
+            f"{type(self).__name__} does not implement write_file"
+        )
+
+    def list_dir(self, path: str) -> list[str]:
+        """列目录，返回条目名列表。默认不支持。"""
+        raise UnsupportedBackendError(
+            f"{type(self).__name__} does not implement list_dir"
+        )
+
+    def stat_file(self, path: str) -> dict:
+        """返回文件信息 {size, is_dir, is_file, mtime}。默认不支持。"""
+        raise UnsupportedBackendError(
+            f"{type(self).__name__} does not implement stat_file"
+        )
 
 
 def create_backend(config: dict) -> BaseExecutionEnvironment:

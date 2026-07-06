@@ -225,4 +225,203 @@ def run_unit_tests():
     set_job_store(old_store)
     os.unlink(tmp2.name)
 
+    # --- file 工具测试 ---
+    print()
+    _test_file_tool()
+
     print("\nAll s15 unit tests passed.")
+
+
+def _test_file_tool():
+    """file 工具单元测试：路径守卫、覆盖保护、读截断、Docker/SSH 行为。"""
+    import json as _json
+    import tempfile as _tf
+    from hermes.tools.file import handle_file, _guard_path, _is_sensitive, READ_LIMIT
+    from hermes import backends as _bm
+
+    # 用临时目录当 backend.cwd，避免污染项目目录
+    tmp_root = _tf.mkdtemp(prefix="hermes-file-test-")
+    original_backends = dict(_bm._backends)
+    _bm._backends.clear()
+    try:
+        sk = "file-unit"
+        backend = _bm.get_backend(session_key=sk)
+        backend.cwd = tmp_root  # 直接覆盖 cwd 当作测试沙箱
+        backend.file_root = tmp_root
+
+        # 写入 + 读回
+        r = handle_file({
+            "action": "write", "path": "a.txt", "content": "hello",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["size"] == 5, d
+        r = handle_file({"action": "read", "path": "a.txt"}, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["content"] == "hello", d
+        print("  file write+read ..... OK")
+
+        # 覆盖保护：默认不覆盖
+        r = handle_file({
+            "action": "write", "path": "a.txt", "content": "other",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "exists", d
+        # overwrite=true 后成功
+        r = handle_file({
+            "action": "write", "path": "a.txt", "content": "world!", "overwrite": True,
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["size"] == 6, d
+        print("  file overwrite guard OK")
+
+        # 路径穿越：.. 逃出 root
+        r = handle_file({
+            "action": "read", "path": "../../../etc/passwd",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "forbidden", d
+        print("  file traversal block  OK")
+
+        # 敏感文件：.env 默认拒绝；allow_sensitive=true 才放行
+        r = handle_file({
+            "action": "write", "path": ".env", "content": "LEAKED=1",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "forbidden", d
+        r = handle_file({
+            "action": "write", "path": ".env", "content": "OK=1",
+            "allow_sensitive": True,
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True, d
+        print("  file sensitive guard . OK")
+
+        # 单元化路径守卫与敏感判定
+        assert _is_sensitive(os.path.join(tmp_root, "id_rsa"))
+        assert _is_sensitive(os.path.join(tmp_root, "secrets.pem"))
+        assert _is_sensitive(os.path.join(tmp_root, "app.db"))
+        assert not _is_sensitive(os.path.join(tmp_root, "README.md"))
+        ok, _ = _guard_path(os.path.join(tmp_root, "sub", "x.txt"), tmp_root, False)
+        assert ok
+        ok, _ = _guard_path(os.path.join(tmp_root, "..", "x"), tmp_root, False)
+        assert not ok
+        print("  file guard helpers ... OK")
+
+        # cwd 可以变化，但 file_root 不能随之扩大。
+        backend.cwd = os.path.dirname(tmp_root)
+        r = handle_file({
+            "action": "write", "path": "outside.txt", "content": "bad",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "forbidden", d
+        backend.cwd = tmp_root
+        print("  file fixed root ...... OK")
+
+        # 大文件截断
+        big_content = "A" * (READ_LIMIT + 100)
+        with open(os.path.join(tmp_root, "big.txt"), "w") as f:
+            f.write(big_content)
+        r = handle_file({"action": "read", "path": "big.txt"}, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["truncated"] is True, d
+        assert d["size"] == READ_LIMIT, d
+        # offset 续读
+        r = handle_file({
+            "action": "read_range", "path": "big.txt",
+            "offset": READ_LIMIT, "limit": 100,
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["size"] == 100 and d["truncated"] is False, d
+        print("  file truncation ...... OK")
+
+        r = handle_file({
+            "action": "replace", "path": "big.txt",
+            "find": "A", "replace": "B",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "file_too_large", d
+
+        with open(os.path.join(tmp_root, "binary.bin"), "wb") as f:
+            f.write(b"\xff\xfehello")
+        r = handle_file({
+            "action": "replace", "path": "binary.bin",
+            "find": "hello", "replace": "x",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "decode_error", d
+        print("  file replace guards .. OK")
+
+        # append
+        r = handle_file({
+            "action": "append", "path": "a.txt", "content": "++",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True, d
+        r = handle_file({"action": "read", "path": "a.txt"}, session_key=sk)
+        d = _json.loads(r)
+        assert d["content"] == "world!++", d
+        print("  file append .......... OK")
+
+        # replace: a.txt 当前是 "world!++"，1 个 l
+        r = handle_file({
+            "action": "replace", "path": "a.txt", "find": "l", "replace": "L",
+            "all": True,
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["replacements"] == 1, d
+        # find 不存在
+        r = handle_file({
+            "action": "replace", "path": "a.txt", "find": "ZZZZ", "replace": "x",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is False and d["error_type"] == "not_found_in_file", d
+        print("  file replace ......... OK")
+
+        # list + stat
+        r = handle_file({"action": "list", "path": "."}, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and "a.txt" in d["entries"], d
+        r = handle_file({"action": "stat", "path": "a.txt"}, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True and d["is_file"] is True, d
+        print("  file list+stat ....... OK")
+
+        # terminal cd 后 cwd 一致性：通过 backend.execute 改 cwd，再写相对路径
+        sub = os.path.join(tmp_root, "subdir")
+        os.makedirs(sub, exist_ok=True)
+        # Windows 下 bash 不认反斜杠路径，得转成 MSYS 形式
+        sub_for_shell = backend._cwd_to_shell(sub)
+        backend.execute(f"cd {sub_for_shell}")
+        # 注意：execute 会触发 _update_cwd，backend.cwd 同步到 sub
+        assert os.path.realpath(backend.cwd) == os.path.realpath(sub), backend.cwd
+        r = handle_file({
+            "action": "write", "path": "in_subdir.txt", "content": "ok",
+        }, session_key=sk)
+        d = _json.loads(r)
+        assert d["ok"] is True, d
+        assert os.path.exists(os.path.join(sub, "in_subdir.txt"))
+        print("  file cwd-sync ........ OK")
+
+        # Docker/SSH 不支持文件 IO：用伪 session_key + monkey-patch backend 类型
+        from hermes.backends.docker import DockerBackend
+        from hermes.backends.ssh import SSHBackend
+        for fake_type in (DockerBackend, SSHBackend):
+            fake = fake_type.__new__(fake_type)
+            # 借用 LocalBackend 的 cwd 但保留 fake_type 的方法（默认不支持）
+            fake.cwd = tmp_root
+            fake.file_root = tmp_root
+            _bm._backends["file-unsupported"] = fake
+            r = handle_file({
+                "action": "read", "path": "a.txt",
+            }, session_key="file-unsupported")
+            d = _json.loads(r)
+            assert d["ok"] is False and d["error_type"] == "unsupported_backend", d
+            _bm._backends.pop("file-unsupported", None)
+        print("  file docker/ssh unsupported OK")
+
+    finally:
+        # 清理：还原 backends 缓存，删临时目录
+        _bm._backends.clear()
+        _bm._backends.update(original_backends)
+        import shutil as _sh
+        _sh.rmtree(tmp_root, ignore_errors=True)

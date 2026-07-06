@@ -10,6 +10,7 @@ Windows 上明确优先使用 Git Bash，绝不回退到 WSL 的
 from __future__ import annotations
 
 import os
+import stat as stat_mod
 import subprocess
 import sys
 from pathlib import Path
@@ -158,3 +159,56 @@ class LocalBackend(BaseExecutionEnvironment):
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+    # --- 文件 IO：LocalBackend 直接走 Python 标准库 ---
+
+    def resolve_path(self, rel_path: str) -> str:
+        """相对路径以 cwd 为基准；同时接受 MSYS 形式（``/d/...``）方便 LLM。"""
+        if (
+            sys.platform == "win32"
+            and rel_path.startswith("/")
+            and len(rel_path) >= 3
+            and rel_path[2] == "/"
+        ):
+            rel_path = _bash_to_win_path(rel_path)
+        p = Path(rel_path)
+        if not p.is_absolute():
+            p = Path(self.cwd) / p
+        return str(p)
+
+    def read_file(self, path: str, offset: int = 0, limit: int | None = None) -> bytes:
+        """按字节读取文件，offset/limit 都是字节单位。"""
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return f.read(limit) if limit is not None else f.read()
+
+    def write_file(self, path: str, content: bytes, mode: str = "write") -> None:
+        """写入文件。write 模式走 tmp + os.replace 原子替换；append 直接追加。"""
+        # 父目录不存在时自动创建，对齐旧 write_file 的行为。
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if mode == "append":
+            with open(path, "ab") as f:
+                f.write(content)
+            return
+
+        tmp = path + ".hermes.tmp"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.replace(tmp, path)
+
+    def list_dir(self, path: str) -> list[str]:
+        """返回目录下条目名（不含路径前缀）。"""
+        return [entry.name for entry in os.scandir(path)]
+
+    def stat_file(self, path: str) -> dict:
+        """返回文件元数据。"""
+        st = os.stat(path)
+        return {
+            "size": st.st_size,
+            "is_dir": stat_mod.S_ISDIR(st.st_mode),
+            "is_file": stat_mod.S_ISREG(st.st_mode),
+            "mtime": st.st_mtime,
+        }
