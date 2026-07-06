@@ -26,11 +26,12 @@ def run_terminal(args, **kwargs):
     backend = get_backend(session_key=session_key)
     result = backend.execute(command)
 
-    output = result["output"]
+    output = result["output"].rstrip()
     if result["returncode"] != 0:
         output += f"\n(exit code: {result['returncode']})"
 
-    return output if output.strip() else "(no output)"
+    body = output if output.strip() else "(no output)"
+    return f"{body}\n(cwd: {backend.cwd})"
 
 
 def register(registry):

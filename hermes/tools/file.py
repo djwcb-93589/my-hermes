@@ -22,6 +22,8 @@ from hermes.backends import get_backend, UnsupportedBackendError
 # 单次读取的字节上限。超过则 truncated=true，调用方再用 offset 续读。
 READ_LIMIT = 100_000
 REPLACE_LIMIT = READ_LIMIT
+_CONTEXT_ACTIONS = {"pwd", "context"}
+_PATH_ACTIONS = {"read", "read_range", "write", "append", "replace", "list", "stat"}
 
 # 敏感文件模式（路径用 / 归一化后匹配）。命中且未显式 allow_sensitive 时拒绝。
 _SENSITIVE_PATTERNS = [
@@ -62,6 +64,20 @@ def _json(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+def _file_context(backend) -> dict:
+    cwd = getattr(backend, "cwd", "")
+    return {
+        "cwd": cwd,
+        "file_root": getattr(backend, "file_root", cwd),
+    }
+
+
+def _file_error(backend, payload: dict) -> str:
+    obj = {"ok": False, **payload}
+    obj.update(_file_context(backend))
+    return _json(obj)
+
+
 def _file_exists(backend, abs_path: str) -> bool:
     """通过 backend 检查路径是否存在，避免 tool 层直接耦合本机 FS。"""
     try:
@@ -78,20 +94,42 @@ def handle_file(args, **kwargs):
     session_key = kwargs.get("session_key") or "default"
     backend = get_backend(session_key=session_key)
 
+    if action in _CONTEXT_ACTIONS:
+        return _json({"ok": True, **_file_context(backend)})
+
+    if action not in _PATH_ACTIONS:
+        return _file_error(
+            backend,
+            {
+                "error_type": "unknown_action",
+                "error": f"unknown action: {action!r}",
+            },
+        )
+
+    if not rel_path:
+        return _file_error(
+            backend,
+            {
+                "path": rel_path,
+                "error_type": "invalid_args",
+                "error": "path is required for this action",
+            },
+        )
+
     # 解析路径（相对 backend.cwd）
     try:
         abs_path = backend.resolve_path(rel_path)
     except Exception as exc:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "invalid_path", "error": str(exc)})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "invalid_path", "error": str(exc)})
 
     # 路径守卫
     allow_sensitive = bool(args.get("allow_sensitive", False))
     file_root = getattr(backend, "file_root", backend.cwd)
     ok, reason = _guard_path(abs_path, file_root, allow_sensitive=allow_sensitive)
     if not ok:
-        return _json({"ok": False, "path": rel_path, "abs_path": abs_path,
-                      "error_type": "forbidden", "error": reason})
+        return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
+                           "error_type": "forbidden", "error": reason})
 
     try:
         if action == "read":
@@ -108,24 +146,22 @@ def handle_file(args, **kwargs):
             return _do_list(backend, abs_path, rel_path)
         if action == "stat":
             return _do_stat(backend, abs_path, rel_path)
-        return _json({"ok": False, "error_type": "unknown_action",
-                      "error": f"unknown action: {action!r}"})
     except UnsupportedBackendError as exc:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "unsupported_backend", "error": str(exc)})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "unsupported_backend", "error": str(exc)})
     except FileNotFoundError:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "not_found", "error": "file does not exist"})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "not_found", "error": "file does not exist"})
     except IsADirectoryError:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "is_directory", "error": "path is a directory"})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "is_directory", "error": "path is a directory"})
     except NotADirectoryError:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "not_directory",
-                      "error": "expected a directory"})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "not_directory",
+                           "error": "expected a directory"})
     except Exception as exc:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "io_error", "error": str(exc)})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "io_error", "error": str(exc)})
 
 
 # --- 各 action 的处理 ---
@@ -137,8 +173,8 @@ def _do_read(backend, abs_path, rel_path, args, require_range: bool):
 
     if require_range:
         if offset < 0 or not limit_arg or int(limit_arg) <= 0:
-            return _json({"ok": False, "error_type": "invalid_args",
-                          "error": "read_range requires offset>=0 and limit>0"})
+            return _file_error(backend, {"error_type": "invalid_args",
+                               "error": "read_range requires offset>=0 and limit>0"})
 
     limit = READ_LIMIT if limit_arg is None else min(int(limit_arg), READ_LIMIT)
     data = backend.read_file(abs_path, offset=offset, limit=limit)
@@ -169,9 +205,9 @@ def _do_write(backend, abs_path, rel_path, args):
     overwrite = bool(args.get("overwrite", False))
 
     if _file_exists(backend, abs_path) and not overwrite:
-        return _json({"ok": False, "path": rel_path, "abs_path": abs_path,
-                      "error_type": "exists",
-                      "error": "file exists; pass overwrite=true to replace"})
+        return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
+                           "error_type": "exists",
+                           "error": "file exists; pass overwrite=true to replace"})
 
     data = content.encode("utf-8")
     backend.write_file(abs_path, data, mode="write")
@@ -195,37 +231,37 @@ def _do_replace(backend, abs_path, rel_path, args):
     replace_all = bool(args.get("all", True))
 
     if not find:
-        return _json({"ok": False, "error_type": "invalid_args",
-                      "error": "find is required"})
+        return _file_error(backend, {"error_type": "invalid_args",
+                           "error": "find is required"})
 
     info = backend.stat_file(abs_path)
     if not info.get("is_file"):
-        return _json({"ok": False, "path": rel_path, "abs_path": abs_path,
-                      "error_type": "not_file",
-                      "error": "replace only supports regular files"})
+        return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
+                           "error_type": "not_file",
+                           "error": "replace only supports regular files"})
 
     file_size = int(info.get("size", 0))
     if file_size > REPLACE_LIMIT:
-        return _json({"ok": False, "path": rel_path, "abs_path": abs_path,
-                      "error_type": "file_too_large",
-                      "error": (
-                          f"replace supports files up to {REPLACE_LIMIT} bytes"
-                      ),
-                      "size": file_size, "limit": REPLACE_LIMIT})
+        return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
+                           "error_type": "file_too_large",
+                           "error": (
+                               f"replace supports files up to {REPLACE_LIMIT} bytes"
+                           ),
+                           "size": file_size, "limit": REPLACE_LIMIT})
 
     data = backend.read_file(abs_path, offset=0, limit=file_size)
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        return _json({"ok": False, "path": rel_path, "abs_path": abs_path,
-                      "error_type": "decode_error",
-                      "error": f"file is not valid UTF-8 text: {exc}"})
+        return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
+                           "error_type": "decode_error",
+                           "error": f"file is not valid UTF-8 text: {exc}"})
 
     count = content.count(find)
     if count == 0:
-        return _json({"ok": False, "path": rel_path,
-                      "error_type": "not_found_in_file",
-                      "error": "find string not present in file"})
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "not_found_in_file",
+                           "error": "find string not present in file"})
 
     if replace_all:
         new_content = content.replace(find, replace_text)
@@ -263,7 +299,8 @@ def register(registry):
                 "File operations constrained to the session's fixed file root. "
                 "Relative paths resolve from backend.cwd (same cwd the "
                 "`terminal` tool sees). Actions: "
-                "read, read_range, write, append, replace, list, stat. "
+                "read, read_range, write, append, replace, list, stat, "
+                "pwd, context. "
                 "Paths are relative to backend.cwd unless absolute. "
                 "Path traversal outside the fixed file root is rejected. Sensitive files "
                 "(.env, *.key, *.pem, id_rsa, *.db, .git/*) require "
@@ -280,9 +317,10 @@ def register(registry):
                     "action": {
                         "type": "string",
                         "enum": ["read", "read_range", "write", "append",
-                                 "replace", "list", "stat"],
+                                 "replace", "list", "stat", "pwd", "context"],
                     },
-                    "path": {"type": "string", "description": "relative or absolute path"},
+                    "path": {"type": "string",
+                             "description": "relative or absolute path; not required for pwd/context"},
                     "content": {"type": "string", "description": "for write/append"},
                     "offset": {"type": "integer", "minimum": 0,
                                "description": "byte offset (read/read_range/replace)"},
@@ -297,7 +335,7 @@ def register(registry):
                     "allow_sensitive": {"type": "boolean", "default": False,
                                         "description": "bypass sensitive-file guard"},
                 },
-                "required": ["action", "path"],
+                "required": ["action"],
             },
         },
         handler=handle_file,

@@ -3,7 +3,7 @@ file 工具的端到端测试。
 
 通过 run_conversation 发送自然语言 prompt；LLM 调用 file 工具完成
 文件操作。覆盖：相对路径基准、terminal cd 后 cwd 一致性、路径穿越
-被拒、覆盖保护、大文件截断、Docker/SSH 行为。
+被拒、覆盖保护、大文件截断、复杂路径/追加/列表/元数据、read_range/replace/敏感文件守卫、Docker/SSH 行为。
 
 用法：
     python file_e2e.py local     # 仅 LocalBackend
@@ -125,6 +125,95 @@ def test_truncation(backend, conn, session_id, system_prompt, sandbox, session_k
     return True, "truncation flag surfaced to LLM"
 
 
+def test_nested_unicode_append_list_stat(backend, conn, session_id, system_prompt, sandbox, session_key):
+    """复杂路径 + Unicode 文件名 + append/list/stat/read 的组合场景。LocalBackend 专用。"""
+    if type(backend).__name__ != "LocalBackend":
+        return True, f"skipped for {type(backend).__name__}"
+
+    nested_dir = sandbox / "level one" / "中文 子目录"
+    nested_dir.mkdir(parents=True, exist_ok=True)
+    target = nested_dir / "report 中文.md"
+    rel_path = "level one/中文 子目录/report 中文.md"
+    rel_dir = "level one/中文 子目录"
+
+    initial = "# Hermes 文件测试\nalpha=1\nemoji=🐍\n"
+    appended = "status=appended\n"
+    expected = initial + appended
+
+    prompt = (
+        "Use the file tool only. Do not use the terminal tool.\n"
+        f"First write exactly {initial!r} to {rel_path!r} in the current directory.\n"
+        f"Then append exactly {appended!r} to the same file.\n"
+        f"Then list directory {rel_dir!r}.\n"
+        f"Then stat {rel_path!r}.\n"
+        f"Finally read {rel_path!r} and report the final content, the listed entries, and the file size."
+    )
+    result = run_conversation(prompt, conn, session_id, system_prompt, session_key=session_key)
+    output = result.get("final_response") or ""
+
+    if not target.exists():
+        return False, f"file not created at {target}"
+
+    actual = target.read_text(encoding="utf-8")
+    if actual != expected:
+        return False, f"content mismatch: {actual!r}"
+
+    expected_size = len(expected.encode("utf-8"))
+    if "report 中文.md" not in output and "report" not in output.lower():
+        return False, f"list result not surfaced in response: {output[:240]!r}"
+    if str(expected_size) not in output and f"{expected_size:,}" not in output:
+        return False, f"stat size {expected_size} not surfaced in response: {output[:240]!r}"
+    if "status=appended" not in output:
+        return False, f"final appended content not surfaced in response: {output[:240]!r}"
+
+    return True, "complex Unicode path append/list/stat/read verified"
+
+
+def test_read_range_replace_and_sensitive_guard(backend, conn, session_id, system_prompt, sandbox, session_key):
+    """
+    read_range 续读大文件尾部 + replace 单次替换 + 敏感文件默认拒绝。
+    LocalBackend 专用。
+    """
+    if type(backend).__name__ != "LocalBackend":
+        return True, f"skipped for {type(backend).__name__}"
+
+    big = sandbox / "big_tail.txt"
+    config = sandbox / "config.txt"
+    secret = sandbox / ".env"
+
+    tail = "TAIL_TOKEN_Ω\nEND\n"
+    big.write_bytes(("B" * 100_000).encode("utf-8") + tail.encode("utf-8"))
+    config.write_text("mode=old\nmode=old\n", encoding="utf-8")
+    secret.write_text("OPENAI_API_KEY=should_not_be_read\n", encoding="utf-8")
+
+    prompt = (
+        "Use the file tool only. Do not use the terminal tool.\n"
+        "Do these operations in order and report each result:\n"
+        "1. read 'big_tail.txt' and report truncated plus size.\n"
+        "2. read_range 'big_tail.txt' with offset=100000 and limit=80, and report the content.\n"
+        "3. replace in 'config.txt' with find='mode=old', replace='mode=new', all=false, then report replacements.\n"
+        "4. read 'config.txt' and report its content.\n"
+        "5. read '.env' without allow_sensitive=true and report the error_type and error."
+    )
+    result = run_conversation(prompt, conn, session_id, system_prompt, session_key=session_key)
+    output = (result.get("final_response") or "").lower()
+
+    final_config = config.read_text(encoding="utf-8")
+    if final_config != "mode=new\nmode=old\n":
+        return False, f"replace(all=false) did not update exactly one occurrence: {final_config!r}"
+
+    if "truncat" not in output or "true" not in output:
+        return False, f"initial read truncation not surfaced: {output[:260]!r}"
+    if "tail_token" not in output and "tail token" not in output:
+        return False, f"read_range tail content not surfaced: {output[:260]!r}"
+    if "mode=new" not in output or "mode=old" not in output:
+        return False, f"post-replace content not surfaced: {output[:260]!r}"
+    if "forbidden" not in output or "sensitive" not in output:
+        return False, f"sensitive file guard not surfaced: {output[:260]!r}"
+
+    return True, "read_range, single replace, and sensitive-file guard verified"
+
+
 def test_docker_ssh_unsupported(backend, conn, session_id, system_prompt, sandbox, session_key):
     """Docker/SSH 应返回 unsupported_backend。LocalBackend 跳过此测试。"""
     if type(backend).__name__ == "LocalBackend":
@@ -144,6 +233,8 @@ TESTS: list[tuple[str, TestFn]] = [
     ("traversal_blocked",    test_traversal_blocked),
     ("overwrite_protection", test_overwrite_protection),
     ("truncation",           test_truncation),
+    ("nested_unicode_append_list_stat", test_nested_unicode_append_list_stat),
+    ("read_range_replace_and_sensitive_guard", test_read_range_replace_and_sensitive_guard),
     ("docker_ssh_unsupported", test_docker_ssh_unsupported),
 ]
 
