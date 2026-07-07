@@ -5,8 +5,14 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from hermes.config import HERMES_HOME
-from hermes.tools.memory import load_memory, render_entries, MEMORY_FILE, USER_FILE
+from hermes.config import HERMES_HOME, MEMORY_CHAR_LIMIT, USER_CHAR_LIMIT
+from hermes.tools.memory import (
+    load_memory,
+    render_entries,
+    _current_chars,
+    MEMORY_FILE,
+    USER_FILE,
+)
 from hermes.tools.skill import discover_skills
 
 
@@ -37,11 +43,15 @@ def build_system_prompt(cwd: str) -> str:
 
     memory_entries = load_memory(MEMORY_FILE)
     if memory_entries:
-        parts.append("# Memory\n" + render_entries(memory_entries))
+        used = _current_chars(MEMORY_FILE)
+        header = f"# Memory ({len(memory_entries)} entries, {used}/{MEMORY_CHAR_LIMIT} chars)"
+        parts.append(header + "\n" + render_entries(memory_entries))
 
     user_entries = load_memory(USER_FILE)
     if user_entries:
-        parts.append("# User Profile\n" + render_entries(user_entries))
+        used = _current_chars(USER_FILE)
+        header = f"# User Profile ({len(user_entries)} entries, {used}/{USER_CHAR_LIMIT} chars)"
+        parts.append(header + "\n" + render_entries(user_entries))
 
     skills = discover_skills()
     if skills:
