@@ -19,6 +19,10 @@ from hermes.db import add_message, get_session_messages
 from hermes.errors import classify_error, jittered_backoff, switch_to_fallback
 from hermes.tokens import estimate_tokens, compress
 from hermes.tools import registry
+# ponytail: 主循环的大部分能力(DB / 压缩 / fallback / continuation)暂留在
+# conversation.py,AgentLoop 只抽公共的"assistant message 组装"helper。
+# tool_call 处理由于副作用(print + DB 持久化)特殊,仍内联。
+from hermes.agent_loop import build_assistant_msg_dict
 
 
 ENABLED_TOOLSETS = ["terminal", "file", "memory", "skill", "delegate", "cron"]
@@ -85,22 +89,8 @@ def run_conversation(
         assistant_msg = response.choices[0].message
         finish_reason = response.choices[0].finish_reason
 
-        msg_dict: dict = {
-            "role": "assistant",
-            "content": assistant_msg.content or "",
-        }
-        if assistant_msg.tool_calls:
-            msg_dict["tool_calls"] = [
-                {
-                    "id": tool_call.id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
-                    },
-                }
-                for tool_call in assistant_msg.tool_calls
-            ]
+        # 与 delegate 子 agent 共用同一份 assistant → dict 组装逻辑
+        msg_dict = build_assistant_msg_dict(assistant_msg)
         messages.append(msg_dict)
         add_message(conn, session_id, msg_dict)
 
