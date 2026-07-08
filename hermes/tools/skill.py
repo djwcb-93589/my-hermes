@@ -242,6 +242,11 @@ def discover_skills() -> list[dict]:
     for skill_dir in sorted(SKILLS_DIR.iterdir()):
         if not skill_dir.is_dir():
             continue
+        # 复用 name 校验:目录名非法就直接跳过,不抛错,不影响后续扫描。
+        # 否则会出现"列表能看到但 view/manage 拒绝操作"的尴尬。
+        ok_name, _ = _validate_name(skill_dir.name)
+        if not ok_name:
+            continue
         skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             continue

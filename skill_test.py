@@ -219,9 +219,58 @@ def main() -> None:
         assert not lock.exists(), "lock file must be released after failure"
         print("  atomic write fail ..... OK")
 
+        # 名称规则一致性:discover_skills 必须复用 _validate_name,
+        # 非法目录名(含点 / 空格 / 路径分隔符等)被跳过,合法的照常返回
+        _run_name_consistency_suite(tmp)
+
         print("\nAll skill tests passed.")
     finally:
         _restore(tmp, original)
+
+
+def _run_name_consistency_suite(tmp: Path) -> None:
+    """验证 discover_skills 复用 _validate_name,跳过非法目录名。"""
+    # 先清空,确保起点干净
+    for child in tmp.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+    # 1. 仅非法目录:含点号(常见例子 ``apache.skill``)→ 不应被列出
+    bad_dir = tmp / "apache.skill"
+    bad_dir.mkdir()
+    (bad_dir / "SKILL.md").write_text("---\nname: apache.skill\ndescription: x\n---\n\nbody", encoding="utf-8")
+    skills = sk.discover_skills()
+    names = [s["name"] for s in skills]
+    assert names == [], f"illegal dir should be skipped; got {names}"
+    # 但不报错,扫描正常完成
+    print("  illegal dir skipped .. OK")
+
+    # 2. 仅合法目录:``apache_skill`` → 正常返回
+    good_dir = tmp / "apache_skill"
+    good_dir.mkdir()
+    (good_dir / "SKILL.md").write_text("---\nname: apache_skill\ndescription: x\n---\n\nbody", encoding="utf-8")
+    skills = sk.discover_skills()
+    names = [s["name"] for s in skills]
+    assert names == ["apache_skill"], f"legal dir should be listed; got {names}"
+    print("  legal dir listed ...... OK")
+
+    # 3. 同时存在:合法 + 非法 → 只返回合法那条
+    skills = sk.discover_skills()
+    names = [s["name"] for s in skills]
+    assert "apache_skill" in names, names
+    assert "apache.skill" not in names, f"illegal must be excluded; got {names}"
+    # 同时检查 skills_list 工具(走 handle_skill_list,同一函数)
+    d = _list()
+    listed = [s["name"] for s in d["skills"]]
+    assert listed == ["apache_skill"], listed
+    # skill_view 能操作合法目录,非法的 view 也拒
+    d = _view({"name": "apache_skill"})
+    assert d["ok"] is True, d
+    d = _view({"name": "apache.skill"})
+    assert d["ok"] is False and d["error_type"] == "invalid_name", d
+    print("  mixed legal/illegal ... OK")
 
 
 if __name__ == "__main__":
