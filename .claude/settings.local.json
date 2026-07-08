@@ -9,7 +9,8 @@
       "Bash(python main.py --test)",
       "Bash(python memory_test.py)",
       "Bash(python memory_test.py infra)",
-      "Bash(python memory_test.py e2e)"
+      "Bash(python memory_test.py e2e)",
+      "Bash(python skill_test.py)"
     ]
   }
 }
