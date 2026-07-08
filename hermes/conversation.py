@@ -1,4 +1,15 @@
-"""Core conversation loop."""
+"""主会话 agent:ConversationAgentLoop + run_conversation 入口。
+
+ConversationAgentLoop 继承 AgentLoop,覆盖 hooks 注入主会话专有行为:
+  - compression(每轮模型调用前)
+  - classify_error / fallback / jittered_backoff(模型异常时)
+  - finish_reason == "length" 的 continuation
+  - 每条 assistant / continuation / tool message 的 add_message 持久化
+  - tool_call 处理的 print 日志 + raise 行为(保留原语义)
+
+run_conversation() 保持原有 module-level 签名,内部委托给
+ConversationAgentLoop.run(),返回 dict 保持调用方兼容。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +17,7 @@ import json
 import sqlite3
 import time
 
+from hermes.agent_loop import AgentLoop, AgentLoopResult
 from hermes.config import (
     client,
     MODEL,
@@ -19,14 +31,150 @@ from hermes.db import add_message, get_session_messages
 from hermes.errors import classify_error, jittered_backoff, switch_to_fallback
 from hermes.tokens import estimate_tokens, compress
 from hermes.tools import registry
-# ponytail: 主循环的大部分能力(DB / 压缩 / fallback / continuation)暂留在
-# conversation.py,AgentLoop 只抽公共的"assistant message 组装"helper。
-# tool_call 处理由于副作用(print + DB 持久化)特殊,仍内联。
-from hermes.agent_loop import build_assistant_msg_dict
 
 
 ENABLED_TOOLSETS = ["terminal", "file", "memory", "skill", "delegate", "cron"]
 
+
+class ConversationAgentLoop(AgentLoop):
+    """主会话 agent 循环。
+
+    在 AgentLoop 公共骨架基础上注入 compression / fallback / retry /
+    continuation / DB 持久化等行为。
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        max_iterations: int,
+        tools: list[dict],
+        system_prompt: str,
+        registry,
+        client,
+        session_key: str,
+        conn: sqlite3.Connection,
+        db_session_id: str,
+        existing_messages: list[dict],
+        max_retries: int,
+        max_continuations: int,
+        compression_threshold: int,
+    ):
+        super().__init__(
+            model=model,
+            max_iterations=max_iterations,
+            tools=tools,
+            system_prompt=system_prompt,
+            registry=registry,
+            client=client,
+            session_key=session_key,
+        )
+        # 主会话专有状态
+        self.conn = conn
+        self.db_session_id = db_session_id
+        self.max_retries = max_retries
+        self.max_continuations = max_continuations
+        self.compression_threshold = compression_threshold
+        self._existing_messages = existing_messages
+        self._retry_count = 0
+        self._continuation_count = 0
+
+    # --- messages 初始化:主会话从 DB 加载历史 ---
+
+    def init_messages(self, user_message: str) -> list[dict]:
+        # 复用调用方已 add_message 过的 user_msg;这里只负责把历史 + 当前
+        # user msg 拼成 messages 列表给循环用。
+        return list(self._existing_messages) + [{"role": "user", "content": user_message}]
+
+    # --- 模型调用前:compression ---
+
+    def pre_model_call(self, messages: list[dict]) -> list[dict]:
+        if estimate_tokens(messages) >= self.compression_threshold:
+            messages = compress(messages)
+        return messages
+
+    # --- 模型异常处理:classify → compress / fallback / retry / raise ---
+
+    def handle_model_error(self, exc, messages) -> str:
+        status = getattr(exc, "status_code", None)
+        classified = classify_error(status, str(exc))
+        print(f"  [error] {classified['reason']} (status={status})")
+
+        if classified["should_compress"]:
+            # 触发压缩后让循环重试本轮
+            # ponytail: 直接 mutate messages 是为了让下一轮 pre_model_call
+            # 拿到压缩后的版本(compress 返回新列表,这里覆盖原 list 内容)
+            compressed = compress(messages)
+            messages.clear()
+            messages.extend(compressed)
+            return "retry"
+
+        if classified["should_fallback"]:
+            fallback_client, fallback_model = switch_to_fallback()
+            if fallback_client:
+                self.client = fallback_client
+                self.model = fallback_model
+                return "retry"
+            return "raise"
+
+        if classified["retryable"] and self._retry_count < self.max_retries:
+            self._retry_count += 1
+            time.sleep(jittered_backoff(self._retry_count))
+            return "retry"
+
+        return "raise"
+
+    # --- assistant msg 追加后:add_message + 重置 retry_count ---
+
+    def on_assistant_message(self, msg_dict: dict, response) -> None:
+        add_message(self.conn, self.db_session_id, msg_dict)
+        # 模型调用成功 → 重置 retry_count(对齐原行为)
+        self._retry_count = 0
+
+    # --- continuation ---
+
+    def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
+        if finish_reason == "length" and self._continuation_count < self.max_continuations:
+            self._continuation_count += 1
+            return True
+        return False
+
+    def continuation_message(self) -> dict:
+        return {"role": "user", "content": CONTINUE_MESSAGE}
+
+    def on_continuation_message(self, cont_msg: dict) -> None:
+        add_message(self.conn, self.db_session_id, cont_msg)
+
+    # --- tool_call 处理 ---
+
+    def on_tool_dispatch_start(self) -> None:
+        """进入 tool_call 路径时重置 continuation_count(对齐原行为)。"""
+        self._continuation_count = 0
+
+    def dispatch_one(self, tool_call) -> tuple[str, str | None, str | None]:
+        """主会话保留原行为:json/dispatch 错误直接 raise(不吞)。
+
+        也保留 print 日志(子 agent 没有这条日志)。
+        """
+        tool_name = tool_call.function.name
+        tool_args = json.loads(tool_call.function.arguments)  # 抛就抛
+        print(
+            f"  [tool] {tool_name}: "
+            f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
+        )
+        output = self.registry.dispatch(
+            tool_name, tool_args,
+            session_key=self.session_key,
+        )
+        return output, None, None
+
+    def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
+        add_message(self.conn, self.db_session_id, tool_msg)
+
+
+# ---------------------------------------------------------------------------
+# 对外入口(签名 / 返回格式与原版完全一致)
+# ---------------------------------------------------------------------------
 
 def run_conversation(
     user_message: str,
@@ -35,99 +183,43 @@ def run_conversation(
     cached_prompt: str,
     session_key: str | None = None,
 ) -> dict:
-    """Run a conversation loop with all features enabled."""
-    messages = get_session_messages(conn, session_id)
+    """主会话 agent 入口。委托给 ConversationAgentLoop。
+
+    返回 ``{"final_response": str, "messages": list[dict]}``,
+    与原版完全一致。
+    """
+    # 把 user message 落库后再交给 loop(loop 内部 init_messages 会从 DB
+    # 加载历史 + 这条 user msg 拼成 messages)。
     user_msg = {"role": "user", "content": user_message}
-    messages.append(user_msg)
     add_message(conn, session_id, user_msg)
+    existing = get_session_messages(conn, session_id)
 
-    tools = registry.get_definitions(ENABLED_TOOLSETS)
-    active_client = client
-    active_model = MODEL
-    retry_count = 0
-    continuation_count = 0
+    loop = ConversationAgentLoop(
+        model=MODEL,
+        max_iterations=MAX_ITERATIONS,
+        tools=registry.get_definitions(ENABLED_TOOLSETS),
+        system_prompt=cached_prompt,
+        registry=registry,
+        client=client,
+        session_key=session_key or session_id,
+        conn=conn,
+        db_session_id=session_id,
+        existing_messages=existing,
+        max_retries=MAX_RETRIES,
+        max_continuations=MAX_CONTINUATIONS,
+        compression_threshold=COMPRESSION_THRESHOLD,
+    )
+    result: AgentLoopResult = loop.run(user_message)
 
-    for iteration in range(MAX_ITERATIONS):
-        if estimate_tokens(messages) >= COMPRESSION_THRESHOLD:
-            messages = compress(messages)
+    # 把 loop 的结构化结果映射回原 run_conversation 的 dict 输出
+    if result.status == "completed":
+        final = result.summary
+    elif result.status == "max_iterations":
+        final = "(max iterations reached)"
+    else:
+        # model_error / tool_error:主会话默认路径下不会到这里
+        # (model_error 默认 raise,tool_error 走 dispatch_one raise)
+        # 兜底文案,信息不丢
+        final = f"(agent loop ended: status={result.status}, error={result.error})"
 
-        api_messages = (
-            [{"role": "system", "content": cached_prompt}] + messages
-        )
-
-        try:
-            response = active_client.chat.completions.create(
-                model=active_model,
-                messages=api_messages,
-                tools=tools,
-            )
-        except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            classified = classify_error(status, str(exc))
-            print(f"  [error] {classified['reason']} (status={status})")
-
-            if classified["should_compress"]:
-                messages = compress(messages)
-                continue
-
-            if classified["should_fallback"]:
-                fallback_client, fallback_model = switch_to_fallback()
-                if fallback_client:
-                    active_client = fallback_client
-                    active_model = fallback_model
-                    continue
-                raise
-
-            if classified["retryable"] and retry_count < MAX_RETRIES:
-                retry_count += 1
-                time.sleep(jittered_backoff(retry_count))
-                continue
-
-            raise
-
-        retry_count = 0
-        assistant_msg = response.choices[0].message
-        finish_reason = response.choices[0].finish_reason
-
-        # 与 delegate 子 agent 共用同一份 assistant → dict 组装逻辑
-        msg_dict = build_assistant_msg_dict(assistant_msg)
-        messages.append(msg_dict)
-        add_message(conn, session_id, msg_dict)
-
-        if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
-            continuation_count += 1
-            cont_msg = {"role": "user", "content": CONTINUE_MESSAGE}
-            messages.append(cont_msg)
-            add_message(conn, session_id, cont_msg)
-            continue
-
-        if not assistant_msg.tool_calls:
-            return {
-                "final_response": assistant_msg.content,
-                "messages": messages,
-            }
-
-        continuation_count = 0
-        for tool_call in assistant_msg.tool_calls:
-            tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
-            print(
-                f"  [tool] {tool_name}: "
-                f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
-            )
-            output = registry.dispatch(
-                tool_name, tool_args,
-                session_key=session_key or session_id,
-            )
-            tool_msg = {
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": output,
-            }
-            messages.append(tool_msg)
-            add_message(conn, session_id, tool_msg)
-
-    return {
-        "final_response": "(max iterations reached)",
-        "messages": messages,
-    }
+    return {"final_response": final, "messages": result.messages}

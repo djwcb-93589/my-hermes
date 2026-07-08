@@ -1,13 +1,14 @@
 """
-AgentLoop:parent agent 与 sub agent 共用的最小循环抽象。
+AgentLoop:parent agent 与 sub agent 共用的循环骨架(模板方法模式)。
 
-只负责"模型调用 → 解析 assistant → 处理 tool_call → 追加 message →
-iterations 计数 → max_iterations 处理"。DB 持久化、token 压缩、
-fallback、continuation 等高层行为由调用方包裹,AgentLoop 不绑定。
+``run()`` 是公共骨架:iteration loop → model call → assistant parse →
+tool_call dispatch → messages append → stop condition。所有"主会话
+专有"行为(DB 持久化、压缩、fallback、continuation 等)通过覆盖下方
+hooks 注入,AgentLoop 本身不依赖 conn / session_id / add_message。
 
-辅助函数 ``build_assistant_msg_dict`` / ``dispatch_tool_call`` 是更细
-粒度的复用单元——conversation.py 主循环只用了前者,delegate 子 agent
-直接用 AgentLoop 类。
+默认实现是一份无副作用的最小循环,delegate 子 agent 直接使用;
+主会话通过 ``ConversationAgentLoop``(定义在 conversation.py)覆盖
+hooks 注入压缩 / fallback / DB 持久化等行为。
 """
 
 from __future__ import annotations
@@ -31,14 +32,11 @@ class AgentLoopResult:
 
 
 # ---------------------------------------------------------------------------
-# 共享 helper
+# 共享 helper(也可独立使用)
 # ---------------------------------------------------------------------------
 
 def build_assistant_msg_dict(assistant_msg) -> dict:
-    """把 SDK 的 assistant message 对象转成可序列化 dict。
-
-    parent 和 sub 都用同一个组装逻辑,避免两边 drift。
-    """
+    """把 SDK 的 assistant message 对象转成可序列化 dict。"""
     msg_dict: dict = {
         "role": "assistant",
         "content": assistant_msg.content or "",
@@ -72,9 +70,6 @@ def dispatch_tool_call(
       - blocked 工具: ``("(error: ...)", "blocked", "blocked tool invoked: <name>")``
       - JSON 参数解析失败: ``("(error: ...)", "json", "invalid JSON in <name>: <exc>")``
       - dispatch 抛异常: ``("(error: ...)", "dispatch", "tool <name> raised: <exc>")``
-
-    tool_message_content 用于塞回 messages 让模型看到;error_status / error_detail
-    让调用方决定是否终止循环。
     """
     tool_name = tool_call.function.name
 
@@ -107,18 +102,24 @@ def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# AgentLoop
+# AgentLoop —— 模板方法基类
 # ---------------------------------------------------------------------------
 
 class AgentLoop:
-    """最小公共 agent 循环。
+    """公共循环骨架。
 
-    负责模型调用、assistant 解析、tool_call 处理、message 追加、
-    iterations 计数、max_iterations 处理。不负责 DB 持久化、压缩、
-    fallback、continuation —— 这些由调用方包裹。
-
-    parent agent / sub agent 都能复用;区别仅在 tools / blocked_tools /
-    session_key / system_prompt 的传参。
+    子类通过覆盖下列 hook 注入主会话行为:
+      - ``init_messages``               构造初始 messages(默认单条 user)
+      - ``pre_model_call``              模型调用前(主会话用来做 compression)
+      - ``call_model``                  实际 API 调用
+      - ``handle_model_error``          模型异常处理,返回 "retry"/"abort"/"raise"
+      - ``on_assistant_message``        assistant msg 追加后(主会话用来 add_message)
+      - ``should_continue``             是否触发 continuation
+      - ``continuation_message``        续写 prompt
+      - ``on_continuation_message``     continuation 追加后(主会话 add_message)
+      - ``on_tool_dispatch_start``      即将处理 tool_calls(主会话重置 continuation_count)
+      - ``dispatch_one``                处理单个 tool_call(主会话保留 raise 行为)
+      - ``on_tool_message``             tool msg 追加后(主会话 add_message)
     """
 
     def __init__(
@@ -141,91 +142,187 @@ class AgentLoop:
         self.client = client
         self.session_key = session_key
         self.blocked_tools = set(blocked_tools) if blocked_tools else set()
+        # 运行期状态(每次 run() 重置)
+        self.iterations = 0
         self.tools_used: list[str] = []
 
+    # ===================== 模板方法 =====================
+
+    def run(self, user_message: str) -> AgentLoopResult:
+        """跑一次完整循环。从单条 user_message 开始。"""
+        messages = self.init_messages(user_message)
+        self.iterations = 0
+        self.tools_used = []
+
+        for iteration in range(self.max_iterations):
+            self.iterations = iteration + 1
+            messages = self.pre_model_call(messages)
+
+            # 模型调用 —— 走 handle_model_error 决定后续动作
+            try:
+                response = self.call_model(messages)
+            except Exception as exc:
+                decision = self.handle_model_error(exc, messages)
+                if decision == "retry":
+                    continue
+                if decision == "abort":
+                    return self._result(
+                        ok=False, status="model_error",
+                        summary=self.last_assistant_text(messages),
+                        messages=messages, error=repr(exc),
+                    )
+                # "raise" 或任何未知返回值都重新抛
+                raise
+
+            assistant_msg = response.choices[0].message
+            finish_reason = response.choices[0].finish_reason
+
+            msg_dict = build_assistant_msg_dict(assistant_msg)
+            messages.append(msg_dict)
+            self.on_assistant_message(msg_dict, response)
+
+            # continuation hook(主会话:finish_reason == "length")
+            if self.should_continue(finish_reason, messages):
+                cont_msg = self.continuation_message()
+                messages.append(cont_msg)
+                self.on_continuation_message(cont_msg)
+                continue
+
+            # 模型不再调工具 → 任务完成
+            if not assistant_msg.tool_calls:
+                return self._result(
+                    ok=True, status="completed",
+                    summary=assistant_msg.content or "",
+                    messages=messages,
+                )
+
+            # 处理本轮 tool_calls
+            self.on_tool_dispatch_start()
+            tool_error = self.process_tool_calls(assistant_msg.tool_calls, messages)
+            if tool_error is not None:
+                return tool_error
+
+        # 跑满 max_iterations 仍未完成
+        return self._result(
+            ok=False, status="max_iterations",
+            summary=self.last_assistant_text(messages),
+            messages=messages,
+        )
+
+    def process_tool_calls(self, tool_calls, messages) -> AgentLoopResult | None:
+        """处理本轮所有 tool_calls。返回 AgentLoopResult 表示终止,None 表示继续。
+
+        默认实现:用 dispatch_one 处理每个 tool_call,任何 error_status 都终止。
+        主会话覆盖 dispatch_one 改成 raise 行为后,这里仍正确(None)。
+        """
+        for tc in tool_calls:
+            output, err_status, err_detail = self.dispatch_one(tc)
+            if err_status is not None:
+                return self._result(
+                    ok=False, status="tool_error",
+                    summary=self.last_assistant_text(messages),
+                    messages=messages, error=err_detail,
+                )
+            tc_name = tc.function.name
+            if tc_name not in self.tools_used:
+                self.tools_used.append(tc_name)
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": output,
+            }
+            messages.append(tool_msg)
+            self.on_tool_message(tc, tool_msg, output)
+        return None
+
+    # ===================== 可覆盖 hooks =====================
+
+    def init_messages(self, user_message: str) -> list[dict]:
+        """构造初始 messages。默认单条 user message。"""
+        return [{"role": "user", "content": user_message}]
+
+    def pre_model_call(self, messages: list[dict]) -> list[dict]:
+        """模型调用前的 hook。返回(可能修改后的)messages。默认无操作。"""
+        return messages
+
+    def call_model(self, messages: list[dict]):
+        """实际 API 调用。"""
+        api_messages = (
+            [{"role": "system", "content": self.system_prompt}] + messages
+        )
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=api_messages,
+            tools=self.tools if self.tools else None,
+        )
+
+    def handle_model_error(self, exc, messages) -> str:
+        """模型调用异常时调用。返回:
+          - "retry": 跳过本轮 tool_calls,进下一轮 iteration
+          - "abort": 作为 model_error 返回
+          - "raise": 重新抛异常(默认)
+        """
+        return "raise"
+
+    def on_assistant_message(self, msg_dict: dict, response) -> None:
+        """assistant msg 追加后(主会话用来 add_message)。默认空。"""
+        pass
+
+    def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
+        """是否触发 continuation(默认不触发)。"""
+        return False
+
+    def continuation_message(self) -> dict:
+        """continuation 时塞回的 prompt。"""
+        return {"role": "user", "content": "Please continue from where you left off."}
+
+    def on_continuation_message(self, cont_msg: dict) -> None:
+        """continuation msg 追加后(主会话 add_message)。默认空。"""
+        pass
+
+    def on_tool_dispatch_start(self) -> None:
+        """即将进入 tool_call 处理。主会话用来重置 continuation_count。默认空。"""
+        pass
+
+    def dispatch_one(self, tool_call) -> tuple[str, str | None, str | None]:
+        """处理单个 tool_call。默认走 dispatch_tool_call helper。
+
+        主会话(ConversationAgentLoop)覆盖此方法以保留"json/dispatch
+        错误直接 raise"的原行为。
+        """
+        return dispatch_tool_call(
+            tool_call, self.registry,
+            session_key=self.session_key,
+            blocked_tools=self.blocked_tools,
+        )
+
+    def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
+        """tool msg 追加后(主会话 add_message)。默认空。"""
+        pass
+
+    # ===================== 辅助 =====================
+
     @staticmethod
-    def _last_assistant_text(messages: list[dict]) -> str:
+    def last_assistant_text(messages: list[dict]) -> str:
         """取最后一段 assistant 文本(用于异常 / max_iter 路径的 summary)。"""
         for m in reversed(messages):
             if m.get("role") == "assistant" and m.get("content"):
                 return m["content"]
         return ""
 
-    def run(self, user_message: str) -> AgentLoopResult:
-        """跑一次完整循环,从单条 user_message 开始。"""
-        messages: list[dict] = [{"role": "user", "content": user_message}]
-        iterations = 0
-
-        for iteration in range(self.max_iterations):
-            iterations = iteration + 1
-            api_messages = (
-                [{"role": "system", "content": self.system_prompt}] + messages
-            )
-
-            # 模型调用 —— 异常直接当作 model_error 返回
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=api_messages,
-                    tools=self.tools if self.tools else None,
-                )
-            except Exception as exc:
-                return AgentLoopResult(
-                    ok=False,
-                    status="model_error",
-                    summary=self._last_assistant_text(messages),
-                    messages=messages,
-                    iterations=iterations,
-                    tools_used=self.tools_used,
-                    error=repr(exc),
-                )
-
-            assistant_msg = response.choices[0].message
-            messages.append(build_assistant_msg_dict(assistant_msg))
-
-            # 模型不再调工具 → 任务完成
-            if not assistant_msg.tool_calls:
-                return AgentLoopResult(
-                    ok=True,
-                    status="completed",
-                    summary=assistant_msg.content or "",
-                    messages=messages,
-                    iterations=iterations,
-                    tools_used=self.tools_used,
-                )
-
-            # 处理本轮 tool_calls
-            for tc in assistant_msg.tool_calls:
-                output, err_status, err_detail = dispatch_tool_call(
-                    tc, self.registry,
-                    session_key=self.session_key,
-                    blocked_tools=self.blocked_tools,
-                )
-                if err_status is not None:
-                    return AgentLoopResult(
-                        ok=False,
-                        status="tool_error",
-                        summary=self._last_assistant_text(messages),
-                        messages=messages,
-                        iterations=iterations,
-                        tools_used=self.tools_used,
-                        error=err_detail,
-                    )
-                tc_name = tc.function.name
-                if tc_name not in self.tools_used:
-                    self.tools_used.append(tc_name)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": output,
-                })
-
-        # 跑满 max_iterations 仍未完成
+    def _result(
+        self,
+        *,
+        ok: bool,
+        status: str,
+        summary: str,
+        messages: list[dict],
+        error: str | None = None,
+    ) -> AgentLoopResult:
+        """统一构造结果对象。"""
         return AgentLoopResult(
-            ok=False,
-            status="max_iterations",
-            summary=self._last_assistant_text(messages),
-            messages=messages,
-            iterations=iterations,
-            tools_used=self.tools_used,
+            ok=ok, status=status, summary=summary,
+            messages=messages, iterations=self.iterations,
+            tools_used=list(self.tools_used),
+            error=error,
         )
