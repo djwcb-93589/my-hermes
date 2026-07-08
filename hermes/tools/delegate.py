@@ -20,7 +20,7 @@ from datetime import datetime
 
 from hermes.agent_loop import AgentLoop
 from hermes.backends import cleanup_backend
-from hermes.config import MAX_CHILD_ITERATIONS, MODEL
+from hermes.config import MAX_CHILD_ITERATIONS, MODEL, client as _default_client
 from hermes.tools import registry
 
 
@@ -131,12 +131,17 @@ def _filter_definitions(toolsets: list[str]) -> list[dict]:
     ]
 
 
-def _build_child_prompt(goal: str, context: str) -> str:
-    """组装子 agent 的 system prompt。"""
+def _build_child_prompt(context: str) -> str:
+    """组装子 agent 的 system prompt。
+
+    只写角色 / 约束 / 当前环境;具体 task 作为 user message 传入
+    (``loop.run(goal)``),避免 goal 在 system / user 两处重复。
+    """
     prompt = (
-        "You are a focused sub-agent. "
-        "Complete the task and report results.\n"
-        f"# Task\n{goal}\n\n"
+        "You are a focused leaf sub-agent. "
+        "Complete the task given in the next user message and report results. "
+        "Do not call delegate / memory / skill_manage / cron. "
+        "Use only the tools provided to you.\n\n"
     )
     if context:
         prompt += f"# Context\n{context}\n\n"
@@ -145,6 +150,32 @@ def _build_child_prompt(goal: str, context: str) -> str:
         f"Working directory: {os.getcwd()}"
     )
     return prompt
+
+
+# ---------------------------------------------------------------------------
+# DelegateAgentLoop —— 子 agent 专属策略(只继承公共骨架,不沾主会话能力)
+# ---------------------------------------------------------------------------
+
+class DelegateAgentLoop(AgentLoop):
+    """子 agent 循环。
+
+    只继承 AgentLoop 公共骨架:iteration loop / model call / assistant
+    parse / tool_call dispatch / messages append / stop condition。
+
+    明确不启用主会话能力:
+      - 无 DB 持久化(不覆盖 on_assistant_message / on_tool_message 等)
+      - 无 compression(不覆盖 pre_model_call)
+      - 无 fallback / retry / continuation(不启用主会话策略)
+      - 无 blocked tools 之外的工具限制变更
+
+    handle_model_error 覆盖为返 ``"abort"``:模型 API 异常走
+    ``status="model_error"`` 路径,而不是默认 ``"raise"`` 冒泡到
+    handle_delegate 兜底被误标为 tool_error。
+    """
+
+    def handle_model_error(self, exc, messages) -> str:
+        # 子 agent 不做 fallback / retry;模型异常直接 abort 出 model_error
+        return "abort"
 
 
 # ---------------------------------------------------------------------------
@@ -169,15 +200,17 @@ def handle_delegate(args, **kwargs) -> str:
     print(f"  [delegate] child session={child_session_key} goal={goal[:80]!r}")
 
     try:
-        loop = AgentLoop(
+        loop = DelegateAgentLoop(
             model=MODEL,
             max_iterations=MAX_CHILD_ITERATIONS,
             tools=tools,
-            system_prompt=_build_child_prompt(goal, context),
+            system_prompt=_build_child_prompt(context),
             registry=registry,
+            client=_default_client,
             session_key=child_session_key,
             blocked_tools=DELEGATE_BLOCKED_TOOLS,
         )
+        # goal 作为 user message 传入;system prompt 只描述角色 / 约束
         result = loop.run(goal)
         status = result.status
         summary = result.summary
@@ -185,7 +218,8 @@ def handle_delegate(args, **kwargs) -> str:
         tools_used = result.tools_used
         error = result.error
     except Exception as exc:
-        # AgentLoop 内部已捕获大部分异常;此处兜底防漏
+        # DelegateAgentLoop.handle_model_error 已返 abort,模型异常不会冒泡
+        # 到这里;真到这里说明是别的未预期异常,归到 tool_error 作兜底。
         status = "tool_error"
         summary = ""
         iterations = 0

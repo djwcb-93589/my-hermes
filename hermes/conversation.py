@@ -168,6 +168,7 @@ class ConversationAgentLoop(AgentLoop):
         )
         return output, None, None
 
+    # 工具结果写入数据库
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
         add_message(self.conn, self.db_session_id, tool_msg)
 
@@ -188,11 +189,12 @@ def run_conversation(
     返回 ``{"final_response": str, "messages": list[dict]}``,
     与原版完全一致。
     """
-    # 把 user message 落库后再交给 loop(loop 内部 init_messages 会从 DB
-    # 加载历史 + 这条 user msg 拼成 messages)。
+    # 关键顺序:先读历史(不含当前 user_msg),再 add_message 当前 user_msg。
+    # 这样 ConversationAgentLoop.init_messages 拼 existing + [user_msg] 时,
+    # user message 在 API 调用 和 DB 里都只出现一次。
+    existing = get_session_messages(conn, session_id)
     user_msg = {"role": "user", "content": user_message}
     add_message(conn, session_id, user_msg)
-    existing = get_session_messages(conn, session_id)
 
     loop = ConversationAgentLoop(
         model=MODEL,
