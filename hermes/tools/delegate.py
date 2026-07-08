@@ -373,29 +373,40 @@ def handle_delegate(args, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 def handle_delegate_status(args, **kwargs) -> str:
-    """查询后台 job 当前状态。"""
+    """查询后台 job 当前状态(轻量视图,不含 summary)。
+
+    返回字段: ok / job_id / status / child_status / cancel_requested /
+    created_at / started_at / finished_at / iterations / tools_used / error。
+    job_id 不存在返 not_found。
+    """
     job_id = args.get("job_id", "")
     if not job_id:
         return _json_dumps({"ok": False, "error_type": "invalid_args",
                             "error": "job_id is required"})
-    snap = get_delegate_job_manager().get_status(job_id)
-    if snap is None:
+    view = get_delegate_job_manager().status_view(job_id)
+    if view is None:
         return _json_dumps({"ok": False, "error_type": "not_found",
                             "error": f"unknown job_id: {job_id}"})
-    return _json_dumps({"ok": True, **snap})
+    return _json_dumps(view)
 
 
 def handle_delegate_result(args, **kwargs) -> str:
-    """查询后台 job 结果。未终态时返回 status=running/queued,不阻塞等待。"""
+    """查询后台 job 结果(完整视图,非阻塞)。
+
+    - queued / running:ok=False, error="Job is still running", summary=""
+    - completed / failed / cancelled:ok 视 job.status 而定(completed→True),
+      返完整 summary / iterations / tools_used / child_session_key / error /
+      child_status
+    """
     job_id = args.get("job_id", "")
     if not job_id:
         return _json_dumps({"ok": False, "error_type": "invalid_args",
                             "error": "job_id is required"})
-    snap = get_delegate_job_manager().get_result(job_id)
-    if snap is None:
+    view = get_delegate_job_manager().result_view(job_id)
+    if view is None:
         return _json_dumps({"ok": False, "error_type": "not_found",
                             "error": f"unknown job_id: {job_id}"})
-    return _json_dumps({"ok": True, **snap})
+    return _json_dumps(view)
 
 
 def handle_delegate_cancel(args, **kwargs) -> str:
@@ -470,11 +481,12 @@ def register(registry):
         schema={
             "name": "delegate_status",
             "description": (
-                "Query the current status of a background delegate job. "
-                "Returns {ok, status ∈ queued|running|completed|failed|"
-                "cancelled, summary, iterations, tools_used, error, "
-                "cancel_requested, timestamps}. Returns not_found if the "
-                "job_id is unknown."
+                "Lightweight status probe for a background delegate job. "
+                "Returns {ok, job_id, status ∈ queued|running|completed|"
+                "failed|cancelled, child_status, cancel_requested, "
+                "iterations, tools_used, error, timestamps}. Does NOT "
+                "include summary (use delegate_result for that). Use this "
+                "to check whether the job is still running or how it ended."
             ),
             "parameters": {
                 "type": "object",
@@ -492,10 +504,12 @@ def register(registry):
         schema={
             "name": "delegate_result",
             "description": (
-                "Fetch the result of a background delegate job. Non-blocking: "
-                "if the job is still queued/running, returns status=queued/"
-                "running with empty summary; if completed/failed/cancelled, "
-                "returns summary/iterations/tools_used/error."
+                "Fetch the full result of a background delegate job. "
+                "Non-blocking: if still queued/running, returns ok=false "
+                "with error='Job is still running' and empty summary. If "
+                "completed/failed/cancelled, returns ok (true only when "
+                "status=completed), summary, iterations, tools_used, "
+                "child_session_key, child_status, error."
             ),
             "parameters": {
                 "type": "object",

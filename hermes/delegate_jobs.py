@@ -30,7 +30,13 @@ class DelegateJob:
     goal: str
     context: str
     toolsets: list[str]
-    status: str  # queued | running | completed | failed | cancelled
+    # job 生命周期状态:queued / running / completed / failed / cancelled
+    status: str = "queued"
+    # child AgentLoop 返回的原始状态:completed / max_iterations / tool_error /
+    # model_error / invalid_args / cancelled 等。worker 自身异常时为 None
+    # 或 "worker_error"。让调用方区分"job 失败因为 child 撞 max_iter"
+    # 还是"job 失败因为 child tool_error"。
+    child_status: str | None = None
     summary: str = ""
     iterations: int = 0
     tools_used: list[str] = field(default_factory=list)
@@ -43,6 +49,10 @@ class DelegateJob:
     _thread: threading.Thread | None = None
 
 
+# 终态集合:worker 跑完后 status 必落在这里之一
+TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+
 class DelegateJobManager:
     """进程内后台 delegate job 调度器。线程安全。"""
 
@@ -51,41 +61,65 @@ class DelegateJobManager:
         self._lock = threading.Lock()
         self.max_jobs = max_jobs
 
-    # ---------- 内部:状态快照 ----------
+    # ---------- 查询:两种视图 ----------
 
-    @staticmethod
-    def _snapshot(job: DelegateJob) -> dict:
-        """生成对外可见的状态快照(剥离内部字段)。"""
-        return {
-            "job_id": job.job_id,
-            "parent_session_key": job.parent_session_key,
-            "child_session_key": job.child_session_key,
-            "goal": job.goal,
-            "toolsets": list(job.toolsets),
-            "status": job.status,
-            "summary": job.summary,
-            "iterations": job.iterations,
-            "tools_used": list(job.tools_used),
-            "error": job.error,
-            "created_at": job.created_at,
-            "started_at": job.started_at,
-            "finished_at": job.finished_at,
-            "cancel_requested": job.cancel_requested,
-        }
+    def status_view(self, job_id: str) -> dict | None:
+        """轻量状态视图,用于 delegate_status 工具。
 
-    # ---------- 查询 ----------
-
-    def get_status(self, job_id: str) -> dict | None:
+        不返 summary(可能很长);只返判断"还在跑 / 是否完成 / 是否失败"
+        所需的最小字段集。
+        """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
-            return self._snapshot(job)
+            return {
+                "ok": True,
+                "job_id": job.job_id,
+                "status": job.status,
+                "child_status": job.child_status,
+                "cancel_requested": job.cancel_requested,
+                "created_at": job.created_at,
+                "started_at": job.started_at,
+                "finished_at": job.finished_at,
+                "iterations": job.iterations,
+                "tools_used": list(job.tools_used),
+                "error": job.error,
+            }
 
-    def get_result(self, job_id: str) -> dict | None:
-        # 终态(completed/failed/cancelled)才有完整 summary/iterations。
-        # 未终态(queued/running)也返回 snapshot,但 summary 等字段为空。
-        return self.get_status(job_id)
+    def result_view(self, job_id: str) -> dict | None:
+        """结果视图,用于 delegate_result 工具。
+
+        未终态(queued / running)时返 ``ok=False`` + ``error="Job is still running"``,
+        ``summary=""``,不阻塞等待。
+        终态时返完整 summary / iterations / tools_used / child_session_key / error。
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            if job.status not in TERMINAL_STATUSES:
+                return {
+                    "ok": False,
+                    "job_id": job.job_id,
+                    "status": job.status,           # queued / running
+                    "child_status": job.child_status,
+                    "summary": "",
+                    "error": "Job is still running",
+                }
+            # 终态:ok 仅当 job 真正 completed
+            ok = (job.status == "completed")
+            return {
+                "ok": ok,
+                "job_id": job.job_id,
+                "status": job.status,
+                "child_status": job.child_status,
+                "summary": job.summary,
+                "iterations": job.iterations,
+                "tools_used": list(job.tools_used),
+                "child_session_key": job.child_session_key,
+                "error": job.error,
+            }
 
     def is_cancel_requested(self, job_id: str) -> bool:
         """供 runner 闭包构造 cancel_checker 使用。"""
@@ -197,17 +231,21 @@ class DelegateJobManager:
                 job.iterations = int(result.get("iterations", 0) or 0)
                 job.tools_used = list(result.get("tools_used", []) or [])
                 job.error = result.get("error")
-                status = result.get("status", "failed")
-                if status == "completed":
+                # 保留 child AgentLoop 的原始状态,不粗暴归并
+                child_status = result.get("status")
+                job.child_status = child_status
+                if child_status == "completed":
                     job.status = "completed"
-                elif status == "cancelled":
+                elif child_status == "cancelled":
                     job.status = "cancelled"
                 else:
-                    # tool_error / model_error / max_iterations 归到 failed
+                    # max_iterations / tool_error / model_error / invalid_args 等
+                    # 都归到 job 失败,但 child_status 保留原始原因
                     job.status = "failed"
         except Exception as exc:
             with self._lock:
                 job.status = "failed"
+                job.child_status = "worker_error"
                 job.error = f"worker exception: {exc!r}"
         finally:
             with self._lock:
