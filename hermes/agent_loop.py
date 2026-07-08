@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Callable
 
 from hermes.config import client as _default_client
 
@@ -133,6 +134,8 @@ class AgentLoop:
         client=_default_client,
         session_key: str | None = None,
         blocked_tools: set[str] | None = None,
+        model_kwargs: dict | None = None,
+        cancel_checker: "Callable[[], bool] | None" = None,
     ):
         self.model = model
         self.max_iterations = max_iterations
@@ -142,9 +145,28 @@ class AgentLoop:
         self.client = client
         self.session_key = session_key
         self.blocked_tools = set(blocked_tools) if blocked_tools else set()
+        # provider-specific 额外参数(如 extra_body / temperature 等)。
+        # AgentLoop 只透传,不理解内容;由 ConversationAgentLoop /
+        # DelegateAgentLoop 的调用方决定。
+        self.model_kwargs = dict(model_kwargs) if model_kwargs else {}
+        # 协作式取消检查器:返回 True 表示外部已请求取消,循环应尽快退出。
+        # 默认 None = 不检查。后台 delegate 用它实现 cancel。
+        self.cancel_checker = cancel_checker
         # 运行期状态(每次 run() 重置)
         self.iterations = 0
         self.tools_used: list[str] = []
+
+    # --- 取消检查(后台 delegate 用) ---
+
+    def _is_cancelled(self) -> bool:
+        return self.cancel_checker is not None and bool(self.cancel_checker())
+
+    def _cancel_result(self, messages: list[dict]) -> "AgentLoopResult":
+        return self._result(
+            ok=False, status="cancelled",
+            summary=self.last_assistant_text(messages),
+            messages=messages, error="cancel requested",
+        )
 
     # ===================== 模板方法 =====================
 
@@ -155,8 +177,16 @@ class AgentLoop:
         self.tools_used = []
 
         for iteration in range(self.max_iterations):
+            # 1) iteration 开始前检查取消
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+
             self.iterations = iteration + 1
             messages = self.pre_model_call(messages)
+
+            # 2) 模型调用前检查取消
+            if self._is_cancelled():
+                return self._cancel_result(messages)
 
             # 模型调用 —— 走 handle_model_error 决定后续动作
             try:
@@ -198,6 +228,9 @@ class AgentLoop:
 
             # 处理本轮 tool_calls
             self.on_tool_dispatch_start()
+            # 3) tool 调用前检查取消
+            if self._is_cancelled():
+                return self._cancel_result(messages)
             tool_error = self.process_tool_calls(assistant_msg.tool_calls, messages)
             if tool_error is not None:
                 return tool_error
@@ -246,7 +279,7 @@ class AgentLoop:
         return messages
 
     def call_model(self, messages: list[dict]):
-        """实际 API 调用。"""
+        """实际 API 调用。``model_kwargs`` 原样透传给 provider SDK。"""
         api_messages = (
             [{"role": "system", "content": self.system_prompt}] + messages
         )
@@ -254,6 +287,7 @@ class AgentLoop:
             model=self.model,
             messages=api_messages,
             tools=self.tools if self.tools else None,
+            **self.model_kwargs,
         )
 
     def handle_model_error(self, exc, messages) -> str:

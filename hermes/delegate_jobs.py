@@ -1,0 +1,231 @@
+"""
+后台 delegate job 管理器(进程内,非持久化)。
+
+提供 ``submit`` / ``get_status`` / ``get_result`` / ``cancel`` 接口,
+后台 daemon worker 线程执行子任务。所有 job 状态用 ``threading.Lock``
+保护;worker 无论成功 / 失败 / 取消 / 异常,都通过 runner 闭包内的
+``finally`` 清理 child backend。
+
+第一版:进程内内存存储,**不跨进程,不重启恢复**。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+MAX_BACKGROUND_DELEGATE_JOBS = 3
+
+
+@dataclass
+class DelegateJob:
+    """单个后台 delegate job 的状态记录。"""
+    job_id: str
+    parent_session_key: str | None
+    child_session_key: str
+    goal: str
+    context: str
+    toolsets: list[str]
+    status: str  # queued | running | completed | failed | cancelled
+    summary: str = ""
+    iterations: int = 0
+    tools_used: list[str] = field(default_factory=list)
+    error: str | None = None
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    cancel_requested: bool = False
+    # 内部:worker 线程对象(不暴露给查询接口)
+    _thread: threading.Thread | None = None
+
+
+class DelegateJobManager:
+    """进程内后台 delegate job 调度器。线程安全。"""
+
+    def __init__(self, max_jobs: int = MAX_BACKGROUND_DELEGATE_JOBS):
+        self._jobs: dict[str, DelegateJob] = {}
+        self._lock = threading.Lock()
+        self.max_jobs = max_jobs
+
+    # ---------- 内部:状态快照 ----------
+
+    @staticmethod
+    def _snapshot(job: DelegateJob) -> dict:
+        """生成对外可见的状态快照(剥离内部字段)。"""
+        return {
+            "job_id": job.job_id,
+            "parent_session_key": job.parent_session_key,
+            "child_session_key": job.child_session_key,
+            "goal": job.goal,
+            "toolsets": list(job.toolsets),
+            "status": job.status,
+            "summary": job.summary,
+            "iterations": job.iterations,
+            "tools_used": list(job.tools_used),
+            "error": job.error,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "cancel_requested": job.cancel_requested,
+        }
+
+    # ---------- 查询 ----------
+
+    def get_status(self, job_id: str) -> dict | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            return self._snapshot(job)
+
+    def get_result(self, job_id: str) -> dict | None:
+        # 终态(completed/failed/cancelled)才有完整 summary/iterations。
+        # 未终态(queued/running)也返回 snapshot,但 summary 等字段为空。
+        return self.get_status(job_id)
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        """供 runner 闭包构造 cancel_checker 使用。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return bool(job and job.cancel_requested)
+
+    # ---------- 提交 / 取消 ----------
+
+    def submit(
+        self,
+        *,
+        runner_factory: Callable[[DelegateJob], Callable[[], dict]],
+        goal: str,
+        context: str,
+        toolsets: list[str],
+        parent_session_key: str | None,
+        child_session_key: str,
+    ) -> dict:
+        """提交后台 job。
+
+        ``runner_factory`` 接收刚创建的 ``DelegateJob`` 对象,返回一个
+        无参 ``runner()`` 闭包(内部跑 ``run_delegate_child``)。manager
+        先创建 job 拿到 ``job_id``,再调 factory 让调用方据此构造
+        cancel_checker(查 ``job.cancel_requested``),最后启动 worker。
+        """
+        with self._lock:
+            active = sum(
+                1 for j in self._jobs.values()
+                if j.status in ("queued", "running")
+            )
+            if active >= self.max_jobs:
+                return {
+                    "ok": False,
+                    "status": "rejected",
+                    "error": "too many background delegate jobs",
+                }
+
+            job_id = f"delegate-job-{uuid.uuid4().hex[:12]}"
+            job = DelegateJob(
+                job_id=job_id,
+                parent_session_key=parent_session_key,
+                child_session_key=child_session_key,
+                goal=goal,
+                context=context,
+                toolsets=list(toolsets),
+                status="queued",
+            )
+            self._jobs[job_id] = job
+
+        # 锁外构造 runner(避免 factory 内若有重操作会阻塞其它 submit)
+        runner = runner_factory(job)
+
+        thread = threading.Thread(
+            target=self._worker,
+            args=(job, runner),
+            name=f"delegate-worker-{job_id}",
+            daemon=True,
+        )
+        with self._lock:
+            job._thread = thread
+        thread.start()
+
+        return {
+            "ok": True,
+            "status": "submitted",
+            "job_id": job_id,
+            "child_session_key": child_session_key,
+        }
+
+    def cancel(self, job_id: str) -> dict:
+        """协作式取消:标记 cancel_requested,worker 在下一轮检查时退出。
+
+        不会强行 kill 线程。
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return {
+                    "ok": False, "status": "not_found",
+                    "error": f"unknown job_id: {job_id}",
+                }
+            if job.status in ("completed", "failed", "cancelled"):
+                return {
+                    "ok": True, "status": job.status, "job_id": job_id,
+                    "message": "job already finished",
+                }
+            if job.cancel_requested:
+                return {
+                    "ok": True, "status": "cancel_requested", "job_id": job_id,
+                    "message": "cancel already requested",
+                }
+            job.cancel_requested = True
+            return {
+                "ok": True, "status": "cancel_requested", "job_id": job_id,
+                "message": "cancel flag set; worker will exit at next checkpoint",
+            }
+
+    # ---------- worker ----------
+
+    def _worker(self, job: DelegateJob, runner: Callable[[], dict]) -> None:
+        with self._lock:
+            job.status = "running"
+            job.started_at = time.time()
+        try:
+            result = runner() or {}
+            with self._lock:
+                job.summary = result.get("summary", "") or ""
+                job.iterations = int(result.get("iterations", 0) or 0)
+                job.tools_used = list(result.get("tools_used", []) or [])
+                job.error = result.get("error")
+                status = result.get("status", "failed")
+                if status == "completed":
+                    job.status = "completed"
+                elif status == "cancelled":
+                    job.status = "cancelled"
+                else:
+                    # tool_error / model_error / max_iterations 归到 failed
+                    job.status = "failed"
+        except Exception as exc:
+            with self._lock:
+                job.status = "failed"
+                job.error = f"worker exception: {exc!r}"
+        finally:
+            with self._lock:
+                job.finished_at = time.time()
+
+
+# ---------------------------------------------------------------------------
+# 模块级单例(进程内)
+# ---------------------------------------------------------------------------
+
+_manager: DelegateJobManager | None = None
+_manager_lock = threading.Lock()
+
+
+def get_delegate_job_manager() -> DelegateJobManager:
+    """获取进程级单例。第一版用内存存储,所以单例即可。"""
+    global _manager
+    with _manager_lock:
+        if _manager is None:
+            _manager = DelegateJobManager()
+        return _manager

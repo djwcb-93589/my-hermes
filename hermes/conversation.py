@@ -59,6 +59,7 @@ class ConversationAgentLoop(AgentLoop):
         max_retries: int,
         max_continuations: int,
         compression_threshold: int,
+        model_kwargs: dict | None = None,
     ):
         super().__init__(
             model=model,
@@ -68,6 +69,7 @@ class ConversationAgentLoop(AgentLoop):
             registry=registry,
             client=client,
             session_key=session_key,
+            model_kwargs=model_kwargs,
         )
         # 主会话专有状态
         self.conn = conn
@@ -210,6 +212,10 @@ def run_conversation(
         max_retries=MAX_RETRIES,
         max_continuations=MAX_CONTINUATIONS,
         compression_threshold=COMPRESSION_THRESHOLD,
+        # ponytail: 当前项目 client.chat.completions.create 只传基础三参数
+        # (model/messages/tools)。若后续切到 GLM 5.2 / deepseek v4 等需要
+        # extra_body / temperature 的 provider,在这里透传即可,无需改 AgentLoop。
+        model_kwargs=None,
     )
     result: AgentLoopResult = loop.run(user_message)
 
