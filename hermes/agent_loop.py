@@ -377,10 +377,12 @@ class AgentLoop:
 
         判定顺序:
           1. err_status == "blocked":致命(模型调黑名单工具)
-          2. err_status in {"json", "dispatch"}:非致命(模型参数 / 调用问题,可修正)
-          3. 普通字符串 fatal marker 扫描(对非 JSON 或 JSON 解析失败也生效):
+          2. 普通字符串 fatal marker 扫描(优先于 err_status 判断):
              safety_blocked / forbidden / permission_denied / path_escape /
-             persistence_error / cancelled → 致命
+             persistence_error / cancelled → 致命。即使 err_status 是
+             "json" / "dispatch",只要异常文本里含 fatal marker 就立即终止,
+             避免 dispatch 抛出含 "permission_denied" 的异常被误判为可恢复。
+          3. err_status in {"json", "dispatch"}:非致命(模型参数 / 调用问题,可修正)
           4. output 是 JSON 含 error_type 字段:
              - fatal=True 或 error_type 在致命集合 → 致命
              - 其它 error_type → 非致命
@@ -393,17 +395,20 @@ class AgentLoop:
         if err_status == "blocked":
             return True, "blocked"
 
+        # fatal marker 优先:即使 err_status 是 json/dispatch,只要异常文本
+        # 里含 forbidden / permission_denied / path_escape 等关键字,立刻终止。
+        # 否则工具抛"permission denied"异常会被当成普通 dispatch 错误继续 loop,
+        # 模型反复重试无意义的越权调用。
+        if isinstance(output, str):
+            marker = _detect_fatal_marker(output)
+            if marker:
+                return True, marker
+
         if err_status in ("json", "dispatch"):
             # 调用层错误(参数 JSON 非法 / 工具抛异常):非致命,让模型修正
             return False, err_status
 
         if isinstance(output, str):
-            # 先扫 fatal marker:对普通字符串工具错误也生效,避免安全 / 权限 /
-            # 路径逃逸类错误因没结构化 error_type 被当成可恢复错误继续 loop
-            marker = _detect_fatal_marker(output)
-            if marker:
-                return True, marker
-
             try:
                 obj = json.loads(output)
             except (ValueError, TypeError):
