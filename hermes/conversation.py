@@ -4,8 +4,9 @@ ConversationAgentLoop 继承 AgentLoop,覆盖 hooks 注入主会话专有行为:
   - compression(每轮模型调用前)
   - classify_error / fallback / jittered_backoff(模型异常时)
   - finish_reason == "length" 的 continuation
-  - 每条 assistant / continuation / tool message 的 add_messages 持久化
-  - tool_call 处理的 print 日志 + raise 行为(保留原语义)
+  - 普通 assistant / continuation message 的 add_messages 持久化
+  - assistant tool_call + tool results 的 batch 原子持久化
+  - tool_call 处理的 print 日志 + 错误 tool message 包装
 
 run_conversation() 保持原有 module-level 签名,内部委托给
 ConversationAgentLoop.run(),返回 dict 保持调用方兼容。
@@ -126,7 +127,7 @@ class ConversationAgentLoop(AgentLoop):
 
         return "raise"
 
-    # --- assistant msg 追加后:add_messages + 重置 retry_count ---
+    # --- 普通 assistant msg 追加后:add_messages + 重置 retry_count ---
 
     def on_assistant_message(self, msg_dict: dict, response) -> None:
         add_messages(self.conn, self.db_session_id, [msg_dict])
@@ -154,25 +155,51 @@ class ConversationAgentLoop(AgentLoop):
         self._continuation_count = 0
 
     def dispatch_one(self, tool_call) -> tuple[str, str | None, str | None]:
-        """主会话保留原行为:json/dispatch 错误直接 raise(不吞)。
+        """主会话保留 print 日志,并把工具异常包装成 tool message。
 
-        也保留 print 日志(子 agent 没有这条日志)。
+        工具失败不是 DB 事务失败;真正持久化失败交给 add_messages 抛出。
         """
         tool_name = tool_call.function.name
-        tool_args = json.loads(tool_call.function.arguments)  # 抛就抛
+        try:
+            tool_args = json.loads(tool_call.function.arguments)
+        except Exception as exc:
+            return (
+                f"(error: invalid JSON arguments in {tool_name}: {exc})",
+                "json",
+                f"invalid JSON in tool_call {tool_name!r}: {exc}",
+            )
         print(
             f"  [tool] {tool_name}: "
             f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
         )
-        output = self.registry.dispatch(
-            tool_name, tool_args,
-            session_key=self.session_key,
-        )
+        try:
+            output = self.registry.dispatch(
+                tool_name, tool_args,
+                session_key=self.session_key,
+            )
+        except Exception as exc:
+            return (
+                f"(error: tool {tool_name} raised: {exc})",
+                "dispatch",
+                f"tool {tool_name!r} raised: {exc}",
+            )
         return output, None, None
 
-    # 工具结果写入数据库
+    # 单条 tool result 不单独持久化,避免 assistant tool_call 与 tool result
+    # 被拆成多次提交。
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
-        add_messages(self.conn, self.db_session_id, [tool_msg])
+        pass
+
+    def on_tool_messages_batch(
+        self,
+        assistant_msg: dict,
+        tool_messages: list[dict],
+        response,
+    ) -> None:
+        # assistant tool_call 与对应 tool result 必须同事务写入,
+        # 否则崩溃时会留下只有 tool_call 没有 tool result 的残缺历史。
+        add_messages(self.conn, self.db_session_id, [assistant_msg, *tool_messages])
+        self._retry_count = 0
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +252,7 @@ def run_conversation(
     elif result.status == "max_iterations":
         final = "(max iterations reached)"
     else:
-        # model_error / tool_error:主会话默认路径下不会到这里
-        # (model_error 默认 raise,tool_error 走 dispatch_one raise)
+        # model_error 默认 raise;tool_error 会先把错误 tool message 持久化
         # 兜底文案,信息不丢
         final = f"(agent loop ended: status={result.status}, error={result.error})"
 

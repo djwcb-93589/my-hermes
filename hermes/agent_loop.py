@@ -114,13 +114,14 @@ class AgentLoop:
       - ``pre_model_call``              模型调用前(主会话用来做 compression)
       - ``call_model``                  实际 API 调用
       - ``handle_model_error``          模型异常处理,返回 "retry"/"abort"/"raise"
-      - ``on_assistant_message``        assistant msg 追加后(主会话用来 add_messages)
+      - ``on_assistant_message``        普通 assistant msg 追加后
       - ``should_continue``             是否触发 continuation
       - ``continuation_message``        续写 prompt
       - ``on_continuation_message``     continuation 追加后(主会话 add_messages)
       - ``on_tool_dispatch_start``      即将处理 tool_calls(主会话重置 continuation_count)
-      - ``dispatch_one``                处理单个 tool_call(主会话保留 raise 行为)
-      - ``on_tool_message``             tool msg 追加后(主会话 add_messages)
+      - ``dispatch_one``                处理单个 tool_call
+      - ``on_tool_message``             单条 tool msg 追加后
+      - ``on_tool_messages_batch``      assistant tool_call + tool results 完成后
     """
 
     def __init__(
@@ -209,31 +210,37 @@ class AgentLoop:
 
             msg_dict = build_assistant_msg_dict(assistant_msg)
             messages.append(msg_dict)
-            self.on_assistant_message(msg_dict, response)
+
+            if assistant_msg.tool_calls:
+                # assistant tool_call 必须等对应 tool result 生成后一起持久化,
+                # 避免数据库里出现只有 tool_call 没有 tool result 的半截历史。
+                self.on_tool_dispatch_start()
+                # 3) tool 调用前检查取消
+                if self._is_cancelled():
+                    return self._cancel_result(messages)
+                tool_messages, tool_error = self.process_tool_calls(
+                    assistant_msg.tool_calls, messages
+                )
+                self.on_tool_messages_batch(msg_dict, tool_messages, response)
+                if tool_error is not None:
+                    return tool_error
+                continue
 
             # continuation hook(主会话:finish_reason == "length")
             if self.should_continue(finish_reason, messages):
+                self.on_assistant_message(msg_dict, response)
                 cont_msg = self.continuation_message()
                 messages.append(cont_msg)
                 self.on_continuation_message(cont_msg)
                 continue
 
             # 模型不再调工具 → 任务完成
-            if not assistant_msg.tool_calls:
-                return self._result(
-                    ok=True, status="completed",
-                    summary=assistant_msg.content or "",
-                    messages=messages,
-                )
-
-            # 处理本轮 tool_calls
-            self.on_tool_dispatch_start()
-            # 3) tool 调用前检查取消
-            if self._is_cancelled():
-                return self._cancel_result(messages)
-            tool_error = self.process_tool_calls(assistant_msg.tool_calls, messages)
-            if tool_error is not None:
-                return tool_error
+            self.on_assistant_message(msg_dict, response)
+            return self._result(
+                ok=True, status="completed",
+                summary=assistant_msg.content or "",
+                messages=messages,
+            )
 
         # 跑满 max_iterations 仍未完成
         return self._result(
@@ -242,21 +249,34 @@ class AgentLoop:
             messages=messages,
         )
 
-    def process_tool_calls(self, tool_calls, messages) -> AgentLoopResult | None:
-        """处理本轮所有 tool_calls。返回 AgentLoopResult 表示终止,None 表示继续。
+    def process_tool_calls(
+        self,
+        tool_calls,
+        messages,
+    ) -> tuple[list[dict], AgentLoopResult | None]:
+        """处理本轮所有 tool_calls,返回生成的 tool messages 和可选错误结果。
 
-        默认实现:用 dispatch_one 处理每个 tool_call,任何 error_status 都终止。
-        主会话覆盖 dispatch_one 改成 raise 行为后,这里仍正确(None)。
+        工具执行失败不是持久化失败:异常会被包装成合法 tool message
+        追加到上下文,由调用方和 assistant tool_call 一起原子持久化。
         """
+        tool_messages: list[dict] = []
+        first_error_detail: str | None = None
         for tc in tool_calls:
-            output, err_status, err_detail = self.dispatch_one(tc)
+            try:
+                output, err_status, err_detail = self.dispatch_one(tc)
+            except Exception as exc:
+                tool_name = self._tool_call_name(tc)
+                output = f"(error: tool {tool_name} raised: {exc})"
+                err_status = "dispatch"
+                err_detail = f"tool {tool_name!r} raised: {exc}"
+
             if err_status is not None:
-                return self._result(
-                    ok=False, status="tool_error",
-                    summary=self.last_assistant_text(messages),
-                    messages=messages, error=err_detail,
+                first_error_detail = first_error_detail or (
+                    err_detail
+                    or f"tool {self._tool_call_name(tc)!r} failed: {err_status}"
                 )
-            tc_name = tc.function.name
+
+            tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
                 self.tools_used.append(tc_name)
             tool_msg = {
@@ -265,8 +285,16 @@ class AgentLoop:
                 "content": output,
             }
             messages.append(tool_msg)
+            tool_messages.append(tool_msg)
             self.on_tool_message(tc, tool_msg, output)
-        return None
+
+        if first_error_detail is not None:
+            return tool_messages, self._result(
+                ok=False, status="tool_error",
+                summary=self.last_assistant_text(messages),
+                messages=messages, error=first_error_detail,
+            )
+        return tool_messages, None
 
     # ===================== 可覆盖 hooks =====================
 
@@ -299,7 +327,7 @@ class AgentLoop:
         return "raise"
 
     def on_assistant_message(self, msg_dict: dict, response) -> None:
-        """assistant msg 追加后(主会话用来 add_messages)。默认空。"""
+        """普通 assistant msg 追加后调用。默认空。"""
         pass
 
     def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
@@ -321,8 +349,8 @@ class AgentLoop:
     def dispatch_one(self, tool_call) -> tuple[str, str | None, str | None]:
         """处理单个 tool_call。默认走 dispatch_tool_call helper。
 
-        主会话(ConversationAgentLoop)覆盖此方法以保留"json/dispatch
-        错误直接 raise"的原行为。
+        返回值里的 error_status 表示工具执行失败,但调用方仍会生成
+        合法 tool message,再由 batch hook 原子持久化。
         """
         return dispatch_tool_call(
             tool_call, self.registry,
@@ -331,10 +359,24 @@ class AgentLoop:
         )
 
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
-        """tool msg 追加后(主会话 add_messages)。默认空。"""
+        """单条 tool msg 追加后调用。默认空。"""
+        pass
+
+    def on_tool_messages_batch(
+        self,
+        assistant_msg: dict,
+        tool_messages: list[dict],
+        response,
+    ) -> None:
+        """assistant tool_call 与对应 tool results 全部生成后调用。默认空。"""
         pass
 
     # ===================== 辅助 =====================
+
+    @staticmethod
+    def _tool_call_name(tool_call) -> str:
+        function = getattr(tool_call, "function", None)
+        return getattr(function, "name", "<unknown>")
 
     @staticmethod
     def last_assistant_text(messages: list[dict]) -> str:

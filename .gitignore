@@ -6,3 +6,6 @@
 *.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
+__pycache__/
+*.py[cod]
+*$py.class
