@@ -14,7 +14,10 @@ hooks 注入压缩 / fallback / DB 持久化等行为。
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from hermes.config import client as _default_client
@@ -44,6 +47,139 @@ class AgentLoopResult:
 # 共享 helper(也可独立使用)
 # ---------------------------------------------------------------------------
 
+# 密钥 / token / password 脱敏模式。命中后替换成 <secret>,避免泄漏进模型上下文。
+_SECRET_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*['\"]?[^'\"\s]+"),
+]
+
+# 敏感路径标记。命中任一即视为敏感路径,完全隐藏具体位置。
+_SENSITIVE_PATH_MARKERS = (
+    ".env", ".ssh", "id_rsa", "id_ed25519",
+    "token", "secret", "password", "apikey", "api_key",
+)
+
+# fatal marker:普通字符串工具错误命中这些关键字时直接终止 loop,
+# 即使工具没返结构化 JSON error_type 也能识别。
+_FATAL_MARKERS = (
+    "safety_blocked",
+    "forbidden",
+    "permission_denied",
+    "path_escape",
+    "persistence_error",
+    "cancelled",
+)
+
+_WINDOWS_ABS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\n\r\t\"']+")
+# Unix 绝对路径:要求 / 前面不是字母数字 / 路径字符 / 占位符定界符,
+# 避免把相对路径(如 Windows 替换后的 data/a.txt)或已脱敏占位符
+# (如 <external_path>/x)里的 /x 当成绝对路径二次脱敏。
+_UNIX_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9._\-/<>])(/[A-Za-z0-9._\-/]+)")
+
+
+def _is_sensitive_path(path_text: str) -> bool:
+    lower = path_text.lower().replace("\\", "/")
+    return any(marker in lower for marker in _SENSITIVE_PATH_MARKERS)
+
+
+def _sanitize_path_text(path_text: str, workspace_root: str | None = None) -> str:
+    """路径脱敏策略:
+    - 敏感路径(.env / .ssh / id_rsa 等)→ ``<sensitive_path>`` 完全隐藏
+    - 工作区内路径 → 相对路径(帮模型定位文件做修正)
+    - 工作区外路径 → ``<external_path>/<filename>`` 只留文件名
+
+    workspace_root 默认用 os.getcwd() 兜底;AgentLoop 调用方需要时
+    可传更精确的值(如 backend.cwd / file_root)。
+    """
+    if _is_sensitive_path(path_text):
+        return "<sensitive_path>"
+    normalized = path_text.strip().strip("'\"")
+    if workspace_root:
+        try:
+            p = Path(normalized)
+            root = Path(workspace_root)
+            if p.is_absolute():
+                rel = p.resolve().relative_to(root.resolve())
+                return str(rel).replace("\\", "/")
+        except Exception:
+            pass
+    try:
+        name = Path(normalized).name
+    except Exception:
+        name = ""
+    return f"<external_path>/{name}" if name else "<external_path>"
+
+
+def _sanitize_error_message(
+    exc,
+    max_len: int = 300,
+    workspace_root: str | None = None,
+) -> str:
+    """把底层异常转成可给模型看的短错误信息。
+
+    做四件事,避免把敏感信息放进模型上下文:
+      1. 多行 traceback 简短化 —— 只保留最后一个非空摘要行
+      2. 密钥脱敏 —— sk-xxx / api_key=xxx / token=xxx → ``<secret>``
+      3. 路径脱敏 —— 工作区内保相对路径,工作区外只留文件名,
+         .env / .ssh / id_rsa 等敏感路径完全隐藏
+      4. 限长 —— 超过 max_len 截断
+
+    workspace_root 默认用 os.getcwd() 兜底,不阻塞修复。
+    """
+    if workspace_root is None:
+        try:
+            workspace_root = os.getcwd()
+        except Exception:
+            workspace_root = None
+
+    text = exc if isinstance(exc, str) else str(exc)
+
+    # 多行 traceback 只保留最后一个非空行(通常是异常类型 + 消息)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        text = lines[-1]
+
+    # 脱敏密钥 / token / password
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("<secret>", text)
+
+    # Windows / Unix 绝对路径:工作区内保相对,工作区外脱敏
+    text = _WINDOWS_ABS_PATH_RE.sub(
+        lambda m: _sanitize_path_text(m.group(0), workspace_root), text,
+    )
+    text = _UNIX_ABS_PATH_RE.sub(
+        lambda m: _sanitize_path_text(m.group(0), workspace_root), text,
+    )
+
+    if len(text) > max_len:
+        text = text[:max_len] + "..."
+    return text or "Tool execution failed."
+
+
+def _short_error(exc) -> str:
+    """旧 API 保留:脱敏 + 截断到 200 字符的简短错误描述。
+
+    内部调 ``_sanitize_error_message``,所有调用点自动获得脱敏能力。
+    """
+    return _sanitize_error_message(exc, max_len=200)
+
+
+def _detect_fatal_marker(text: str) -> str | None:
+    """扫描普通字符串错误,命中 fatal 关键字返具体 marker 名。
+
+    用于工具返非 JSON 字符串(或 JSON 解析失败)时仍能识别致命错误,
+    避免安全 / 权限 / 路径逃逸类错误因没结构化 error_type 而被当成
+    可恢复错误继续 loop。
+    """
+    if not text:
+        return None
+    lower = text.lower()
+    for marker in _FATAL_MARKERS:
+        if marker in lower:
+            return marker
+    return None
+
+
 def build_assistant_msg_dict(assistant_msg) -> dict:
     """把 SDK 的 assistant message 对象转成可序列化 dict。"""
     msg_dict: dict = {
@@ -63,14 +199,6 @@ def build_assistant_msg_dict(assistant_msg) -> dict:
             for tc in assistant_msg.tool_calls
         ]
     return msg_dict
-
-
-def _short_error(exc) -> str:
-    """把异常转成简短字符串,脱敏 + 截断,避免把完整 traceback 回写给模型。"""
-    msg = str(exc)
-    if not msg:
-        msg = type(exc).__name__
-    return msg[:200]
 
 
 def dispatch_tool_call(
@@ -247,10 +375,17 @@ class AgentLoop:
     ) -> tuple[bool, str]:
         """判断工具错误是否致命。返回 (fatal, error_type)。
 
-        优先看 err_status(blocked 一定致命);
-        其次尝试解析 output JSON 里的 error_type 字段;
-        显式标记 fatal=true 的也认致命;
-        其它默认非致命,让模型有机会修正参数或换做法。
+        判定顺序:
+          1. err_status == "blocked":致命(模型调黑名单工具)
+          2. err_status in {"json", "dispatch"}:非致命(模型参数 / 调用问题,可修正)
+          3. 普通字符串 fatal marker 扫描(对非 JSON 或 JSON 解析失败也生效):
+             safety_blocked / forbidden / permission_denied / path_escape /
+             persistence_error / cancelled → 致命
+          4. output 是 JSON 含 error_type 字段:
+             - fatal=True 或 error_type 在致命集合 → 致命
+             - 其它 error_type → 非致命
+             - 有 error 但无 error_type → unknown_error(非致命)
+          5. 其它:非致命(默认让模型继续)
 
         为什么允许非致命错误继续 loop:模型可能传错参数 / 调不存在文件,
         看到错误后能调整。直接终止会让简单工具错误升级成整个 agent 失败。
@@ -263,6 +398,12 @@ class AgentLoop:
             return False, err_status
 
         if isinstance(output, str):
+            # 先扫 fatal marker:对普通字符串工具错误也生效,避免安全 / 权限 /
+            # 路径逃逸类错误因没结构化 error_type 被当成可恢复错误继续 loop
+            marker = _detect_fatal_marker(output)
+            if marker:
+                return True, marker
+
             try:
                 obj = json.loads(output)
             except (ValueError, TypeError):

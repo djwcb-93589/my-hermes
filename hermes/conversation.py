@@ -18,7 +18,7 @@ import json
 import sqlite3
 import time
 
-from hermes.agent_loop import AgentLoop, AgentLoopResult
+from hermes.agent_loop import AgentLoop, AgentLoopResult, _sanitize_error_message
 from hermes.config import (
     client,
     MODEL,
@@ -191,13 +191,14 @@ class ConversationAgentLoop(AgentLoop):
         """主会话保留 print 日志,并把工具异常包装成 tool message。
 
         工具失败不是 DB 事务失败;真正持久化失败交给 add_messages 抛出。
-        output 回写给模型时做脱敏 + 截断,不返完整 traceback。
+        output 回写给模型时走统一脱敏(密钥 / 外部路径 / traceback),
+        复用 agent_loop._sanitize_error_message 避免重复实现。
         """
         tool_name = tool_call.function.name
         try:
             tool_args = json.loads(tool_call.function.arguments)
         except Exception as exc:
-            short = str(exc)[:200] or type(exc).__name__
+            short = _sanitize_error_message(exc, max_len=200)
             return (
                 f"(error: invalid JSON arguments in {tool_name}: {short})",
                 "json",
@@ -213,11 +214,11 @@ class ConversationAgentLoop(AgentLoop):
                 session_key=self.session_key,
             )
         except Exception as exc:
-            short = str(exc)[:200] or type(exc).__name__
+            short = _sanitize_error_message(exc, max_len=200)
             return (
                 f"(error: tool {tool_name} failed: {short})",
                 "dispatch",
-                f"tool {tool_name!r} raised: {type(exc).__name__}: {short}",
+                f"tool {tool_name!r} raised: {short}",
             )
         return output, None, None
 
