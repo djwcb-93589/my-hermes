@@ -13,7 +13,8 @@
       "Bash(python skill_test.py)",
       "Bash(python delegate_test.py)",
       "Bash(python _db_check.py)",
-      "Bash(python _err_check.py)"
+      "Bash(python _err_check.py)",
+      "Bash(python _err2_check.py)"
     ]
   }
 }

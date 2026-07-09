@@ -81,6 +81,9 @@ class ConversationAgentLoop(AgentLoop):
         self._existing_messages = existing_messages
         self._retry_count = 0
         self._continuation_count = 0
+        # fallback 只能从 primary 切换一次。已经切到 fallback 后再失败,
+        # 不再二次切换、不重置 retry_count,直接 abort 避免 max_iterations 拖延。
+        self._using_fallback = False
 
     # --- messages 初始化:主会话从 DB 加载历史 ---
 
@@ -133,16 +136,26 @@ class ConversationAgentLoop(AgentLoop):
         return self._try_fallback_or_abort()
 
     def _try_fallback_or_abort(self) -> str:
-        """尝试切到 fallback 模型。配置了就 retry,没配置就 abort。
+        """尝试切到 fallback 模型。配置了就 retry,没配置 / 已切换过就 abort。
+
+        - 已经在用 fallback 还失败:直接 abort,不再二次切换、不重置
+          retry_count,避免 fallback 反复重启或靠 max_iterations 拖延。
+        - 首次切换:设置 _using_fallback=True,重置 retry_count 一次,
+          让 fallback 也有完整的 max_retries 重试机会。
+        - 没配置 fallback:直接 abort。
 
         返回 abort(而非 raise)让 AgentLoop.run 返结构化 model_error,
         避免底层 openai / http 异常冒到最外层。
         """
+        if self._using_fallback:
+            return "abort"
         fallback_client, fallback_model = switch_to_fallback()
         if fallback_client:
             self.client = fallback_client
             self.model = fallback_model
-            # 切到 fallback 后重置 retry_count,让 fallback 也有重试机会
+            self._using_fallback = True
+            # 切到 fallback 后重置 retry_count 一次,让 fallback 有重试机会。
+            # 后续 fallback 自己失败时不再重置(上面的 _using_fallback 守卫)。
             self._retry_count = 0
             return "retry"
         return "abort"
@@ -178,15 +191,17 @@ class ConversationAgentLoop(AgentLoop):
         """主会话保留 print 日志,并把工具异常包装成 tool message。
 
         工具失败不是 DB 事务失败;真正持久化失败交给 add_messages 抛出。
+        output 回写给模型时做脱敏 + 截断,不返完整 traceback。
         """
         tool_name = tool_call.function.name
         try:
             tool_args = json.loads(tool_call.function.arguments)
         except Exception as exc:
+            short = str(exc)[:200] or type(exc).__name__
             return (
-                f"(error: invalid JSON arguments in {tool_name}: {exc})",
+                f"(error: invalid JSON arguments in {tool_name}: {short})",
                 "json",
-                f"invalid JSON in tool_call {tool_name!r}: {exc}",
+                f"invalid JSON in tool_call {tool_name!r}: {short}",
             )
         print(
             f"  [tool] {tool_name}: "
@@ -198,10 +213,11 @@ class ConversationAgentLoop(AgentLoop):
                 session_key=self.session_key,
             )
         except Exception as exc:
+            short = str(exc)[:200] or type(exc).__name__
             return (
-                f"(error: tool {tool_name} raised: {exc})",
+                f"(error: tool {tool_name} failed: {short})",
                 "dispatch",
-                f"tool {tool_name!r} raised: {exc}",
+                f"tool {tool_name!r} raised: {type(exc).__name__}: {short}",
             )
         return output, None, None
 
@@ -226,6 +242,35 @@ class ConversationAgentLoop(AgentLoop):
 # 对外入口(签名 / 返回格式与原版完全一致)
 # ---------------------------------------------------------------------------
 
+def _short_db_error(exc) -> str:
+    """DB 异常简短描述,不带完整 traceback。"""
+    msg = str(exc)
+    if not msg:
+        msg = type(exc).__name__
+    return msg[:200]
+
+
+def _persistence_error_response(exc) -> dict:
+    """run_conversation 入口 DB 读写失败时的结构化返回。
+
+    不启动 AgentLoop —— 历史都读不出来 / user msg 写不进去时,继续跑模型
+    没有意义。fatal=True / retryable=False:调用方不应盲目重试整个 agent。
+    """
+    detail = _short_db_error(exc)
+    return {
+        "final_response": (
+            f"(agent error: persistence_error; fatal=True; "
+            f"retryable=False; detail={detail})"
+        ),
+        "messages": [],
+        "ok": False,
+        "status": "error",
+        "error_type": "persistence_error",
+        "fatal": True,
+        "retryable": False,
+    }
+
+
 def run_conversation(
     user_message: str,
     conn: sqlite3.Connection,
@@ -236,14 +281,21 @@ def run_conversation(
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
     返回 ``{"final_response": str, "messages": list[dict]}``,
-    与原版完全一致。
+    与原版完全一致;额外带 ok / status / error_type / fatal / retryable
+    结构化字段,供调用方精确判断错误。
     """
     # 关键顺序:先读历史(不含当前 user_msg),再 add_messages 当前 user_msg。
     # 这样 ConversationAgentLoop.init_messages 拼 existing + [user_msg] 时,
     # user message 在 API 调用 和 DB 里都只出现一次。
-    existing = get_session_messages(conn, session_id)
-    user_msg = {"role": "user", "content": user_message}
-    add_messages(conn, session_id, [user_msg])
+    #
+    # DB 读写失败时直接返结构化 persistence_error,不启动 AgentLoop ——
+    # 历史读不出 / user msg 写不进时,跑模型无意义。
+    try:
+        existing = get_session_messages(conn, session_id)
+        user_msg = {"role": "user", "content": user_message}
+        add_messages(conn, session_id, [user_msg])
+    except Exception as exc:
+        return _persistence_error_response(exc)
 
     loop = ConversationAgentLoop(
         model=MODEL,

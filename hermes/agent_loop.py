@@ -65,6 +65,14 @@ def build_assistant_msg_dict(assistant_msg) -> dict:
     return msg_dict
 
 
+def _short_error(exc) -> str:
+    """把异常转成简短字符串,脱敏 + 截断,避免把完整 traceback 回写给模型。"""
+    msg = str(exc)
+    if not msg:
+        msg = type(exc).__name__
+    return msg[:200]
+
+
 def dispatch_tool_call(
     tool_call,
     registry,
@@ -79,6 +87,8 @@ def dispatch_tool_call(
       - blocked 工具: ``("(error: ...)", "blocked", "blocked tool invoked: <name>")``
       - JSON 参数解析失败: ``("(error: ...)", "json", "invalid JSON in <name>: <exc>")``
       - dispatch 抛异常: ``("(error: ...)", "dispatch", "tool <name> raised: <exc>")``
+
+    output 会做脱敏 + 截断,不返完整 traceback 给模型。
     """
     tool_name = tool_call.function.name
 
@@ -92,19 +102,21 @@ def dispatch_tool_call(
     try:
         tool_args = json.loads(tool_call.function.arguments)
     except Exception as exc:
+        short = _short_error(exc)
         return (
-            f"(error: invalid JSON arguments in {tool_name}: {exc})",
+            f"(error: invalid JSON arguments in {tool_name}: {short})",
             "json",
-            f"invalid JSON in tool_call {tool_name!r}: {exc}",
+            f"invalid JSON in tool_call {tool_name!r}: {short}",
         )
 
     try:
         output = registry.dispatch(tool_name, tool_args, session_key=session_key)
     except Exception as exc:
+        short = _short_error(exc)
         return (
-            f"(error: tool {tool_name} raised: {exc})",
+            f"(error: tool {tool_name} failed: {short})",
             "dispatch",
-            f"tool {tool_name!r} raised: {exc}",
+            f"tool {tool_name!r} raised: {type(exc).__name__}: {short}",
         )
 
     return output, None, None
@@ -131,6 +143,10 @@ class AgentLoop:
       - ``on_tool_message``             单条 tool msg 追加后
       - ``on_tool_messages_batch``      assistant tool_call + tool results 完成后
     """
+
+    # 同一 (tool_name, error_type) 连续错误上限。超过即升级为 fatal:
+    # 避免模型卡在反复传错参数的死循环里,浪费 token / iteration。
+    TOOL_ERROR_LIMIT = 3
 
     def __init__(
         self,
@@ -164,6 +180,9 @@ class AgentLoop:
         # 运行期状态(每次 run() 重置)
         self.iterations = 0
         self.tools_used: list[str] = []
+        # 工具错误计数:按 (tool_name, error_type) 累计连续失败次数。
+        # 工具成功调用后清掉该 tool_name 的所有计数,避免历史错误干扰。
+        self._tool_error_counts: dict[tuple[str, str], int] = {}
 
     # --- 取消检查(后台 delegate 用) ---
 
@@ -256,6 +275,11 @@ class AgentLoop:
                     return True, err_type
                 if err_type:
                     return False, err_type
+                # 有 error 字段但没 error_type(如 registry 的 "Unknown tool"
+                # 返回 {"error": "..."}):归类为 unknown_error,让计数逻辑
+                # 能把它和真正的成功调用(无 error 字段)区分开。
+                if "error" in obj or obj.get("ok") is False:
+                    return False, "unknown_error"
 
         return False, ""
 
@@ -375,23 +399,30 @@ class AgentLoop:
         """处理本轮所有 tool_calls,返回生成的 tool messages 和可选错误结果。
 
         错误分类策略:
-          - 非致命错误(参数非法 / 工具异常 / file_not_found / ambiguous 等):
-            包装成合法 tool message 追加到上下文,让模型有机会在下一轮
-            修正参数或换做法。loop 继续。
-          - 致命错误(forbidden / safety_blocked / permission_denied /
-            path_escape / cancelled / persistence_error):终止 loop,
-            返回结构化 tool_error。
+          - 致命错误(safety_blocked / forbidden / permission_denied /
+            path_escape / cancelled / persistence_error):立即终止 loop。
+            这类错误模型即使看到也无法修正,继续只会无限循环或越界。
+          - 非致命错误(invalid_json / unknown_tool / file_not_found /
+            ambiguous_match / 普通工具异常):包装成合法 tool message
+            追加到上下文,让模型下一轮有机会修正参数或换做法。
+          - 同一 (tool_name, error_type) 连续失败次数达到
+            ``TOOL_ERROR_LIMIT``:升级为 fatal,终止 loop。
+            避免模型卡在反复传错参数的死循环里。
+          - 工具成功调用:清掉该 tool_name 的所有错误计数。
         """
         tool_messages: list[dict] = []
         fatal_detail: str | None = None
+        fatal_error_type: str | None = None
         for tc in tool_calls:
             try:
                 output, err_status, err_detail = self.dispatch_one(tc)
             except Exception as exc:
+                # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
                 tool_name = self._tool_call_name(tc)
-                output = f"(error: tool {tool_name} raised: {exc})"
+                short = _short_error(exc)
+                output = f"(error: tool {tool_name} failed: {short})"
                 err_status = "dispatch"
-                err_detail = f"tool {tool_name!r} raised: {exc}"
+                err_detail = f"tool {tool_name!r} dispatch raised: {short}"
 
             tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
@@ -405,24 +436,61 @@ class AgentLoop:
             tool_messages.append(tool_msg)
             self.on_tool_message(tc, tool_msg, output)
 
-            # 只记第一个致命错误,继续把后续 tool_call 的结果也生成
-            # (整批 tool_messages 都要持久化,避免残缺历史)
-            if fatal_detail is None:
-                fatal, err_type = self._classify_tool_error(output, err_status)
-                if fatal:
+            # 已经决定终止,后续 tool_call 仍生成 tool_msg 让 batch 持久化完整
+            if fatal_detail is not None:
+                continue
+
+            fatal, err_type = self._classify_tool_error(output, err_status)
+
+            if fatal:
+                # safety / 权限 / 路径逃逸 / cancelled / persistence:必须终止
+                fatal_detail = (
+                    err_detail
+                    or f"fatal tool error ({err_type}) in {tc_name!r}"
+                )
+                fatal_error_type = err_type or "tool_error"
+                continue
+
+            # 非致命:计数。工具成功(err_status falsy 且无 error_type)清计数
+            # 注意 _classify_tool_error 成功时返 err_type="",不是 None。
+            if not err_type and not err_status:
+                self._clear_tool_error_counts(tc_name)
+            else:
+                # 计数 key 按 (tool_name, error_type) 隔离:工具 A 的错误
+                # 不应被工具 B 的成功清掉,也不应被工具 B 的错误累计影响。
+                display_type = err_type or err_status or "unknown"
+                key = (tc_name, display_type)
+                self._tool_error_counts[key] = (
+                    self._tool_error_counts.get(key, 0) + 1
+                )
+                if self._tool_error_counts[key] >= self.TOOL_ERROR_LIMIT:
+                    # 同类错误连续超上限:升级 fatal,防模型死循环
                     fatal_detail = (
-                        err_detail
-                        or f"fatal tool error ({err_type}) in {tc_name!r}"
+                        f"tool {tc_name!r} repeated "
+                        f"{display_type} "
+                        f"{self._tool_error_counts[key]} times; aborting"
                     )
+                    fatal_error_type = display_type
 
         if fatal_detail is not None:
             return tool_messages, self._result(
                 ok=False, status="tool_error",
                 summary=self.last_assistant_text(messages),
                 messages=messages, error=fatal_detail,
-                error_type="tool_error", fatal=True, retryable=False,
+                error_type=fatal_error_type or "tool_error",
+                fatal=True, retryable=False,
             )
         return tool_messages, None
+
+    def _clear_tool_error_counts(self, tool_name: str) -> None:
+        """工具成功调用后清掉该 tool 的所有错误计数。
+
+        避免历史错误累积影响后续正常流程:模型修正参数后应重新获得
+        完整 TOOL_ERROR_LIMIT 次重试机会。
+        """
+        keys = [k for k in self._tool_error_counts if k[0] == tool_name]
+        for k in keys:
+            del self._tool_error_counts[k]
 
     # ===================== 可覆盖 hooks =====================
 
