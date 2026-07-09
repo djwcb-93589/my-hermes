@@ -244,16 +244,16 @@ def run_delegate_child(
     helper,避免两套 subagent 执行逻辑。``cleanup_backend`` 在 finally
     里保证执行,无论成功 / 异常 / 取消 / max_iter。
     """
-    tools = _filter_definitions(toolsets)
-    if not tools:
-        return {
-            "ok": False, "status": "invalid_args",
-            "summary": "", "iterations": 0, "tools_used": [],
-            "error": (f"no usable tools after applying child restrictions; "
-                      f"toolsets={toolsets!r}"),
-        }
-
     try:
+        tools = _filter_definitions(toolsets)
+        if not tools:
+            return {
+                "ok": False, "status": "invalid_args",
+                "summary": "", "iterations": 0, "tools_used": [],
+                "error": (f"no usable tools after applying child restrictions; "
+                          f"toolsets={toolsets!r}"),
+            }
+
         loop = DelegateAgentLoop(
             model=MODEL,
             max_iterations=MAX_CHILD_ITERATIONS,

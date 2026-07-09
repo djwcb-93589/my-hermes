@@ -4,7 +4,7 @@ ConversationAgentLoop 继承 AgentLoop,覆盖 hooks 注入主会话专有行为:
   - compression(每轮模型调用前)
   - classify_error / fallback / jittered_backoff(模型异常时)
   - finish_reason == "length" 的 continuation
-  - 每条 assistant / continuation / tool message 的 add_message 持久化
+  - 每条 assistant / continuation / tool message 的 add_messages 持久化
   - tool_call 处理的 print 日志 + raise 行为(保留原语义)
 
 run_conversation() 保持原有 module-level 签名,内部委托给
@@ -27,7 +27,7 @@ from hermes.config import (
     COMPRESSION_THRESHOLD,
     CONTINUE_MESSAGE,
 )
-from hermes.db import add_message, get_session_messages
+from hermes.db import add_messages, get_session_messages
 from hermes.errors import classify_error, jittered_backoff, switch_to_fallback
 from hermes.tokens import estimate_tokens, compress
 from hermes.tools import registry
@@ -84,7 +84,7 @@ class ConversationAgentLoop(AgentLoop):
     # --- messages 初始化:主会话从 DB 加载历史 ---
 
     def init_messages(self, user_message: str) -> list[dict]:
-        # 复用调用方已 add_message 过的 user_msg;这里只负责把历史 + 当前
+        # 复用调用方已 add_messages 过的 user_msg;这里只负责把历史 + 当前
         # user msg 拼成 messages 列表给循环用。
         return list(self._existing_messages) + [{"role": "user", "content": user_message}]
 
@@ -126,10 +126,10 @@ class ConversationAgentLoop(AgentLoop):
 
         return "raise"
 
-    # --- assistant msg 追加后:add_message + 重置 retry_count ---
+    # --- assistant msg 追加后:add_messages + 重置 retry_count ---
 
     def on_assistant_message(self, msg_dict: dict, response) -> None:
-        add_message(self.conn, self.db_session_id, msg_dict)
+        add_messages(self.conn, self.db_session_id, [msg_dict])
         # 模型调用成功 → 重置 retry_count(对齐原行为)
         self._retry_count = 0
 
@@ -145,7 +145,7 @@ class ConversationAgentLoop(AgentLoop):
         return {"role": "user", "content": CONTINUE_MESSAGE}
 
     def on_continuation_message(self, cont_msg: dict) -> None:
-        add_message(self.conn, self.db_session_id, cont_msg)
+        add_messages(self.conn, self.db_session_id, [cont_msg])
 
     # --- tool_call 处理 ---
 
@@ -172,7 +172,7 @@ class ConversationAgentLoop(AgentLoop):
 
     # 工具结果写入数据库
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
-        add_message(self.conn, self.db_session_id, tool_msg)
+        add_messages(self.conn, self.db_session_id, [tool_msg])
 
 
 # ---------------------------------------------------------------------------
@@ -191,12 +191,12 @@ def run_conversation(
     返回 ``{"final_response": str, "messages": list[dict]}``,
     与原版完全一致。
     """
-    # 关键顺序:先读历史(不含当前 user_msg),再 add_message 当前 user_msg。
+    # 关键顺序:先读历史(不含当前 user_msg),再 add_messages 当前 user_msg。
     # 这样 ConversationAgentLoop.init_messages 拼 existing + [user_msg] 时,
     # user message 在 API 调用 和 DB 里都只出现一次。
     existing = get_session_messages(conn, session_id)
     user_msg = {"role": "user", "content": user_message}
-    add_message(conn, session_id, user_msg)
+    add_messages(conn, session_id, [user_msg])
 
     loop = ConversationAgentLoop(
         model=MODEL,

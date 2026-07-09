@@ -11,7 +11,8 @@
       "Bash(python memory_test.py infra)",
       "Bash(python memory_test.py e2e)",
       "Bash(python skill_test.py)",
-      "Bash(python delegate_test.py)"
+      "Bash(python delegate_test.py)",
+      "Bash(python _db_check.py)"
     ]
   }
 }

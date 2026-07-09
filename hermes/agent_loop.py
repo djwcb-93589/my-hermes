@@ -4,7 +4,7 @@ AgentLoop:parent agent 与 sub agent 共用的循环骨架(模板方法模式)�
 ``run()`` 是公共骨架:iteration loop → model call → assistant parse →
 tool_call dispatch → messages append → stop condition。所有"主会话
 专有"行为(DB 持久化、压缩、fallback、continuation 等)通过覆盖下方
-hooks 注入,AgentLoop 本身不依赖 conn / session_id / add_message。
+hooks 注入,AgentLoop 本身不依赖 conn / session_id / add_messages。
 
 默认实现是一份无副作用的最小循环,delegate 子 agent 直接使用;
 主会话通过 ``ConversationAgentLoop``(定义在 conversation.py)覆盖
@@ -114,13 +114,13 @@ class AgentLoop:
       - ``pre_model_call``              模型调用前(主会话用来做 compression)
       - ``call_model``                  实际 API 调用
       - ``handle_model_error``          模型异常处理,返回 "retry"/"abort"/"raise"
-      - ``on_assistant_message``        assistant msg 追加后(主会话用来 add_message)
+      - ``on_assistant_message``        assistant msg 追加后(主会话用来 add_messages)
       - ``should_continue``             是否触发 continuation
       - ``continuation_message``        续写 prompt
-      - ``on_continuation_message``     continuation 追加后(主会话 add_message)
+      - ``on_continuation_message``     continuation 追加后(主会话 add_messages)
       - ``on_tool_dispatch_start``      即将处理 tool_calls(主会话重置 continuation_count)
       - ``dispatch_one``                处理单个 tool_call(主会话保留 raise 行为)
-      - ``on_tool_message``             tool msg 追加后(主会话 add_message)
+      - ``on_tool_message``             tool msg 追加后(主会话 add_messages)
     """
 
     def __init__(
@@ -299,7 +299,7 @@ class AgentLoop:
         return "raise"
 
     def on_assistant_message(self, msg_dict: dict, response) -> None:
-        """assistant msg 追加后(主会话用来 add_message)。默认空。"""
+        """assistant msg 追加后(主会话用来 add_messages)。默认空。"""
         pass
 
     def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
@@ -311,7 +311,7 @@ class AgentLoop:
         return {"role": "user", "content": "Please continue from where you left off."}
 
     def on_continuation_message(self, cont_msg: dict) -> None:
-        """continuation msg 追加后(主会话 add_message)。默认空。"""
+        """continuation msg 追加后(主会话 add_messages)。默认空。"""
         pass
 
     def on_tool_dispatch_start(self) -> None:
@@ -331,7 +331,7 @@ class AgentLoop:
         )
 
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
-        """tool msg 追加后(主会话 add_message)。默认空。"""
+        """tool msg 追加后(主会话 add_messages)。默认空。"""
         pass
 
     # ===================== 辅助 =====================

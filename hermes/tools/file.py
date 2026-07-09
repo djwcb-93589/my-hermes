@@ -32,7 +32,8 @@ _SENSITIVE_PATTERNS = [
         r"(^|/)\.env(\..*)?$",        # .env / .env.local
         r"\.(key|pem|pfx|p12)$",      # 私钥 / 证书
         r"/id_(rsa|dsa|ed25519|ecdsa)(\.pub)?$",  # SSH 私钥
-        r"\.(db|sqlite|sqlite3)$",    # SQLite / 数据库文件
+        # SQLite 主文件和 WAL/SHM/journal sidecar 都可能包含会话内容。
+        r"\.(db|sqlite|sqlite3)(-(wal|shm|journal))?$",
         r"(^|/)\.git($|/)",               # git 内部目录
     ]
 ]
@@ -303,7 +304,7 @@ def register(registry):
                 "pwd, context. "
                 "Paths are relative to backend.cwd unless absolute. "
                 "Path traversal outside the fixed file root is rejected. Sensitive files "
-                "(.env, *.key, *.pem, id_rsa, *.db, .git/*) require "
+                "(.env, *.key, *.pem, id_rsa, *.db, *.db-wal, .git/*) require "
                 "allow_sensitive=true. write defaults to no-overwrite; "
                 "pass overwrite=true to replace (atomic via tmp + os.replace). "
                 "Reads capped at 100KB; truncated=true means more data "
