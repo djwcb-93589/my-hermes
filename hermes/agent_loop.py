@@ -24,12 +24,20 @@ from hermes.config import client as _default_client
 class AgentLoopResult:
     """AgentLoop.run 的返回。"""
     ok: bool
-    status: str  # "completed" | "max_iterations" | "tool_error" | "model_error"
+    status: str  # completed | max_iterations | tool_error | model_error | error | cancelled
     summary: str
     messages: list[dict]
     iterations: int
     tools_used: list[str] = field(default_factory=list)
     error: str | None = None
+    # 错误分类字段(只在 ok=False 时有意义):
+    #   error_type: 具体类型(model_error / persistence_error / tool_error /
+    #               internal_error / cancelled / 具体工具 error_type)
+    #   fatal: True 表示调用方不应盲目重试整个 agent
+    #   retryable: True 表示瞬时可重试(模型临时不可用等)
+    error_type: str | None = None
+    fatal: bool = False
+    retryable: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -167,12 +175,108 @@ class AgentLoop:
             ok=False, status="cancelled",
             summary=self.last_assistant_text(messages),
             messages=messages, error="cancel requested",
+            error_type="cancelled", fatal=True, retryable=False,
         )
+
+    # --- 边界错误结果 helper(让 run() 调用点统一) ---
+
+    def _model_error_result(self, messages, error):
+        """模型最终失败:不可继续 loop,但调用方可能下次能重试整个 agent。"""
+        return self._result(
+            ok=False, status="model_error",
+            summary=self.last_assistant_text(messages),
+            messages=messages, error=error,
+            error_type="model_error", fatal=True, retryable=True,
+        )
+
+    def _persistence_error_result(self, messages, error):
+        """DB 持久化失败:数据完整性问题,不重试。"""
+        return self._result(
+            ok=False, status="error",
+            summary=self.last_assistant_text(messages),
+            messages=messages, error=error,
+            error_type="persistence_error", fatal=True, retryable=False,
+        )
+
+    def _internal_error_result(self, messages, error):
+        """未预期异常:兜底,避免原始异常冒到最外层。"""
+        return self._result(
+            ok=False, status="error",
+            summary=self.last_assistant_text(messages),
+            messages=messages, error=error,
+            error_type="internal_error", fatal=True, retryable=False,
+        )
+
+    # --- 工具错误致命判定 ---
+
+    # 致命工具错误集合:模型即使看到错误也无法修正,继续 loop 只会无限循环。
+    # 安全 / 权限 / 路径逃逸 / DB / 取消 都属于这一类。
+    _FATAL_TOOL_ERROR_TYPES = frozenset({
+        "forbidden",
+        "permission_denied",
+        "path_escape",
+        "safety_blocked",
+        "cancelled",
+        "persistence_error",
+        "internal_error",
+    })
+
+    def _classify_tool_error(
+        self,
+        output: str,
+        err_status: str | None,
+    ) -> tuple[bool, str]:
+        """判断工具错误是否致命。返回 (fatal, error_type)。
+
+        优先看 err_status(blocked 一定致命);
+        其次尝试解析 output JSON 里的 error_type 字段;
+        显式标记 fatal=true 的也认致命;
+        其它默认非致命,让模型有机会修正参数或换做法。
+
+        为什么允许非致命错误继续 loop:模型可能传错参数 / 调不存在文件,
+        看到错误后能调整。直接终止会让简单工具错误升级成整个 agent 失败。
+        """
+        if err_status == "blocked":
+            return True, "blocked"
+
+        if err_status in ("json", "dispatch"):
+            # 调用层错误(参数 JSON 非法 / 工具抛异常):非致命,让模型修正
+            return False, err_status
+
+        if isinstance(output, str):
+            try:
+                obj = json.loads(output)
+            except (ValueError, TypeError):
+                obj = None
+            if isinstance(obj, dict):
+                err_type = obj.get("error_type")
+                if obj.get("fatal") is True:
+                    return True, err_type or "fatal_flagged"
+                if err_type in self._FATAL_TOOL_ERROR_TYPES:
+                    return True, err_type
+                if err_type:
+                    return False, err_type
+
+        return False, ""
 
     # ===================== 模板方法 =====================
 
     def run(self, user_message: str) -> AgentLoopResult:
-        """跑一次完整循环。从单条 user_message 开始。"""
+        """跑一次完整循环。从单条 user_message 开始。
+
+        顶层 try/except 兜底:任何未预期异常都包装成 internal_error,
+        不让原始异常(openai client / sqlite3 / json)冒到最外层。
+        """
+        try:
+            return self._run_inner(user_message)
+        except Exception as exc:
+            # 内部 _run_inner 已经处理了 model / persistence / tool 等已知
+            # 异常,真到这里说明是未预期 bug,统一标 internal_error
+            return self._internal_error_result(
+                messages=[], error=f"unhandled exception: {exc!r}",
+            )
+
+    def _run_inner(self, user_message: str) -> AgentLoopResult:
         messages = self.init_messages(user_message)
         self.iterations = 0
         self.tools_used = []
@@ -197,12 +301,9 @@ class AgentLoop:
                 if decision == "retry":
                     continue
                 if decision == "abort":
-                    return self._result(
-                        ok=False, status="model_error",
-                        summary=self.last_assistant_text(messages),
-                        messages=messages, error=repr(exc),
-                    )
-                # "raise" 或任何未知返回值都重新抛
+                    # 模型最终失败:返回结构化 model_error,不抛异常
+                    return self._model_error_result(messages, repr(exc))
+                # "raise" 或任何未知返回值都重新抛,但被顶层兜底 catch
                 raise
 
             assistant_msg = response.choices[0].message
@@ -218,24 +319,41 @@ class AgentLoop:
                 # 3) tool 调用前检查取消
                 if self._is_cancelled():
                     return self._cancel_result(messages)
-                tool_messages, tool_error = self.process_tool_calls(
-                    assistant_msg.tool_calls, messages
-                )
-                self.on_tool_messages_batch(msg_dict, tool_messages, response)
+                try:
+                    tool_messages, tool_error = self.process_tool_calls(
+                        assistant_msg.tool_calls, messages
+                    )
+                except Exception as exc:
+                    # 工具分发过程中的持久化 / 结构异常
+                    return self._persistence_error_result(messages, repr(exc))
+                try:
+                    self.on_tool_messages_batch(msg_dict, tool_messages, response)
+                except Exception as exc:
+                    # DB 写入失败:assistant + tool_messages 整组未落盘,停止 loop
+                    return self._persistence_error_result(messages, repr(exc))
                 if tool_error is not None:
                     return tool_error
                 continue
 
             # continuation hook(主会话:finish_reason == "length")
             if self.should_continue(finish_reason, messages):
-                self.on_assistant_message(msg_dict, response)
+                try:
+                    self.on_assistant_message(msg_dict, response)
+                except Exception as exc:
+                    return self._persistence_error_result(messages, repr(exc))
                 cont_msg = self.continuation_message()
                 messages.append(cont_msg)
-                self.on_continuation_message(cont_msg)
+                try:
+                    self.on_continuation_message(cont_msg)
+                except Exception as exc:
+                    return self._persistence_error_result(messages, repr(exc))
                 continue
 
             # 模型不再调工具 → 任务完成
-            self.on_assistant_message(msg_dict, response)
+            try:
+                self.on_assistant_message(msg_dict, response)
+            except Exception as exc:
+                return self._persistence_error_result(messages, repr(exc))
             return self._result(
                 ok=True, status="completed",
                 summary=assistant_msg.content or "",
@@ -256,11 +374,16 @@ class AgentLoop:
     ) -> tuple[list[dict], AgentLoopResult | None]:
         """处理本轮所有 tool_calls,返回生成的 tool messages 和可选错误结果。
 
-        工具执行失败不是持久化失败:异常会被包装成合法 tool message
-        追加到上下文,由调用方和 assistant tool_call 一起原子持久化。
+        错误分类策略:
+          - 非致命错误(参数非法 / 工具异常 / file_not_found / ambiguous 等):
+            包装成合法 tool message 追加到上下文,让模型有机会在下一轮
+            修正参数或换做法。loop 继续。
+          - 致命错误(forbidden / safety_blocked / permission_denied /
+            path_escape / cancelled / persistence_error):终止 loop,
+            返回结构化 tool_error。
         """
         tool_messages: list[dict] = []
-        first_error_detail: str | None = None
+        fatal_detail: str | None = None
         for tc in tool_calls:
             try:
                 output, err_status, err_detail = self.dispatch_one(tc)
@@ -269,12 +392,6 @@ class AgentLoop:
                 output = f"(error: tool {tool_name} raised: {exc})"
                 err_status = "dispatch"
                 err_detail = f"tool {tool_name!r} raised: {exc}"
-
-            if err_status is not None:
-                first_error_detail = first_error_detail or (
-                    err_detail
-                    or f"tool {self._tool_call_name(tc)!r} failed: {err_status}"
-                )
 
             tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
@@ -288,11 +405,22 @@ class AgentLoop:
             tool_messages.append(tool_msg)
             self.on_tool_message(tc, tool_msg, output)
 
-        if first_error_detail is not None:
+            # 只记第一个致命错误,继续把后续 tool_call 的结果也生成
+            # (整批 tool_messages 都要持久化,避免残缺历史)
+            if fatal_detail is None:
+                fatal, err_type = self._classify_tool_error(output, err_status)
+                if fatal:
+                    fatal_detail = (
+                        err_detail
+                        or f"fatal tool error ({err_type}) in {tc_name!r}"
+                    )
+
+        if fatal_detail is not None:
             return tool_messages, self._result(
                 ok=False, status="tool_error",
                 summary=self.last_assistant_text(messages),
-                messages=messages, error=first_error_detail,
+                messages=messages, error=fatal_detail,
+                error_type="tool_error", fatal=True, retryable=False,
             )
         return tool_messages, None
 
@@ -394,11 +522,15 @@ class AgentLoop:
         summary: str,
         messages: list[dict],
         error: str | None = None,
+        error_type: str | None = None,
+        fatal: bool = False,
+        retryable: bool = True,
     ) -> AgentLoopResult:
         """统一构造结果对象。"""
         return AgentLoopResult(
             ok=ok, status=status, summary=summary,
             messages=messages, iterations=self.iterations,
             tools_used=list(self.tools_used),
-            error=error,
+            error=error, error_type=error_type,
+            fatal=fatal, retryable=retryable,
         )

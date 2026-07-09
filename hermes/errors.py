@@ -13,11 +13,46 @@ from hermes.config import (
 )
 
 
+# 网络 / 超时类异常关键字。命中时归为 retryable(没有 status_code,但
+# 通常是瞬时网络抖动,值得重试)。
+_NETWORK_MARKERS = (
+    "timeout", "timed out", "connection",
+    "connected", "reset by peer",
+    "temporarily unavailable",
+    "name or service not known",
+    "getaddrinfo", "ssl eof",
+)
+
+
+def is_network_error_message(error_message: str) -> bool:
+    """检查消息是否像网络 / 超时类异常(无 status_code 但应重试)。"""
+    if not error_message:
+        return False
+    lower = error_message.lower()
+    return any(marker in lower for marker in _NETWORK_MARKERS)
+
+
 def classify_error(
     status_code: int | None,
     error_message: str,
 ) -> dict:
-    """Classify an API error into an actionable decision."""
+    """Classify an API error into an actionable decision.
+
+    分类策略:
+      - 429 rate_limit / 5xx server_error / 网络超时:retryable=True,先重试
+      - 400 context_overflow:retryable + 触发压缩
+      - 401 / 403 auth / 404 model_not_found:不可重试,直接 fallback
+      - unknown:不重试(让调用方决定走 fallback 还是 abort)
+    """
+    # 网络 / 超时(无 status_code):通常瞬时,先重试
+    if status_code is None and is_network_error_message(error_message):
+        return {
+            "reason": "network_or_timeout",
+            "retryable": True,
+            "should_compress": False,
+            "should_fallback": False,
+        }
+
     if status_code == 429:
         return {
             "reason": "rate_limit",
@@ -72,7 +107,10 @@ def jittered_backoff(
 
 
 def switch_to_fallback():
-    """Switch to the fallback model. Returns (client, model) or (None, None)."""
+    """Switch to the fallback model. Returns (client, model) or (None, None).
+
+    没配置 FALLBACK_MODEL 时返 (None, None),调用方据此决定是 abort 还是 raise。
+    """
     if not FALLBACK_MODEL:
         return None, None
     print(f"  [fallback] -> {FALLBACK_MODEL}")

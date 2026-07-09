@@ -99,33 +99,53 @@ class ConversationAgentLoop(AgentLoop):
     # --- 模型异常处理:classify → compress / fallback / retry / raise ---
 
     def handle_model_error(self, exc, messages) -> str:
+        """模型异常分类:retry → fallback → abort,不抛异常到最外层。
+
+        策略:
+          - context_overflow:压缩后重试(无副作用)
+          - should_fallback(auth / model_not_found):不做无意义 retry,直接切 fallback
+          - retryable(429 / 5xx / network / timeout):先按 max_retries 重试
+          - retry 耗尽或 unknown:尝试 fallback;没 fallback 就 abort
+        """
         status = getattr(exc, "status_code", None)
         classified = classify_error(status, str(exc))
         print(f"  [error] {classified['reason']} (status={status})")
 
         if classified["should_compress"]:
             # 触发压缩后让循环重试本轮
-            # ponytail: 直接 mutate messages 是为了让下一轮 pre_model_call
-            # 拿到压缩后的版本(compress 返回新列表,这里覆盖原 list 内容)
+            # 直接 mutate messages,让下一轮 pre_model_call 拿到压缩后的版本
             compressed = compress(messages)
             messages.clear()
             messages.extend(compressed)
             return "retry"
 
+        # auth / model_not_found:不重试,直接尝试 fallback
         if classified["should_fallback"]:
-            fallback_client, fallback_model = switch_to_fallback()
-            if fallback_client:
-                self.client = fallback_client
-                self.model = fallback_model
-                return "retry"
-            return "raise"
+            return self._try_fallback_or_abort()
 
+        # 可重试错误(429 / 5xx / network / timeout):先按 max_retries 重试
         if classified["retryable"] and self._retry_count < self.max_retries:
             self._retry_count += 1
             time.sleep(jittered_backoff(self._retry_count))
             return "retry"
 
-        return "raise"
+        # retry 耗尽 / unknown:最后尝试 fallback,没 fallback 就 abort
+        return self._try_fallback_or_abort()
+
+    def _try_fallback_or_abort(self) -> str:
+        """尝试切到 fallback 模型。配置了就 retry,没配置就 abort。
+
+        返回 abort(而非 raise)让 AgentLoop.run 返结构化 model_error,
+        避免底层 openai / http 异常冒到最外层。
+        """
+        fallback_client, fallback_model = switch_to_fallback()
+        if fallback_client:
+            self.client = fallback_client
+            self.model = fallback_model
+            # 切到 fallback 后重置 retry_count,让 fallback 也有重试机会
+            self._retry_count = 0
+            return "retry"
+        return "abort"
 
     # --- 普通 assistant msg 追加后:add_messages + 重置 retry_count ---
 
@@ -246,14 +266,40 @@ def run_conversation(
     )
     result: AgentLoopResult = loop.run(user_message)
 
-    # 把 loop 的结构化结果映射回原 run_conversation 的 dict 输出
+    # 把 loop 的结构化结果映射回原 run_conversation 的 dict 输出。
+    # 外部调用方不会看到原始 openai / sqlite3 异常,只看到结构化 error 文本。
     if result.status == "completed":
         final = result.summary
     elif result.status == "max_iterations":
         final = "(max iterations reached)"
+    elif result.status == "cancelled":
+        final = "(cancelled)"
+    elif result.status == "model_error":
+        final = (
+            f"(agent error: model_error; fatal={result.fatal}; "
+            f"retryable={result.retryable}; detail={result.error})"
+        )
+    elif result.status == "tool_error":
+        final = (
+            f"(agent error: tool_error; fatal={result.fatal}; "
+            f"detail={result.error})"
+        )
+    elif result.status == "error":
+        # persistence_error / internal_error 都落到 status="error"
+        final = (
+            f"(agent error: {result.error_type}; fatal={result.fatal}; "
+            f"retryable={result.retryable}; detail={result.error})"
+        )
     else:
-        # model_error 默认 raise;tool_error 会先把错误 tool message 持久化
-        # 兜底文案,信息不丢
-        final = f"(agent loop ended: status={result.status}, error={result.error})"
+        final = f"(agent ended: status={result.status}, error={result.error})"
 
-    return {"final_response": final, "messages": result.messages}
+    return {
+        "final_response": final,
+        "messages": result.messages,
+        # 结构化错误字段:调用方需要精确判断错误类型时使用
+        "ok": result.ok,
+        "status": result.status,
+        "error_type": result.error_type,
+        "fatal": result.fatal,
+        "retryable": result.retryable,
+    }
