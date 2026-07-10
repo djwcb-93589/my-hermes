@@ -20,7 +20,11 @@ def run_terminal(args, **kwargs):
 
     matches = detect_dangerous_command(command)
     if matches and not approve_command(command, matches):
-        return json.dumps({"error": "Command denied by user."})
+        return json.dumps({
+            "ok": False,
+            "error_type": "user_denied",
+            "error": "Command denied by user.",
+        })
 
     session_key = kwargs.get("session_key") or "default"
     backend = get_backend(session_key=session_key)

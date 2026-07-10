@@ -17,7 +17,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 
 from hermes.config import client as _default_client
@@ -70,7 +70,15 @@ _FATAL_MARKERS = (
     "cancelled",
 )
 
-_WINDOWS_ABS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\n\r\t\"']+")
+# Windows 绝对路径:带引号时允许路径包含空格;未加引号时以空白为边界,
+# 同时覆盖 UNC 路径。避免把路径后面的错误描述和脱敏占位符一起吞掉。
+_WINDOWS_ABS_PATH_RE = re.compile(
+    r"(?:\"(?:[A-Za-z]:[\\/]|\\\\)[^\"\r\n]+\""
+    r"|'(?:[A-Za-z]:[\\/]|\\\\)[^'\r\n]+'"
+    r"|(?:[A-Za-z]:[\\/]|\\\\)[^\s\"']+)"
+)
+_WINDOWS_DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_MSYS_DRIVE_PATH_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?$")
 # Unix 绝对路径:要求 / 前面不是字母数字 / 路径字符 / 占位符定界符,
 # 避免把相对路径(如 Windows 替换后的 data/a.txt)或已脱敏占位符
 # (如 <external_path>/x)里的 /x 当成绝对路径二次脱敏。
@@ -80,6 +88,17 @@ _UNIX_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9._\-/<>])(/[A-Za-z0-9._\-/]+)")
 def _is_sensitive_path(path_text: str) -> bool:
     lower = path_text.lower().replace("\\", "/")
     return any(marker in lower for marker in _SENSITIVE_PATH_MARKERS)
+
+
+def _normalize_msys_path(path_text: str, workspace_root: str | None) -> str:
+    """Windows 工作区下把 Git Bash 的 ``/d/...`` 转成 ``D:\\...``。"""
+    if not workspace_root or not _WINDOWS_DRIVE_ROOT_RE.match(str(workspace_root)):
+        return path_text
+    match = _MSYS_DRIVE_PATH_RE.fullmatch(path_text)
+    if not match:
+        return path_text
+    rest = (match.group(2) or "").replace("/", "\\")
+    return f"{match.group(1).upper()}:\\{rest}"
 
 
 def _sanitize_path_text(path_text: str, workspace_root: str | None = None) -> str:
@@ -94,6 +113,21 @@ def _sanitize_path_text(path_text: str, workspace_root: str | None = None) -> st
     if _is_sensitive_path(path_text):
         return "<sensitive_path>"
     normalized = path_text.strip().strip("'\"")
+    normalized = _normalize_msys_path(normalized, workspace_root)
+
+    # UNC 路径用 PureWindowsPath 做词法判断,避免在非 Windows 平台失去
+    # 路径结构,也避免解析外部网络共享时触发不必要的文件系统访问。
+    if normalized.startswith("\\\\"):
+        path = PureWindowsPath(normalized)
+        if workspace_root and str(workspace_root).startswith("\\\\"):
+            try:
+                rel = path.relative_to(PureWindowsPath(workspace_root))
+                if ".." not in rel.parts:
+                    return rel.as_posix()
+            except ValueError:
+                pass
+        return f"<external_path>/{path.name}" if path.name else "<external_path>"
+
     if workspace_root:
         try:
             p = Path(normalized)
@@ -377,17 +411,19 @@ class AgentLoop:
 
         判定顺序:
           1. err_status == "blocked":致命(模型调黑名单工具)
-          2. 普通字符串 fatal marker 扫描(优先于 err_status 判断):
+          2. 先确认 output 是否为错误:err_status 非空、顶层 JSON 明确包含
+             error / error_type / fatal / ok=false,或文本以 ``(error:`` 开头
+          3. 仅对已确认的错误扫描 fatal marker:
              safety_blocked / forbidden / permission_denied / path_escape /
              persistence_error / cancelled → 致命。即使 err_status 是
              "json" / "dispatch",只要异常文本里含 fatal marker 就立即终止,
              避免 dispatch 抛出含 "permission_denied" 的异常被误判为可恢复。
-          3. err_status in {"json", "dispatch"}:非致命(模型参数 / 调用问题,可修正)
-          4. output 是 JSON 含 error_type 字段:
+          4. err_status in {"json", "dispatch"}:非致命(模型参数 / 调用问题,可修正)
+          5. output 是 JSON 含 error_type 字段:
              - fatal=True 或 error_type 在致命集合 → 致命
              - 其它 error_type → 非致命
              - 有 error 但无 error_type → unknown_error(非致命)
-          5. 其它:非致命(默认让模型继续)
+          6. 其它:非致命(默认让模型继续)
 
         为什么允许非致命错误继续 loop:模型可能传错参数 / 调不存在文件,
         看到错误后能调整。直接终止会让简单工具错误升级成整个 agent 失败。
@@ -395,11 +431,28 @@ class AgentLoop:
         if err_status == "blocked":
             return True, "blocked"
 
-        # fatal marker 优先:即使 err_status 是 json/dispatch,只要异常文本
-        # 里含 forbidden / permission_denied / path_escape 等关键字,立刻终止。
-        # 否则工具抛"permission denied"异常会被当成普通 dispatch 错误继续 loop,
-        # 模型反复重试无意义的越权调用。
+        obj = None
         if isinstance(output, str):
+            try:
+                obj = json.loads(output)
+            except (ValueError, TypeError):
+                pass
+
+        structured_error = isinstance(obj, dict) and (
+            obj.get("ok") is False
+            or "error" in obj
+            or bool(obj.get("error_type"))
+            or obj.get("fatal") is True
+        )
+        explicit_text_error = (
+            isinstance(output, str)
+            and output.lstrip().lower().startswith("(error:")
+        )
+        confirmed_error = bool(err_status) or structured_error or explicit_text_error
+
+        # 只扫描已确认的错误,避免正常文件内容 / terminal 输出中的 fatal
+        # 关键字被误判。dispatch 异常仍可通过 marker 立即升级为致命错误。
+        if confirmed_error and isinstance(output, str):
             marker = _detect_fatal_marker(output)
             if marker:
                 return True, marker
@@ -408,24 +461,19 @@ class AgentLoop:
             # 调用层错误(参数 JSON 非法 / 工具抛异常):非致命,让模型修正
             return False, err_status
 
-        if isinstance(output, str):
-            try:
-                obj = json.loads(output)
-            except (ValueError, TypeError):
-                obj = None
-            if isinstance(obj, dict):
-                err_type = obj.get("error_type")
-                if obj.get("fatal") is True:
-                    return True, err_type or "fatal_flagged"
-                if err_type in self._FATAL_TOOL_ERROR_TYPES:
-                    return True, err_type
-                if err_type:
-                    return False, err_type
-                # 有 error 字段但没 error_type(如 registry 的 "Unknown tool"
-                # 返回 {"error": "..."}):归类为 unknown_error,让计数逻辑
-                # 能把它和真正的成功调用(无 error 字段)区分开。
-                if "error" in obj or obj.get("ok") is False:
-                    return False, "unknown_error"
+        if isinstance(obj, dict):
+            err_type = obj.get("error_type")
+            if obj.get("fatal") is True:
+                return True, err_type or "fatal_flagged"
+            if err_type in self._FATAL_TOOL_ERROR_TYPES:
+                return True, err_type
+            if err_type:
+                return False, err_type
+            # 有 error 字段但没 error_type(如 registry 的 "Unknown tool"
+            # 返回 {"error": "..."}):归类为 unknown_error,让计数逻辑
+            # 能把它和真正的成功调用(无 error 字段)区分开。
+            if "error" in obj or obj.get("ok") is False:
+                return False, "unknown_error"
 
         return False, ""
 

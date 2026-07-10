@@ -244,11 +244,8 @@ class ConversationAgentLoop(AgentLoop):
 # ---------------------------------------------------------------------------
 
 def _short_db_error(exc) -> str:
-    """DB 异常简短描述,不带完整 traceback。"""
-    msg = str(exc)
-    if not msg:
-        msg = type(exc).__name__
-    return msg[:200]
+    """DB 异常简短描述,统一脱敏且不带完整 traceback。"""
+    return _sanitize_error_message(exc, max_len=200)
 
 
 def _persistence_error_response(exc) -> dict:
