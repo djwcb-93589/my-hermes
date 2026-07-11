@@ -61,6 +61,7 @@ class ConversationAgentLoop(AgentLoop):
         max_continuations: int,
         compression_threshold: int,
         model_kwargs: dict | None = None,
+        cancel_checker=None,
     ):
         super().__init__(
             model=model,
@@ -71,6 +72,7 @@ class ConversationAgentLoop(AgentLoop):
             client=client,
             session_key=session_key,
             model_kwargs=model_kwargs,
+            cancel_checker=cancel_checker,
         )
         # 主会话专有状态
         self.conn = conn
@@ -275,6 +277,7 @@ def run_conversation(
     session_id: str,
     cached_prompt: str,
     session_key: str | None = None,
+    cancel_checker=None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -313,6 +316,7 @@ def run_conversation(
         # (model/messages/tools)。若后续切到 GLM 5.2 / deepseek v4 等需要
         # extra_body / temperature 的 provider,在这里透传即可,无需改 AgentLoop。
         model_kwargs=None,
+        cancel_checker=cancel_checker,
     )
     result: AgentLoopResult = loop.run(user_message)
 

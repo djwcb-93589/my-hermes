@@ -66,13 +66,24 @@ def build_system_prompt(cwd: str) -> str:
         "Dangerous commands require user approval."
     )
 
+    parts.append(
+        "# Tool Use\n"
+        "Prefer the file tool for file content, directory listings, and file "
+        "metadata; use terminal for shell commands and processes. Relative "
+        "file paths start at the current session cwd shared with terminal; "
+        "after terminal changes directory, do not repeat that directory prefix. "
+        "Tool-owned state such as memory and skills must be managed through "
+        "their dedicated tools, never repaired by guessing paths in terminal."
+    )
+
     project = find_project_context(cwd)
     if project:
         parts.append(f"# Project Context\n{project}")
 
     parts.append(
         f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"Working directory: {cwd}"
+        f"Working directory: {cwd}\n"
+        f"Hermes home: {HERMES_HOME}"
     )
 
     return "\n\n".join(parts)

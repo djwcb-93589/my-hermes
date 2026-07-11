@@ -51,7 +51,29 @@ DEFAULT_CONFIG = {
     "gateway": {
         "session_idle_timeout": 86400,
         "agent_name": "main",
-        "platforms": {},
+        "platforms": {
+            "cli": {
+                "enabled": True,
+            },
+            "feishu": {
+                "enabled": False,
+                "app_id": "",
+                "app_secret": "",
+                "require_mention": True,
+                "allow_all": False,
+                "allowed_users": [],
+                "allowed_chats": [],
+            },
+            "weixin": {
+                "enabled": False,
+                "account_id": "",
+                "token": "",
+                "base_url": "",
+                "user_id": "",
+                "allow_all": False,
+                "allowed_users": [],
+            },
+        },
     },
 }
 

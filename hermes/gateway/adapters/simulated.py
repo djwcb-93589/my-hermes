@@ -6,7 +6,7 @@ import asyncio
 
 from hermes.gateway.adapters import BasePlatformAdapter
 from hermes.gateway.text_utils import MessageDeduplicator, TextBatcher
-from hermes.gateway.types import MessageEvent, SessionSource, build_session_key
+from hermes.gateway.types import MessageEvent, SendResult, SessionSource, build_session_key
 
 
 class SimulatedAdapter(BasePlatformAdapter):
@@ -41,10 +41,17 @@ class SimulatedAdapter(BasePlatformAdapter):
     async def disconnect(self):
         self._running = False
 
-    async def send(self, chat_id: str, content: str) -> bool:
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to_message_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> SendResult:
         self._replies.append((chat_id, content))
         print(f"\n[simulated] Reply to {chat_id}: {content[:120]}...\n")
-        return True
+        return SendResult(success=True)
 
     async def _replay_script(self):
         """Play scripted messages with specified delays."""

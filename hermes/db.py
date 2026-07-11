@@ -369,6 +369,21 @@ def create_session(conn: sqlite3.Connection, source: str = "cli") -> str:
     return session_id
 
 
+def ensure_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source: str = "gateway",
+) -> None:
+    """确保 session 存在,不存在则创建。Gateway / runner 统一走这个入口,
+    不在上层自行拼 SQL。
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        (session_id, source, time.time()),
+    )
+    conn.commit()
+
+
 def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> None:
     """实际 INSERT 一行,不 commit(供 add_message / add_messages 复用)。"""
     if not session_id:

@@ -64,7 +64,16 @@ def cli_loop():
 
 
 def main():
-    if "--gateway" in sys.argv:
+    if "--gateway" in sys.argv or "--gateway-unified" in sys.argv:
+        # 统一 Gateway 入口(读 config.yaml gateway.platforms)
+        from hermes.gateway_entry import run_gateway
+        asyncio.run(run_gateway())
+    elif "--weixin-login" in sys.argv:
+        # 个人微信二维码登录
+        from hermes.gateway_weixin_login import run as run_weixin_login
+        run_weixin_login()
+    elif "--gateway-console" in sys.argv:
+        # 旧版 ConsoleAdapter + scheduler 入口(保留向后兼容)
         from hermes.gateway_console import run_gateway_console
         asyncio.run(run_gateway_console())
     elif "--simulate" in sys.argv:

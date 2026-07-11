@@ -31,11 +31,15 @@ def run_terminal(args, **kwargs):
     result = backend.execute(command)
 
     output = result["output"].rstrip()
-    if result["returncode"] != 0:
-        output += f"\n(exit code: {result['returncode']})"
-
-    body = output if output.strip() else "(no output)"
-    return f"{body}\n(cwd: {backend.cwd})"
+    return json.dumps({
+        "ok": True,
+        "command_succeeded": result["returncode"] == 0,
+        "output": output if output.strip() else "(no output)",
+        "exit_code": result["returncode"],
+        "cwd": backend.cwd,
+        "cwd_persisted": True,
+        "environment_persisted": True,
+    }, ensure_ascii=False)
 
 
 def register(registry):
@@ -46,11 +50,17 @@ def register(registry):
             "name": "terminal",
             "description": (
                 "Run a shell command via the active backend. "
+                "The current directory and exported environment variables "
+                "persist across terminal calls in the same session. Relative "
+                "paths used by the file tool resolve from this same cwd. "
+                "Use the file tool for file reads, writes, directory listings, "
+                "and metadata; use terminal for shell commands and processes. "
                 "On Windows the local backend uses Git Bash (MINGW/MSYS) — "
                 "NOT PowerShell, CMD, or WSL. Always emit Bash/POSIX-compatible "
                 "commands. Use forward-slash MSYS paths for absolute Windows "
                 "locations (e.g. /d/my-project, not D:\\\\my-project). "
-                "On Linux/macOS the local backend uses /bin/bash."
+                "On Linux/macOS the local backend uses /bin/bash. The result "
+                "is JSON with output, exit_code, cwd, and session-state flags."
             ),
             "parameters": {
                 "type": "object",

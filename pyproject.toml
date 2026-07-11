@@ -9,6 +9,10 @@ dependencies = [
     "openai>=1.0",
     "pyyaml>=6.0",
     "uvicorn>=0.20",
+    "aiohttp>=3.9",
+    "certifi>=2024.0",
+    "qrcode>=7.4",
+    "lark-channel-sdk>=0.1",
 ]
 
 [dependency-groups]

@@ -98,7 +98,7 @@ def _try_save(
             "exceeds_by": len(text) - char_limit,
             "error": "write would exceed char limit; file unchanged",
         }
-    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(file_path, text)
     return True, {"size": len(text)}
 
@@ -236,6 +236,14 @@ def _do_write(
     new_entries 为 None 表示校验失败,文件不写。
     """
     try:
+        # 锁文件与目标文件同目录；必须先建目录再获取锁。
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "target": target,
+                "error_type": "io_error", "error": str(exc),
+                **_capacity(file_path, char_limit)}
+
+    try:
         with _file_lock(file_path):
             entries = load_memory(file_path)
             new_entries, info = mutate(entries)
@@ -251,9 +259,12 @@ def _do_write(
                         **_capacity(file_path, char_limit)}
             if not ok:
                 return {"ok": False, "target": target, **info, **save_info}
-            return {"ok": True, "target": target,
-                    "count": len(new_entries), **info, **save_info,
-                    **_capacity(file_path, char_limit)}
+            result = {"ok": True, "target": target,
+                      "entry_count": len(new_entries), **info, **save_info,
+                      **_capacity(file_path, char_limit)}
+            if info.get("action") == "remove":
+                result["remaining_count"] = len(new_entries)
+            return result
     except _LockTimeout:
         return {"ok": False, "target": target, "error_type": "lock_timeout",
                 "error": "could not acquire memory file lock in time",
@@ -280,7 +291,7 @@ def handle_memory(args, **kwargs):
         entries = load_memory(file_path)
         return _json({
             "ok": True, "target": target, "entries": entries,
-            "count": len(entries), **_capacity(file_path, char_limit),
+            "entry_count": len(entries), **_capacity(file_path, char_limit),
         })
 
     if action not in ("add", "remove", "replace"):
@@ -310,7 +321,7 @@ def handle_memory(args, **kwargs):
             if _is_duplicate(entries, content):
                 return None, {"error_type": "duplicate",
                               "error": "an identical entry already exists; not written"}
-            return entries + [content], {"action": "add"}
+            return entries + [content], {"action": "add", "added_count": 1}
 
     elif action == "remove":
         if not content:
@@ -332,7 +343,7 @@ def handle_memory(args, **kwargs):
                 }
             idx = matches[0]
             new_entries = entries[:idx] + entries[idx + 1:]
-            return new_entries, {"action": "remove"}
+            return new_entries, {"action": "remove", "removed_count": 1}
 
     else:  # replace
         if not content:
@@ -363,7 +374,7 @@ def handle_memory(args, **kwargs):
                               "error": "replacement text duplicates another existing entry"}
             new_entries = list(entries)
             new_entries[idx] = content
-            return new_entries, {"action": "replace"}
+            return new_entries, {"action": "replace", "replaced_count": 1}
 
     return _json(_do_write(file_path, char_limit, mutate, target))
 
@@ -385,6 +396,12 @@ def register(registry):
                 "entries are returned in `matches`. Content with invisible "
                 "Unicode or credential/injection patterns is blocked. Writes "
                 "are serialized per-file via a lock and applied atomically."
+                " Storage directories are initialized automatically; if an "
+                "operation fails, report the structured error instead of using "
+                "terminal to create or repair memory paths. Successful writes "
+                "return entry_count plus added_count / removed_count / "
+                "replaced_count as applicable; remove also returns "
+                "remaining_count."
             ),
             "parameters": {
                 "type": "object",

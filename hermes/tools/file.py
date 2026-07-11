@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 
 from hermes.backends import get_backend, UnsupportedBackendError
 
@@ -197,6 +198,7 @@ def _do_read(backend, abs_path, rel_path, args, require_range: bool):
         "offset": offset,
         "total_size": total,
         "truncated": truncated,
+        **_file_context(backend),
     })
 
 
@@ -213,7 +215,8 @@ def _do_write(backend, abs_path, rel_path, args):
     data = content.encode("utf-8")
     backend.write_file(abs_path, data, mode="write")
     return _json({"ok": True, "path": rel_path, "abs_path": abs_path,
-                  "size": len(data), "mode": "write"})
+                  "size": len(data), "mode": "write",
+                  **_file_context(backend)})
 
 
 def _do_append(backend, abs_path, rel_path, args):
@@ -222,7 +225,8 @@ def _do_append(backend, abs_path, rel_path, args):
     data = content.encode("utf-8")
     backend.write_file(abs_path, data, mode="append")
     return _json({"ok": True, "path": rel_path, "abs_path": abs_path,
-                  "appended": len(data), "mode": "append"})
+                  "appended": len(data), "mode": "append",
+                  **_file_context(backend)})
 
 
 def _do_replace(backend, abs_path, rel_path, args):
@@ -274,20 +278,32 @@ def _do_replace(backend, abs_path, rel_path, args):
     backend.write_file(abs_path, new_content.encode("utf-8"), mode="write")
     return _json({"ok": True, "path": rel_path, "abs_path": abs_path,
                   "replacements": done, "matches_found": count,
-                  "replaced_all": replace_all})
+                  "replaced_all": replace_all, **_file_context(backend)})
 
 
 def _do_list(backend, abs_path, rel_path):
     """list：返回目录下条目名。"""
     entries = backend.list_dir(abs_path)
     return _json({"ok": True, "path": rel_path, "abs_path": abs_path,
-                  "entries": entries, "count": len(entries)})
+                  "entries": entries, "count": len(entries),
+                  **_file_context(backend)})
 
 
 def _do_stat(backend, abs_path, rel_path):
     """stat：返回文件元数据。"""
     info = backend.stat_file(abs_path)
-    return _json({"ok": True, "path": rel_path, "abs_path": abs_path, **info})
+    mtime = info.get("mtime")
+    try:
+        utc_time = datetime.fromtimestamp(mtime, timezone.utc)
+        local_time = utc_time.astimezone()
+    except (OSError, OverflowError, TypeError, ValueError):
+        pass
+    else:
+        info["mtime_utc"] = utc_time.isoformat(timespec="seconds")
+        info["mtime_local"] = local_time.isoformat(timespec="seconds")
+        info["mtime_timezone"] = local_time.tzname() or str(local_time.tzinfo)
+    return _json({"ok": True, "path": rel_path, "abs_path": abs_path,
+                  **info, **_file_context(backend)})
 
 
 def register(registry):
@@ -297,9 +313,14 @@ def register(registry):
         schema={
             "name": "file",
             "description": (
-                "File operations constrained to the session's fixed file root. "
-                "Relative paths resolve from backend.cwd (same cwd the "
-                "`terminal` tool sees). Actions: "
+                "IMPORTANT PATH RULE: every relative path resolves from the "
+                "current session cwd, which is shared with and persisted by "
+                "the terminal tool. After terminal changes directory, use a "
+                "path relative to that new cwd; never prefix the cwd directory "
+                "name again. File operations are constrained to the session's "
+                "fixed file root. Prefer "
+                "this tool over terminal for file content, directory listings, "
+                "and metadata. Actions: "
                 "read, read_range, write, append, replace, list, stat, "
                 "pwd, context. "
                 "Paths are relative to backend.cwd unless absolute. "
@@ -310,7 +331,9 @@ def register(registry):
                 "Reads capped at 100KB; truncated=true means more data "
                 "available. replace only supports UTF-8 files up to 100KB. "
                 "Call again with offset for ranged reads. Docker/SSH backends "
-                "return error_type=unsupported_backend for IO actions."
+                "stat returns mtime_utc and mtime_local with timezone data. "
+                "All successful results include cwd and file_root. Docker/SSH "
+                "backends return error_type=unsupported_backend for IO actions."
             ),
             "parameters": {
                 "type": "object",
@@ -320,8 +343,15 @@ def register(registry):
                         "enum": ["read", "read_range", "write", "append",
                                  "replace", "list", "stat", "pwd", "context"],
                     },
-                    "path": {"type": "string",
-                             "description": "relative or absolute path; not required for pwd/context"},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Relative or absolute path; not required for "
+                            "pwd/context. Relative paths start at the current "
+                            "session cwd shared with terminal. After `cd work`, "
+                            "use `report.md`, not `work/report.md`."
+                        ),
+                    },
                     "content": {"type": "string", "description": "for write/append"},
                     "offset": {"type": "integer", "minimum": 0,
                                "description": "byte offset (read/read_range/replace)"},
