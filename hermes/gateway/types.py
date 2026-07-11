@@ -57,14 +57,21 @@ class SendResult:
 
 
 def build_session_key(source: SessionSource, agent_name: str = "main") -> str:
-    """构建稳定路由 key:agent:{name}:{platform}:{chat_type}:{chat_id}[:user_id]。
+    """构建稳定路由 key。
 
-    群聊按 user_id 隔离 —— 同一群里不同用户各自独立对话。
-    DM 直接用 chat_id 作为 user 标识。
+    格式:
+      agent:{name}:{platform}:{account_id}:{chat_type}:{chat_id}[:user_id][:thread_id]
+
+    - account_id 区分同一平台不同 bot 实例
+    - 群聊 / 话题按 user_id 隔离 —— 同一群里不同用户各自独立对话
+    - thread_id 额外区分话题子线程
     """
     parts = [
-        f"agent:{agent_name}:{source.platform}:{source.chat_type}:{source.chat_id}"
+        f"agent:{agent_name}:{source.platform}:{source.account_id}"
+        f":{source.chat_type}:{source.chat_id}"
     ]
     if source.chat_type in ("group", "topic"):
         parts.append(source.user_id)
+    if source.thread_id:
+        parts.append(source.thread_id)
     return ":".join(parts)

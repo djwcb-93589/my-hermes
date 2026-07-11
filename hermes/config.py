@@ -59,10 +59,13 @@ DEFAULT_CONFIG = {
                 "enabled": False,
                 "app_id": "",
                 "app_secret": "",
+                "security_mode": "compat",        # compat | audit | strict
                 "require_mention": True,
                 "allow_all": False,
                 "allowed_users": [],
                 "allowed_chats": [],
+                "send_max_retries": 3,
+                "send_retry_base_delay": 1.0,
             },
             "weixin": {
                 "enabled": False,

@@ -42,10 +42,13 @@ async def run_gateway():
             runner.add_adapter(FeishuAdapter(
                 app_id=feishu_cfg.get("app_id", ""),
                 app_secret=feishu_cfg.get("app_secret", ""),
+                security_mode=feishu_cfg.get("security_mode", "compat"),
                 require_mention=feishu_cfg.get("require_mention", True),
                 allow_all=feishu_cfg.get("allow_all", False),
                 allowed_users=feishu_cfg.get("allowed_users", []),
                 allowed_chats=feishu_cfg.get("allowed_chats", []),
+                send_max_retries=feishu_cfg.get("send_max_retries", 3),
+                send_retry_base_delay=feishu_cfg.get("send_retry_base_delay", 1.0),
             ))
             print("  [gateway] Feishu adapter added")
         except Exception as exc:

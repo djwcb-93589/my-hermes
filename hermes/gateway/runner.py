@@ -2,22 +2,18 @@
 GatewayRunner:启动 adapter,路由入站消息,跑 agent,回发结果。
 
 核心设计:
-  - 每条 route_key 串行处理(busy 标志 + deque 排队),不同 route_key 并行。
+  - 每条 route_key 串行处理(busy 原子设置 + deque 排队),不同 route_key 并行。
   - 同一会话收到新消息时,先 cancel 当前任务(cancel_checker),再排队。
-  - run_conversation 是同步函数,通过 ``asyncio.to_thread`` 跑在线程池,
-    不阻塞 Gateway 事件循环。
-  - cancel_checker 透传到 ``run_conversation → ConversationAgentLoop → AgentLoop``,
-    AgentLoop 在每轮 iteration 边界检查并退出。
+  - ``run_conversation`` 是同步函数,通过 ``asyncio.to_thread`` 跑在线程池。
+    SQLite 连接在线程函数内部创建 / 使用 / 关闭,不跨线程传递。
+  - cancel_checker 透传到 ``run_conversation → ConversationAgentLoop → AgentLoop``。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import time
 
-from hermes.conversation import run_conversation
-from hermes.db import init_db, get_session_messages, ensure_session
 from hermes.gateway.adapters import BasePlatformAdapter
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import MessageEvent, SendResult, build_session_key
@@ -49,7 +45,7 @@ class GatewayRunner:
                 else:
                     print(f"  [gateway] {name} FAILED to connect")
             except Exception as exc:
-                print(f"  [gateway] {name} crashed on connect: {exc!r}")
+                print(f"  [gateway] {name} crashed on connect: {type(exc).__name__}")
 
     async def stop(self):
         """断开所有 adapter + 清理 backend。"""
@@ -97,12 +93,15 @@ class GatewayRunner:
         if ctx.busy:
             # 正在处理 → 排队(保留全部,不只最后一条)
             ctx.pending.append(event)
-            # 同时请求取消当前任务,让新消息尽快被处理
             ctx.cancel_requested = True
             print(f"  [gateway] {route_key}: queued ({len(ctx.pending)} pending)")
             return
 
-        # 启动处理
+        # 原子设置 busy,避免竞态:create_task 不会立即执行,_rocess 也没
+        # 机会在 _handle_message 返回前跑。所以在 _handle_message 里设 busy
+        # 就能保证同一 route_key 只有一个 worker。
+        ctx.busy = True
+        ctx.cancel_requested = False
         asyncio.create_task(self._process(route_key, event))
 
     async def _process(self, route_key: str, event: MessageEvent):
@@ -110,65 +109,73 @@ class GatewayRunner:
         ctx = self.sessions.get_or_create(
             route_key, build_system_prompt(os.getcwd()),
         )
-        ctx.busy = True
-        ctx.cancel_requested = False
 
         try:
             response = await self._run_agent(event, ctx)
             if response:
                 await self._reply(event, response)
         except Exception as exc:
-            print(f"  [gateway] {route_key} error: {exc!r}")
+            print(f"  [gateway] {route_key} error: {type(exc).__name__}")
             try:
-                await self._reply(event, f"(internal error: {exc!r})")
+                await self._reply(event, f"(internal error: {type(exc).__name__})")
             except Exception:
                 pass
         finally:
             ctx.busy = False
 
-        # 处理队列中的下一条
+        # 处理队列中的下一条(在同一事件循环里,无竞态)
         if ctx.pending:
             next_event = ctx.pending.popleft()
+            ctx.busy = True
+            ctx.cancel_requested = False
             asyncio.create_task(self._process(route_key, next_event))
 
     async def _run_agent(self, event: MessageEvent, ctx) -> str | None:
         """在线程池跑同步的 ``run_conversation``,不阻塞事件循环。
 
-        cancel_checker 从 SessionContext 读,AgentLoop 每轮 iteration 检查。
+        关键:SQLite 连接必须在线程函数内部创建 / 使用 / 关闭,
+        不跨线程传递(asyncio.to_thread 在 worker 线程跑,如果 conn
+        在事件循环线程创建,SQLite 会抛 ProgrammingError)。
         """
-        # 用独立连接(Gateway 每消息一个 conn,不与 CLI 共享)
-        conn = init_db(self.db_path)
-        try:
-            ensure_session(conn, ctx.conversation_id, source=event.source.platform)
+        cancel_checker = lambda: ctx.cancel_requested  # noqa: E731
 
-            # cancel_checker:闭包读 ctx.cancel_requested
-            def cancel_checker():
-                return ctx.cancel_requested
+        def _worker() -> str | None:
+            # 全部在 worker 线程内完成:建连接 → 确保 session → 跑 agent → 关连接
+            from hermes.db import init_db, ensure_session
+            from hermes.conversation import run_conversation
 
-            result = await asyncio.to_thread(
-                run_conversation,
-                event.text,
-                conn,
-                ctx.conversation_id,
-                ctx.system_prompt,
-                ctx.conversation_id,  # session_key = conversation_id
-                cancel_checker,
-            )
-            return result.get("final_response")
-        finally:
-            conn.close()
+            conn = init_db(self.db_path)
+            try:
+                ensure_session(conn, ctx.conversation_id, source=event.source.platform)
+                result = run_conversation(
+                    event.text,
+                    conn,
+                    ctx.conversation_id,
+                    ctx.system_prompt,
+                    ctx.conversation_id,
+                    cancel_checker,
+                )
+                return result.get("final_response")
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_worker)
 
     async def _reply(self, event: MessageEvent, content: str):
-        """通过来源 adapter 回发。"""
+        """通过来源 adapter 回发。检查 SendResult。"""
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
         try:
-            await adapter.send(
+            result: SendResult = await adapter.send(
                 event.source.chat_id,
                 content,
                 reply_to_message_id=event.message_id,
                 thread_id=event.source.thread_id,
             )
+            if not result.success:
+                # 脱敏:只输出错误类型 + 简短描述,不含完整响应体 / token
+                err = (result.error or "unknown error")[:120]
+                print(f"  [gateway] send failed on {event.source.platform}: {err}")
         except Exception as exc:
-            print(f"  [gateway] send failed on {event.source.platform}: {exc!r}")
+            print(f"  [gateway] send exception on {event.source.platform}: {type(exc).__name__}")

@@ -104,14 +104,18 @@ def test_memory_initializes_directory_and_returns_unambiguous_counts(
     current = json.loads(memory_tool.handle_memory({"action": "read"}))
 
     assert added["ok"] is True
-    assert added["added_count"] == 1
+    assert added["action"] == "add"
     assert added["entry_count"] == 1
-    assert removed["removed_count"] == 1
-    assert removed["remaining_count"] == 0
+    assert removed["action"] == "remove"
+    assert removed["entry_count"] == 0
     assert current["entry_count"] == 0
-    assert "count" not in added
-    assert "count" not in removed
-    assert "count" not in current
+    for field in (
+        "count", "added_count", "removed_count",
+        "replaced_count", "remaining_count",
+    ):
+        assert field not in added
+        assert field not in removed
+        assert field not in current
 
 
 def test_system_prompt_contains_only_compact_cross_tool_guidance(tmp_path):
