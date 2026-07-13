@@ -26,6 +26,12 @@ class SessionContext:
     last_activity: float = field(default_factory=time.time)
     # 取消信号:AgentLoop.run 内通过 cancel_checker 检查
     cancel_requested: bool = False
+    # 当前模型任务。/stop 通过 Task.cancel() 中断模型 HTTP 请求。
+    active_task: asyncio.Task | None = field(default=None, repr=False)
+    # 串行收尾任务不直接取消,确保模型 Task 即使尚未启动也能完成队列清理。
+    worker_task: asyncio.Task | None = field(default=None, repr=False)
+    # 区分用户取消、/new、后续消息覆盖和 Gateway 关闭。
+    cancel_reason: str | None = None
     # 待处理消息队列(不止保留最后一条)
     pending: deque = field(default_factory=deque)
     # 是否正在处理(同一会话串行,不同会话并行)
@@ -112,6 +118,9 @@ class SessionStore:
             ctx.conversation_id = new_id
             ctx.system_prompt = system_prompt
             ctx.cancel_requested = False
+            ctx.cancel_reason = None
+            ctx.active_task = None
+            ctx.worker_task = None
         ctx.last_activity = time.time()
         return ctx
 
@@ -122,13 +131,28 @@ class SessionStore:
         ctx.pending.append(event)
         return True
 
-    def request_cancel(self, route_key: str) -> bool:
-        """/stop:标记取消当前任务。"""
+    def request_cancel(self, route_key: str, reason: str = "user") -> bool:
+        """标记并取消当前异步任务。"""
         ctx = self._contexts.get(route_key)
         if ctx is None or not ctx.busy:
             return False
         ctx.cancel_requested = True
+        ctx.cancel_reason = reason
+        if ctx.active_task is not None and not ctx.active_task.done():
+            ctx.active_task.cancel()
         return True
+
+    def cancel_all(self, reason: str = "shutdown") -> list[asyncio.Task]:
+        """取消所有运行中任务,返回可供调用方等待的 Task。"""
+        tasks = []
+        for route_key, ctx in self._contexts.items():
+            if not ctx.busy:
+                continue
+            self.request_cancel(route_key, reason=reason)
+            task = ctx.worker_task or ctx.active_task
+            if task is not None:
+                tasks.append(task)
+        return tasks
 
     def get_status(self, route_key: str) -> dict | None:
         """/status:返回当前会话状态快照。"""
@@ -140,6 +164,7 @@ class SessionStore:
             "conversation_id": ctx.conversation_id,
             "busy": ctx.busy,
             "cancel_requested": ctx.cancel_requested,
+            "cancel_reason": ctx.cancel_reason,
             "pending_count": len(ctx.pending),
             "pending_limit": self.max_pending_messages,
             "last_activity": ctx.last_activity,

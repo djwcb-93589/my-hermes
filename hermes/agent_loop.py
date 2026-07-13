@@ -9,10 +9,14 @@ hooks 注入,AgentLoop 本身不依赖 conn / session_id / add_messages。
 默认实现是一份无副作用的最小循环,delegate 子 agent 直接使用;
 主会话通过 ``ConversationAgentLoop``(定义在 conversation.py)覆盖
 hooks 注入压缩 / fallback / DB 持久化等行为。
+
+``AsyncAgentLoop`` 保留同一结果和错误策略,供 Gateway 直接等待并取消
+异步模型 HTTP 请求;同步 ``AgentLoop`` 继续服务 CLI / delegate。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -801,3 +805,282 @@ class AgentLoop:
             error=error, error_type=error_type,
             fatal=fatal, retryable=retryable,
         )
+
+
+# ---------------------------------------------------------------------------
+# AsyncAgentLoop —— Gateway 专用异步循环骨架
+# ---------------------------------------------------------------------------
+
+class AsyncAgentLoop(AgentLoop):
+    """异步 Agent 循环。
+
+    保留 ``AgentLoop`` 的结果类型、错误判定和纯函数 hooks,只把模型请求、
+    持久化 hooks 与工具分发改为可等待调用。同步 ``AgentLoop`` 不受影响。
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        max_iterations: int,
+        tools: list[dict],
+        system_prompt: str,
+        registry,
+        client,
+        session_key: str | None = None,
+        blocked_tools: set[str] | None = None,
+        model_kwargs: dict | None = None,
+        cancel_checker: "Callable[[], bool] | None" = None,
+    ):
+        super().__init__(
+            model=model,
+            max_iterations=max_iterations,
+            tools=tools,
+            system_prompt=system_prompt,
+            registry=registry,
+            client=client,
+            session_key=session_key,
+            blocked_tools=blocked_tools,
+            model_kwargs=model_kwargs,
+            cancel_checker=cancel_checker,
+        )
+
+    async def run(self, user_message: str) -> AgentLoopResult:
+        """异步跑一次完整循环,Task 取消必须原样向上传播。"""
+        try:
+            return await self._run_inner(user_message)
+        except asyncio.CancelledError:
+            # 真正取消模型 HTTP 请求依赖 CancelledError 继续传到 Runner。
+            raise
+        except Exception as exc:
+            return self._internal_error_result(
+                messages=[], error=f"unhandled exception: {exc!r}",
+            )
+
+    async def _run_inner(self, user_message: str) -> AgentLoopResult:
+        messages = self.init_messages(user_message)
+        self.iterations = 0
+        self.tools_used = []
+
+        for iteration in range(self.max_iterations):
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+
+            self.iterations = iteration + 1
+            messages = await self.pre_model_call(messages)
+
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+
+            try:
+                response = await self.call_model(messages)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                decision = await self.handle_model_error(exc, messages)
+                if decision == "retry":
+                    continue
+                if decision == "abort":
+                    return self._model_error_result(messages, repr(exc))
+                raise
+
+            # 保留协作式取消检查,处理未通过 Task.cancel() 触发的旧调用方。
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+
+            assistant_msg = response.choices[0].message
+            finish_reason = response.choices[0].finish_reason
+
+            msg_dict = build_assistant_msg_dict(assistant_msg)
+            messages.append(msg_dict)
+
+            if assistant_msg.tool_calls:
+                self.on_tool_dispatch_start()
+                if self._is_cancelled():
+                    return self._cancel_result(messages)
+                try:
+                    tool_messages, tool_error = await self.process_tool_calls(
+                        assistant_msg.tool_calls, messages,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return self._persistence_error_result(messages, repr(exc))
+                try:
+                    await self.on_tool_messages_batch(
+                        msg_dict, tool_messages, response,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return self._persistence_error_result(messages, repr(exc))
+                if tool_error is not None:
+                    return tool_error
+                continue
+
+            if self.should_continue(finish_reason, messages):
+                try:
+                    await self.on_assistant_message(msg_dict, response)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return self._persistence_error_result(messages, repr(exc))
+                cont_msg = self.continuation_message()
+                messages.append(cont_msg)
+                try:
+                    await self.on_continuation_message(cont_msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return self._persistence_error_result(messages, repr(exc))
+                continue
+
+            try:
+                await self.on_assistant_message(msg_dict, response)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return self._persistence_error_result(messages, repr(exc))
+            return self._result(
+                ok=True, status="completed",
+                summary=assistant_msg.content or "",
+                messages=messages,
+            )
+
+        return self._result(
+            ok=False, status="max_iterations",
+            summary=self.last_assistant_text(messages),
+            messages=messages,
+        )
+
+    async def process_tool_calls(
+        self,
+        tool_calls,
+        messages,
+    ) -> tuple[list[dict], AgentLoopResult | None]:
+        """异步处理工具调用,错误分类与同步循环保持一致。"""
+        tool_messages: list[dict] = []
+        fatal_detail: str | None = None
+        fatal_error_type: str | None = None
+        for tc in tool_calls:
+            try:
+                output, err_status, err_detail = await self.dispatch_one(tc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                tool_name = self._tool_call_name(tc)
+                short = _short_error(exc)
+                output = f"(error: tool {tool_name} failed: {short})"
+                err_status = "dispatch"
+                err_detail = f"tool {tool_name!r} dispatch raised: {short}"
+
+            tc_name = self._tool_call_name(tc)
+            if tc_name not in self.tools_used:
+                self.tools_used.append(tc_name)
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": output,
+            }
+            messages.append(tool_msg)
+            tool_messages.append(tool_msg)
+            await self.on_tool_message(tc, tool_msg, output)
+
+            if fatal_detail is not None:
+                continue
+
+            fatal, err_type = self._classify_tool_error(output, err_status)
+            if fatal:
+                fatal_detail = (
+                    err_detail
+                    or f"fatal tool error ({err_type}) in {tc_name!r}"
+                )
+                fatal_error_type = err_type or "tool_error"
+                continue
+
+            if not err_type and not err_status:
+                self._clear_tool_error_counts(tc_name)
+            else:
+                display_type = err_type or err_status or "unknown"
+                key = (tc_name, display_type)
+                self._tool_error_counts[key] = (
+                    self._tool_error_counts.get(key, 0) + 1
+                )
+                if self._tool_error_counts[key] >= self.TOOL_ERROR_LIMIT:
+                    fatal_detail = (
+                        f"tool {tc_name!r} repeated "
+                        f"{display_type} "
+                        f"{self._tool_error_counts[key]} times; aborting"
+                    )
+                    fatal_error_type = display_type
+
+        if fatal_detail is not None:
+            return tool_messages, self._result(
+                ok=False, status="tool_error",
+                summary=self.last_assistant_text(messages),
+                messages=messages, error=fatal_detail,
+                error_type=fatal_error_type or "tool_error",
+                fatal=True, retryable=False,
+            )
+        return tool_messages, None
+
+    # ===================== 异步 hooks =====================
+
+    async def pre_model_call(self, messages: list[dict]) -> list[dict]:
+        """模型调用前的异步 hook。默认无操作。"""
+        return messages
+
+    async def call_model(self, messages: list[dict]):
+        """异步模型调用。``model_kwargs`` 原样透传给 provider SDK。"""
+        api_messages = (
+            [{"role": "system", "content": self.system_prompt}] + messages
+        )
+        return await self.client.chat.completions.create(
+            model=self.model,
+            messages=api_messages,
+            tools=self.tools if self.tools else None,
+            **self.model_kwargs,
+        )
+
+    async def handle_model_error(self, exc, messages) -> str:
+        """模型调用异常时调用。默认重新抛出。"""
+        return "raise"
+
+    async def on_assistant_message(self, msg_dict: dict, response) -> None:
+        """普通 assistant msg 追加后的异步 hook。默认空。"""
+        pass
+
+    async def on_continuation_message(self, cont_msg: dict) -> None:
+        """continuation msg 追加后的异步 hook。默认空。"""
+        pass
+
+    async def dispatch_one(
+        self,
+        tool_call,
+    ) -> tuple[str, str | None, str | None]:
+        """在线程池运行现有同步工具,避免阻塞 Gateway 事件循环。"""
+        return await asyncio.to_thread(
+            dispatch_tool_call,
+            tool_call,
+            self.registry,
+            session_key=self.session_key,
+            blocked_tools=self.blocked_tools,
+        )
+
+    async def on_tool_message(
+        self,
+        tool_call,
+        tool_msg: dict,
+        output: str,
+    ) -> None:
+        """单条 tool msg 追加后的异步 hook。默认空。"""
+        pass
+
+    async def on_tool_messages_batch(
+        self,
+        assistant_msg: dict,
+        tool_messages: list[dict],
+        response,
+    ) -> None:
+        """assistant tool_call 与 tool results 生成后的异步 hook。默认空。"""
+        pass

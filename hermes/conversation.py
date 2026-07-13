@@ -8,19 +8,26 @@ ConversationAgentLoop 继承 AgentLoop,覆盖 hooks 注入主会话专有行为:
   - assistant tool_call + tool results 的 batch 原子持久化
   - tool_call 处理的 print 日志 + 错误 tool message 包装
 
-run_conversation() 保持原有 module-level 签名,内部委托给
-ConversationAgentLoop.run(),返回 dict 保持调用方兼容。
+run_conversation() 保持原有同步签名;run_conversation_async() 为 Gateway
+提供可取消的异步入口,两者返回 dict 格式一致。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import time
 
-from hermes.agent_loop import AgentLoop, AgentLoopResult, _sanitize_error_message
+from hermes.agent_loop import (
+    AgentLoop,
+    AgentLoopResult,
+    AsyncAgentLoop,
+    _sanitize_error_message,
+)
 from hermes.config import (
     client,
+    create_async_client,
     MODEL,
     MAX_ITERATIONS,
     MAX_RETRIES,
@@ -29,12 +36,48 @@ from hermes.config import (
     CONTINUE_MESSAGE,
 )
 from hermes.db import add_messages, get_session_messages
-from hermes.errors import classify_error, jittered_backoff, switch_to_fallback
-from hermes.tokens import estimate_tokens, compress
+from hermes.errors import (
+    classify_error,
+    jittered_backoff,
+    switch_to_async_fallback,
+    switch_to_fallback,
+)
+from hermes.tokens import compress, compress_async, estimate_tokens
 from hermes.tools import registry
 
 
 ENABLED_TOOLSETS = ["terminal", "file", "memory", "skill", "delegate", "cron"]
+
+
+def _dispatch_conversation_tool_call(loop, tool_call):
+    """主会话工具分发共享实现,供同步 / 异步循环复用。"""
+    tool_name = tool_call.function.name
+    try:
+        tool_args = json.loads(tool_call.function.arguments)
+    except Exception as exc:
+        short = _sanitize_error_message(exc, max_len=200)
+        return (
+            f"(error: invalid JSON arguments in {tool_name}: {short})",
+            "json",
+            f"invalid JSON in tool_call {tool_name!r}: {short}",
+        )
+    print(
+        f"  [tool] {tool_name}: "
+        f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
+    )
+    try:
+        output = loop.registry.dispatch(
+            tool_name, tool_args,
+            session_key=loop.session_key,
+        )
+    except Exception as exc:
+        short = _sanitize_error_message(exc, max_len=200)
+        return (
+            f"(error: tool {tool_name} failed: {short})",
+            "dispatch",
+            f"tool {tool_name!r} raised: {short}",
+        )
+    return output, None, None
 
 
 class ConversationAgentLoop(AgentLoop):
@@ -241,6 +284,163 @@ class ConversationAgentLoop(AgentLoop):
         self._retry_count = 0
 
 
+class AsyncConversationAgentLoop(AsyncAgentLoop):
+    """Gateway 使用的异步主会话循环。
+
+    会话策略与 ``ConversationAgentLoop`` 保持一致,模型、压缩和重试等待
+    使用异步调用,从而允许 Runner 直接取消正在等待的 HTTP 请求。
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        max_iterations: int,
+        tools: list[dict],
+        system_prompt: str,
+        registry,
+        client,
+        session_key: str,
+        conn: sqlite3.Connection,
+        db_session_id: str,
+        existing_messages: list[dict],
+        max_retries: int,
+        max_continuations: int,
+        compression_threshold: int,
+        model_kwargs: dict | None = None,
+        cancel_checker=None,
+    ):
+        super().__init__(
+            model=model,
+            max_iterations=max_iterations,
+            tools=tools,
+            system_prompt=system_prompt,
+            registry=registry,
+            client=client,
+            session_key=session_key,
+            model_kwargs=model_kwargs,
+            cancel_checker=cancel_checker,
+        )
+        self.conn = conn
+        self.db_session_id = db_session_id
+        self.max_retries = max_retries
+        self.max_continuations = max_continuations
+        self.compression_threshold = compression_threshold
+        self._existing_messages = existing_messages
+        self._retry_count = 0
+        self._continuation_count = 0
+        self._using_fallback = False
+        # fallback 客户端由本循环创建,结束时单独关闭;主客户端归 Runner 管理。
+        self._fallback_client = None
+
+    def init_messages(self, user_message: str) -> list[dict]:
+        return list(self._existing_messages) + [
+            {"role": "user", "content": user_message},
+        ]
+
+    async def pre_model_call(self, messages: list[dict]) -> list[dict]:
+        if estimate_tokens(messages) >= self.compression_threshold:
+            messages = await compress_async(messages, self.client, self.model)
+        return messages
+
+    async def handle_model_error(self, exc, messages) -> str:
+        """异步模型异常策略,取消不会进入普通重试 / fallback。"""
+        status = getattr(exc, "status_code", None)
+        classified = classify_error(status, str(exc))
+        print(f"  [error] {classified['reason']} (status={status})")
+
+        if classified["should_compress"]:
+            compressed = await compress_async(
+                messages, self.client, self.model,
+            )
+            messages.clear()
+            messages.extend(compressed)
+            return "retry"
+
+        if classified["should_fallback"]:
+            return self._try_fallback_or_abort()
+
+        if classified["retryable"] and self._retry_count < self.max_retries:
+            self._retry_count += 1
+            await asyncio.sleep(jittered_backoff(self._retry_count))
+            return "retry"
+
+        return self._try_fallback_or_abort()
+
+    def _try_fallback_or_abort(self) -> str:
+        if self._using_fallback:
+            return "abort"
+        fallback_client, fallback_model = switch_to_async_fallback()
+        if fallback_client:
+            self.client = fallback_client
+            self.model = fallback_model
+            self._fallback_client = fallback_client
+            self._using_fallback = True
+            self._retry_count = 0
+            return "retry"
+        return "abort"
+
+    async def close(self) -> None:
+        """只关闭本循环创建的 fallback 客户端。"""
+        if self._fallback_client is None:
+            return
+        try:
+            await self._fallback_client.close()
+        except Exception:
+            # 清理失败不应覆盖已经生成的会话结果或取消状态。
+            pass
+        finally:
+            self._fallback_client = None
+
+    async def on_assistant_message(self, msg_dict: dict, response) -> None:
+        add_messages(self.conn, self.db_session_id, [msg_dict])
+        self._retry_count = 0
+
+    def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
+        if finish_reason == "length" and self._continuation_count < self.max_continuations:
+            self._continuation_count += 1
+            return True
+        return False
+
+    def continuation_message(self) -> dict:
+        return {"role": "user", "content": CONTINUE_MESSAGE}
+
+    async def on_continuation_message(self, cont_msg: dict) -> None:
+        add_messages(self.conn, self.db_session_id, [cont_msg])
+
+    def on_tool_dispatch_start(self) -> None:
+        self._continuation_count = 0
+
+    async def dispatch_one(
+        self,
+        tool_call,
+    ) -> tuple[str, str | None, str | None]:
+        return await asyncio.to_thread(
+            _dispatch_conversation_tool_call, self, tool_call,
+        )
+
+    async def on_tool_message(
+        self,
+        tool_call,
+        tool_msg: dict,
+        output: str,
+    ) -> None:
+        pass
+
+    async def on_tool_messages_batch(
+        self,
+        assistant_msg: dict,
+        tool_messages: list[dict],
+        response,
+    ) -> None:
+        add_messages(
+            self.conn,
+            self.db_session_id,
+            [assistant_msg, *tool_messages],
+        )
+        self._retry_count = 0
+
+
 # ---------------------------------------------------------------------------
 # 对外入口(签名 / 返回格式与原版完全一致)
 # ---------------------------------------------------------------------------
@@ -268,6 +468,43 @@ def _persistence_error_response(exc) -> dict:
         "error_type": "persistence_error",
         "fatal": True,
         "retryable": False,
+    }
+
+
+def _conversation_result_response(result: AgentLoopResult) -> dict:
+    """把同步 / 异步循环结果映射为统一的对外返回格式。"""
+    if result.status == "completed":
+        final = result.summary
+    elif result.status == "max_iterations":
+        final = "(max iterations reached)"
+    elif result.status == "cancelled":
+        final = "(cancelled)"
+    elif result.status == "model_error":
+        final = (
+            f"(agent error: model_error; fatal={result.fatal}; "
+            f"retryable={result.retryable}; detail={result.error})"
+        )
+    elif result.status == "tool_error":
+        final = (
+            f"(agent error: tool_error; fatal={result.fatal}; "
+            f"detail={result.error})"
+        )
+    elif result.status == "error":
+        final = (
+            f"(agent error: {result.error_type}; fatal={result.fatal}; "
+            f"retryable={result.retryable}; detail={result.error})"
+        )
+    else:
+        final = f"(agent ended: status={result.status}, error={result.error})"
+
+    return {
+        "final_response": final,
+        "messages": result.messages,
+        "ok": result.ok,
+        "status": result.status,
+        "error_type": result.error_type,
+        "fatal": result.fatal,
+        "retryable": result.retryable,
     }
 
 
@@ -320,40 +557,58 @@ def run_conversation(
     )
     result: AgentLoopResult = loop.run(user_message)
 
-    # 把 loop 的结构化结果映射回原 run_conversation 的 dict 输出。
-    # 外部调用方不会看到原始 openai / sqlite3 异常,只看到结构化 error 文本。
-    if result.status == "completed":
-        final = result.summary
-    elif result.status == "max_iterations":
-        final = "(max iterations reached)"
-    elif result.status == "cancelled":
-        final = "(cancelled)"
-    elif result.status == "model_error":
-        final = (
-            f"(agent error: model_error; fatal={result.fatal}; "
-            f"retryable={result.retryable}; detail={result.error})"
-        )
-    elif result.status == "tool_error":
-        final = (
-            f"(agent error: tool_error; fatal={result.fatal}; "
-            f"detail={result.error})"
-        )
-    elif result.status == "error":
-        # persistence_error / internal_error 都落到 status="error"
-        final = (
-            f"(agent error: {result.error_type}; fatal={result.fatal}; "
-            f"retryable={result.retryable}; detail={result.error})"
-        )
-    else:
-        final = f"(agent ended: status={result.status}, error={result.error})"
+    # 同步 / 异步入口使用同一映射,避免两条链路返回格式漂移。
+    return _conversation_result_response(result)
 
-    return {
-        "final_response": final,
-        "messages": result.messages,
-        # 结构化错误字段:调用方需要精确判断错误类型时使用
-        "ok": result.ok,
-        "status": result.status,
-        "error_type": result.error_type,
-        "fatal": result.fatal,
-        "retryable": result.retryable,
-    }
+
+async def run_conversation_async(
+    user_message: str,
+    conn: sqlite3.Connection,
+    session_id: str,
+    cached_prompt: str,
+    session_key: str | None = None,
+    cancel_checker=None,
+    *,
+    async_client=None,
+) -> dict:
+    """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。"""
+    owns_client = async_client is None
+    if async_client is None:
+        async_client = create_async_client()
+
+    loop = None
+    try:
+        try:
+            existing = get_session_messages(conn, session_id)
+            user_msg = {"role": "user", "content": user_message}
+            add_messages(conn, session_id, [user_msg])
+        except Exception as exc:
+            return _persistence_error_response(exc)
+
+        loop = AsyncConversationAgentLoop(
+            model=MODEL,
+            max_iterations=MAX_ITERATIONS,
+            tools=registry.get_definitions(ENABLED_TOOLSETS),
+            system_prompt=cached_prompt,
+            registry=registry,
+            client=async_client,
+            session_key=session_key or session_id,
+            conn=conn,
+            db_session_id=session_id,
+            existing_messages=existing,
+            max_retries=MAX_RETRIES,
+            max_continuations=MAX_CONTINUATIONS,
+            compression_threshold=COMPRESSION_THRESHOLD,
+            model_kwargs=None,
+            cancel_checker=cancel_checker,
+        )
+        result: AgentLoopResult = await loop.run(user_message)
+        return _conversation_result_response(result)
+    finally:
+        if loop is not None:
+            await loop.close()
+        if owns_client:
+            try:
+                await async_client.close()
+            except Exception:
+                pass

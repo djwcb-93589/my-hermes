@@ -3,12 +3,12 @@ GatewayRunner:启动 adapter,路由入站消息,跑 agent,回发结果。
 
 核心设计:
   - 每条 route_key 串行处理(busy 原子设置 + deque 排队),不同 route_key 并行。
-  - 同一会话收到新消息时,先 cancel 当前任务(cancel_checker),再排队。
+  - 同一会话收到新消息时,先取消当前模型 Task,再排队。
   - busy / pending 消息持久化到 SQLite,重启后按接收顺序恢复。
   - 全局 semaphore 限制不同会话同时调用 LLM 的数量。
-  - ``run_conversation`` 是同步函数,通过 ``asyncio.to_thread`` 跑在线程池。
-    SQLite 连接在线程函数内部创建 / 使用 / 关闭,不跨线程传递。
-  - cancel_checker 透传到 ``run_conversation → ConversationAgentLoop → AgentLoop``。
+  - Gateway 使用 ``run_conversation_async``,模型 HTTP 请求由 asyncio.Task 管理。
+  - /stop、/new 或后续消息可直接取消当前 Task,不再等待同步线程返回。
+  - cancel_checker 仍作为协作式取消兜底,保持旧调用链兼容。
 """
 
 from __future__ import annotations
@@ -61,6 +61,8 @@ class GatewayRunner:
             self.max_concurrent_llm_requests
         )
         self._accepted_messages: set[tuple[str, str]] = set()
+        # 异步模型客户端按需创建,Gateway 停止时统一关闭。
+        self._async_client = None
 
     def add_adapter(self, adapter: BasePlatformAdapter):
         adapter._on_message = self._handle_message
@@ -80,12 +82,22 @@ class GatewayRunner:
         await self._restore_queued_messages()
 
     async def stop(self):
-        """断开所有 adapter + 清理 backend。"""
+        """取消运行中任务,断开 adapter,关闭模型客户端并清理 backend。"""
+        active_tasks = self.sessions.cancel_all(reason="shutdown")
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
         for adapter in self.adapters.values():
             try:
                 await adapter.disconnect()
             except Exception:
                 pass
+        if self._async_client is not None:
+            try:
+                await self._async_client.close()
+            except Exception:
+                pass
+            finally:
+                self._async_client = None
         from hermes.backends import cleanup_all_backends
         cleanup_all_backends()
 
@@ -251,7 +263,7 @@ class GatewayRunner:
                 if not from_queue:
                     self._persist_event(route_key, event)
                 self.sessions.enqueue(ctx, event)
-                ctx.cancel_requested = True
+                self.sessions.request_cancel(route_key, reason="new")
                 print(
                     f"  [gateway] {route_key}: /new queued "
                     f"({len(dropped_events)} old pending dropped)"
@@ -308,7 +320,10 @@ class GatewayRunner:
                 ctx.pending.append(event)
             else:
                 self.sessions.enqueue(ctx, event)
-            ctx.cancel_requested = True
+            # 重启恢复的历史队列按原顺序完整执行,不能让后一条恢复消息
+            # 取消前一条;只有新到达的实时消息才覆盖当前请求。
+            if not from_queue:
+                self.sessions.request_cancel(route_key, reason="superseded")
             print(f"  [gateway] {route_key}: queued ({len(ctx.pending)} pending)")
             return
 
@@ -320,22 +335,42 @@ class GatewayRunner:
         self._mark_event_processing(route_key, event)
         ctx.busy = True
         ctx.cancel_requested = False
-        asyncio.create_task(self._process(route_key, event))
+        ctx.cancel_reason = None
+        # 模型 Task 与串行收尾 worker 分开管理。即使模型 Task 在首次运行前
+        # 就被取消,worker 仍会启动并清理 busy / 持久队列。
+        agent_task = asyncio.create_task(self._run_agent(event, ctx))
+        ctx.active_task = agent_task
+        worker_task = asyncio.create_task(
+            self._process(route_key, event, agent_task),
+        )
+        ctx.worker_task = worker_task
 
-    async def _process(self, route_key: str, event: MessageEvent):
+    async def _process(
+        self,
+        route_key: str,
+        event: MessageEvent,
+        agent_task: asyncio.Task | None = None,
+    ):
         """串行处理一条消息,然后检查队列。"""
         ctx = self.sessions.get_or_create(
             route_key, build_system_prompt(os.getcwd()),
         )
 
+        cancel_reason = None
         try:
-            response = await self._run_agent(event, ctx)
+            if agent_task is None:
+                response = await self._run_agent(event, ctx)
+            else:
+                response = await agent_task
             # worker 返回到事件循环后做最后一道取消检查。即使取消恰好
             # 发生在模型响应检查之后,也不能把旧回复发送给用户。
             if ctx.cancel_requested:
                 print(f"  [gateway] {route_key}: stale response discarded")
             elif response:
                 await self._reply(event, response)
+        except asyncio.CancelledError:
+            cancel_reason = ctx.cancel_reason or "cancelled"
+            print(f"  [gateway] {route_key}: task cancelled ({cancel_reason})")
         except Exception as exc:
             print(f"  [gateway] {route_key} error: {type(exc).__name__}")
             try:
@@ -343,10 +378,19 @@ class GatewayRunner:
             except Exception:
                 pass
         finally:
+            cancel_reason = cancel_reason or ctx.cancel_reason
             ctx.busy = False
-            self._complete_event(route_key, event)
+            if agent_task is not None and ctx.active_task is agent_task:
+                ctx.active_task = None
+            if ctx.worker_task is asyncio.current_task():
+                ctx.worker_task = None
+            # 用户取消 /new / 后续消息覆盖表示这条消息已经明确放弃;
+            # shutdown 则保留 processing 记录,下次启动恢复。
+            if cancel_reason != "shutdown":
+                self._complete_event(route_key, event)
 
-        await self._dispatch_next(ctx)
+        if cancel_reason != "shutdown":
+            await self._dispatch_next(ctx)
 
     async def _dispatch_next(self, ctx) -> None:
         """按入队顺序分发下一条消息,命令也走同一串行入口。"""
@@ -356,20 +400,15 @@ class GatewayRunner:
         await self._handle_message(next_event, from_queue=True)
 
     async def _run_agent(self, event: MessageEvent, ctx) -> str | None:
-        """在线程池跑同步的 ``run_conversation``,不阻塞事件循环。
-
-        关键:SQLite 连接必须在线程函数内部创建 / 使用 / 关闭,
-        不跨线程传递(asyncio.to_thread 在 worker 线程跑,如果 conn
-        在事件循环线程创建,SQLite 会抛 ProgrammingError)。
-        """
+        """在全局并发限制内运行异步主会话。"""
         # 所有 route_key 共用同一信号量,避免不同会话同时打满模型服务。
         async with self._llm_semaphore:
-            return await asyncio.to_thread(self._run_agent_sync, event, ctx)
+            return await self._run_agent_async(event, ctx)
 
-    def _run_agent_sync(self, event: MessageEvent, ctx) -> str | None:
-        """工作线程中的同步会话调用。"""
+    async def _run_agent_async(self, event: MessageEvent, ctx) -> str | None:
+        """使用 AsyncOpenAI 跑主会话,SQLite 仍复用现有同步接口。"""
         from hermes.db import ensure_session
-        from hermes.conversation import run_conversation
+        from hermes.conversation import run_conversation_async
 
         cancel_checker = lambda: ctx.cancel_requested  # noqa: E731
         conn = init_db(self.db_path)
@@ -379,17 +418,25 @@ class GatewayRunner:
                 ctx.conversation_id,
                 source=event.source.platform,
             )
-            result = run_conversation(
+            result = await run_conversation_async(
                 event.text,
                 conn,
                 ctx.conversation_id,
                 ctx.system_prompt,
                 ctx.conversation_id,
                 cancel_checker,
+                async_client=self._get_async_client(),
             )
             return result.get("final_response")
         finally:
             conn.close()
+
+    def _get_async_client(self):
+        """按需创建 Runner 独占的异步模型客户端。"""
+        if self._async_client is None:
+            from hermes.config import create_async_client
+            self._async_client = create_async_client()
+        return self._async_client
 
     async def _reply(self, event: MessageEvent, content: str):
         """通过来源 adapter 回发。检查 SendResult。"""

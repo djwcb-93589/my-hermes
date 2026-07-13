@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from hermes.config import (
     FALLBACK_API_KEY,
@@ -116,6 +116,19 @@ def switch_to_fallback():
         return None, None
     print(f"  [fallback] -> {FALLBACK_MODEL}")
     fallback_client = OpenAI(
+        base_url=FALLBACK_BASE_URL,
+        api_key=FALLBACK_API_KEY,
+        timeout=MODEL_TIMEOUT_SECONDS,
+    )
+    return fallback_client, FALLBACK_MODEL
+
+
+def switch_to_async_fallback():
+    """切换到异步 fallback 模型,未配置时返回 ``(None, None)``。"""
+    if not FALLBACK_MODEL:
+        return None, None
+    print(f"  [fallback] -> {FALLBACK_MODEL}")
+    fallback_client = AsyncOpenAI(
         base_url=FALLBACK_BASE_URL,
         api_key=FALLBACK_API_KEY,
         timeout=MODEL_TIMEOUT_SECONDS,

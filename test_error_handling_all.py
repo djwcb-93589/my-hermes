@@ -92,6 +92,60 @@ class FakeClient:
         )
 
 
+class BlockingAsyncCompletions:
+    """等待取消的异步模型调用,用于验证 HTTP Task 取消链路。"""
+
+    def __init__(self):
+        import asyncio
+
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def create(self, **kwargs):
+        import asyncio
+
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class BlockingAsyncClient:
+    def __init__(self):
+        self.completions = BlockingAsyncCompletions()
+        self.chat = SimpleNamespace(completions=self.completions)
+
+    async def close(self):
+        pass
+
+
+class FakeAsyncCompletions:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def create(self, **kwargs):
+        self.calls += 1
+        if not self.outcomes:
+            raise AssertionError("FakeAsyncClient 没有剩余响应")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class FakeAsyncClient:
+    def __init__(self, outcomes):
+        self.completions = FakeAsyncCompletions(outcomes)
+        self.chat = SimpleNamespace(completions=self.completions)
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
 class RecordingRegistry:
     def __init__(self, outcomes=None):
         self.outcomes = list(outcomes or ["ok"])
@@ -305,6 +359,31 @@ def test_switch_to_fallback_builds_client_from_fallback_config(monkeypatch):
     client, model = errors.switch_to_fallback()
 
     assert isinstance(client, FakeOpenAI)
+    assert model == "fallback-model"
+    assert captured == {
+        "base_url": "https://fallback.invalid/v1",
+        "api_key": "fallback-key",
+        "timeout": errors.MODEL_TIMEOUT_SECONDS,
+    }
+
+
+def test_switch_to_async_fallback_builds_async_client(monkeypatch):
+    import hermes.errors as errors
+
+    captured = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(errors, "FALLBACK_MODEL", "fallback-model")
+    monkeypatch.setattr(errors, "FALLBACK_BASE_URL", "https://fallback.invalid/v1")
+    monkeypatch.setattr(errors, "FALLBACK_API_KEY", "fallback-key")
+    monkeypatch.setattr(errors, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    client, model = errors.switch_to_async_fallback()
+
+    assert isinstance(client, FakeAsyncOpenAI)
     assert model == "fallback-model"
     assert captured == {
         "base_url": "https://fallback.invalid/v1",
@@ -945,8 +1024,6 @@ def test_gateway_restores_processing_and_pending_messages(tmp_path):
 
 def test_gateway_limits_global_llm_concurrency(tmp_path):
     import asyncio
-    import threading
-    import time
 
     from hermes.gateway.runner import GatewayRunner
 
@@ -960,23 +1037,20 @@ def test_gateway_limits_global_llm_concurrency(tmp_path):
             },
             db_path=str(tmp_path / "gateway.db"),
         )
-        lock = threading.Lock()
         active = 0
         max_active = 0
 
-        def run_sync(event, _ctx):
+        async def run_async(event, _ctx):
             nonlocal active, max_active
-            with lock:
-                active += 1
-                max_active = max(max_active, active)
+            active += 1
+            max_active = max(max_active, active)
             try:
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
                 return event.text
             finally:
-                with lock:
-                    active -= 1
+                active -= 1
 
-        runner._run_agent_sync = run_sync
+        runner._run_agent_async = run_async
         events = [SimpleNamespace(text=f"message-{i}") for i in range(4)]
         results = await asyncio.gather(*[
             runner._run_agent(event, SimpleNamespace())
@@ -985,6 +1059,249 @@ def test_gateway_limits_global_llm_concurrency(tmp_path):
 
         assert results == [f"message-{i}" for i in range(4)]
         assert max_active == 2
+
+    asyncio.run(scenario())
+
+
+def test_run_conversation_async_cancels_model_and_skips_assistant(tmp_path):
+    import asyncio
+
+    from hermes.conversation import run_conversation_async
+    from hermes.db import create_session, get_session_messages, init_db
+
+    async def scenario():
+        conn = init_db(str(tmp_path / "conversation.db"))
+        try:
+            session_id = create_session(conn)
+            fake_client = BlockingAsyncClient()
+            task = asyncio.create_task(
+                run_conversation_async(
+                    "slow request",
+                    conn,
+                    session_id,
+                    "system",
+                    async_client=fake_client,
+                )
+            )
+            await asyncio.wait_for(
+                fake_client.completions.started.wait(), timeout=1,
+            )
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert fake_client.completions.cancelled.is_set()
+            assert [
+                message["role"]
+                for message in get_session_messages(conn, session_id)
+            ] == ["user"]
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
+
+
+def test_compress_async_propagates_model_cancellation(monkeypatch):
+    import asyncio
+
+    import hermes.tokens as tokens
+
+    async def scenario():
+        monkeypatch.setattr(tokens, "PROTECT_FIRST", 0)
+        monkeypatch.setattr(tokens, "TAIL_TOKEN_BUDGET", 0)
+        fake_client = BlockingAsyncClient()
+        task = asyncio.create_task(
+            tokens.compress_async(
+                [{"role": "user", "content": "long context"}],
+                fake_client,
+                "fake-model",
+            )
+        )
+        await asyncio.wait_for(
+            fake_client.completions.started.wait(), timeout=1,
+        )
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake_client.completions.cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_run_conversation_async_keeps_sync_result_format(tmp_path):
+    import asyncio
+
+    from hermes.conversation import run_conversation_async
+    from hermes.db import create_session, get_session_messages, init_db
+
+    async def scenario():
+        conn = init_db(str(tmp_path / "conversation.db"))
+        try:
+            session_id = create_session(conn)
+            fake_client = FakeAsyncClient([text_response("async reply")])
+            result = await run_conversation_async(
+                "hello",
+                conn,
+                session_id,
+                "system",
+                async_client=fake_client,
+            )
+
+            assert result["ok"] is True
+            assert result["status"] == "completed"
+            assert result["final_response"] == "async reply"
+            assert [
+                message["role"]
+                for message in get_session_messages(conn, session_id)
+            ] == ["user", "assistant"]
+            # 外部注入的共享客户端由 Runner 管理,会话入口不能擅自关闭。
+            assert fake_client.closed is False
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
+
+
+def test_run_conversation_async_uses_and_closes_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    import asyncio
+
+    import hermes.conversation as conversation
+    from hermes.db import create_session, init_db
+
+    async def scenario():
+        conn = init_db(str(tmp_path / "conversation.db"))
+        try:
+            session_id = create_session(conn)
+            primary = FakeAsyncClient([
+                FakeAPIError("unauthorized", status_code=401),
+            ])
+            fallback = FakeAsyncClient([text_response("fallback reply")])
+            monkeypatch.setattr(
+                conversation,
+                "switch_to_async_fallback",
+                lambda: (fallback, "fallback-model"),
+            )
+
+            result = await conversation.run_conversation_async(
+                "hello",
+                conn,
+                session_id,
+                "system",
+                async_client=primary,
+            )
+
+            assert result["status"] == "completed"
+            assert result["final_response"] == "fallback reply"
+            assert primary.closed is False
+            assert fallback.closed is True
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
+
+
+def test_gateway_stop_cancels_model_task_and_completes_queue(tmp_path):
+    import asyncio
+
+    from hermes.db import get_gateway_queued_messages, init_db
+    from hermes.gateway.runner import GatewayRunner
+    from hermes.gateway.types import MessageEvent, SessionSource, build_session_key
+
+    async def scenario():
+        runner = GatewayRunner(
+            config={"gateway": {"agent_name": "main"}},
+            db_path=str(tmp_path / "gateway.db"),
+        )
+        fake_client = BlockingAsyncClient()
+        runner._async_client = fake_client
+        replies = []
+
+        async def reply(event, content):
+            replies.append((event.text, content))
+
+        runner._reply = reply
+        source = SessionSource(
+            platform="feishu",
+            account_id="app-1",
+            chat_id="chat-1",
+            user_id="user-1",
+        )
+        message = MessageEvent(
+            message_id="m1", text="slow request", source=source,
+        )
+        stop = MessageEvent(
+            message_id="m2", text="/stop", source=source,
+        )
+
+        await runner._handle_message(message)
+        await asyncio.wait_for(
+            fake_client.completions.started.wait(), timeout=1,
+        )
+        await runner._handle_message(stop)
+
+        route_key = build_session_key(source, "main")
+        ctx = runner.sessions.get_or_create(route_key, "system")
+        for _ in range(100):
+            if not ctx.busy:
+                break
+            await asyncio.sleep(0.01)
+
+        assert fake_client.completions.cancelled.is_set()
+        assert ("/stop", "(cancel requested)") in replies
+        assert not any(text == "slow request" for text, _ in replies)
+        conn = init_db(runner.db_path)
+        try:
+            assert get_gateway_queued_messages(conn) == []
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
+
+
+def test_gateway_shutdown_keeps_cancelled_message_for_recovery(tmp_path):
+    import asyncio
+
+    from hermes.db import get_gateway_queued_messages, init_db
+    from hermes.gateway.runner import GatewayRunner
+    from hermes.gateway.types import MessageEvent, SessionSource
+
+    async def scenario():
+        runner = GatewayRunner(
+            config={"gateway": {"agent_name": "main"}},
+            db_path=str(tmp_path / "gateway.db"),
+        )
+        fake_client = BlockingAsyncClient()
+        runner._async_client = fake_client
+        source = SessionSource(
+            platform="feishu",
+            account_id="app-1",
+            chat_id="chat-1",
+            user_id="user-1",
+        )
+        message = MessageEvent(
+            message_id="m1", text="slow request", source=source,
+        )
+
+        await runner._handle_message(message)
+        await asyncio.wait_for(
+            fake_client.completions.started.wait(), timeout=1,
+        )
+        await runner.stop()
+
+        assert fake_client.completions.cancelled.is_set()
+        conn = init_db(runner.db_path)
+        try:
+            rows = get_gateway_queued_messages(conn)
+        finally:
+            conn.close()
+        assert [row["message_id"] for row in rows] == ["m1"]
+        assert rows[0]["status"] == "processing"
 
     asyncio.run(scenario())
 

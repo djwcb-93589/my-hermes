@@ -12,7 +12,7 @@ import os
 import re
 
 import yaml
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 
 def _expand_env_vars(value):
@@ -161,3 +161,12 @@ client = OpenAI(
     api_key=API_KEY,
     timeout=MODEL_TIMEOUT_SECONDS,
 )
+
+
+def create_async_client() -> AsyncOpenAI:
+    """创建 Gateway 专用异步模型客户端,由调用方负责关闭。"""
+    return AsyncOpenAI(
+        base_url=BASE_URL,
+        api_key=API_KEY,
+        timeout=MODEL_TIMEOUT_SECONDS,
+    )
