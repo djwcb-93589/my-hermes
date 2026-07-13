@@ -309,6 +309,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         compression_threshold: int,
         model_kwargs: dict | None = None,
         cancel_checker=None,
+        final_message_callback=None,
     ):
         super().__init__(
             model=model,
@@ -330,6 +331,8 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self._retry_count = 0
         self._continuation_count = 0
         self._using_fallback = False
+        # Gateway 可注入回调,把最终消息和 outbox 放进同一事务。
+        self.final_message_callback = final_message_callback
         # fallback 客户端由本循环创建,结束时单独关闭;主客户端归 Runner 管理。
         self._fallback_client = None
 
@@ -394,6 +397,21 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
 
     async def on_assistant_message(self, msg_dict: dict, response) -> None:
         add_messages(self.conn, self.db_session_id, [msg_dict])
+        self._retry_count = 0
+
+    async def on_final_assistant_message(
+        self,
+        msg_dict: dict,
+        response,
+    ) -> None:
+        if self.final_message_callback is None:
+            add_messages(self.conn, self.db_session_id, [msg_dict])
+        else:
+            self.final_message_callback(
+                self.conn,
+                self.db_session_id,
+                msg_dict,
+            )
         self._retry_count = 0
 
     def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
@@ -570,6 +588,7 @@ async def run_conversation_async(
     cancel_checker=None,
     *,
     async_client=None,
+    final_message_callback=None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。"""
     owns_client = async_client is None
@@ -601,6 +620,7 @@ async def run_conversation_async(
             compression_threshold=COMPRESSION_THRESHOLD,
             model_kwargs=None,
             cancel_checker=cancel_checker,
+            final_message_callback=final_message_callback,
         )
         result: AgentLoopResult = await loop.run(user_message)
         return _conversation_result_response(result)

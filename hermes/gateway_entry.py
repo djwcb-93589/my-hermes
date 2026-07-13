@@ -55,6 +55,9 @@ async def run_gateway():
                 allowed_chats=feishu_cfg.get("allowed_chats", []),
                 send_max_retries=feishu_cfg.get("send_max_retries", 3),
                 send_retry_base_delay=feishu_cfg.get("send_retry_base_delay", 1.0),
+                send_rate_limit_per_chat=feishu_cfg.get(
+                    "send_rate_limit_per_chat", 5,
+                ),
             ))
             print("  [gateway] Feishu adapter added")
         except Exception as exc:

@@ -28,6 +28,8 @@ class SessionContext:
     cancel_requested: bool = False
     # 当前模型任务。/stop 通过 Task.cancel() 中断模型 HTTP 请求。
     active_task: asyncio.Task | None = field(default=None, repr=False)
+    # 当前入站消息对应的 outbox delivery id,供 Runner 内部跨方法传递。
+    delivery_id: str | None = None
     # 串行收尾任务不直接取消,确保模型 Task 即使尚未启动也能完成队列清理。
     worker_task: asyncio.Task | None = field(default=None, repr=False)
     # 区分用户取消、/new、后续消息覆盖和 Gateway 关闭。
@@ -120,6 +122,7 @@ class SessionStore:
             ctx.cancel_requested = False
             ctx.cancel_reason = None
             ctx.active_task = None
+            ctx.delivery_id = None
             ctx.worker_task = None
         ctx.last_activity = time.time()
         return ctx
@@ -140,6 +143,14 @@ class SessionStore:
         ctx.cancel_reason = reason
         if ctx.active_task is not None and not ctx.active_task.done():
             ctx.active_task.cancel()
+        if (
+            reason == "shutdown"
+            and ctx.worker_task is not None
+            and not ctx.worker_task.done()
+        ):
+            # 模型完成后 worker 可能仍在等待 outbox 重试。Gateway 关闭时
+            # 也要取消该等待,持久状态会在下次启动恢复。
+            ctx.worker_task.cancel()
         return True
 
     def cancel_all(self, reason: str = "shutdown") -> list[asyncio.Task]:

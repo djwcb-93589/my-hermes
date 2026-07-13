@@ -47,6 +47,35 @@ class BasePlatformAdapter(ABC):
     ) -> SendResult:
         ...
 
+    def prepare_outbound(
+        self,
+        content: str,
+        *,
+        delivery_id: str,
+    ) -> list[dict]:
+        """把回复转换成可持久化的确定分片。
+
+        普通 adapter 默认只生成一个纯文本分片。平台有自己的消息格式或
+        长度限制时覆盖该方法,但不能在这里执行网络请求。
+        """
+        return [{"content": content}]
+
+    async def send_prepared(
+        self,
+        chat_id: str,
+        payload: dict,
+        *,
+        reply_to_message_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> SendResult:
+        """发送一个已准备分片;默认复用现有 ``send`` 实现。"""
+        return await self.send(
+            chat_id,
+            str(payload.get("content", "")),
+            reply_to_message_id=reply_to_message_id,
+            thread_id=thread_id,
+        )
+
     async def handle_message(self, event: MessageEvent):
         """把翻译好的 event 转发给 GatewayRunner 回调。"""
         if self._on_message:

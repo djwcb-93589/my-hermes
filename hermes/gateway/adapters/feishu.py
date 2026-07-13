@@ -1,5 +1,5 @@
 """
-飞书 adapter:基于 Webhook HTTP 回调,第一阶段仅支持文本。
+飞书 adapter:基于 Webhook HTTP 回调,接收文本并发送 Markdown 富文本。
 
 特性:
   - 内置 ThreadingHTTPServer,接收飞书事件回调
@@ -8,8 +8,9 @@
   - 群聊默认仅响应 @机器人
   - open_id + union_id
   - tenant_access_token 缓存
-  - HTTP API 发送重试
-  - 长文本分片(UTF-16 安全,不截断 Unicode)
+  - HTTP API 分类重试和 tenant token 失效刷新
+  - Markdown 富文本和按请求体字节数安全分片
+  - 消息回复 / 话题回复和按会话发送限速
   - allowed_users / allowed_chats / allow_all 白名单
   - MessageDeduplicator 防止飞书重复推送
 
@@ -25,16 +26,18 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from hermes.gateway.adapters import BasePlatformAdapter
-from hermes.gateway.text_utils import utf16_len, truncate_utf16
 from hermes.gateway.types import MessageEvent, MessageType, SendResult, SessionSource
 
 
-FEISHU_UTF16_LIMIT = 30000  # 飞书单条文本 UTF-16 code units 上限
+FEISHU_POST_LIMIT_BYTES = 30 * 1024  # 飞书单条富文本请求体上限
+FEISHU_POST_SAFETY_MARGIN_BYTES = 1024  # 为 receive_id 等外层字段预留空间
+FEISHU_TOKEN_ERROR_CODES = frozenset({99991663, 99991665})
 FEISHU_BATCH_QUIET_SECONDS = 0.6  # 连续文本静默多久后提交
 FEISHU_BATCH_MAX_WAIT_SECONDS = 2.0  # 单批消息最长累计等待时间
 FEISHU_BATCH_SEPARATOR = "\n"
@@ -68,6 +71,7 @@ class FeishuAdapter(BasePlatformAdapter):
         allowed_chats: list[str] | None = None,
         send_max_retries: int = 3,
         send_retry_base_delay: float = 1.0,
+        send_rate_limit_per_chat: int = 5,
     ):
         super().__init__("feishu")
         self.app_id = app_id
@@ -86,6 +90,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self.allowed_chats = set(allowed_chats or [])
         self.send_max_retries = max(1, int(send_max_retries))
         self.send_retry_base_delay = max(0.0, float(send_retry_base_delay))
+        self.send_rate_limit_per_chat = max(1, int(send_rate_limit_per_chat))
 
         self.api_base = (
             "https://open.larksuite.com/open-apis"
@@ -109,6 +114,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._batch_tasks: dict[str, asyncio.Task] = {}
         self._batch_waiters: dict[str, list[asyncio.Future]] = {}
         self._inflight_messages: dict[str, asyncio.Future] = {}
+        self._send_rate_locks: dict[str, asyncio.Lock] = {}
+        self._send_timestamps: dict[str, deque[float]] = {}
 
     # ===================== 生命周期 =====================
 
@@ -215,6 +222,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._close_reliability_store()
         self._tenant_token = ""
         self._token_expires_at = 0.0
+        self._send_rate_locks.clear()
+        self._send_timestamps.clear()
         self._loop = None
 
     async def _close_http_client(self):
@@ -868,12 +877,20 @@ class FeishuAdapter(BasePlatformAdapter):
 
     # ===================== 消息出站 =====================
 
-    async def _refresh_token(self) -> str:
-        if self._tenant_token and time.time() < self._token_expires_at:
+    async def _refresh_token(self, *, force: bool = False) -> str:
+        if (
+            not force
+            and self._tenant_token
+            and time.time() < self._token_expires_at
+        ):
             return self._tenant_token
 
         async with self._token_lock:
-            if self._tenant_token and time.time() < self._token_expires_at:
+            if (
+                not force
+                and self._tenant_token
+                and time.time() < self._token_expires_at
+            ):
                 return self._tenant_token
             if not self._http:
                 return ""
@@ -900,6 +917,34 @@ class FeishuAdapter(BasePlatformAdapter):
             self._token_expires_at = time.time() + max(60, expires - 300)
             return self._tenant_token
 
+    async def _invalidate_token(self, rejected_token: str) -> None:
+        """只清除本次被拒绝的 token,避免覆盖并发刷新出的新 token。"""
+        async with self._token_lock:
+            if self._tenant_token == rejected_token:
+                self._tenant_token = ""
+                self._token_expires_at = 0.0
+
+    def prepare_outbound(
+        self,
+        content: str,
+        *,
+        delivery_id: str,
+    ) -> list[dict]:
+        """把 Markdown 回复转换成可持久化的飞书富文本分片。"""
+        chunks = self._split_markdown(content)
+        payloads = []
+        for index, chunk in enumerate(chunks):
+            request_uuid = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes:feishu:{delivery_id}:{index}",
+            ))
+            payloads.append({
+                "msg_type": "post",
+                "content": self._build_post_content(chunk),
+                "request_uuid": request_uuid,
+            })
+        return payloads
+
     async def send(
         self,
         chat_id: str,
@@ -909,48 +954,116 @@ class FeishuAdapter(BasePlatformAdapter):
         thread_id: str | None = None,
     ) -> SendResult:
         if not self._running or not self._http:
-            return SendResult(success=False, error="not_connected")
+            return SendResult(
+                success=False,
+                error="not_connected",
+                retryable=True,
+            )
 
-        chunks = self._split_text(content, FEISHU_UTF16_LIMIT)
-        last_result = SendResult(success=True)
-        for chunk in chunks:
-            result = await self._send_chunk(chat_id, chunk)
+        payloads = self.prepare_outbound(
+            content,
+            delivery_id=str(uuid.uuid4()),
+        )
+        message_ids: list[str] = []
+        for index, payload in enumerate(payloads):
+            result = await self.send_prepared(
+                chat_id,
+                payload,
+                reply_to_message_id=reply_to_message_id,
+                thread_id=thread_id,
+            )
             if not result.success:
+                result.sent_chunks = index
+                result.total_chunks = len(payloads)
+                result.failed_chunk_index = index
+                result.message_ids = message_ids
                 return result
-            last_result = result
-        return last_result
+            if result.message_id:
+                message_ids.append(result.message_id)
+        return SendResult(
+            success=True,
+            message_id=message_ids[-1] if message_ids else None,
+            sent_chunks=len(payloads),
+            total_chunks=len(payloads),
+            message_ids=message_ids,
+        )
 
-    async def _send_chunk(self, chat_id: str, chunk: str) -> SendResult:
-        """发送一个文本分片,网络或限流失败时按配置重试。"""
+    async def send_prepared(
+        self,
+        chat_id: str,
+        payload: dict,
+        *,
+        reply_to_message_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> SendResult:
+        """发送一个已经确定格式和 UUID 的飞书消息分片。"""
         if not self._http:
-            return SendResult(success=False, error="not_connected")
+            return SendResult(
+                success=False,
+                error="not_connected",
+                retryable=True,
+            )
 
-        last_error = "unknown"
-        request_uuid = str(uuid.uuid4())
-        for attempt in range(self.send_max_retries):
+        request_uuid = str(payload.get("request_uuid", "") or "")
+        msg_type = str(payload.get("msg_type", "post") or "post")
+        message_content = str(payload.get("content", "") or "")
+        reply_in_thread = bool(thread_id)
+        thread_fallback_used = False
+        token_refreshed = False
+        attempt = 0
+        retry_after = None
+        last_result = SendResult(
+            success=False,
+            error="unknown",
+            retryable=False,
+        )
+
+        while attempt < self.send_max_retries:
             token = await self._refresh_token()
             if not token:
-                last_error = "not_connected"
+                last_result = SendResult(
+                    success=False,
+                    error="token_unavailable",
+                    retryable=True,
+                )
+                attempt += 1
             else:
                 try:
-                    response = await self._http.post(
-                        f"{self.api_base}/im/v1/messages",
-                        params={
-                            "receive_id_type": "chat_id",
-                            "uuid": request_uuid,
-                        },
-                        headers={"Authorization": f"Bearer {token}"},
-                        json={
-                            "receive_id": chat_id,
-                            "msg_type": "text",
-                            "content": json.dumps(
-                                {"text": chunk},
-                                ensure_ascii=False,
-                            ),
-                        },
-                    )
-                    data = response.json()
-                    if data.get("code") == 0:
+                    await self._wait_send_slot(chat_id)
+                    if reply_to_message_id:
+                        response = await self._http.post(
+                            f"{self.api_base}/im/v1/messages/"
+                            f"{reply_to_message_id}/reply",
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={
+                                "msg_type": msg_type,
+                                "content": message_content,
+                                "reply_in_thread": reply_in_thread,
+                                "uuid": request_uuid,
+                            },
+                        )
+                    else:
+                        response = await self._http.post(
+                            f"{self.api_base}/im/v1/messages",
+                            params={
+                                "receive_id_type": "chat_id",
+                                "uuid": request_uuid,
+                            },
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={
+                                "receive_id": chat_id,
+                                "msg_type": msg_type,
+                                "content": message_content,
+                            },
+                        )
+                    try:
+                        data = response.json()
+                    except (TypeError, ValueError):
+                        # 即使错误响应体不是 JSON,仍要按 HTTP 状态决定
+                        # 401 刷新 token、403 停止、5xx 重试。
+                        data = {}
+                    code = data.get("code")
+                    if code == 0:
                         message_id = (
                             data.get("data", {}).get("message_id")
                             if isinstance(data.get("data"), dict)
@@ -959,41 +1072,166 @@ class FeishuAdapter(BasePlatformAdapter):
                         return SendResult(
                             success=True,
                             message_id=message_id,
+                            sent_chunks=1,
+                            total_chunks=1,
+                            message_ids=[message_id] if message_id else [],
                         )
-                    last_error = self._classify_send_error(
+
+                    # 当前群不支持话题时降级为普通回复一次。同一次请求尚未
+                    # 成功,所以可以继续复用分片 UUID。
+                    if (
+                        code == 230071
+                        and reply_in_thread
+                        and not thread_fallback_used
+                    ):
+                        reply_in_thread = False
+                        thread_fallback_used = True
+                        continue
+
+                    error, retryable, refresh_token = self._classify_send_error(
                         response.status_code,
-                        data.get("code"),
+                        code,
                     )
+                    last_result = SendResult(
+                        success=False,
+                        error=error,
+                        error_code=str(code) if code is not None else None,
+                        retryable=retryable,
+                    )
+
+                    if refresh_token and not token_refreshed:
+                        await self._invalidate_token(token)
+                        token_refreshed = True
+                        continue
+                    if not retryable:
+                        return last_result
+                    retry_after = self._parse_retry_after(response.headers)
+                    attempt += 1
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
-                    last_error = "send_timeout"
+                    last_result = SendResult(
+                        success=False,
+                        error="send_timeout",
+                        retryable=True,
+                    )
+                    retry_after = None
+                    attempt += 1
 
-            if attempt + 1 < self.send_max_retries:
-                delay = self.send_retry_base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
+            if attempt < self.send_max_retries:
+                delay = self.send_retry_base_delay * (2 ** (attempt - 1))
+                if retry_after is not None:
+                    delay = max(delay, retry_after)
+                await asyncio.sleep(max(0.0, delay))
 
-        return SendResult(success=False, error=last_error)
+        return last_result
+
+    async def _wait_send_slot(self, chat_id: str) -> None:
+        """按会话限制发送速率,避免多路回复同时触发飞书限流。"""
+        lock = self._send_rate_locks.setdefault(chat_id, asyncio.Lock())
+        timestamps = self._send_timestamps.setdefault(chat_id, deque())
+        async with lock:
+            while True:
+                now = time.monotonic()
+                while timestamps and now - timestamps[0] >= 1.0:
+                    timestamps.popleft()
+                if len(timestamps) < self.send_rate_limit_per_chat:
+                    timestamps.append(now)
+                    return
+                await asyncio.sleep(max(0.0, 1.0 - (now - timestamps[0])))
 
     @staticmethod
-    def _classify_send_error(status_code: int, code: Any) -> str:
+    def _parse_retry_after(headers) -> float | None:
+        value = headers.get("Retry-After") if headers else None
+        if value is None:
+            return None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _classify_send_error(
+        status_code: int,
+        code: Any,
+    ) -> tuple[str, bool, bool]:
+        """返回 ``错误类型、是否重试、是否刷新 tenant token``。"""
         if status_code == 429 or code in (99991400, 99991401):
-            return "rate_limited"
-        if status_code in (401, 403):
-            return "permission_denied"
+            return "rate_limited", True, False
+        if status_code == 401 or code in FEISHU_TOKEN_ERROR_CODES:
+            return "token_invalid", False, True
+        if status_code == 403 or code == 99991672:
+            return "permission_denied", False, False
         if status_code >= 500:
-            return "send_timeout"
-        return "unknown"
+            return "server_error", True, False
+        if 400 <= status_code < 500:
+            return "invalid_request", False, False
+        return "unknown", False, False
 
     @staticmethod
-    def _split_text(text: str, max_units: int) -> list[str]:
-        """按 UTF-16 code units 安全分片,不截断 Unicode 字符。"""
-        if utf16_len(text) <= max_units:
+    def _build_post_content(text: str) -> str:
+        content = {
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": text,
+                }]],
+            },
+        }
+        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def _post_payload_size(cls, text: str) -> int:
+        """估算完整回复请求体大小,为外层路由字段预留固定空间。"""
+        body = {
+            "msg_type": "post",
+            "content": cls._build_post_content(text),
+            "reply_in_thread": True,
+            "uuid": "00000000-0000-0000-0000-000000000000",
+        }
+        encoded = json.dumps(
+            body,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return len(encoded) + FEISHU_POST_SAFETY_MARGIN_BYTES
+
+    @classmethod
+    def _split_markdown(cls, text: str) -> list[str]:
+        """按富文本请求体字节数分片,优先保持段落和行边界。"""
+        if cls._post_payload_size(text) <= FEISHU_POST_LIMIT_BYTES:
             return [text]
+
         chunks: list[str] = []
         remaining = text
-        while utf16_len(remaining) > max_units:
-            chunk = truncate_utf16(remaining, max_units)
-            chunks.append(chunk)
-            remaining = remaining[len(chunk):]
-        if remaining:
-            chunks.append(remaining)
+        while remaining:
+            if cls._post_payload_size(remaining) <= FEISHU_POST_LIMIT_BYTES:
+                chunks.append(remaining)
+                break
+
+            low, high = 1, len(remaining)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if (
+                    cls._post_payload_size(remaining[:middle])
+                    <= FEISHU_POST_LIMIT_BYTES
+                ):
+                    low = middle
+                else:
+                    high = middle - 1
+
+            split_at = low
+            prefix = remaining[:split_at]
+            minimum_boundary = max(1, split_at // 2)
+            for separator in ("\n\n", "\n", " "):
+                boundary = prefix.rfind(separator)
+                if boundary >= minimum_boundary:
+                    split_at = boundary + len(separator)
+                    break
+
+            # 即使单个字符也无法满足限制,也必须前进以避免死循环。
+            split_at = max(1, split_at)
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+
         return chunks or [text]

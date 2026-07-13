@@ -578,7 +578,7 @@ class AgentLoop:
 
             # 模型不再调工具 → 任务完成
             try:
-                self.on_assistant_message(msg_dict, response)
+                self.on_final_assistant_message(msg_dict, response)
             except Exception as exc:
                 return self._persistence_error_result(messages, repr(exc))
             return self._result(
@@ -728,6 +728,10 @@ class AgentLoop:
     def on_assistant_message(self, msg_dict: dict, response) -> None:
         """普通 assistant msg 追加后调用。默认空。"""
         pass
+
+    def on_final_assistant_message(self, msg_dict: dict, response) -> None:
+        """最终 assistant 消息 hook;默认保持旧持久化行为。"""
+        self.on_assistant_message(msg_dict, response)
 
     def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
         """是否触发 continuation(默认不触发)。"""
@@ -936,7 +940,7 @@ class AsyncAgentLoop(AgentLoop):
                 continue
 
             try:
-                await self.on_assistant_message(msg_dict, response)
+                await self.on_final_assistant_message(msg_dict, response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1049,6 +1053,14 @@ class AsyncAgentLoop(AgentLoop):
     async def on_assistant_message(self, msg_dict: dict, response) -> None:
         """普通 assistant msg 追加后的异步 hook。默认空。"""
         pass
+
+    async def on_final_assistant_message(
+        self,
+        msg_dict: dict,
+        response,
+    ) -> None:
+        """最终 assistant 消息 hook;默认保持旧持久化行为。"""
+        await self.on_assistant_message(msg_dict, response)
 
     async def on_continuation_message(self, cont_msg: dict) -> None:
         """continuation msg 追加后的异步 hook。默认空。"""

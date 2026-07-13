@@ -50,10 +50,21 @@ class MessageEvent:
 
 @dataclass
 class SendResult:
-    """统一出站结果。"""
+    """统一出站结果。
+
+    ``message_id`` 保留单消息调用的旧接口;分片发送时通过
+    ``message_ids`` / ``sent_chunks`` 返回完整进度,让 Runner 能决定
+    是否完成入站消息或从失败分片继续恢复。
+    """
     success: bool
     message_id: str | None = None
     error: str | None = None
+    error_code: str | None = None
+    retryable: bool = False
+    sent_chunks: int = 0
+    total_chunks: int = 0
+    failed_chunk_index: int | None = None
+    message_ids: list[str] = field(default_factory=list)
 
 
 def build_session_key(source: SessionSource, agent_name: str = "main") -> str:
