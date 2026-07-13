@@ -35,10 +35,16 @@ class SessionContext:
 class SessionStore:
     """进程内会话状态管理器。线程安全(asyncio 单线程,锁保护 dict 操作)。"""
 
-    def __init__(self, idle_timeout: float = 86400, db_path: str | None = None):
+    def __init__(
+        self,
+        idle_timeout: float = 86400,
+        db_path: str | None = None,
+        max_pending_messages: int = 20,
+    ):
         self._contexts: dict[str, SessionContext] = {}
         self.idle_timeout = idle_timeout
         self.db_path = db_path
+        self.max_pending_messages = max(1, int(max_pending_messages))
 
     def _load_conversation_id(self, route_key: str) -> str:
         """从数据库恢复 route_key 当前会话;没有映射时保持旧行为。"""
@@ -88,8 +94,10 @@ class SessionStore:
         return ctx
 
     def new_conversation(self, route_key: str, system_prompt: str) -> SessionContext:
-        """/new:用新 UUID 重置 conversation_id,清空 pending。"""
+        """/new:仅在会话空闲时切换 UUID,保留命令后的 pending。"""
         ctx = self._contexts.get(route_key)
+        if ctx is not None and ctx.busy:
+            raise RuntimeError("cannot switch a busy conversation")
         new_id = str(uuid.uuid4())
         # 先落库再切换内存状态,避免写入失败时两边指向不同会话。
         self._save_conversation_id(route_key, new_id)
@@ -103,11 +111,16 @@ class SessionStore:
         else:
             ctx.conversation_id = new_id
             ctx.system_prompt = system_prompt
-            ctx.pending.clear()
             ctx.cancel_requested = False
-            ctx.busy = False
         ctx.last_activity = time.time()
         return ctx
+
+    def enqueue(self, ctx: SessionContext, event) -> bool:
+        """在单会话上限内入队,队列已满时返回 False。"""
+        if len(ctx.pending) >= self.max_pending_messages:
+            return False
+        ctx.pending.append(event)
+        return True
 
     def request_cancel(self, route_key: str) -> bool:
         """/stop:标记取消当前任务。"""
@@ -128,6 +141,7 @@ class SessionStore:
             "busy": ctx.busy,
             "cancel_requested": ctx.cancel_requested,
             "pending_count": len(ctx.pending),
+            "pending_limit": self.max_pending_messages,
             "last_activity": ctx.last_activity,
             "idle_seconds": time.time() - ctx.last_activity,
         }

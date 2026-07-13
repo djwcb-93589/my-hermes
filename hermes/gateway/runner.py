@@ -4,6 +4,8 @@ GatewayRunner:启动 adapter,路由入站消息,跑 agent,回发结果。
 核心设计:
   - 每条 route_key 串行处理(busy 原子设置 + deque 排队),不同 route_key 并行。
   - 同一会话收到新消息时,先 cancel 当前任务(cancel_checker),再排队。
+  - busy / pending 消息持久化到 SQLite,重启后按接收顺序恢复。
+  - 全局 semaphore 限制不同会话同时调用 LLM 的数量。
   - ``run_conversation`` 是同步函数,通过 ``asyncio.to_thread`` 跑在线程池。
     SQLite 连接在线程函数内部创建 / 使用 / 关闭,不跨线程传递。
   - cancel_checker 透传到 ``run_conversation → ConversationAgentLoop → AgentLoop``。
@@ -12,11 +14,27 @@ GatewayRunner:启动 adapter,路由入站消息,跑 agent,回发结果。
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 
+from hermes.db import (
+    complete_gateway_message,
+    delete_gateway_messages,
+    enqueue_gateway_message,
+    get_gateway_queued_messages,
+    init_db,
+    mark_gateway_message_processing,
+    reset_gateway_processing_messages,
+)
 from hermes.gateway.adapters import BasePlatformAdapter
 from hermes.gateway.session_store import SessionStore
-from hermes.gateway.types import MessageEvent, SendResult, build_session_key
+from hermes.gateway.types import (
+    MessageEvent,
+    MessageType,
+    SendResult,
+    SessionSource,
+    build_session_key,
+)
 from hermes.prompt import build_system_prompt
 
 
@@ -29,14 +47,27 @@ class GatewayRunner:
         self.adapters: dict[str, BasePlatformAdapter] = {}
         self.agent_name = config.get("gateway", {}).get("agent_name", "main")
         idle_timeout = config.get("gateway", {}).get("session_idle_timeout", 86400)
-        self.sessions = SessionStore(idle_timeout=idle_timeout, db_path=db_path)
+        max_pending = config.get("gateway", {}).get("max_pending_messages", 20)
+        max_concurrent = config.get(
+            "gateway", {},
+        ).get("max_concurrent_llm_requests", 4)
+        self.sessions = SessionStore(
+            idle_timeout=idle_timeout,
+            db_path=db_path,
+            max_pending_messages=max_pending,
+        )
+        self.max_concurrent_llm_requests = max(1, int(max_concurrent))
+        self._llm_semaphore = asyncio.Semaphore(
+            self.max_concurrent_llm_requests
+        )
+        self._accepted_messages: set[tuple[str, str]] = set()
 
     def add_adapter(self, adapter: BasePlatformAdapter):
         adapter._on_message = self._handle_message
         self.adapters[adapter.platform_name] = adapter
 
     async def start(self):
-        """逐个连接 adapter,单个失败不阻止其他。"""
+        """逐个连接 adapter,然后恢复上次未完成的 Runner 消息。"""
         for name, adapter in self.adapters.items():
             try:
                 ok = await adapter.connect()
@@ -46,6 +77,7 @@ class GatewayRunner:
                     print(f"  [gateway] {name} FAILED to connect")
             except Exception as exc:
                 print(f"  [gateway] {name} crashed on connect: {type(exc).__name__}")
+        await self._restore_queued_messages()
 
     async def stop(self):
         """断开所有 adapter + 清理 backend。"""
@@ -59,17 +91,184 @@ class GatewayRunner:
 
     # ----- 消息路由 -----
 
-    async def _handle_message(self, event: MessageEvent):
+    @staticmethod
+    def _serialize_event(event: MessageEvent) -> str:
+        """把平台无关事件序列化后写入 Runner 恢复队列。"""
+        source = event.source
+        payload = {
+            "message_id": event.message_id,
+            "text": event.text,
+            "message_type": event.message_type.value,
+            "media_urls": event.media_urls,
+            "reply_to_message_id": event.reply_to_message_id,
+            "attachments": event.attachments,
+            "metadata": event.metadata,
+            "source": {
+                "platform": source.platform,
+                "account_id": source.account_id,
+                "chat_id": source.chat_id,
+                "chat_type": source.chat_type,
+                "user_id": source.user_id,
+                "user_id_alt": source.user_id_alt,
+                "user_name": source.user_name,
+                "thread_id": source.thread_id,
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _deserialize_event(raw: str) -> MessageEvent:
+        """从 Runner 恢复队列重建 MessageEvent。"""
+        payload = json.loads(raw)
+        source = payload["source"]
+        return MessageEvent(
+            message_id=str(payload["message_id"]),
+            text=str(payload["text"]),
+            message_type=MessageType(payload.get("message_type", "text")),
+            media_urls=list(payload.get("media_urls", [])),
+            reply_to_message_id=payload.get("reply_to_message_id"),
+            attachments=list(payload.get("attachments", [])),
+            metadata=dict(payload.get("metadata", {})),
+            source=SessionSource(
+                platform=str(source["platform"]),
+                account_id=str(source.get("account_id", "")),
+                chat_id=str(source.get("chat_id", "")),
+                chat_type=str(source.get("chat_type", "dm")),
+                user_id=str(source.get("user_id", "")),
+                user_id_alt=str(source.get("user_id_alt", "")),
+                user_name=str(source.get("user_name", "")),
+                thread_id=source.get("thread_id"),
+            ),
+        )
+
+    def _persist_event(self, route_key: str, event: MessageEvent) -> None:
+        """消息进入内存 busy / pending 前先持久化。"""
+        conn = init_db(self.db_path)
+        try:
+            enqueue_gateway_message(
+                conn,
+                route_key,
+                event.message_id,
+                self._serialize_event(event),
+            )
+        finally:
+            conn.close()
+        self._accepted_messages.add((route_key, event.message_id))
+
+    def _mark_event_processing(self, route_key: str, event: MessageEvent) -> None:
+        conn = init_db(self.db_path)
+        try:
+            mark_gateway_message_processing(
+                conn, route_key, event.message_id,
+            )
+        finally:
+            conn.close()
+
+    def _complete_event(self, route_key: str, event: MessageEvent) -> bool:
+        """处理结束后删除恢复记录;失败时保留到下次重启。"""
+        try:
+            conn = init_db(self.db_path)
+            try:
+                complete_gateway_message(
+                    conn, route_key, event.message_id,
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            print(
+                f"  [gateway] {route_key}: queue completion failed "
+                f"({type(exc).__name__})"
+            )
+            return False
+        self._accepted_messages.discard((route_key, event.message_id))
+        return True
+
+    def _drop_events(self, route_key: str, events: list[MessageEvent]) -> None:
+        """持久化删除被 /new 明确取消的旧 pending。"""
+        message_ids = [event.message_id for event in events]
+        conn = init_db(self.db_path)
+        try:
+            delete_gateway_messages(conn, route_key, message_ids)
+        finally:
+            conn.close()
+        for message_id in message_ids:
+            self._accepted_messages.discard((route_key, message_id))
+
+    async def _restore_queued_messages(self) -> None:
+        """Adapter 就绪后恢复 queued / processing 消息。"""
+        conn = init_db(self.db_path)
+        try:
+            reset_gateway_processing_messages(conn)
+            rows = get_gateway_queued_messages(conn)
+        finally:
+            conn.close()
+
+        restored = 0
+        for row in rows:
+            try:
+                event = self._deserialize_event(row["event_json"])
+                route_key = build_session_key(event.source, self.agent_name)
+                if route_key != row["route_key"]:
+                    raise ValueError("route key mismatch")
+                key = (route_key, event.message_id)
+                if key in self._accepted_messages:
+                    continue
+                self._accepted_messages.add(key)
+                await self._handle_message(event, from_queue=True)
+                restored += 1
+            except Exception as exc:
+                print(
+                    "  [gateway] queued message recovery failed: "
+                    f"{type(exc).__name__}"
+                )
+        if restored:
+            print(f"  [gateway] restored queued messages: {restored}")
+
+    async def _handle_message(
+        self,
+        event: MessageEvent,
+        *,
+        from_queue: bool = False,
+    ):
         """所有 adapter 的入站消息在此汇聚。"""
         route_key = build_session_key(event.source, self.agent_name)
+        queue_key = (route_key, event.message_id)
+        if not from_queue and queue_key in self._accepted_messages:
+            return
 
         # slash 命令(所有平台通用)
         cmd = (event.text or "").strip().lower()
         if cmd == "/new":
-            self.sessions.new_conversation(
+            ctx = self.sessions.get_or_create(
                 route_key, build_system_prompt(os.getcwd()),
             )
-            await self._reply(event, "(new conversation started)")
+            if ctx.busy:
+                # /new 作为串行屏障:丢弃命令前尚未执行的旧消息,
+                # 等当前 worker 完全退出后再切换 conversation_id。
+                dropped_events = list(ctx.pending)
+                self._drop_events(route_key, dropped_events)
+                ctx.pending.clear()
+                if not from_queue:
+                    self._persist_event(route_key, event)
+                self.sessions.enqueue(ctx, event)
+                ctx.cancel_requested = True
+                print(
+                    f"  [gateway] {route_key}: /new queued "
+                    f"({len(dropped_events)} old pending dropped)"
+                )
+                return
+            if not from_queue:
+                self._persist_event(route_key, event)
+            try:
+                self.sessions.new_conversation(
+                    route_key, build_system_prompt(os.getcwd()),
+                )
+                await self._reply(event, "(new conversation started)")
+            except Exception:
+                raise
+            else:
+                self._complete_event(route_key, event)
+            await self._dispatch_next(ctx)
             return
         if cmd == "/stop":
             ok = self.sessions.request_cancel(route_key)
@@ -91,8 +290,24 @@ class GatewayRunner:
         )
 
         if ctx.busy:
-            # 正在处理 → 排队(保留全部,不只最后一条)
-            ctx.pending.append(event)
+            # 正在处理 → 在单会话上限内排队。
+            if (
+                not from_queue
+                and len(ctx.pending) >= self.sessions.max_pending_messages
+            ):
+                print(f"  [gateway] {route_key}: queue full")
+                await self._reply(
+                    event,
+                    "(queue full: please wait for pending messages)",
+                )
+                return
+            if not from_queue:
+                self._persist_event(route_key, event)
+            if from_queue:
+                # 已持久化消息必须全部恢复,不能因重启后的新上限丢失。
+                ctx.pending.append(event)
+            else:
+                self.sessions.enqueue(ctx, event)
             ctx.cancel_requested = True
             print(f"  [gateway] {route_key}: queued ({len(ctx.pending)} pending)")
             return
@@ -100,6 +315,9 @@ class GatewayRunner:
         # 原子设置 busy,避免竞态:create_task 不会立即执行,_rocess 也没
         # 机会在 _handle_message 返回前跑。所以在 _handle_message 里设 busy
         # 就能保证同一 route_key 只有一个 worker。
+        if not from_queue:
+            self._persist_event(route_key, event)
+        self._mark_event_processing(route_key, event)
         ctx.busy = True
         ctx.cancel_requested = False
         asyncio.create_task(self._process(route_key, event))
@@ -112,7 +330,11 @@ class GatewayRunner:
 
         try:
             response = await self._run_agent(event, ctx)
-            if response:
+            # worker 返回到事件循环后做最后一道取消检查。即使取消恰好
+            # 发生在模型响应检查之后,也不能把旧回复发送给用户。
+            if ctx.cancel_requested:
+                print(f"  [gateway] {route_key}: stale response discarded")
+            elif response:
                 await self._reply(event, response)
         except Exception as exc:
             print(f"  [gateway] {route_key} error: {type(exc).__name__}")
@@ -122,13 +344,16 @@ class GatewayRunner:
                 pass
         finally:
             ctx.busy = False
+            self._complete_event(route_key, event)
 
-        # 处理队列中的下一条(在同一事件循环里,无竞态)
-        if ctx.pending:
-            next_event = ctx.pending.popleft()
-            ctx.busy = True
-            ctx.cancel_requested = False
-            asyncio.create_task(self._process(route_key, next_event))
+        await self._dispatch_next(ctx)
+
+    async def _dispatch_next(self, ctx) -> None:
+        """按入队顺序分发下一条消息,命令也走同一串行入口。"""
+        if ctx.busy or not ctx.pending:
+            return
+        next_event = ctx.pending.popleft()
+        await self._handle_message(next_event, from_queue=True)
 
     async def _run_agent(self, event: MessageEvent, ctx) -> str | None:
         """在线程池跑同步的 ``run_conversation``,不阻塞事件循环。
@@ -137,29 +362,34 @@ class GatewayRunner:
         不跨线程传递(asyncio.to_thread 在 worker 线程跑,如果 conn
         在事件循环线程创建,SQLite 会抛 ProgrammingError)。
         """
+        # 所有 route_key 共用同一信号量,避免不同会话同时打满模型服务。
+        async with self._llm_semaphore:
+            return await asyncio.to_thread(self._run_agent_sync, event, ctx)
+
+    def _run_agent_sync(self, event: MessageEvent, ctx) -> str | None:
+        """工作线程中的同步会话调用。"""
+        from hermes.db import ensure_session
+        from hermes.conversation import run_conversation
+
         cancel_checker = lambda: ctx.cancel_requested  # noqa: E731
-
-        def _worker() -> str | None:
-            # 全部在 worker 线程内完成:建连接 → 确保 session → 跑 agent → 关连接
-            from hermes.db import init_db, ensure_session
-            from hermes.conversation import run_conversation
-
-            conn = init_db(self.db_path)
-            try:
-                ensure_session(conn, ctx.conversation_id, source=event.source.platform)
-                result = run_conversation(
-                    event.text,
-                    conn,
-                    ctx.conversation_id,
-                    ctx.system_prompt,
-                    ctx.conversation_id,
-                    cancel_checker,
-                )
-                return result.get("final_response")
-            finally:
-                conn.close()
-
-        return await asyncio.to_thread(_worker)
+        conn = init_db(self.db_path)
+        try:
+            ensure_session(
+                conn,
+                ctx.conversation_id,
+                source=event.source.platform,
+            )
+            result = run_conversation(
+                event.text,
+                conn,
+                ctx.conversation_id,
+                ctx.system_prompt,
+                ctx.conversation_id,
+                cancel_checker,
+            )
+            return result.get("final_response")
+        finally:
+            conn.close()
 
     async def _reply(self, event: MessageEvent, content: str):
         """通过来源 adapter 回发。检查 SendResult。"""

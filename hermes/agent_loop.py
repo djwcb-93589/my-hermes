@@ -524,6 +524,11 @@ class AgentLoop:
                 # "raise" 或任何未知返回值都重新抛,但被顶层兜底 catch
                 raise
 
+            # 模型请求期间可能收到 /stop 或后续消息。响应返回后必须
+            # 再检查一次,避免把已经过时的内容写入历史或继续发送。
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+
             assistant_msg = response.choices[0].message
             finish_reason = response.choices[0].finish_reason
 

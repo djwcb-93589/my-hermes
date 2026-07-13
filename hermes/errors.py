@@ -10,6 +10,7 @@ from hermes.config import (
     FALLBACK_API_KEY,
     FALLBACK_BASE_URL,
     FALLBACK_MODEL,
+    MODEL_TIMEOUT_SECONDS,
 )
 
 
@@ -117,5 +118,6 @@ def switch_to_fallback():
     fallback_client = OpenAI(
         base_url=FALLBACK_BASE_URL,
         api_key=FALLBACK_API_KEY,
+        timeout=MODEL_TIMEOUT_SECONDS,
     )
     return fallback_client, FALLBACK_MODEL

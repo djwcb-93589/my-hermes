@@ -143,6 +143,12 @@ TAIL_TOKEN_BUDGET = _config["compression"]["tail_token_budget"]
 MAX_RETRIES = _config["limits"]["max_retries"]
 MAX_CONTINUATIONS = _config["limits"]["max_continuations"]
 MAX_CHILD_ITERATIONS = _config["limits"]["max_child_iterations"]
+MODEL_TIMEOUT_SECONDS = float(
+    os.getenv("MODEL_TIMEOUT_SECONDS")
+    or _config["limits"].get("model_timeout_seconds", 120)
+)
+if MODEL_TIMEOUT_SECONDS <= 0:
+    raise ValueError("model_timeout_seconds must be greater than 0")
 MEMORY_CHAR_LIMIT = _config["memory"]["memory_char_limit"]
 USER_CHAR_LIMIT = _config["memory"]["user_char_limit"]
 
@@ -150,4 +156,8 @@ CONTINUE_MESSAGE = "Please continue from where you left off."
 
 GATEWAY_AGENT_NAME = _config.get("gateway", {}).get("agent_name", "main")
 
-client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+client = OpenAI(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    timeout=MODEL_TIMEOUT_SECONDS,
+)

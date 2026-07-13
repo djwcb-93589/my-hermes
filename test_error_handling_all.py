@@ -309,6 +309,7 @@ def test_switch_to_fallback_builds_client_from_fallback_config(monkeypatch):
     assert captured == {
         "base_url": "https://fallback.invalid/v1",
         "api_key": "fallback-key",
+        "timeout": errors.MODEL_TIMEOUT_SECONDS,
     }
 
 
@@ -648,6 +649,344 @@ def test_agent_loop_cancelled_before_model_call():
     assert result.fatal is True
     assert result.retryable is False
     assert loop.client.chat.completions.calls == 0
+
+
+def test_agent_loop_cancelled_after_model_call_discards_response():
+    checks = iter((False, False, True))
+    loop = make_base_loop(
+        outcomes=[text_response("stale response")],
+        tools=[],
+        cancel_checker=lambda: next(checks),
+    )
+
+    result = loop.run("hello")
+
+    assert result.ok is False
+    assert result.status == "cancelled"
+    assert result.error_type == "cancelled"
+    assert result.summary == ""
+    assert loop.client.chat.completions.calls == 1
+
+
+def test_gateway_runner_discards_cancelled_response_before_reply(tmp_path):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from hermes.gateway.runner import GatewayRunner
+    from hermes.gateway.types import MessageEvent, SessionSource
+
+    runner = GatewayRunner(
+        config={"gateway": {"agent_name": "main"}},
+        db_path=str(tmp_path / "gateway.db"),
+    )
+    ctx = runner.sessions.get_or_create("route-1", "system")
+    ctx.cancel_requested = True
+    ctx.busy = True
+    event = MessageEvent(
+        message_id="m1",
+        text="old task",
+        source=SessionSource(platform="feishu", chat_id="chat-1"),
+    )
+    runner._run_agent = AsyncMock(return_value="stale response")
+    runner._reply = AsyncMock()
+
+    asyncio.run(runner._process("route-1", event))
+
+    runner._reply.assert_not_awaited()
+    assert ctx.busy is False
+
+
+def test_gateway_new_waits_for_worker_and_preserves_following_messages(tmp_path):
+    import asyncio
+
+    from hermes.gateway.runner import GatewayRunner
+    from hermes.gateway.types import MessageEvent, SessionSource, build_session_key
+
+    async def scenario():
+        runner = GatewayRunner(
+            config={
+                "gateway": {
+                    "agent_name": "main",
+                    "max_pending_messages": 3,
+                },
+            },
+            db_path=str(tmp_path / "gateway.db"),
+        )
+        source = SessionSource(
+            platform="feishu",
+            account_id="app-1",
+            chat_id="chat-1",
+            user_id="user-1",
+        )
+
+        def event(message_id, text):
+            return MessageEvent(
+                message_id=message_id,
+                text=text,
+                source=source,
+            )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+        replies = []
+        active = 0
+        max_active = 0
+
+        async def run_agent(message, ctx):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append((message.text, ctx.conversation_id))
+            try:
+                if message.text == "old task":
+                    started.set()
+                    await release.wait()
+                return f"reply:{message.text}"
+            finally:
+                active -= 1
+
+        async def reply(message, content):
+            replies.append((message.text, content))
+
+        runner._run_agent = run_agent
+        runner._reply = reply
+
+        await runner._handle_message(event("m1", "old task"))
+        await started.wait()
+        route_key = build_session_key(source, "main")
+        ctx = runner.sessions.get_or_create(route_key, "system")
+        old_conversation_id = ctx.conversation_id
+
+        await runner._handle_message(event("m2", "/new"))
+        await runner._handle_message(event("m3", "new task"))
+
+        assert ctx.conversation_id == old_conversation_id
+        assert [item.text for item in ctx.pending] == ["/new", "new task"]
+        release.set()
+
+        for _ in range(100):
+            if not ctx.busy and not ctx.pending and len(calls) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert [item[0] for item in calls] == ["old task", "new task"]
+        assert calls[0][1] == old_conversation_id
+        assert calls[1][1] != old_conversation_id
+        assert max_active == 1
+        assert ("old task", "reply:old task") not in replies
+        assert ("/new", "(new conversation started)") in replies
+        assert ("new task", "reply:new task") in replies
+
+    asyncio.run(scenario())
+
+
+def test_gateway_pending_queue_rejects_messages_over_limit(tmp_path):
+    import asyncio
+
+    from hermes.db import get_gateway_queued_messages, init_db
+    from hermes.gateway.runner import GatewayRunner
+    from hermes.gateway.types import MessageEvent, SessionSource, build_session_key
+
+    async def scenario():
+        runner = GatewayRunner(
+            config={
+                "gateway": {
+                    "agent_name": "main",
+                    "max_pending_messages": 2,
+                },
+            },
+            db_path=str(tmp_path / "gateway.db"),
+        )
+        source = SessionSource(
+            platform="feishu",
+            account_id="app-1",
+            chat_id="chat-1",
+            user_id="user-1",
+        )
+
+        def event(message_id, text):
+            return MessageEvent(
+                message_id=message_id,
+                text=text,
+                source=source,
+            )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+        replies = []
+
+        async def run_agent(message, _ctx):
+            calls.append(message.text)
+            if message.text == "active":
+                started.set()
+                await release.wait()
+            return f"reply:{message.text}"
+
+        async def reply(message, content):
+            replies.append((message.text, content))
+
+        runner._run_agent = run_agent
+        runner._reply = reply
+
+        await runner._handle_message(event("m1", "active"))
+        await started.wait()
+        await runner._handle_message(event("m2", "pending-1"))
+        await runner._handle_message(event("m3", "pending-2"))
+        await runner._handle_message(event("m4", "rejected"))
+
+        route_key = build_session_key(source, "main")
+        ctx = runner.sessions.get_or_create(route_key, "system")
+        assert len(ctx.pending) == 2
+        assert runner.sessions.get_status(route_key)["pending_limit"] == 2
+        assert (
+            "rejected",
+            "(queue full: please wait for pending messages)",
+        ) in replies
+        conn = init_db(runner.db_path)
+        try:
+            rows = get_gateway_queued_messages(conn)
+        finally:
+            conn.close()
+        assert [row["message_id"] for row in rows] == ["m1", "m2", "m3"]
+        assert [row["status"] for row in rows] == [
+            "processing",
+            "queued",
+            "queued",
+        ]
+
+        release.set()
+        for _ in range(100):
+            if not ctx.busy and not ctx.pending and len(calls) == 3:
+                break
+            await asyncio.sleep(0.01)
+
+        assert calls == ["active", "pending-1", "pending-2"]
+        conn = init_db(runner.db_path)
+        try:
+            assert get_gateway_queued_messages(conn) == []
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
+
+
+def test_gateway_restores_processing_and_pending_messages(tmp_path):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from hermes.db import (
+        enqueue_gateway_message,
+        get_gateway_queued_messages,
+        init_db,
+        mark_gateway_message_processing,
+    )
+    from hermes.gateway.runner import GatewayRunner
+    from hermes.gateway.types import (
+        MessageEvent,
+        SessionSource,
+        build_session_key,
+    )
+
+    async def scenario():
+        runner = GatewayRunner(
+            config={"gateway": {"agent_name": "main"}},
+            db_path=str(tmp_path / "gateway.db"),
+        )
+        source = SessionSource(
+            platform="feishu",
+            account_id="app-1",
+            chat_id="chat-1",
+            user_id="user-1",
+        )
+        events = [
+            MessageEvent(message_id="m1", text="first", source=source),
+            MessageEvent(message_id="m2", text="second", source=source),
+        ]
+        route_key = build_session_key(source, "main")
+        conn = init_db(runner.db_path)
+        try:
+            for event in events:
+                enqueue_gateway_message(
+                    conn,
+                    route_key,
+                    event.message_id,
+                    runner._serialize_event(event),
+                )
+            mark_gateway_message_processing(conn, route_key, "m1")
+        finally:
+            conn.close()
+
+        calls = []
+
+        async def run_agent(event, _ctx):
+            calls.append(event.text)
+            return f"reply:{event.text}"
+
+        runner._run_agent = run_agent
+        runner._reply = AsyncMock()
+        await runner._restore_queued_messages()
+
+        for _ in range(100):
+            if not runner._accepted_messages and len(calls) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert calls == ["first", "second"]
+        conn = init_db(runner.db_path)
+        try:
+            assert get_gateway_queued_messages(conn) == []
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
+
+
+def test_gateway_limits_global_llm_concurrency(tmp_path):
+    import asyncio
+    import threading
+    import time
+
+    from hermes.gateway.runner import GatewayRunner
+
+    async def scenario():
+        runner = GatewayRunner(
+            config={
+                "gateway": {
+                    "agent_name": "main",
+                    "max_concurrent_llm_requests": 2,
+                },
+            },
+            db_path=str(tmp_path / "gateway.db"),
+        )
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def run_sync(event, _ctx):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return event.text
+            finally:
+                with lock:
+                    active -= 1
+
+        runner._run_agent_sync = run_sync
+        events = [SimpleNamespace(text=f"message-{i}") for i in range(4)]
+        results = await asyncio.gather(*[
+            runner._run_agent(event, SimpleNamespace())
+            for event in events
+        ])
+
+        assert results == [f"message-{i}" for i in range(4)]
+        assert max_active == 2
+
+    asyncio.run(scenario())
 
 
 def test_agent_loop_reaches_max_iterations_when_model_never_finishes():

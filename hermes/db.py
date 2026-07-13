@@ -24,7 +24,7 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
@@ -95,6 +95,22 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             conversation_id TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+
+        -- Runner 接受但尚未完成的消息。queued / processing 都会在
+        -- Gateway 重启后恢复,完成后删除。
+        CREATE TABLE IF NOT EXISTS gateway_message_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_key TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(route_key, message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_gateway_message_queue_status
+            ON gateway_message_queue(status, id);
         """
     )
 
@@ -235,7 +251,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
     老库 v1 → v2 会重建 sessions/messages,让外键 / NOT NULL
-    约束对既有数据库也生效。v2 → v3 新增 Gateway 当前会话映射。
+    约束对既有数据库也生效。v2 → v3 新增 Gateway 当前会话映射,
+    v3 → v4 新增 Gateway 待处理消息队列。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -284,6 +301,35 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 3
+
+    if current < 4:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gateway_message_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    route_key TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(route_key, message_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gateway_message_queue_status "
+                "ON gateway_message_queue(status, id)"
+            )
+            _set_schema_version(conn, 4)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 4
 
     return current
 
@@ -443,6 +489,110 @@ def set_gateway_conversation_id(
         (route_key, conversation_id, time.time()),
     )
     conn.commit()
+
+
+def enqueue_gateway_message(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_id: str,
+    event_json: str,
+) -> None:
+    """持久化 Runner 已接受的消息,重复 message_id 保持原记录。"""
+    now = time.time()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO gateway_message_queue
+            (route_key, message_id, event_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'queued', ?, ?)
+        """,
+        (route_key, message_id, event_json, now, now),
+    )
+    conn.commit()
+
+
+def mark_gateway_message_processing(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_id: str,
+) -> None:
+    """标记消息已由当前 worker 开始处理。"""
+    conn.execute(
+        """
+        UPDATE gateway_message_queue
+        SET status='processing', updated_at=?
+        WHERE route_key=? AND message_id=?
+        """,
+        (time.time(), route_key, message_id),
+    )
+    conn.commit()
+
+
+def complete_gateway_message(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_id: str,
+) -> None:
+    """消息处理结束后从恢复队列删除。"""
+    conn.execute(
+        """
+        DELETE FROM gateway_message_queue
+        WHERE route_key=? AND message_id=?
+        """,
+        (route_key, message_id),
+    )
+    conn.commit()
+
+
+def delete_gateway_messages(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_ids: list[str],
+) -> None:
+    """删除被 /new 明确取消的旧 pending 消息。"""
+    if not message_ids:
+        return
+    placeholders = ",".join("?" for _ in message_ids)
+    conn.execute(
+        f"""
+        DELETE FROM gateway_message_queue
+        WHERE route_key=? AND message_id IN ({placeholders})
+        """,
+        (route_key, *message_ids),
+    )
+    conn.commit()
+
+
+def reset_gateway_processing_messages(conn: sqlite3.Connection) -> None:
+    """启动恢复前把上次中断的 processing 重新置为 queued。"""
+    conn.execute(
+        """
+        UPDATE gateway_message_queue
+        SET status='queued', updated_at=?
+        WHERE status='processing'
+        """,
+        (time.time(),),
+    )
+    conn.commit()
+
+
+def get_gateway_queued_messages(conn: sqlite3.Connection) -> list[dict]:
+    """按原始接收顺序返回所有未完成的 Gateway 消息。"""
+    rows = conn.execute(
+        """
+        SELECT route_key, message_id, event_json, status
+        FROM gateway_message_queue
+        ORDER BY id
+        """
+    ).fetchall()
+    return [
+        {
+            "route_key": route_key,
+            "message_id": message_id,
+            "event_json": event_json,
+            "status": status,
+        }
+        for route_key, message_id, event_json, status in rows
+    ]
 
 
 def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> None:

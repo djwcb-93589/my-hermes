@@ -38,9 +38,14 @@ from hermes.db import (  # noqa: E402
     LATEST_SCHEMA_VERSION,
     add_message,
     add_messages,
+    complete_gateway_message,
     create_session,
+    enqueue_gateway_message,
+    get_gateway_queued_messages,
     get_session_messages,
     init_db,
+    mark_gateway_message_processing,
+    reset_gateway_processing_messages,
 )
 from hermes.conversation import ConversationAgentLoop  # noqa: E402
 
@@ -67,7 +72,12 @@ def test_init_new_db_creates_schema_version_tables_pragmas_and_index(conn):
         ).fetchall()
     }
 
-    assert {"schema_version", "sessions", "messages"} <= tables
+    assert {
+        "schema_version",
+        "sessions",
+        "messages",
+        "gateway_message_queue",
+    } <= tables
     assert scalar(conn, "SELECT version FROM schema_version") == LATEST_SCHEMA_VERSION
 
     assert scalar(conn, "PRAGMA foreign_keys") == 1
@@ -96,6 +106,40 @@ def test_init_new_db_creates_schema_version_tables_pragmas_and_index(conn):
         for row in conn.execute("PRAGMA index_list(messages)").fetchall()
     }
     assert "idx_messages_session_order" in indexes
+
+    queue_indexes = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA index_list(gateway_message_queue)"
+        ).fetchall()
+    }
+    assert "idx_gateway_message_queue_status" in queue_indexes
+
+
+def test_gateway_message_queue_round_trip_and_recovery_state(conn):
+    enqueue_gateway_message(
+        conn,
+        "route-1",
+        "message-1",
+        '{"text":"hello"}',
+    )
+    mark_gateway_message_processing(conn, "route-1", "message-1")
+
+    rows = get_gateway_queued_messages(conn)
+    assert rows == [
+        {
+            "route_key": "route-1",
+            "message_id": "message-1",
+            "event_json": '{"text":"hello"}',
+            "status": "processing",
+        },
+    ]
+
+    reset_gateway_processing_messages(conn)
+    assert get_gateway_queued_messages(conn)[0]["status"] == "queued"
+
+    complete_gateway_message(conn, "route-1", "message-1")
+    assert get_gateway_queued_messages(conn) == []
 
 
 def test_repeated_init_preserves_existing_data(tmp_path: Path):
