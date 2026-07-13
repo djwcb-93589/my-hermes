@@ -13,7 +13,6 @@ import signal
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
 from hermes.prompt import build_system_prompt
-from hermes.tools import register_all
 
 
 async def run_gateway():
@@ -21,7 +20,7 @@ async def run_gateway():
     print(f"=== Hermes Gateway ===")
     print(f"Model: {MODEL}")
 
-    register_all()
+    # Gateway 仅保留基础会话能力,不向模型注册任何工具。
 
     runner = GatewayRunner(config=_config, db_path=DB_PATH)
 
@@ -42,7 +41,14 @@ async def run_gateway():
             runner.add_adapter(FeishuAdapter(
                 app_id=feishu_cfg.get("app_id", ""),
                 app_secret=feishu_cfg.get("app_secret", ""),
-                security_mode=feishu_cfg.get("security_mode", "compat"),
+                db_path=DB_PATH,
+                webhook_host=feishu_cfg.get("webhook_host", "0.0.0.0"),
+                webhook_port=feishu_cfg.get("webhook_port", 8787),
+                verification_token=feishu_cfg.get("verification_token", ""),
+                encrypt_key=feishu_cfg.get("encrypt_key", ""),
+                bot_open_id=feishu_cfg.get("bot_open_id", ""),
+                is_lark=feishu_cfg.get("is_lark", False),
+                dm_only=feishu_cfg.get("dm_only", True),
                 require_mention=feishu_cfg.get("require_mention", True),
                 allow_all=feishu_cfg.get("allow_all", False),
                 allowed_users=feishu_cfg.get("allowed_users", []),

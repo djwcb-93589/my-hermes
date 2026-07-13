@@ -24,7 +24,7 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
@@ -87,6 +87,14 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
         -- 按 id 排序。复合索引 (session_id, id) 让该查询稳定高效。
         CREATE INDEX IF NOT EXISTS idx_messages_session_order
             ON messages(session_id, id);
+
+        -- Gateway 的 route_key 稳定不变,/new 只切换 conversation_id。
+        -- 单独持久化当前映射,让进程重启后仍能恢复到最新会话。
+        CREATE TABLE IF NOT EXISTS gateway_session_routes (
+            route_key TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
         """
     )
 
@@ -227,7 +235,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
     老库 v1 → v2 会重建 sessions/messages,让外键 / NOT NULL
-    约束对既有数据库也生效。旧数据不满足新约束时拒绝迁移。
+    约束对既有数据库也生效。v2 → v3 新增 Gateway 当前会话映射。
+    旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
         # 极少见:有 schema_version 表但版本 < 1,补基础表
@@ -255,6 +264,26 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 2
+
+    if current < 3:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gateway_session_routes (
+                    route_key TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            _set_schema_version(conn, 3)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 3
 
     return current
 
@@ -380,6 +409,38 @@ def ensure_session(
     conn.execute(
         "INSERT OR IGNORE INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
         (session_id, source, time.time()),
+    )
+    conn.commit()
+
+
+def get_gateway_conversation_id(
+    conn: sqlite3.Connection,
+    route_key: str,
+) -> str | None:
+    """读取 route_key 当前指向的 conversation_id。没有映射时返回 None。"""
+    row = conn.execute(
+        "SELECT conversation_id FROM gateway_session_routes WHERE route_key=?",
+        (route_key,),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def set_gateway_conversation_id(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+) -> None:
+    """持久化 route_key 当前指向的 conversation_id。"""
+    conn.execute(
+        """
+        INSERT INTO gateway_session_routes
+            (route_key, conversation_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(route_key) DO UPDATE SET
+            conversation_id=excluded.conversation_id,
+            updated_at=excluded.updated_at
+        """,
+        (route_key, conversation_id, time.time()),
     )
     conn.commit()
 

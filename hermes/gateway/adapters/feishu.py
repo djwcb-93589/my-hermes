@@ -1,41 +1,51 @@
 """
-飞书 adapter:基于 ``lark-channel-sdk``,第一阶段仅支持文本。
+飞书 adapter:基于 Webhook HTTP 回调,第一阶段仅支持文本。
 
 特性:
-  - 私聊 / 群聊 / 话题(PolicyConfig: dm_policy / group_policy / require_mention)
+  - 内置 ThreadingHTTPServer,接收飞书事件回调
+  - 支持 URL challenge 校验
+  - 私聊 / 群聊 / 话题路由
   - 群聊默认仅响应 @机器人
   - open_id + union_id
-  - reply / thread 路由
-  - SDK 内部发送重试(OutboundConfig: max_attempts / backoff / jitter)
-  - SDK 结构化错误码(error.code / error.retryable)
+  - tenant_access_token 缓存
+  - HTTP API 发送重试
   - 长文本分片(UTF-16 安全,不截断 Unicode)
-  - allowed_users / allowed_chats / allow_all 白名单(adapter 自身 + SDK 双层)
-  - 安全模式 compat / audit / strict(SecurityConfig)
-  - MessageDeduplicator 二次去重(主依赖 SDK 去重)
+  - allowed_users / allowed_chats / allow_all 白名单
+  - MessageDeduplicator 防止飞书重复推送
 
-不实现:图片、文件、语音、卡片、流式回复。
+不实现:加密事件解密、图片、文件、语音、卡片、流式回复。
 """
 
 from __future__ import annotations
 
+import asyncio
+import hmac
+import json
+import sqlite3
+import threading
+import time
 import uuid
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 from hermes.gateway.adapters import BasePlatformAdapter
-from hermes.gateway.text_utils import MessageDeduplicator, utf16_len, truncate_utf16
+from hermes.gateway.text_utils import utf16_len, truncate_utf16
 from hermes.gateway.types import MessageEvent, MessageType, SendResult, SessionSource
 
 
 FEISHU_UTF16_LIMIT = 30000  # 飞书单条文本 UTF-16 code units 上限
-
-# 脱敏后允许暴露给上层 / 日志的错误码白名单
-_SAFE_ERROR_CODES = frozenset({
-    "rate_limited", "permission_denied", "send_timeout",
-    "not_connected", "format_error",
-})
+FEISHU_BATCH_QUIET_SECONDS = 0.6  # 连续文本静默多久后提交
+FEISHU_BATCH_MAX_WAIT_SECONDS = 2.0  # 单批消息最长累计等待时间
+FEISHU_BATCH_SEPARATOR = "\n"
+FEISHU_WEBHOOK_ACCEPT_TIMEOUT_SECONDS = 2.5
+FEISHU_DEDUP_TTL_SECONDS = 72 * 60 * 60  # 已处理消息保留 72 小时
+FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
+_IMMEDIATE_COMMANDS = frozenset({"/new", "/stop", "/status"})
 
 
 class FeishuAdapter(BasePlatformAdapter):
-    """飞书文本 adapter。"""
+    """飞书 Webhook 文本 adapter。"""
 
     PLATFORM = "feishu"
 
@@ -44,192 +54,557 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         app_id: str,
         app_secret: str,
+        db_path: str,
+        webhook_host: str = "0.0.0.0",
+        webhook_port: int = 8787,
+        verification_token: str = "",
+        encrypt_key: str = "",
+        bot_open_id: str = "",
+        is_lark: bool = False,
+        dm_only: bool = True,
         require_mention: bool = True,
         allow_all: bool = False,
         allowed_users: list[str] | None = None,
         allowed_chats: list[str] | None = None,
-        security_mode: str = "compat",
         send_max_retries: int = 3,
         send_retry_base_delay: float = 1.0,
     ):
         super().__init__("feishu")
         self.app_id = app_id
         self.app_secret = app_secret
+        self.db_path = db_path
+        self.webhook_host = webhook_host
+        self.webhook_port = int(webhook_port)
+        self.verification_token = verification_token
+        self.encrypt_key = encrypt_key
+        self.bot_open_id = bot_open_id
+        self.is_lark = bool(is_lark)
+        self.dm_only = bool(dm_only)
         self.require_mention = require_mention
         self.allow_all = allow_all
         self.allowed_users = set(allowed_users or [])
         self.allowed_chats = set(allowed_chats or [])
-        self.security_mode = security_mode
-        # send_max_retries 是 SDK 的"总尝试次数",不是"额外重试次数"。
-        # 小于 1 时校正为 1(至少尝试一次)。
         self.send_max_retries = max(1, int(send_max_retries))
-        # 退避基础时间不能为负
         self.send_retry_base_delay = max(0.0, float(send_retry_base_delay))
-        self._channel = None
-        self._dedup = MessageDeduplicator(max_size=5000)
+
+        self.api_base = (
+            "https://open.larksuite.com/open-apis"
+            if self.is_lark
+            else "https://open.feishu.cn/open-apis"
+        )
+        self._tenant_token = ""
+        self._token_expires_at = 0.0
+        self._token_lock = asyncio.Lock()
+        self._http = None
+        self._server: ThreadingHTTPServer | None = None
+        self._server_thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._reliability_db: sqlite3.Connection | None = None
+        self._last_dedup_cleanup = 0.0
+        self._batch_buffers: dict[str, list[str]] = {}
+        self._batch_events: dict[str, MessageEvent] = {}
+        self._batch_message_ids: dict[str, list[str]] = {}
+        self._batch_sources: dict[str, list[dict]] = {}
+        self._batch_started_at: dict[str, float] = {}
+        self._batch_tasks: dict[str, asyncio.Task] = {}
+        self._batch_waiters: dict[str, list[asyncio.Future]] = {}
+        self._inflight_messages: dict[str, asyncio.Future] = {}
 
     # ===================== 生命周期 =====================
 
     async def connect(self) -> bool:
         try:
-            from lark_channel import FeishuChannel
+            import httpx
         except ImportError:
-            print("  [feishu] lark-channel-sdk not installed, skipping")
+            print("  [feishu] httpx not installed, skipping")
             return False
 
         if not self.app_id or not self.app_secret:
             print("  [feishu] missing app_id / app_secret")
             return False
-
-        try:
-            kwargs: dict = {
-                "app_id": self.app_id,
-                "app_secret": self.app_secret,
-            }
-            # 注入 SDK 配置:任何构造失败(TypeError / ImportError)直接抛,
-            # connect 的 except 捕获后返回 False —— 不静默吞掉错误配置
-            self._inject_policy_config(kwargs)
-            self._inject_security_config(kwargs)
-            self._inject_outbound_config(kwargs)
-
-            self._channel = FeishuChannel(**kwargs)
-
-            # 注册 SDK 事件(日志只输出脱敏的状态和错误类别)
-            self._channel.on("message", self._on_message)
-            self._channel.on("error", self._on_error)
-            self._channel.on("reconnecting", lambda *a: print("  [feishu] reconnecting"))
-            self._channel.on("reconnected", lambda *a: print("  [feishu] reconnected"))
-
-            await self._channel.connect_until_ready(timeout=30)
-            self._running = True
-            return True
-        except Exception as exc:
-            # 脱敏:不输出 app_secret / 完整 traceback
-            print(f"  [feishu] connect failed: {type(exc).__name__}")
-            self._channel = None
+        if not self.db_path:
+            print("  [feishu] missing db_path")
+            return False
+        if not self.verification_token:
+            print("  [feishu] missing verification_token")
+            return False
+        if self.encrypt_key:
+            # Encrypt Key 模式还需要签名校验和 AES 解密。当前不支持时
+            # 必须拒绝启动,不能降级成明文 token 校验制造伪安全。
+            print("  [feishu] encrypt_key mode is not supported")
             return False
 
-    # ----- SDK 配置注入(失败时 raise,不静默吞) -----
-
-    def _inject_policy_config(self, kwargs: dict) -> None:
-        """用 SDK 当前字段构建 PolicyConfig。
-
-        策略:
-          - allow_all=True → dm_policy / group_policy = "open"
-          - allow_all=False:
-            - 有 allowed_users → dm_policy = "allowlist", allow_from = [...]
-            - 无 allowed_users → dm_policy = "disabled"(不意外放开)
-            - 群聊同理(group_policy / group_allowlist)
-          - require_mention 透传
-
-        构造失败(TypeError / ImportError)直接抛,不静默降级。
-        Adapter 自身仍保留最终白名单校验(见 _is_allowed)。
-        """
-        from lark_channel import PolicyConfig
-
-        if self.allow_all:
-            dm_policy = "open"
-            group_policy = "open"
-        else:
-            dm_policy = "allowlist" if self.allowed_users else "disabled"
-            group_policy = "allowlist" if self.allowed_chats else "disabled"
-
-        kwargs["policy"] = PolicyConfig(
-            dm_policy=dm_policy,
-            group_policy=group_policy,
-            require_mention=self.require_mention,
-            allow_from=list(self.allowed_users) if self.allowed_users else None,
-            group_allowlist=list(self.allowed_chats) if self.allowed_chats else None,
-        )
-
-    def _inject_security_config(self, kwargs: dict) -> None:
-        """注入安全模式(compat / audit / strict)。"""
-        from lark_channel import SecurityConfig
-        kwargs["security"] = SecurityConfig(mode=self.security_mode)
-
-    def _inject_outbound_config(self, kwargs: dict) -> None:
-        """注入 SDK 发送重试策略(总尝试次数 + 退避 + jitter)。
-
-        SDK 内部负责重试,Adapter 不再在外层循环调 channel.send()。
-        尝试 OutboundConfig,SDK 若改名则用 RetryConfig 兜底。
-        """
-        attempts = self.send_max_retries
-        base = self.send_retry_base_delay
-        max_delay = 60.0  # 合理上限,避免指数退避等太久
-
         try:
-            from lark_channel import OutboundConfig
-            kwargs["outbound"] = OutboundConfig(
-                max_attempts=attempts,
-                base_delay_seconds=base,
-                max_delay_seconds=max_delay,
-                jitter=True,
+            self._open_reliability_store()
+            self._loop = asyncio.get_running_loop()
+            self._http = httpx.AsyncClient(timeout=15.0)
+            handler = self._make_webhook_handler()
+            self._server = ThreadingHTTPServer(
+                (self.webhook_host, self.webhook_port),
+                handler,
             )
-        except ImportError:
-            from lark_channel import RetryConfig
-            kwargs["retry"] = RetryConfig(
-                max_attempts=attempts,
-                base_delay_seconds=base,
-                max_delay_seconds=max_delay,
-                jitter=True,
+            self._server_thread = threading.Thread(
+                target=self._server.serve_forever,
+                name="feishu-webhook",
+                daemon=True,
             )
+            self._running = True
+            await self._restore_pending_messages()
+            self._server_thread.start()
+
+            # 端口为 0 时系统会自动分配端口,主要用于测试。
+            actual_port = self._server.server_address[1]
+            print(
+                f"  [feishu] webhook listening on "
+                f"http://{self.webhook_host}:{actual_port}/"
+            )
+            return True
+        except Exception as exc:
+            print(f"  [feishu] webhook start failed: {type(exc).__name__}")
+            self._running = False
+            if self._server:
+                self._server.server_close()
+            await self._close_http_client()
+            self._close_reliability_store()
+            self._server = None
+            self._server_thread = None
+            self._loop = None
+            return False
 
     async def disconnect(self):
         self._running = False
-        if self._channel:
+
+        # 关闭时取消尚未提交的文本批次,避免 Adapter 停止后继续处理消息。
+        for task in self._batch_tasks.values():
+            task.cancel()
+        self._batch_tasks.clear()
+        self._batch_buffers.clear()
+        self._batch_events.clear()
+        self._batch_message_ids.clear()
+        self._batch_sources.clear()
+        self._batch_started_at.clear()
+        for waiters in self._batch_waiters.values():
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_exception(RuntimeError("feishu adapter stopped"))
+        self._batch_waiters.clear()
+        for waiter in self._inflight_messages.values():
+            if not waiter.done():
+                waiter.set_exception(RuntimeError("feishu adapter stopped"))
+            # 主处理协程不等待此 Future,主动读取异常避免 asyncio 告警。
+            waiter.exception()
+        self._inflight_messages.clear()
+
+        if self._server:
+            server = self._server
+            self._server = None
             try:
-                await self._channel.disconnect()
+                await asyncio.to_thread(server.shutdown)
             except Exception:
                 pass
-            self._channel = None
+            try:
+                server.server_close()
+            except Exception:
+                pass
+
+        if self._server_thread:
+            self._server_thread.join(timeout=2.0)
+            self._server_thread = None
+
+        await self._close_http_client()
+        self._close_reliability_store()
+        self._tenant_token = ""
+        self._token_expires_at = 0.0
+        self._loop = None
+
+    async def _close_http_client(self):
+        if self._http:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
+
+    def _open_reliability_store(self) -> None:
+        """在现有 Hermes 数据库中创建飞书入站可靠性表。"""
+        from hermes.db import init_db
+
+        self._reliability_db = init_db(self.db_path)
+        self._reliability_db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS feishu_message_inbox (
+                app_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                received_at REAL NOT NULL,
+                status TEXT NOT NULL,
+                completed_at REAL,
+                batch_message_id TEXT,
+                PRIMARY KEY (app_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feishu_inbox_completed
+                ON feishu_message_inbox(app_id, completed_at);
+            """
+        )
+        self._reliability_db.commit()
+        self._prune_completed_messages(force=True)
+
+    def _close_reliability_store(self) -> None:
+        if self._reliability_db:
+            self._reliability_db.close()
+            self._reliability_db = None
+
+    def _prune_completed_messages(self, *, force: bool = False) -> None:
+        """按 TTL 清理已完成记录,未处理 inbox 永不自动删除。"""
+        if not self._reliability_db:
+            raise RuntimeError("feishu reliability store is unavailable")
+        now = time.time()
+        if (
+            not force
+            and now - self._last_dedup_cleanup
+            < FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS
+        ):
+            return
+        cutoff = now - FEISHU_DEDUP_TTL_SECONDS
+        with self._reliability_db:
+            self._reliability_db.execute(
+                """
+                DELETE FROM feishu_message_inbox
+                WHERE app_id = ?
+                  AND status != 'pending'
+                  AND completed_at < ?
+                """,
+                (self.app_id, cutoff),
+            )
+        self._last_dedup_cleanup = now
+
+    def _is_message_completed(self, message_id: str) -> bool:
+        if not self._reliability_db:
+            raise RuntimeError("feishu reliability store is unavailable")
+        cutoff = time.time() - FEISHU_DEDUP_TTL_SECONDS
+        row = self._reliability_db.execute(
+            """
+            SELECT 1
+            FROM feishu_message_inbox
+            WHERE app_id = ?
+              AND message_id = ?
+              AND status != 'pending'
+              AND completed_at >= ?
+            """,
+            (self.app_id, message_id, cutoff),
+        ).fetchone()
+        return row is not None
+
+    def _store_pending_message(self, message_id: str, payload: dict) -> None:
+        """先持久化原始事件,成功交给 Runner 后再标记完成。"""
+        if not self._reliability_db:
+            raise RuntimeError("feishu reliability store is unavailable")
+        self._prune_completed_messages()
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with self._reliability_db:
+            self._reliability_db.execute(
+                """
+                INSERT OR IGNORE INTO feishu_message_inbox
+                    (app_id, message_id, payload, received_at, status)
+                VALUES (?, ?, ?, ?, 'pending')
+                """,
+                (self.app_id, message_id, encoded, time.time()),
+            )
+
+    def _complete_messages(
+        self,
+        message_ids: list[str],
+        *,
+        status: str = "processed",
+        batch_message_id: str | None = None,
+    ) -> None:
+        """原子标记整批消息完成,保留来源 ID 与拼接目标用于追踪。"""
+        if not message_ids:
+            return
+        if not self._reliability_db:
+            raise RuntimeError("feishu reliability store is unavailable")
+        completed_at = time.time()
+        with self._reliability_db:
+            self._reliability_db.executemany(
+                """
+                UPDATE feishu_message_inbox
+                SET status = ?, completed_at = ?, batch_message_id = ?
+                WHERE app_id = ? AND message_id = ?
+                """,
+                [
+                    (
+                        status,
+                        completed_at,
+                        batch_message_id,
+                        self.app_id,
+                        message_id,
+                    )
+                    for message_id in message_ids
+                ],
+            )
+
+    async def _restore_pending_messages(self) -> None:
+        """启动时恢复上次未完成的飞书消息,按接收顺序重新提交。"""
+        if not self._reliability_db:
+            return
+        rows = self._reliability_db.execute(
+            """
+            SELECT payload
+            FROM feishu_message_inbox
+            WHERE app_id = ? AND status = 'pending'
+            ORDER BY received_at, message_id
+            """,
+            (self.app_id,),
+        ).fetchall()
+        tasks = []
+        for row in rows:
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                print("  [feishu] invalid pending payload skipped")
+                continue
+            tasks.append(asyncio.create_task(self._handle_payload(payload)))
+        if not tasks:
+            return
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failed = sum(isinstance(result, BaseException) for result in results)
+        if failed:
+            print(f"  [feishu] pending recovery failed: {failed}")
+        else:
+            print(f"  [feishu] restored pending messages: {len(tasks)}")
+
+    # ===================== Webhook HTTP 服务 =====================
+
+    def _make_webhook_handler(self) -> type[BaseHTTPRequestHandler]:
+        adapter = self
+
+        class FeishuWebhookHandler(BaseHTTPRequestHandler):
+            """飞书回调处理器。HTTP 线程只解析请求,Agent 在主事件循环运行。"""
+
+            server_version = "HermesFeishuWebhook/0.1"
+
+            def _send_json(self, status: int, payload: dict) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                self._send_json(200, {"ok": True, "channel": "feishu"})
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length)
+                try:
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._send_json(400, {"ok": False, "error": "invalid json"})
+                    return
+
+                if not isinstance(payload, dict):
+                    self._send_json(
+                        400,
+                        {"ok": False, "error": "json object required"},
+                    )
+                    return
+
+                token = adapter._extract_token(payload)
+                if not adapter._token_allowed(token):
+                    print("  [feishu] token verification failed")
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+
+                challenge = adapter._extract_challenge(payload)
+                if challenge:
+                    print("  [feishu] webhook challenge verified")
+                    self._send_json(200, {"challenge": challenge})
+                    return
+
+                if not adapter._app_allowed(payload):
+                    print("  [feishu] app verification failed")
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+
+                event_type = adapter._extract_event_type(payload)
+                if not event_type:
+                    self._send_json(
+                        400,
+                        {"ok": False, "error": "missing event_type"},
+                    )
+                    return
+                if event_type != "im.message.receive_v1":
+                    # 未订阅的其它合法事件不应触发飞书重试,明确忽略即可。
+                    self._send_json(200, {"ok": True, "ignored": True})
+                    return
+
+                # 等消息完成解析、拼接并成功交给 GatewayRunner 后再确认。
+                # 不等待 LLM 最终回复,因此仍能满足飞书的快速响应要求。
+                future = adapter._submit_payload(payload)
+                if future is None:
+                    self._send_json(
+                        503,
+                        {"ok": False, "error": "gateway unavailable"},
+                    )
+                    return
+                try:
+                    future.result(timeout=FEISHU_WEBHOOK_ACCEPT_TIMEOUT_SECONDS)
+                except FutureTimeoutError:
+                    print("  [feishu] webhook acceptance timed out")
+                    self._send_json(
+                        503,
+                        {"ok": False, "error": "gateway timeout"},
+                    )
+                    return
+                except Exception as exc:
+                    print(
+                        "  [feishu] webhook processing failed: "
+                        f"{type(exc).__name__}"
+                    )
+                    self._send_json(
+                        500,
+                        {"ok": False, "error": "processing failed"},
+                    )
+                    return
+
+                self._send_json(200, {"ok": True})
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                print(
+                    f"  [feishu:http] {self.address_string()} - "
+                    f"{fmt % args}"
+                )
+
+        return FeishuWebhookHandler
+
+    @staticmethod
+    def _extract_token(payload: dict) -> str:
+        """按飞书明文事件结构提取 Verification Token。"""
+        header = payload.get("header", {})
+        if not isinstance(header, dict):
+            header = {}
+        return str(
+            payload.get("token")
+            or header.get("token")
+            or ""
+        )
+
+    @staticmethod
+    def _extract_challenge(payload: dict) -> str:
+        challenge = payload.get("challenge", "")
+        if challenge:
+            return str(challenge)
+        event = payload.get("event", {})
+        if isinstance(event, dict) and event.get("challenge"):
+            return str(event["challenge"])
+        return ""
+
+    def _token_allowed(self, token: str) -> bool:
+        """使用常量时间比较校验 Verification Token,缺失时默认拒绝。"""
+        if not self.verification_token or not token:
+            return False
+        return hmac.compare_digest(token, self.verification_token)
+
+    def _app_allowed(self, payload: dict) -> bool:
+        """校验 v2.0 事件属于当前飞书应用。"""
+        header = payload.get("header", {})
+        if not isinstance(header, dict):
+            return False
+        event_app_id = str(header.get("app_id", "") or "")
+        if not event_app_id:
+            return False
+        return hmac.compare_digest(event_app_id, self.app_id)
+
+    @staticmethod
+    def _extract_event_type(payload: dict) -> str:
+        """提取飞书 v2.0 事件类型。"""
+        header = payload.get("header", {})
+        if not isinstance(header, dict):
+            return ""
+        return str(header.get("event_type", "") or "")
+
+    def _submit_payload(self, payload: dict) -> Future | None:
+        if not self._loop or not self._running:
+            return None
+        coroutine = self._handle_payload(payload)
+        try:
+            return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        except RuntimeError:
+            coroutine.close()
+            return None
 
     # ===================== 消息入站 =====================
 
-    async def _on_message(self, msg):
-        """SDK message 回调 → 翻译成 MessageEvent。"""
-        msg_id = getattr(msg, "message_id", "") or ""
-        chat_id = getattr(msg, "chat_id", "") or ""
-        sender_id = getattr(msg, "sender_id", "") or ""
+    async def _handle_payload(self, payload: dict) -> None:
+        """飞书 webhook payload -> MessageEvent。"""
+        header = payload.get("header", {})
+        if not isinstance(header, dict):
+            header = {}
+        event_type = self._extract_event_type(payload)
+        if event_type != "im.message.receive_v1":
+            return
+
+        event = payload.get("event", {})
+        if not isinstance(event, dict):
+            return
+        message = event.get("message", {})
+        if not isinstance(message, dict):
+            return
+        sender = event.get("sender", {})
+        if not isinstance(sender, dict):
+            sender = {}
+
+        # 单聊也可能收到机器人 / 应用侧消息。只接受真实用户消息,
+        # 避免把机器人自己的回复再次送入会话形成自触发循环。
+        sender_type = str(sender.get("sender_type", "") or "")
+        if sender_type != "user":
+            return
+
+        sender_ids = sender.get("sender_id", {})
+        if not isinstance(sender_ids, dict):
+            sender_ids = {}
+
+        msg_id = str(message.get("message_id", "") or "")
+        chat_id = str(message.get("chat_id", "") or "")
+        sender_id = str(
+            sender_ids.get("open_id")
+            or sender_ids.get("user_id")
+            or ""
+        )
         if not msg_id or not chat_id or not sender_id:
             return
 
-        # 二次去重(主依赖 SDK;这里用 MessageDeduplicator 做有限容量保护)
-        if self._dedup.is_duplicate(msg_id):
+        # 当前 Gateway 飞书链路严格只处理文本消息。
+        msg_type = str(message.get("message_type") or message.get("msg_type") or "")
+        if msg_type != "text":
             return
-
-        # 第一阶段:严格只处理文本消息
-        raw_type = getattr(msg, "raw_content_type", "") or ""
-        if raw_type != "text":
-            return
-
-        text = getattr(msg, "content_text", "") or ""
+        text = self._parse_text(message)
         if not text.strip():
             return
 
-        chat_type_raw = getattr(msg, "chat_type", "p2p")
+        chat_type_raw = str(message.get("chat_type", "p2p") or "p2p")
         chat_type = "dm" if chat_type_raw == "p2p" else chat_type_raw
 
-        # 群聊 / topic 默认仅响应 @机器人
+        # 单聊模式下忽略所有群聊和话题消息。
+        if self.dm_only and chat_type != "dm":
+            return
+
+        mentioned_bot = self._bot_mentioned(message)
         if (
             chat_type in ("group", "topic")
             and self.require_mention
-            and not getattr(msg, "mentioned_bot", False)
+            and not mentioned_bot
         ):
             return
 
-        sender = getattr(msg, "sender", None)
-        union_id = getattr(sender, "union_id", None) if sender else None
-
-        # Adapter 自身保留最终白名单校验(不完全依赖 SDK PolicyConfig)
         if not self._is_allowed(sender_id, chat_id):
             return
 
-        thread_id = None
-        conversation = getattr(msg, "conversation", None)
-        if conversation:
-            thread_id = getattr(conversation, "thread_id", None)
-
-        event = MessageEvent(
+        thread_id = message.get("thread_id") or message.get("root_id")
+        event_obj = MessageEvent(
             message_id=msg_id,
             text=text,
             message_type=MessageType.TEXT,
@@ -239,26 +614,250 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 chat_type=chat_type,
                 user_id=sender_id,
-                user_id_alt=union_id or "",
-                user_name=getattr(msg, "sender_name", "") or "",
-                thread_id=thread_id,
+                user_id_alt=str(sender_ids.get("union_id", "") or ""),
+                user_name=str(sender.get("sender_name", "") or ""),
+                thread_id=str(thread_id) if thread_id else None,
             ),
-            reply_to_message_id=getattr(msg, "reply_to_message_id", None),
+            reply_to_message_id=message.get("parent_id"),
             metadata={
-                "mentioned_bot": getattr(msg, "mentioned_bot", False),
-                "mentioned_all": getattr(msg, "mentioned_all", False),
-                "raw_content_type": raw_type,
+                "mentioned_bot": mentioned_bot,
+                "mentioned_all": False,
+                "raw_content_type": msg_type,
+                "event_id": header.get("event_id", ""),
             },
         )
-        await self.handle_message(event)
 
-    async def _on_error(self, err, *args):
-        """SDK error 事件:只输出脱敏的错误类别。"""
-        err_type = type(err).__name__ if err else "Unknown"
-        print(f"  [feishu] SDK error: {err_type}")
+        # 同一消息在首个请求仍处理中被飞书重推时,共享首个请求的
+        # 处理结果,不能因简单去重而提前向重推请求返回 200。
+        inflight = self._inflight_messages.get(msg_id)
+        if inflight:
+            await asyncio.shield(inflight)
+            return
+        if self._is_message_completed(msg_id):
+            return
+        self._store_pending_message(msg_id, payload)
+
+        accepted = asyncio.get_running_loop().create_future()
+        self._inflight_messages[msg_id] = accepted
+        try:
+            if not self._on_message:
+                raise RuntimeError("gateway runner is unavailable")
+
+            command = text.strip().lower()
+            if command in _IMMEDIATE_COMMANDS:
+                batch_key = self._build_batch_key(event_obj)
+                if command in ("/new", "/stop"):
+                    # 新建或停止会话时取消尚未提交的普通文本,避免命令
+                    # 执行后旧批次反而启动并进入错误的会话。
+                    await self._discard_batch(batch_key)
+                else:
+                    # /status 前先提交旧批次,让状态包含刚发送的任务。
+                    await self._flush_batch(batch_key)
+                await self.handle_message(event_obj)
+                self._complete_messages(
+                    [msg_id],
+                    batch_message_id=msg_id,
+                )
+            else:
+                await self._enqueue_text(event_obj)
+        except asyncio.CancelledError:
+            if not accepted.done():
+                accepted.cancel()
+            raise
+        except Exception as exc:
+            if not accepted.done():
+                accepted.set_exception(exc)
+                # 没有并发重推等待时也要主动读取异常。
+                accepted.exception()
+            raise
+        else:
+            if not accepted.done():
+                accepted.set_result(None)
+        finally:
+            if self._inflight_messages.get(msg_id) is accepted:
+                self._inflight_messages.pop(msg_id, None)
+
+    async def _enqueue_text(self, event: MessageEvent) -> None:
+        """把同一来源短时间内的连续文本加入同一批次。"""
+        batch_key = self._build_batch_key(event)
+        now = time.monotonic()
+        waiter = asyncio.get_running_loop().create_future()
+
+        if batch_key not in self._batch_buffers:
+            self._batch_buffers[batch_key] = []
+            self._batch_message_ids[batch_key] = []
+            self._batch_sources[batch_key] = []
+            self._batch_waiters[batch_key] = []
+            self._batch_started_at[batch_key] = now
+        self._batch_buffers[batch_key].append(event.text)
+        self._batch_message_ids[batch_key].append(event.message_id)
+        self._batch_sources[batch_key].append({
+            "message_id": event.message_id,
+            "reply_to_message_id": event.reply_to_message_id,
+            "event_id": event.metadata.get("event_id", ""),
+        })
+        self._batch_waiters[batch_key].append(waiter)
+        # 使用最后一条消息的 message_id / reply 元数据回发。
+        self._batch_events[batch_key] = event
+
+        old_task = self._batch_tasks.get(batch_key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        elapsed = now - self._batch_started_at[batch_key]
+        remaining = max(0.0, FEISHU_BATCH_MAX_WAIT_SECONDS - elapsed)
+        delay = min(FEISHU_BATCH_QUIET_SECONDS, remaining)
+        task = asyncio.create_task(
+            self._flush_batch_after(batch_key, delay)
+        )
+        task.add_done_callback(self._on_batch_task_done)
+        self._batch_tasks[batch_key] = task
+        await waiter
+
+    async def _flush_batch_after(self, batch_key: str, delay: float) -> None:
+        """等待静默窗口结束,合并并提交当前文本批次。"""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        # 只有当前最新计时任务可以提交,避免旧任务取消竞态重复发送。
+        if self._batch_tasks.get(batch_key) is not asyncio.current_task():
+            return
+
+        await self._flush_batch(batch_key)
+
+    def _pop_batch(self, batch_key: str) -> tuple:
+        """原子取出一个批次,并取消对应的静默计时任务。"""
+        task = self._batch_tasks.pop(batch_key, None)
+        current_task = asyncio.current_task()
+        if task and task is not current_task and not task.done():
+            task.cancel()
+
+        chunks = self._batch_buffers.pop(batch_key, [])
+        event = self._batch_events.pop(batch_key, None)
+        message_ids = self._batch_message_ids.pop(batch_key, [])
+        sources = self._batch_sources.pop(batch_key, [])
+        waiters = self._batch_waiters.pop(batch_key, [])
+        self._batch_started_at.pop(batch_key, None)
+        return chunks, event, message_ids, sources, waiters
+
+    async def _flush_batch(self, batch_key: str) -> None:
+        """立即合并并提交指定批次。"""
+        chunks, event, message_ids, sources, waiters = self._pop_batch(batch_key)
+        if not chunks or event is None:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
+            return
+
+        event.text = FEISHU_BATCH_SEPARATOR.join(chunks)
+        event.metadata["source_message_ids"] = message_ids
+        event.metadata["source_messages"] = sources
+        try:
+            await self.handle_message(event)
+            self._complete_messages(
+                message_ids,
+                batch_message_id=event.message_id,
+            )
+        except asyncio.CancelledError:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            raise
+        except Exception as exc:
+            # inbox 保持 pending,飞书重推或进程重启后会再次处理。
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_exception(exc)
+            raise
+        else:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
+
+    async def _discard_batch(self, batch_key: str) -> None:
+        """取消尚未提交的批次,用于 /new 和 /stop 保持命令语义。"""
+        _, _, message_ids, _, waiters = self._pop_batch(batch_key)
+        try:
+            self._complete_messages(
+                message_ids,
+                status="cancelled",
+                batch_message_id=message_ids[-1] if message_ids else None,
+            )
+        except Exception as exc:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_exception(exc)
+            raise
+        else:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
+
+    @staticmethod
+    def _on_batch_task_done(task: asyncio.Task) -> None:
+        """读取后台拼接任务异常,避免错误被 asyncio 静默回收。"""
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            print(f"  [feishu] batch processing failed: {type(exc).__name__}")
+
+    @staticmethod
+    def _build_batch_key(event: MessageEvent) -> str:
+        """构建拼接隔离键,不同会话 / 用户 / 话题绝不混合。"""
+        source = event.source
+        return ":".join((
+            source.platform,
+            source.account_id,
+            source.chat_type,
+            source.chat_id,
+            source.user_id,
+            source.thread_id or "",
+        ))
+
+    @staticmethod
+    def _parse_text(message: dict) -> str:
+        raw = message.get("content", "{}")
+        try:
+            content = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(content, dict):
+            return ""
+        return str(content.get("text", "") or "")
+
+    def _bot_mentioned(self, message: dict) -> bool:
+        mentions = message.get("mentions", [])
+        if not isinstance(mentions, list):
+            return False
+
+        # 未配置 bot_open_id 时,接收消息事件中出现 mention 即视为 @机器人。
+        # 配置后则做精确匹配,避免把 @其他成员误判为 @机器人。
+        if not self.bot_open_id:
+            return bool(mentions)
+
+        for mention in mentions:
+            if not isinstance(mention, dict):
+                continue
+            mention_id = mention.get("id", {})
+            if (
+                isinstance(mention_id, dict)
+                and mention_id.get("open_id") == self.bot_open_id
+            ):
+                return True
+            if isinstance(mention_id, str) and mention_id == self.bot_open_id:
+                return True
+            if mention.get("key") == self.bot_open_id:
+                return True
+        return False
 
     def _is_allowed(self, user_id: str, chat_id: str) -> bool:
-        """白名单检查(adapter 自身保留,不完全依赖 SDK)。"""
+        """白名单检查。"""
         if self.allow_all:
             return True
         if user_id and user_id in self.allowed_users:
@@ -269,6 +868,38 @@ class FeishuAdapter(BasePlatformAdapter):
 
     # ===================== 消息出站 =====================
 
+    async def _refresh_token(self) -> str:
+        if self._tenant_token and time.time() < self._token_expires_at:
+            return self._tenant_token
+
+        async with self._token_lock:
+            if self._tenant_token and time.time() < self._token_expires_at:
+                return self._tenant_token
+            if not self._http:
+                return ""
+
+            try:
+                response = await self._http.post(
+                    f"{self.api_base}/auth/v3/tenant_access_token/internal",
+                    json={
+                        "app_id": self.app_id,
+                        "app_secret": self.app_secret,
+                    },
+                )
+                data = response.json()
+            except Exception:
+                print("  [feishu] tenant token request failed")
+                return ""
+
+            if data.get("code") != 0:
+                print("  [feishu] tenant token rejected")
+                return ""
+
+            self._tenant_token = str(data.get("tenant_access_token", "") or "")
+            expires = int(data.get("expire", 7200) or 7200)
+            self._token_expires_at = time.time() + max(60, expires - 300)
+            return self._tenant_token
+
     async def send(
         self,
         chat_id: str,
@@ -277,77 +908,80 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to_message_id: str | None = None,
         thread_id: str | None = None,
     ) -> SendResult:
-        if not self._channel:
+        if not self._running or not self._http:
             return SendResult(success=False, error="not_connected")
 
         chunks = self._split_text(content, FEISHU_UTF16_LIMIT)
-        original_reply_to = reply_to_message_id
         last_result = SendResult(success=True)
-
-        for i, chunk in enumerate(chunks):
-            # 每个分片一个固定 UUID,SDK 内部重试时复用同一 UUID 做幂等
-            chunk_uuid = str(uuid.uuid4())
-
-            opts: dict = {
-                "receive_id_type": "chat_id",
-                "uuid": chunk_uuid,
-            }
-            # 第一段回复原始消息;后续分片不再 reply(避免机器人自回复链)
-            # thread 场景下所有分片保持在同一线程(reply_in_thread=True)
-            if i == 0 and original_reply_to:
-                opts["reply_to"] = original_reply_to
-            if thread_id:
-                opts["reply_in_thread"] = True
-
-            result = await self._send_once(chat_id, chunk, opts)
+        for chunk in chunks:
+            result = await self._send_chunk(chat_id, chunk)
             if not result.success:
                 return result
             last_result = result
-
         return last_result
 
-    async def _send_once(
-        self,
-        chat_id: str,
-        chunk: str,
-        opts: dict,
-    ) -> SendResult:
-        """单次发送(SDK 内部已做重试,这里不再外层循环)。"""
-        try:
-            result = await self._channel.send(
-                chat_id,
-                {"text": chunk},
-                opts,
-            )
-        except Exception:
-            return SendResult(success=False, error="unknown")
+    async def _send_chunk(self, chat_id: str, chunk: str) -> SendResult:
+        """发送一个文本分片,网络或限流失败时按配置重试。"""
+        if not self._http:
+            return SendResult(success=False, error="not_connected")
 
-        # SDK 返 None → 失败
-        if result is None:
-            return SendResult(success=False, error="unknown")
+        last_error = "unknown"
+        request_uuid = str(uuid.uuid4())
+        for attempt in range(self.send_max_retries):
+            token = await self._refresh_token()
+            if not token:
+                last_error = "not_connected"
+            else:
+                try:
+                    response = await self._http.post(
+                        f"{self.api_base}/im/v1/messages",
+                        params={
+                            "receive_id_type": "chat_id",
+                            "uuid": request_uuid,
+                        },
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={
+                            "receive_id": chat_id,
+                            "msg_type": "text",
+                            "content": json.dumps(
+                                {"text": chunk},
+                                ensure_ascii=False,
+                            ),
+                        },
+                    )
+                    data = response.json()
+                    if data.get("code") == 0:
+                        message_id = (
+                            data.get("data", {}).get("message_id")
+                            if isinstance(data.get("data"), dict)
+                            else None
+                        )
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                        )
+                    last_error = self._classify_send_error(
+                        response.status_code,
+                        data.get("code"),
+                    )
+                except Exception:
+                    last_error = "send_timeout"
 
-        if getattr(result, "success", True) is False:
-            # 读取 SDK 结构化错误对象,转换为脱敏错误码
-            error_obj = getattr(result, "error", None)
-            code = self._sanitize_error_code(error_obj)
-            return SendResult(success=False, error=code)
+            if attempt + 1 < self.send_max_retries:
+                delay = self.send_retry_base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
 
-        mid = getattr(result, "message_id", None)
-        return SendResult(success=True, message_id=mid)
+        return SendResult(success=False, error=last_error)
 
     @staticmethod
-    def _sanitize_error_code(error_obj) -> str:
-        """把 SDK 错误对象转成脱敏错误码。
-
-        只返回白名单内的 code(rate_limited / permission_denied / send_timeout
-        / not_connected / format_error),不输出 hint / raw / 完整响应体。
-        未知 code 统一返 "unknown"。
-        """
-        code = getattr(error_obj, "code", None) if error_obj else None
-        if not code:
-            return "unknown"
-        code_lower = str(code).lower()
-        return code_lower if code_lower in _SAFE_ERROR_CODES else "unknown"
+    def _classify_send_error(status_code: int, code: Any) -> str:
+        if status_code == 429 or code in (99991400, 99991401):
+            return "rate_limited"
+        if status_code in (401, 403):
+            return "permission_denied"
+        if status_code >= 500:
+            return "send_timeout"
+        return "unknown"
 
     @staticmethod
     def _split_text(text: str, max_units: int) -> list[str]:

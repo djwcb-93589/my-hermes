@@ -35,9 +35,40 @@ class SessionContext:
 class SessionStore:
     """进程内会话状态管理器。线程安全(asyncio 单线程,锁保护 dict 操作)。"""
 
-    def __init__(self, idle_timeout: float = 86400):
+    def __init__(self, idle_timeout: float = 86400, db_path: str | None = None):
         self._contexts: dict[str, SessionContext] = {}
         self.idle_timeout = idle_timeout
+        self.db_path = db_path
+
+    def _load_conversation_id(self, route_key: str) -> str:
+        """从数据库恢复 route_key 当前会话;没有映射时保持旧行为。"""
+        if not self.db_path:
+            return route_key
+
+        from hermes.db import get_gateway_conversation_id, init_db
+
+        conn = init_db(self.db_path)
+        try:
+            return get_gateway_conversation_id(conn, route_key) or route_key
+        finally:
+            conn.close()
+
+    def _save_conversation_id(
+        self,
+        route_key: str,
+        conversation_id: str,
+    ) -> None:
+        """持久化 /new 产生的新会话映射。"""
+        if not self.db_path:
+            return
+
+        from hermes.db import init_db, set_gateway_conversation_id
+
+        conn = init_db(self.db_path)
+        try:
+            set_gateway_conversation_id(conn, route_key, conversation_id)
+        finally:
+            conn.close()
 
     def get_or_create(
         self,
@@ -49,7 +80,7 @@ class SessionStore:
         if ctx is None:
             ctx = SessionContext(
                 route_key=route_key,
-                conversation_id=route_key,  # 默认 route_key 作 DB session_id
+                conversation_id=self._load_conversation_id(route_key),
                 system_prompt=system_prompt,
             )
             self._contexts[route_key] = ctx
@@ -60,6 +91,8 @@ class SessionStore:
         """/new:用新 UUID 重置 conversation_id,清空 pending。"""
         ctx = self._contexts.get(route_key)
         new_id = str(uuid.uuid4())
+        # 先落库再切换内存状态,避免写入失败时两边指向不同会话。
+        self._save_conversation_id(route_key, new_id)
         if ctx is None:
             ctx = SessionContext(
                 route_key=route_key,

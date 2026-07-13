@@ -29,7 +29,7 @@ class GatewayRunner:
         self.adapters: dict[str, BasePlatformAdapter] = {}
         self.agent_name = config.get("gateway", {}).get("agent_name", "main")
         idle_timeout = config.get("gateway", {}).get("session_idle_timeout", 86400)
-        self.sessions = SessionStore(idle_timeout=idle_timeout)
+        self.sessions = SessionStore(idle_timeout=idle_timeout, db_path=db_path)
 
     def add_adapter(self, adapter: BasePlatformAdapter):
         adapter._on_message = self._handle_message

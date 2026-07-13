@@ -12,7 +12,7 @@ dependencies = [
     "aiohttp>=3.9",
     "certifi>=2024.0",
     "qrcode>=7.4",
-    "lark-channel-sdk>=1.1,<2",
+    "httpx>=0.28,<1",
 ]
 
 [dependency-groups]

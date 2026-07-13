@@ -1,5 +1,5 @@
 """
-Configuration: DEFAULT_CONFIG, env loading, config merging, and module constants.
+Configuration: .env loading, config.yaml parsing, and module constants.
 
 This is the foundation module — imported by everything else. Loading this module
 triggers load_env() and load_config() as side effects, exactly as the original
@@ -13,87 +13,6 @@ import re
 
 import yaml
 from openai import OpenAI
-
-
-DEFAULT_CONFIG = {
-    "model": "anthropic/claude-sonnet-4",
-    "base_url": "https://openrouter.ai/api/v1",
-    "api_key": "",
-    "fallback": {
-        "model": "",
-        "base_url": "",
-        "api_key": "",
-    },
-    "limits": {
-        "max_iterations": 40,
-        "max_child_iterations": 20,
-        "max_retries": 3,
-        "max_continuations": 3,
-    },
-    "compression": {
-        "threshold": 180000,
-        "protect_first": 4,
-        "keep_recent_tool_results": 4,
-        "tail_token_budget": 60000,
-    },
-    "memory": {
-        "memory_char_limit": 4000,
-        "user_char_limit": 2000,
-    },
-    "db_path": "database/hermes.db",
-    "terminal": {
-        "backend": "local",          # local | docker | ssh
-        "docker_image": "python:3.11-slim",
-        "ssh_host": "",              # required when backend=ssh
-        "ssh_user": "",              # required when backend=ssh
-        "ssh_key": "",               # optional path to private key
-    },
-    "gateway": {
-        "session_idle_timeout": 86400,
-        "agent_name": "main",
-        "platforms": {
-            "cli": {
-                "enabled": True,
-            },
-            "feishu": {
-                "enabled": False,
-                "app_id": "",
-                "app_secret": "",
-                "security_mode": "compat",        # compat | audit | strict
-                "require_mention": True,
-                "allow_all": False,
-                "allowed_users": [],
-                "allowed_chats": [],
-                "send_max_retries": 3,
-                "send_retry_base_delay": 1.0,
-            },
-            "weixin": {
-                "enabled": False,
-                "account_id": "",
-                "token": "",
-                "base_url": "",
-                "user_id": "",
-                "allow_all": False,
-                "allowed_users": [],
-            },
-        },
-    },
-}
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge two dicts. Override values take precedence."""
-    result = base.copy()
-    for key, value in override.items():
-        if (
-            key in result
-            and isinstance(result[key], dict)
-            and isinstance(value, dict)
-        ):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
 
 
 def _expand_env_vars(value):
@@ -137,22 +56,23 @@ def load_env(env_path=None):
 
 
 def load_config(config_path=None) -> dict:
-    """Load config.yaml, deep merge with defaults, expand env vars."""
+    """加载 config.yaml 并展开环境变量。配置缺失或非法时明确报错。"""
     from pathlib import Path
     if config_path is None:
         config_path = HERMES_HOME / "config.yaml"
 
     if not config_path.exists():
-        return _expand_env_vars(DEFAULT_CONFIG.copy())
+        raise FileNotFoundError(f"config file not found: {config_path}")
 
     try:
         raw_text = config_path.read_text(encoding="utf-8")
-        user_config = yaml.safe_load(raw_text) or {}
-    except Exception:
-        user_config = {}
+        config = yaml.safe_load(raw_text)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"failed to load config file: {config_path}") from exc
 
-    merged = _deep_merge(DEFAULT_CONFIG, user_config)
-    return _expand_env_vars(merged)
+    if not isinstance(config, dict):
+        raise ValueError(f"config file must contain a mapping: {config_path}")
+    return _expand_env_vars(config)
 
 
 def save_config(config: dict, config_path=None):

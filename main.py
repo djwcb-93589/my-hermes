@@ -79,9 +79,6 @@ def main():
     elif "--simulate" in sys.argv:
         from hermes.gateway_simulated import run_gateway_simulated
         asyncio.run(run_gateway_simulated())
-    elif "--test" in sys.argv:
-        from hermes.tests import run_unit_tests
-        run_unit_tests()
     else:
         cli_loop()
 
