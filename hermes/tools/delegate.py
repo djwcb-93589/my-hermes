@@ -168,9 +168,9 @@ def _filter_definitions(toolsets: list[str]) -> list[dict]:
     也只会拿到 ``_ALLOWED_CHILD_TOOLS`` 列出的只读 skill 工具。
     未来 skill toolset 新增写工具不会自动放行。
 
-    显式处理空列表:registry.get_definitions 把空 enabled_toolsets 视作
-    "不过滤",delegate 这里必须当成"没工具",否则 toolsets=[] 会泄漏
-    所有工具给子 agent。
+    显式处理空列表:registry 现在同样把 ``[]`` 解释为“没工具”；这里保留
+    前置拒绝作为 delegate 自己的参数边界，避免未来 registry 语义变化时
+    子 agent 意外获得工具。
     """
     if not toolsets:
         return []

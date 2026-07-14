@@ -24,10 +24,13 @@ import uuid
 from hermes.db import (
     add_final_message_with_gateway_outbox,
     add_messages,
+    cancel_gateway_delivery,
+    complete_gateway_delivery,
     complete_gateway_message,
     delete_gateway_messages,
     enqueue_gateway_outbox,
     enqueue_gateway_message,
+    fail_gateway_delivery,
     get_gateway_message_persistence_state,
     get_next_recoverable_gateway_outbox_for_route,
     get_gateway_outbox,
@@ -36,10 +39,7 @@ from hermes.db import (
     init_db,
     mark_gateway_message_delivery_failed,
     mark_gateway_message_processing,
-    mark_gateway_outbox_cancelled,
     mark_gateway_outbox_chunk_sent,
-    mark_gateway_outbox_delivered,
-    mark_gateway_outbox_failed,
     mark_gateway_outbox_retry,
     mark_gateway_outbox_sending,
     reset_gateway_processing_messages,
@@ -113,6 +113,14 @@ class GatewayRunner:
         self._lifecycle_phase = "created"
         # 异步模型客户端按需创建,Gateway 停止时统一关闭。
         self._async_client = None
+
+    @staticmethod
+    def _build_gateway_prompt() -> str:
+        """统一构造不宣称、也不授予任何本地工具能力的 Gateway prompt。"""
+        return build_system_prompt(
+            os.getcwd(),
+            enabled_toolsets=[],
+        )
 
     def add_adapter(self, adapter: BasePlatformAdapter):
         adapter._on_message = self._handle_message
@@ -409,10 +417,87 @@ class GatewayRunner:
         finally:
             conn.close()
 
-    def _cancel_outbox(self, outbox_id: str) -> None:
+    def _cancel_outbox(
+        self,
+        outbox_id: str,
+        *,
+        route_key: str | None = None,
+        source_message_id: str | None = None,
+    ) -> bool:
         conn = init_db(self.db_path)
         try:
-            mark_gateway_outbox_cancelled(conn, outbox_id)
+            outbox = get_gateway_outbox(conn, outbox_id)
+            if outbox is None:
+                return False
+            expected_route = route_key or str(outbox["route_key"])
+            expected_source = source_message_id or str(
+                outbox["source_message_id"]
+            )
+            cancelled = cancel_gateway_delivery(
+                conn,
+                outbox_id,
+                expected_route,
+                expected_source,
+            )
+            if not cancelled:
+                current = get_gateway_outbox(conn, outbox_id)
+                cancelled = bool(
+                    current
+                    and current["status"] in {
+                        "cancelled",
+                        "partial_cancelled",
+                        "delivered",
+                    }
+                )
+        finally:
+            conn.close()
+        if cancelled:
+            self._accepted_messages.discard((expected_route, expected_source))
+        return cancelled
+
+    def _complete_outbox(
+        self,
+        outbox_id: str,
+        route_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        conn = init_db(self.db_path)
+        try:
+            completed = complete_gateway_delivery(
+                conn,
+                outbox_id,
+                route_key,
+                event.message_id,
+            )
+            if not completed:
+                current = get_gateway_outbox(conn, outbox_id)
+                completed = bool(
+                    current and current["status"] == "delivered"
+                )
+        finally:
+            conn.close()
+        if completed:
+            self._accepted_messages.discard((route_key, event.message_id))
+        return completed
+
+    def _fail_outbox(
+        self,
+        outbox_id: str,
+        route_key: str,
+        event: MessageEvent,
+        error: str,
+        error_code: str | None,
+    ) -> bool:
+        conn = init_db(self.db_path)
+        try:
+            return fail_gateway_delivery(
+                conn,
+                outbox_id,
+                route_key,
+                event.message_id,
+                error,
+                error_code,
+            )
         finally:
             conn.close()
 
@@ -422,7 +507,7 @@ class GatewayRunner:
         delivery_id = ctx.delivery_id if ctx is not None else None
         cancelled = self.sessions.request_cancel(route_key, reason=reason)
         if cancelled and reason != "shutdown" and delivery_id:
-            self._cancel_outbox(delivery_id)
+            self._cancel_outbox(delivery_id, route_key=route_key)
         return cancelled
 
     @staticmethod
@@ -457,7 +542,10 @@ class GatewayRunner:
         """显式放弃旧任务时原子地终止未完成 Outbox。"""
         reason = self._task_cancel_reason(ctx, generation)
         if reason is not None and reason != "shutdown":
-            self._cancel_outbox(outbox_id)
+            self._cancel_outbox(
+                outbox_id,
+                route_key=getattr(ctx, "route_key", None),
+            )
         return reason
 
     async def _wait_for_delivery_attempt(
@@ -481,11 +569,12 @@ class GatewayRunner:
                 pass
         return self._cancel_stale_outbox(ctx, generation, outbox_id)
 
-    def _mark_delivery_failed(
+    def _mark_delivery_failed_without_outbox(
         self,
         route_key: str,
         event: MessageEvent,
     ) -> None:
+        """兼容无 Outbox 的嵌入式回复，只保留入站失败审计。"""
         conn = init_db(self.db_path)
         try:
             mark_gateway_message_delivery_failed(
@@ -550,7 +639,11 @@ class GatewayRunner:
                 return None
             if outbox["status"] == "delivered":
                 return True
-            if outbox["status"] in ("permanent_failed", "cancelled"):
+            if outbox["status"] in (
+                "permanent_failed",
+                "cancelled",
+                "partial_cancelled",
+            ):
                 return False
 
             next_attempt_at = outbox.get("next_attempt_at")
@@ -627,13 +720,6 @@ class GatewayRunner:
                     failed_index = index
                     break
 
-                # send_prepared 已经成功的分片无法撤回；若等待期间任务失效，
-                # 立即把 Outbox 终止在 cancelled，绝不发送下一片。
-                if (
-                    self._cancel_stale_outbox(ctx, generation, outbox_id)
-                    is not None
-                ):
-                    return None
                 if result.message_id:
                     message_ids.append(result.message_id)
                 conn = init_db(self.db_path)
@@ -643,23 +729,39 @@ class GatewayRunner:
                         outbox_id,
                         index + 1,
                         message_ids,
+                        len(payloads),
                     )
                 finally:
                     conn.close()
                 if not progress_saved:
                     return None
 
-            if failed_result is None:
+                all_chunks_sent = index + 1 >= len(payloads)
+                if all_chunks_sent:
+                    # 平台已经确认完整回答。即使取消与本次成功并发，delivered
+                    # 也必须优先，取消不能反向抹除已发生的外部事实。
+                    delivered = self._complete_outbox(
+                        outbox_id,
+                        route_key,
+                        event,
+                    )
+                    return True if delivered else None
+
+                # 成功进度已经持久化；从这里开始，取消只终止尚未发送的分片。
                 if (
                     self._cancel_stale_outbox(ctx, generation, outbox_id)
                     is not None
                 ):
                     return None
-                conn = init_db(self.db_path)
-                try:
-                    delivered = mark_gateway_outbox_delivered(conn, outbox_id)
-                finally:
-                    conn.close()
+
+            if failed_result is None:
+                # 恢复时可能读取到 next_chunk_index 已经等于总片数、但进程
+                # 尚未来得及写 delivered 的记录；完整进度同样优先于取消。
+                delivered = self._complete_outbox(
+                    outbox_id,
+                    route_key,
+                    event,
+                )
                 return True if delivered else None
 
             attempt = int(outbox["attempt_count"]) + 1
@@ -671,17 +773,17 @@ class GatewayRunner:
                 not failed_result.retryable
                 or attempt >= max_attempts
             ):
-                conn = init_db(self.db_path)
-                try:
-                    mark_gateway_outbox_failed(
-                        conn,
-                        outbox_id,
-                        error,
-                        failed_result.error_code,
-                    )
-                finally:
-                    conn.close()
-                self._mark_delivery_failed(route_key, event)
+                permanently_failed = self._fail_outbox(
+                    outbox_id,
+                    route_key,
+                    event,
+                    error,
+                    failed_result.error_code,
+                )
+                if not permanently_failed:
+                    current = self._load_outbox(outbox_id)
+                    if not current or current["status"] != "permanent_failed":
+                        return None
                 print(
                     f"  [gateway] {route_key}: delivery failed permanently "
                     f"(chunk={failed_index}, error={error})"
@@ -788,12 +890,8 @@ class GatewayRunner:
                 generation,
                 invalidation_event,
             )
-            if delivered:
-                self._complete_event(route_key, event)
-            elif delivered is None:
+            if delivered is None:
                 cancel_reason = self._task_cancel_reason(ctx, generation)
-                if cancel_reason != "shutdown":
-                    self._complete_event(route_key, event)
         except asyncio.CancelledError:
             cancel_reason = self._task_cancel_reason(ctx, generation)
             print(f"  [gateway] {route_key}: durable reply cancelled")
@@ -890,7 +988,7 @@ class GatewayRunner:
                     )
                 ctx = self.sessions.get_or_create(
                     route_key,
-                    build_system_prompt(os.getcwd()),
+                    self._build_gateway_prompt(),
                 )
                 if self._route_has_active_worker(ctx):
                     print(
@@ -933,7 +1031,7 @@ class GatewayRunner:
         """同一路由按原创建顺序恢复回复,避免后回复先到。"""
         ctx = self.sessions.get_or_create(
             route_key,
-            build_system_prompt(os.getcwd()),
+            self._build_gateway_prompt(),
         )
         cancel_reason = None
         try:
@@ -949,19 +1047,19 @@ class GatewayRunner:
                     generation,
                     invalidation_event,
                 )
-                if delivered:
-                    self._complete_event(route_key, event)
-                elif delivered is None:
+                if delivered is None:
                     cancel_reason = self._task_cancel_reason(ctx, generation)
                     if cancel_reason != "shutdown":
                         # 该恢复 worker 中其余回复同属已经被明确放弃的旧工作；
                         # 全部终止，避免下一次重启又把它们发送出来。
                         for stale_row in rows[position:]:
-                            self._cancel_outbox(stale_row["id"])
-                            stale_event = self._deserialize_event(
-                                stale_row["event_json"],
+                            self._cancel_outbox(
+                                stale_row["id"],
+                                route_key=route_key,
+                                source_message_id=stale_row[
+                                    "source_message_id"
+                                ],
                             )
-                            self._complete_event(route_key, stale_event)
                     break
                 if (
                     ctx.delivery_id == row["id"]
@@ -1067,7 +1165,7 @@ class GatewayRunner:
         cmd = (event.text or "").strip().lower()
         if cmd == "/new":
             ctx = self.sessions.get_or_create(
-                route_key, build_system_prompt(os.getcwd()),
+                route_key, self._build_gateway_prompt(),
             )
             if self._route_has_active_worker(ctx):
                 # /new 作为串行屏障:丢弃命令前尚未执行的旧消息,
@@ -1087,7 +1185,7 @@ class GatewayRunner:
             if not from_queue:
                 self._persist_event(route_key, event)
             ctx = self.sessions.new_conversation(
-                route_key, build_system_prompt(os.getcwd()),
+                route_key, self._build_gateway_prompt(),
             )
             if event.source.platform not in self.adapters:
                 # 保留无 Adapter 的测试 / 嵌入式调用兼容路径。真实平台事件
@@ -1096,7 +1194,7 @@ class GatewayRunner:
                 if result is None or result.success:
                     self._complete_event(route_key, event)
                 else:
-                    self._mark_delivery_failed(route_key, event)
+                    self._mark_delivery_failed_without_outbox(route_key, event)
                 await self._dispatch_next(ctx)
                 return
             self._start_durable_reply(
@@ -1109,7 +1207,7 @@ class GatewayRunner:
             return
         if cmd == "/stop":
             ctx = self.sessions.get_or_create(
-                route_key, build_system_prompt(os.getcwd()),
+                route_key, self._build_gateway_prompt(),
             )
             ok = self._request_session_cancel(route_key, reason="user")
             content = "(cancel requested)" if ok else "(no active task)"
@@ -1134,7 +1232,7 @@ class GatewayRunner:
             return
 
         ctx = self.sessions.get_or_create(
-            route_key, build_system_prompt(os.getcwd()),
+            route_key, self._build_gateway_prompt(),
         )
 
         if self._route_has_active_worker(ctx):
@@ -1214,7 +1312,7 @@ class GatewayRunner:
     ):
         """串行处理一条消息,然后检查队列。"""
         ctx = self.sessions.get_or_create(
-            route_key, build_system_prompt(os.getcwd()),
+            route_key, self._build_gateway_prompt(),
         )
         if generation is None:
             generation = (
@@ -1252,7 +1350,11 @@ class GatewayRunner:
                     cancel_reason != "shutdown"
                     and persisted_outbox
                 ):
-                    self._cancel_outbox(delivery_id)
+                    event_completed = self._cancel_outbox(
+                        delivery_id,
+                        route_key=route_key,
+                        source_message_id=event.message_id,
+                    )
                 print(f"  [gateway] {route_key}: stale response discarded")
             elif not response and not persisted_outbox:
                 event_completed = self._complete_event(route_key, event)
@@ -1261,10 +1363,27 @@ class GatewayRunner:
                 result = await self._reply(event, str(response or ""))
                 if result is None or result.success:
                     if persisted_outbox:
-                        self._cancel_outbox(delivery_id)
-                    event_completed = self._complete_event(route_key, event)
+                        event_completed = self._cancel_outbox(
+                            delivery_id,
+                            route_key=route_key,
+                            source_message_id=event.message_id,
+                        )
+                    else:
+                        event_completed = self._complete_event(route_key, event)
                 else:
-                    self._mark_delivery_failed(route_key, event)
+                    if persisted_outbox:
+                        event_completed = self._fail_outbox(
+                            delivery_id,
+                            route_key,
+                            event,
+                            result.error or "internal_send_error",
+                            result.error_code,
+                        )
+                    else:
+                        self._mark_delivery_failed_without_outbox(
+                            route_key,
+                            event,
+                        )
             elif persisted_outbox:
                 delivered = await self._deliver_outbox(
                     route_key,
@@ -1275,7 +1394,7 @@ class GatewayRunner:
                     invalidation_event,
                 )
                 if delivered:
-                    event_completed = self._complete_event(route_key, event)
+                    event_completed = True
                 elif delivered is None:
                     cancel_reason = self._task_cancel_reason(ctx, generation)
                     abandoned = True
@@ -1303,7 +1422,7 @@ class GatewayRunner:
                     invalidation_event,
                 )
                 if delivered:
-                    event_completed = self._complete_event(route_key, event)
+                    event_completed = True
                 elif delivered is None:
                     cancel_reason = self._task_cancel_reason(ctx, generation)
                     abandoned = True
@@ -1344,7 +1463,7 @@ class GatewayRunner:
                         invalidation_event,
                     )
                     if delivered:
-                        event_completed = self._complete_event(route_key, event)
+                        event_completed = True
                     elif delivered is None:
                         cancel_reason = self._task_cancel_reason(
                             ctx,
@@ -1402,8 +1521,13 @@ class GatewayRunner:
                 and not event_completed
             ):
                 if self._load_outbox(delivery_id):
-                    self._cancel_outbox(delivery_id)
-                self._complete_event(route_key, event)
+                    event_completed = self._cancel_outbox(
+                        delivery_id,
+                        route_key=route_key,
+                        source_message_id=event.message_id,
+                    )
+                else:
+                    event_completed = self._complete_event(route_key, event)
 
         if cancel_reason != "shutdown":
             await self._dispatch_next(ctx)
@@ -1534,6 +1658,7 @@ class GatewayRunner:
                 cancel_checker,
                 async_client=self._get_async_client(),
                 final_message_callback=persist_final_message,
+                enabled_toolsets=[],
             )
             return result.get("final_response")
         finally:

@@ -53,9 +53,42 @@ from hermes.tools import registry
 ENABLED_TOOLSETS = ["terminal", "file", "memory", "skill", "delegate", "cron"]
 
 
+def _tool_names_from_definitions(tools: list[dict]) -> set[str]:
+    """从本会话实际暴露给模型的 schema 派生 dispatch 白名单。"""
+    names: set[str] = set()
+    for definition in tools:
+        function = definition.get("function", {})
+        if isinstance(function, dict) and function.get("name"):
+            names.add(str(function["name"]))
+    return names
+
+
+def _disabled_tool_result(tool_name: str) -> tuple[str, str, str]:
+    """构造不会触达全局 registry 的会话级禁用工具错误。"""
+    return (
+        json.dumps(
+            {
+                "ok": False,
+                "error_type": "tool_disabled",
+                "fatal": True,
+                "error": f"Tool is not enabled in this session: {tool_name}",
+            },
+            ensure_ascii=False,
+        ),
+        "disabled",
+        f"disabled tool invoked: {tool_name!r}",
+    )
+
+
 def _dispatch_conversation_tool_call(loop, tool_call):
     """主会话工具分发共享实现,供同步 / 异步循环复用。"""
     tool_name = tool_call.function.name
+    allowed_tool_names = getattr(loop, "allowed_tool_names", None)
+    if (
+        allowed_tool_names is not None
+        and tool_name not in allowed_tool_names
+    ):
+        return _disabled_tool_result(tool_name)
     try:
         tool_args = json.loads(tool_call.function.arguments)
     except Exception as exc:
@@ -109,6 +142,7 @@ class ConversationAgentLoop(AgentLoop):
         compression_threshold: int,
         model_kwargs: dict | None = None,
         cancel_checker=None,
+        allowed_tool_names: set[str] | None = None,
     ):
         super().__init__(
             model=model,
@@ -133,6 +167,12 @@ class ConversationAgentLoop(AgentLoop):
         # fallback 只能从 primary 切换一次。已经切到 fallback 后再失败,
         # 不再二次切换、不重置 retry_count,直接 abort 避免 max_iterations 拖延。
         self._using_fallback = False
+        # None 兼容直接构造旧循环；集合由会话入口按实际 API tools 派生。
+        self.allowed_tool_names = (
+            None
+            if allowed_tool_names is None
+            else frozenset(allowed_tool_names)
+        )
 
     # --- messages 初始化:主会话从 DB 加载历史 ---
 
@@ -243,33 +283,7 @@ class ConversationAgentLoop(AgentLoop):
         output 回写给模型时走统一脱敏(密钥 / 外部路径 / traceback),
         复用 agent_loop._sanitize_error_message 避免重复实现。
         """
-        tool_name = tool_call.function.name
-        try:
-            tool_args = json.loads(tool_call.function.arguments)
-        except Exception as exc:
-            short = _sanitize_error_message(exc, max_len=200)
-            return (
-                f"(error: invalid JSON arguments in {tool_name}: {short})",
-                "json",
-                f"invalid JSON in tool_call {tool_name!r}: {short}",
-            )
-        print(
-            f"  [tool] {tool_name}: "
-            f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
-        )
-        try:
-            output = self.registry.dispatch(
-                tool_name, tool_args,
-                session_key=self.session_key,
-            )
-        except Exception as exc:
-            short = _sanitize_error_message(exc, max_len=200)
-            return (
-                f"(error: tool {tool_name} failed: {short})",
-                "dispatch",
-                f"tool {tool_name!r} raised: {short}",
-            )
-        return output, None, None
+        return _dispatch_conversation_tool_call(self, tool_call)
 
     # 单条 tool result 不单独持久化,避免 assistant tool_call 与 tool result
     # 被拆成多次提交。
@@ -314,6 +328,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         model_kwargs: dict | None = None,
         cancel_checker=None,
         final_message_callback=None,
+        allowed_tool_names: set[str] | None = None,
     ):
         super().__init__(
             model=model,
@@ -335,6 +350,12 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self._retry_count = 0
         self._continuation_count = 0
         self._using_fallback = False
+        # 空集合是 Gateway 的硬边界：伪造 tool call 也不能触达 registry。
+        self.allowed_tool_names = (
+            None
+            if allowed_tool_names is None
+            else frozenset(allowed_tool_names)
+        )
         # Gateway 可注入回调,把最终消息和 outbox 放进同一事务。
         self.final_message_callback = final_message_callback
         # fallback 客户端由本循环创建,结束时单独关闭;主客户端归 Runner 管理。
@@ -530,6 +551,19 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
     }
 
 
+def _select_conversation_tools(
+    enabled_toolsets: list[str] | None,
+) -> tuple[list[dict], set[str]]:
+    """选择本会话工具，并用同一份定义建立 dispatch 能力边界。"""
+    selected_toolsets = (
+        ENABLED_TOOLSETS
+        if enabled_toolsets is None
+        else enabled_toolsets
+    )
+    tools = registry.get_definitions(selected_toolsets)
+    return tools, _tool_names_from_definitions(tools)
+
+
 def run_conversation(
     user_message: str,
     conn: sqlite3.Connection,
@@ -537,6 +571,7 @@ def run_conversation(
     cached_prompt: str,
     session_key: str | None = None,
     cancel_checker=None,
+    enabled_toolsets: list[str] | None = None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -557,10 +592,11 @@ def run_conversation(
     except Exception as exc:
         return _persistence_error_response(exc)
 
+    tools, allowed_tool_names = _select_conversation_tools(enabled_toolsets)
     loop = ConversationAgentLoop(
         model=MODEL,
         max_iterations=MAX_ITERATIONS,
-        tools=registry.get_definitions(ENABLED_TOOLSETS),
+        tools=tools,
         system_prompt=cached_prompt,
         registry=registry,
         client=client,
@@ -576,6 +612,7 @@ def run_conversation(
         # extra_body / temperature 的 provider,在这里透传即可,无需改 AgentLoop。
         model_kwargs=None,
         cancel_checker=cancel_checker,
+        allowed_tool_names=allowed_tool_names,
     )
     result: AgentLoopResult = loop.run(user_message)
 
@@ -593,6 +630,7 @@ async def run_conversation_async(
     *,
     async_client=None,
     final_message_callback=None,
+    enabled_toolsets: list[str] | None = None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。"""
     owns_client = async_client is None
@@ -608,10 +646,13 @@ async def run_conversation_async(
         except Exception as exc:
             return _persistence_error_response(exc)
 
+        tools, allowed_tool_names = _select_conversation_tools(
+            enabled_toolsets
+        )
         loop = AsyncConversationAgentLoop(
             model=MODEL,
             max_iterations=MAX_ITERATIONS,
-            tools=registry.get_definitions(ENABLED_TOOLSETS),
+            tools=tools,
             system_prompt=cached_prompt,
             registry=registry,
             client=async_client,
@@ -625,6 +666,7 @@ async def run_conversation_async(
             model_kwargs=None,
             cancel_checker=cancel_checker,
             final_message_callback=final_message_callback,
+            allowed_tool_names=allowed_tool_names,
         )
         result: AgentLoopResult = await loop.run(user_message)
         return _conversation_result_response(result)

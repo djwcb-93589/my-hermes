@@ -24,7 +24,7 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
@@ -127,7 +127,12 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             payloads_json TEXT NOT NULL,
             next_chunk_index INTEGER NOT NULL DEFAULT 0,
             message_ids_json TEXT NOT NULL DEFAULT '[]',
-            status TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'sending', 'retry_wait', 'delivered',
+                    'cancelled', 'partial_cancelled', 'permanent_failed'
+                )
+            ),
             attempt_count INTEGER NOT NULL DEFAULT 0,
             next_attempt_at REAL,
             last_error TEXT,
@@ -149,7 +154,10 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             route_key TEXT NOT NULL,
             source_message_id TEXT NOT NULL,
             status TEXT NOT NULL CHECK (
-                status IN ('pending', 'delivered', 'cancelled', 'permanent_failed')
+                status IN (
+                    'pending', 'delivered', 'cancelled', 'partial_cancelled',
+                    'permanent_failed'
+                )
             ),
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -296,12 +304,161 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE sessions_v1_backup")
 
 
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """为部分取消增加显式状态，并修正旧 cancelled 行的可推导语义。"""
+    outbox_rows = conn.execute(
+        """
+        SELECT id, route_key, source_message_id, event_json, platform, chat_id,
+               reply_to_message_id, thread_id, delivery_kind, payloads_json,
+               next_chunk_index, message_ids_json, status, attempt_count,
+               next_attempt_at, last_error, last_error_code, created_at, updated_at
+        FROM gateway_outbox
+        ORDER BY created_at, id
+        """
+    ).fetchall()
+    delivery_rows = conn.execute(
+        """
+        SELECT delivery_id, session_id, assistant_message_id, route_key,
+               source_message_id, status, created_at, updated_at
+        FROM gateway_message_deliveries
+        """
+    ).fetchall()
+
+    reconciled_outbox_rows = []
+    reconciled_statuses: dict[str, str] = {}
+    for row in outbox_rows:
+        values = list(row)
+        outbox_id = str(values[0])
+        next_chunk_index = int(values[10])
+        status = str(values[12])
+        if status == "cancelled" and next_chunk_index > 0:
+            try:
+                payloads = json.loads(values[9])
+            except (TypeError, ValueError):
+                payloads = None
+            if (
+                isinstance(payloads, list)
+                and payloads
+                and next_chunk_index >= len(payloads)
+            ):
+                status = "delivered"
+            else:
+                status = "partial_cancelled"
+            values[12] = status
+        reconciled_statuses[outbox_id] = status
+        reconciled_outbox_rows.append(tuple(values))
+
+    reconciled_delivery_rows = []
+    for row in delivery_rows:
+        values = list(row)
+        delivery_id = str(values[0])
+        if values[5] == "cancelled":
+            outbox_status = reconciled_statuses.get(delivery_id)
+            if outbox_status in {"delivered", "partial_cancelled"}:
+                values[5] = outbox_status
+        reconciled_delivery_rows.append(tuple(values))
+
+    conn.execute(
+        "ALTER TABLE gateway_message_deliveries "
+        "RENAME TO gateway_message_deliveries_v6_backup"
+    )
+    conn.execute(
+        "ALTER TABLE gateway_outbox RENAME TO gateway_outbox_v6_backup"
+    )
+    conn.execute(
+        """
+        CREATE TABLE gateway_outbox (
+            id TEXT PRIMARY KEY,
+            route_key TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            reply_to_message_id TEXT,
+            thread_id TEXT,
+            delivery_kind TEXT NOT NULL,
+            payloads_json TEXT NOT NULL,
+            next_chunk_index INTEGER NOT NULL DEFAULT 0,
+            message_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'sending', 'retry_wait', 'delivered',
+                    'cancelled', 'partial_cancelled', 'permanent_failed'
+                )
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            last_error TEXT,
+            last_error_code TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(route_key, source_message_id, delivery_kind)
+        )
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO gateway_outbox (
+            id, route_key, source_message_id, event_json, platform, chat_id,
+            reply_to_message_id, thread_id, delivery_kind, payloads_json,
+            next_chunk_index, message_ids_json, status, attempt_count,
+            next_attempt_at, last_error, last_error_code, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        reconciled_outbox_rows,
+    )
+    conn.execute(
+        """
+        CREATE TABLE gateway_message_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            assistant_message_id INTEGER NOT NULL UNIQUE,
+            route_key TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'delivered', 'cancelled', 'partial_cancelled',
+                    'permanent_failed'
+                )
+            ),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (delivery_id) REFERENCES gateway_outbox(id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (assistant_message_id)
+                REFERENCES messages(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO gateway_message_deliveries (
+            delivery_id, session_id, assistant_message_id, route_key,
+            source_message_id, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        reconciled_delivery_rows,
+    )
+    conn.execute("DROP TABLE gateway_message_deliveries_v6_backup")
+    conn.execute("DROP TABLE gateway_outbox_v6_backup")
+    conn.execute(
+        "CREATE INDEX idx_gateway_outbox_status_retry "
+        "ON gateway_outbox(status, next_attempt_at, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_gateway_message_deliveries_session_status "
+        "ON gateway_message_deliveries("
+        "session_id, status, assistant_message_id)"
+    )
+
+
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
     老库 v1 → v2 会重建 sessions/messages,让外键 / NOT NULL
     约束对既有数据库也生效。v2 → v3 新增 Gateway 当前会话映射,
-    v3 → v4 新增 Gateway 待处理消息队列,v4 → v5 新增出站回复队列。
+    v3 → v4 新增 Gateway 待处理消息队列,v4 → v5 新增出站回复队列,
+    v5 → v6 关联最终回答投递状态,v6 → v7 区分部分取消。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -462,12 +619,152 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
             conn.commit()
             current = 6
 
+    if current < 7:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v6_to_v7(conn)
+            _set_schema_version(conn, 7)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 7
+
     return current
 
 
 # ===========================================================================
 # init_db
 # ===========================================================================
+
+def _infer_cancelled_gateway_outbox_status(
+    next_chunk_index: int,
+    payloads_json: str,
+) -> str:
+    """按已经持久化的发送进度推导取消类 Outbox 的真实终态。"""
+    if int(next_chunk_index) <= 0:
+        return "cancelled"
+    try:
+        payloads = json.loads(payloads_json)
+    except (TypeError, ValueError):
+        # 损坏 payload 仍保留审计；已有成功进度时至少不能降回完全未发送。
+        return "partial_cancelled"
+    if not isinstance(payloads, list):
+        return "partial_cancelled"
+    if payloads and int(next_chunk_index) >= len(payloads):
+        return "delivered"
+    return "partial_cancelled"
+
+
+def reconcile_gateway_terminal_deliveries(conn: sqlite3.Connection) -> int:
+    """收敛旧版本遗留的终态 Outbox 与 ``reply_pending`` queue。
+
+    新代码通过统一终态函数一次提交三层状态；这里仅修复升级前已经形成的
+    孤儿记录，以及“取消先提交、最后一个平台成功随后落进度”留下的可推导
+    状态。终态审计行不会被删除。
+    """
+    rows = conn.execute(
+        """
+        SELECT o.id, o.route_key, o.source_message_id, o.status,
+               o.next_chunk_index, o.payloads_json,
+               q.status
+        FROM gateway_outbox AS o
+        LEFT JOIN gateway_message_queue AS q
+          ON q.route_key=o.route_key
+         AND q.message_id=o.source_message_id
+        WHERE (
+            o.status IN (
+                'delivered', 'permanent_failed',
+                'cancelled', 'partial_cancelled'
+            )
+            AND q.status='reply_pending'
+        )
+        OR (o.status='cancelled' AND o.next_chunk_index > 0)
+        OR (
+            o.status='partial_cancelled'
+            AND json_valid(o.payloads_json)=1
+            AND o.next_chunk_index >= json_array_length(o.payloads_json)
+        )
+        ORDER BY o.created_at, o.id
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+
+    reconciled = 0
+    now = time.time()
+    with transaction(conn):
+        for (
+            outbox_id,
+            route_key,
+            source_message_id,
+            stored_status,
+            next_chunk_index,
+            payloads_json,
+            queue_status,
+        ) in rows:
+            status = str(stored_status)
+            if status in {"cancelled", "partial_cancelled"}:
+                status = _infer_cancelled_gateway_outbox_status(
+                    int(next_chunk_index),
+                    str(payloads_json),
+                )
+            if status != stored_status:
+                cursor = conn.execute(
+                    """
+                    UPDATE gateway_outbox
+                    SET status=?, next_attempt_at=NULL,
+                        last_error=CASE WHEN ?='delivered' THEN NULL
+                                        ELSE last_error END,
+                        last_error_code=CASE WHEN ?='delivered' THEN NULL
+                                             ELSE last_error_code END,
+                        updated_at=?
+                    WHERE id=? AND status=?
+                    """,
+                    (
+                        status,
+                        status,
+                        status,
+                        now,
+                        outbox_id,
+                        stored_status,
+                    ),
+                )
+                if cursor.rowcount <= 0:
+                    continue
+
+            _mark_gateway_message_delivery_terminal(
+                conn,
+                str(outbox_id),
+                status,
+                now,
+                route_key=str(route_key),
+                source_message_id=str(source_message_id),
+            )
+            if queue_status == "reply_pending":
+                if status == "permanent_failed":
+                    conn.execute(
+                        """
+                        UPDATE gateway_message_queue
+                        SET status='delivery_failed', updated_at=?
+                        WHERE route_key=? AND message_id=?
+                          AND status='reply_pending'
+                        """,
+                        (now, route_key, source_message_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        DELETE FROM gateway_message_queue
+                        WHERE route_key=? AND message_id=?
+                          AND status='reply_pending'
+                        """,
+                        (route_key, source_message_id),
+                    )
+            reconciled += 1
+    return reconciled
+
 
 def init_db(db_path: str) -> sqlite3.Connection:
     """初始化 db:建父目录、应用 PRAGMA、检查 schema version 并按需 migration。
@@ -493,6 +790,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
             _migrate(conn, current)
 
         conn.commit()
+        reconcile_gateway_terminal_deliveries(conn)
         return conn
     except Exception:
         conn.close()
@@ -1089,19 +1387,47 @@ def mark_gateway_outbox_chunk_sent(
     outbox_id: str,
     next_chunk_index: int,
     message_ids: list[str],
+    total_chunks: int | None = None,
 ) -> bool:
-    """单片成功后立即保存进度,避免重启时重发已确认分片。"""
+    """只记录平台成功事实；终态由统一 delivery 事务负责收敛。"""
+    saved_index = int(next_chunk_index)
+    if total_chunks is None:
+        row = conn.execute(
+            "SELECT payloads_json FROM gateway_outbox WHERE id=?",
+            (outbox_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            payloads = json.loads(row[0])
+        except (TypeError, ValueError) as exc:
+            raise DBError(
+                f"gateway outbox JSON deserialization failed: {exc}"
+            ) from exc
+        if not isinstance(payloads, list):
+            raise DBError("gateway outbox payloads JSON has invalid structure")
+        total_chunks = len(payloads)
+    total_chunks = int(total_chunks)
+    if saved_index <= 0 or saved_index > total_chunks:
+        raise DBError("gateway outbox chunk progress is out of range")
+
     cursor = conn.execute(
         """
         UPDATE gateway_outbox
         SET next_chunk_index=?, message_ids_json=?, updated_at=?
-        WHERE id=? AND status IN ('pending', 'sending', 'retry_wait')
+        WHERE id=?
+          AND next_chunk_index <= ?
+          AND status IN (
+              'pending', 'sending', 'retry_wait',
+              'cancelled', 'partial_cancelled'
+          )
         """,
         (
-            int(next_chunk_index),
+            saved_index,
             _serialize_gateway_json(message_ids, "message_ids"),
             time.time(),
             outbox_id,
+            saved_index,
         ),
     )
     conn.commit()
@@ -1134,72 +1460,294 @@ def mark_gateway_outbox_retry(
     return cursor.rowcount > 0
 
 
+def _gateway_terminal_outbox_row(
+    conn: sqlite3.Connection,
+    outbox_id: str,
+):
+    return conn.execute(
+        """
+        SELECT route_key, source_message_id, status,
+               next_chunk_index, payloads_json
+        FROM gateway_outbox
+        WHERE id=?
+        """,
+        (outbox_id,),
+    ).fetchone()
+
+
+def _validate_gateway_delivery_identity(
+    outbox_id: str,
+    row,
+    route_key: str,
+    source_message_id: str,
+) -> None:
+    if str(row[0]) != route_key or str(row[1]) != source_message_id:
+        raise DBError(
+            "gateway delivery identity mismatch "
+            f"for outbox {outbox_id}"
+        )
+
+
+def complete_gateway_delivery(
+    conn: sqlite3.Connection,
+    outbox_id: str,
+    route_key: str,
+    source_message_id: str,
+) -> bool:
+    """原子完成 Outbox、assistant delivery，并删除对应入站 queue。"""
+    now = time.time()
+    with transaction(conn):
+        row = _gateway_terminal_outbox_row(conn, outbox_id)
+        if row is None:
+            return False
+        _validate_gateway_delivery_identity(
+            outbox_id,
+            row,
+            route_key,
+            source_message_id,
+        )
+        old_status = str(row[2])
+        if old_status not in {
+            "pending",
+            "sending",
+            "retry_wait",
+            "cancelled",
+            "partial_cancelled",
+        }:
+            return False
+        try:
+            payloads = json.loads(row[4])
+        except (TypeError, ValueError) as exc:
+            raise DBError(
+                f"gateway outbox JSON deserialization failed: {exc}"
+            ) from exc
+        if not isinstance(payloads, list):
+            raise DBError("gateway outbox payloads JSON has invalid structure")
+        if int(row[3]) < len(payloads):
+            return False
+
+        cursor = conn.execute(
+            """
+            UPDATE gateway_outbox
+            SET status='delivered', next_attempt_at=NULL,
+                last_error=NULL, last_error_code=NULL, updated_at=?
+            WHERE id=? AND route_key=? AND source_message_id=? AND status=?
+            """,
+            (
+                now,
+                outbox_id,
+                route_key,
+                source_message_id,
+                old_status,
+            ),
+        )
+        if cursor.rowcount <= 0:
+            return False
+        _mark_gateway_message_delivery_terminal(
+            conn,
+            outbox_id,
+            "delivered",
+            now,
+            route_key=route_key,
+            source_message_id=source_message_id,
+        )
+        conn.execute(
+            """
+            DELETE FROM gateway_message_queue
+            WHERE route_key=? AND message_id=?
+            """,
+            (route_key, source_message_id),
+        )
+    return True
+
+
+def fail_gateway_delivery(
+    conn: sqlite3.Connection,
+    outbox_id: str,
+    route_key: str,
+    source_message_id: str,
+    error: str,
+    error_code: str | None,
+) -> bool:
+    """原子持久化永久失败，并把入站 queue 留作失败审计。"""
+    safe_error = str(error)[:120]
+    safe_error_code = str(error_code)[:120] if error_code is not None else None
+    now = time.time()
+    with transaction(conn):
+        row = _gateway_terminal_outbox_row(conn, outbox_id)
+        if row is None:
+            return False
+        _validate_gateway_delivery_identity(
+            outbox_id,
+            row,
+            route_key,
+            source_message_id,
+        )
+        old_status = str(row[2])
+        if old_status not in {"pending", "sending", "retry_wait"}:
+            return False
+        cursor = conn.execute(
+            """
+            UPDATE gateway_outbox
+            SET status='permanent_failed', last_error=?, last_error_code=?,
+                next_attempt_at=NULL, updated_at=?
+            WHERE id=? AND route_key=? AND source_message_id=? AND status=?
+            """,
+            (
+                safe_error,
+                safe_error_code,
+                now,
+                outbox_id,
+                route_key,
+                source_message_id,
+                old_status,
+            ),
+        )
+        if cursor.rowcount <= 0:
+            return False
+        _mark_gateway_message_delivery_terminal(
+            conn,
+            outbox_id,
+            "permanent_failed",
+            now,
+            route_key=route_key,
+            source_message_id=source_message_id,
+        )
+        conn.execute(
+            """
+            UPDATE gateway_message_queue
+            SET status='delivery_failed', updated_at=?
+            WHERE route_key=? AND message_id=?
+            """,
+            (now, route_key, source_message_id),
+        )
+    return True
+
+
+def cancel_gateway_delivery(
+    conn: sqlite3.Connection,
+    outbox_id: str,
+    route_key: str,
+    source_message_id: str,
+) -> bool:
+    """按成功进度原子取消剩余投递，并删除对应入站 queue。"""
+    now = time.time()
+    with transaction(conn):
+        row = _gateway_terminal_outbox_row(conn, outbox_id)
+        if row is None:
+            return False
+        _validate_gateway_delivery_identity(
+            outbox_id,
+            row,
+            route_key,
+            source_message_id,
+        )
+        old_status = str(row[2])
+        if old_status not in {
+            "pending",
+            "sending",
+            "retry_wait",
+            "cancelled",
+            "partial_cancelled",
+        }:
+            return False
+        status = _infer_cancelled_gateway_outbox_status(
+            int(row[3]),
+            str(row[4]),
+        )
+        if status == old_status:
+            return False
+
+        cursor = conn.execute(
+            """
+            UPDATE gateway_outbox
+            SET status=?, next_attempt_at=NULL,
+                last_error=CASE WHEN ?='delivered' THEN NULL
+                                ELSE last_error END,
+                last_error_code=CASE WHEN ?='delivered' THEN NULL
+                                     ELSE last_error_code END,
+                updated_at=?
+            WHERE id=? AND route_key=? AND source_message_id=? AND status=?
+            """,
+            (
+                status,
+                status,
+                status,
+                now,
+                outbox_id,
+                route_key,
+                source_message_id,
+                old_status,
+            ),
+        )
+        if cursor.rowcount <= 0:
+            return False
+        _mark_gateway_message_delivery_terminal(
+            conn,
+            outbox_id,
+            status,
+            now,
+            route_key=route_key,
+            source_message_id=source_message_id,
+        )
+        conn.execute(
+            """
+            DELETE FROM gateway_message_queue
+            WHERE route_key=? AND message_id=?
+            """,
+            (route_key, source_message_id),
+        )
+    return True
+
+
+# 旧调用入口保留兼容，但内部同样进入三表统一终态事务。
 def mark_gateway_outbox_failed(
     conn: sqlite3.Connection,
     outbox_id: str,
     error: str,
     error_code: str | None,
 ) -> bool:
-    now = time.time()
-    with transaction(conn):
-        cursor = conn.execute(
-            """
-            UPDATE gateway_outbox
-            SET status='permanent_failed', last_error=?, last_error_code=?,
-                next_attempt_at=NULL, updated_at=?
-            WHERE id=? AND status='sending'
-            """,
-            (error, error_code, now, outbox_id),
-        )
-        if cursor.rowcount > 0:
-            _mark_gateway_message_delivery_terminal(
-                conn, outbox_id, "permanent_failed", now
-            )
-    return cursor.rowcount > 0
+    row = _gateway_terminal_outbox_row(conn, outbox_id)
+    if row is None:
+        return False
+    return fail_gateway_delivery(
+        conn,
+        outbox_id,
+        str(row[0]),
+        str(row[1]),
+        error,
+        error_code,
+    )
 
 
 def mark_gateway_outbox_cancelled(
     conn: sqlite3.Connection,
     outbox_id: str,
 ) -> bool:
-    """用户明确取消旧任务后停止恢复尚未发送的 outbox。"""
-    now = time.time()
-    with transaction(conn):
-        cursor = conn.execute(
-            """
-            UPDATE gateway_outbox
-            SET status='cancelled', next_attempt_at=NULL, updated_at=?
-            WHERE id=? AND status IN ('pending', 'sending', 'retry_wait')
-            """,
-            (now, outbox_id),
-        )
-        if cursor.rowcount > 0:
-            _mark_gateway_message_delivery_terminal(
-                conn, outbox_id, "cancelled", now
-            )
-    return cursor.rowcount > 0
+    row = _gateway_terminal_outbox_row(conn, outbox_id)
+    if row is None:
+        return False
+    return cancel_gateway_delivery(
+        conn,
+        outbox_id,
+        str(row[0]),
+        str(row[1]),
+    )
 
 
 def mark_gateway_outbox_delivered(
     conn: sqlite3.Connection,
     outbox_id: str,
 ) -> bool:
-    now = time.time()
-    with transaction(conn):
-        cursor = conn.execute(
-            """
-            UPDATE gateway_outbox
-            SET status='delivered', next_attempt_at=NULL,
-                last_error=NULL, last_error_code=NULL, updated_at=?
-            WHERE id=? AND status='sending'
-            """,
-            (now, outbox_id),
-        )
-        if cursor.rowcount > 0:
-            _mark_gateway_message_delivery_terminal(
-                conn, outbox_id, "delivered", now
-            )
-    return cursor.rowcount > 0
+    row = _gateway_terminal_outbox_row(conn, outbox_id)
+    if row is None:
+        return False
+    return complete_gateway_delivery(
+        conn,
+        outbox_id,
+        str(row[0]),
+        str(row[1]),
+    )
 
 
 def _mark_gateway_message_delivery_terminal(
@@ -1207,18 +1755,63 @@ def _mark_gateway_message_delivery_terminal(
     delivery_id: str,
     status: str,
     updated_at: float,
+    *,
+    route_key: str | None = None,
+    source_message_id: str | None = None,
 ) -> None:
     """与 Outbox 终态同事务更新；没有关联的旧/命令 Outbox 保持兼容。"""
-    if status not in {"delivered", "cancelled", "permanent_failed"}:
+    allowed_sources = {
+        "delivered": ("pending", "cancelled", "partial_cancelled"),
+        "cancelled": ("pending",),
+        "partial_cancelled": ("pending", "cancelled"),
+        "permanent_failed": ("pending",),
+    }
+    if status not in allowed_sources:
         raise DBError(f"invalid gateway delivery terminal status: {status}")
-    conn.execute(
+    row = conn.execute(
+        """
+        SELECT status, route_key, source_message_id
+        FROM gateway_message_deliveries
+        WHERE delivery_id=?
+        """,
+        (delivery_id,),
+    ).fetchone()
+    if row is None:
+        return
+    if (
+        route_key is not None
+        and source_message_id is not None
+        and (
+            str(row[1]) != route_key
+            or str(row[2]) != source_message_id
+        )
+    ):
+        raise DBError(
+            "gateway assistant delivery identity mismatch "
+            f"for outbox {delivery_id}"
+        )
+    current_status = str(row[0])
+    if current_status == status:
+        return
+    source_statuses = allowed_sources[status]
+    if current_status not in source_statuses:
+        raise DBError(
+            "invalid gateway assistant delivery transition: "
+            f"{current_status} -> {status}"
+        )
+    cursor = conn.execute(
         """
         UPDATE gateway_message_deliveries
         SET status=?, updated_at=?
-        WHERE delivery_id=? AND status='pending'
+        WHERE delivery_id=? AND status=?
         """,
-        (status, updated_at, delivery_id),
+        (status, updated_at, delivery_id, current_status),
     )
+    if cursor.rowcount <= 0:
+        raise DBError(
+            "gateway assistant delivery CAS failed "
+            f"for outbox {delivery_id}"
+        )
 
 
 def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> int:

@@ -13,7 +13,6 @@ import signal
 
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
-from hermes.prompt import build_system_prompt
 
 
 async def run_gateway():
@@ -21,7 +20,8 @@ async def run_gateway():
     print(f"=== Hermes Gateway ===")
     print(f"Model: {MODEL}")
 
-    # Gateway 仅保留基础会话能力,不向模型注册任何工具。
+    # Runner 会对 prompt、API tools 和 dispatch 同时显式传入空工具集；
+    # 这里不再把“未调用 register_all()”当作安全边界。
 
     runner = GatewayRunner(config=_config, db_path=DB_PATH)
 

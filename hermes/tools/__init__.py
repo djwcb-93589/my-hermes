@@ -54,10 +54,16 @@ class ToolRegistry:
         self,
         enabled_toolsets: list[str] | None = None,
     ) -> list[dict]:
-        """Return OpenAI-format tool definitions filtered by toolset."""
+        """Return tool definitions; ``[]`` explicitly means no tools."""
+        if enabled_toolsets is not None and not enabled_toolsets:
+            return []
+
         definitions = []
         for entry in self._tools.values():
-            if enabled_toolsets and entry.toolset not in enabled_toolsets:
+            if (
+                enabled_toolsets is not None
+                and entry.toolset not in enabled_toolsets
+            ):
                 continue
             definitions.append({
                 "type": "function",

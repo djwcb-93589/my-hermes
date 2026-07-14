@@ -50,13 +50,16 @@ FEISHU_TOKEN_ERROR_CODES = frozenset({99991663, 99991665})
 # 飞书回复 API 的降级条件必须与普通权限错误分开。只有目标消息或话题
 # 本身不可用于回复时，才允许改成向 chat 直接发送；通用权限错误不能降级。
 FEISHU_THREAD_REPLY_UNSUPPORTED_CODES = frozenset({230071, 230072})
+# 以下错误码统一按“回复目标已失效或不可用”处理。平台在不同消息场景下
+# 可能给出不同细分原因，因此不在这里写容易过时的过度具体解释。
 FEISHU_REPLY_TARGET_MISSING_CODES = frozenset({
-    230011,  # 原消息已撤回
-    230019,  # 目标话题不存在
-    230050,  # 原消息对当前机器人不可见，无法回复
-    230054,  # 原消息类型不支持回复操作
-    230110,  # 原消息已删除
-    230111,  # 原消息即将自毁，不允许回复
+    230011,
+    230019,
+    230050,
+    230054,
+    230110,
+    230111,
+    231003,
 })
 FEISHU_RATE_LIMIT_ERROR_CODES = frozenset({230020, 99991400, 99991401})
 FEISHU_TRANSIENT_SEND_ERROR_CODES = frozenset({230049})
@@ -1713,14 +1716,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 # 降级不是对同一故障做重试，因此不消耗瞬时重试次数。状态机
                 # 只允许 thread_reply -> reply -> direct 单向前进，且全部复用
                 # 当前分片已经持久化的 request UUID。
+                can_downgrade_reply = (
+                    response.status_code not in {401, 403, 408, 429}
+                    and response.status_code < 500
+                )
                 if (
-                    delivery_mode == "thread_reply"
+                    can_downgrade_reply
+                    and delivery_mode == "thread_reply"
                     and code in FEISHU_THREAD_REPLY_UNSUPPORTED_CODES
                 ):
                     delivery_mode = "reply"
                     continue
                 if (
-                    delivery_mode in {"thread_reply", "reply"}
+                    can_downgrade_reply
+                    and delivery_mode in {"thread_reply", "reply"}
                     and code in FEISHU_REPLY_TARGET_MISSING_CODES
                 ):
                     delivery_mode = "direct"
