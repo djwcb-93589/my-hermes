@@ -246,12 +246,29 @@ class SessionStore:
             "idle_seconds": time.time() - ctx.last_activity,
         }
 
-    def cleanup_idle(self) -> int:
-        """清理超时会话,返回清理数量。"""
+    def cleanup_idle(
+        self,
+        protected_route_keys: set[str] | None = None,
+    ) -> int:
+        """清理真正空闲且没有持久投递负担的会话。"""
         now = time.time()
+        protected = protected_route_keys or set()
         expired = [
             k for k, ctx in self._contexts.items()
-            if not ctx.busy and (now - ctx.last_activity) > self.idle_timeout
+            if (
+                k not in protected
+                and not ctx.busy
+                and not ctx.pending
+                and (
+                    ctx.worker_task is None
+                    or ctx.worker_task.done()
+                )
+                and (
+                    ctx.active_task is None
+                    or ctx.active_task.done()
+                )
+                and (now - ctx.last_activity) > self.idle_timeout
+            )
         ]
         for k in expired:
             del self._contexts[k]

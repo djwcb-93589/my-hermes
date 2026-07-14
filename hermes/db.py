@@ -24,7 +24,7 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 9
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
@@ -170,6 +170,8 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             ON gateway_message_deliveries(session_id, status, assistant_message_id);
         """
     )
+    _create_gateway_source_message_ownership_schema(conn)
+    _create_gateway_runtime_lease_schema(conn)
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -211,6 +213,149 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 def _count_rows(conn: sqlite3.Connection, sql: str) -> int:
     return int(conn.execute(sql).fetchone()[0])
+
+
+def gateway_event_source_message_ids(
+    event_json: str,
+    fallback_message_id: str,
+) -> list[str]:
+    """提取 Gateway event 对应的全部原始平台消息 ID。"""
+    try:
+        payload = json.loads(event_json)
+    except (TypeError, ValueError) as exc:
+        raise DBError("gateway event JSON deserialization failed") from exc
+    if not isinstance(payload, dict):
+        raise DBError("gateway event JSON must contain an object")
+
+    metadata = payload.get("metadata", {})
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise DBError("gateway event metadata must contain an object")
+    source_message_ids = metadata.get("source_message_ids", [])
+    if source_message_ids is None:
+        source_message_ids = []
+    if not isinstance(source_message_ids, list):
+        raise DBError("gateway event source_message_ids must be a list")
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    def append_message_id(value) -> None:
+        if value is None:
+            return
+        message_id = str(value)
+        if not message_id or message_id in seen:
+            return
+        seen.add(message_id)
+        result.append(message_id)
+
+    append_message_id(payload.get("message_id"))
+    # 旧记录可能没有 message_id 字段，数据库列中的主消息 ID 必须保留。
+    append_message_id(fallback_message_id)
+    for source_message_id in source_message_ids:
+        append_message_id(source_message_id)
+
+    if not result:
+        raise DBError("gateway event has no source message id")
+    return result
+
+
+def _create_gateway_source_message_ownership_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """创建原始平台消息到当前持久层所有者的规范化索引。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gateway_source_message_ownership (
+            route_key TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            owner_kind TEXT NOT NULL CHECK (
+                owner_kind IN ('queue', 'outbox')
+            ),
+            owner_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (route_key, source_message_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gateway_source_ownership_owner
+        ON gateway_source_message_ownership(owner_kind, owner_id)
+        """
+    )
+
+
+def _create_gateway_runtime_lease_schema(conn: sqlite3.Connection) -> None:
+    """创建 Gateway 单实例运行租约表。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gateway_runtime_lease (
+            lease_name TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            heartbeat_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        )
+        """
+    )
+
+
+def _upsert_gateway_source_message_ownership(
+    conn: sqlite3.Connection,
+    route_key: str,
+    source_message_ids: list[str],
+    *,
+    owner_kind: str,
+    owner_id: str,
+    status: str,
+    created_at: float,
+    updated_at: float,
+) -> None:
+    """写入 ownership；Outbox 可接管 Queue，同一 Queue 只能刷新自身。"""
+    if owner_kind not in {"queue", "outbox"}:
+        raise DBError(f"invalid gateway ownership kind: {owner_kind}")
+    if not source_message_ids:
+        raise DBError("gateway ownership requires source message ids")
+
+    if owner_kind == "queue":
+        conflict_sql = """
+            ON CONFLICT(route_key, source_message_id) DO UPDATE SET
+                status=excluded.status,
+                updated_at=excluded.updated_at
+            WHERE gateway_source_message_ownership.owner_kind='queue'
+              AND gateway_source_message_ownership.owner_id=excluded.owner_id
+        """
+    else:
+        conflict_sql = """
+            ON CONFLICT(route_key, source_message_id) DO UPDATE SET
+                owner_kind=excluded.owner_kind,
+                owner_id=excluded.owner_id,
+                status=excluded.status,
+                updated_at=excluded.updated_at
+        """
+
+    for source_message_id in source_message_ids:
+        conn.execute(
+            f"""
+            INSERT INTO gateway_source_message_ownership (
+                route_key, source_message_id, owner_kind, owner_id, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            {conflict_sql}
+            """,
+            (
+                route_key,
+                source_message_id,
+                owner_kind,
+                owner_id,
+                status,
+                float(created_at),
+                float(updated_at),
+            ),
+        )
 
 
 def _validate_v1_data(conn: sqlite3.Connection) -> None:
@@ -452,13 +597,88 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """建立原始消息归属索引，并一次性回填 Queue 与 Outbox。"""
+    _create_gateway_source_message_ownership_schema(conn)
+
+    queue_rows = conn.execute(
+        """
+        SELECT route_key, message_id, event_json, status,
+               created_at, updated_at
+        FROM gateway_message_queue
+        ORDER BY id
+        """
+    ).fetchall()
+    for (
+        route_key,
+        message_id,
+        event_json,
+        status,
+        created_at,
+        updated_at,
+    ) in queue_rows:
+        source_message_ids = gateway_event_source_message_ids(
+            str(event_json),
+            str(message_id),
+        )
+        _upsert_gateway_source_message_ownership(
+            conn,
+            str(route_key),
+            source_message_ids,
+            owner_kind="queue",
+            owner_id=str(message_id),
+            status=str(status),
+            created_at=float(created_at),
+            updated_at=float(updated_at),
+        )
+
+    # Outbox 后写，确保模型已经完成的消息不会被旧 Queue 重新认领。
+    outbox_rows = conn.execute(
+        """
+        SELECT id, route_key, source_message_id, event_json, status,
+               created_at, updated_at
+        FROM gateway_outbox
+        ORDER BY created_at, id
+        """
+    ).fetchall()
+    for (
+        outbox_id,
+        route_key,
+        source_message_id,
+        event_json,
+        status,
+        created_at,
+        updated_at,
+    ) in outbox_rows:
+        source_message_ids = gateway_event_source_message_ids(
+            str(event_json),
+            str(source_message_id),
+        )
+        _upsert_gateway_source_message_ownership(
+            conn,
+            str(route_key),
+            source_message_ids,
+            owner_kind="outbox",
+            owner_id=str(outbox_id),
+            status=str(status),
+            created_at=float(created_at),
+            updated_at=float(updated_at),
+        )
+
+
+def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """增加 Gateway 单实例运行租约。"""
+    _create_gateway_runtime_lease_schema(conn)
+
+
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
     老库 v1 → v2 会重建 sessions/messages,让外键 / NOT NULL
     约束对既有数据库也生效。v2 → v3 新增 Gateway 当前会话映射,
     v3 → v4 新增 Gateway 待处理消息队列,v4 → v5 新增出站回复队列,
-    v5 → v6 关联最终回答投递状态,v6 → v7 区分部分取消。
+    v5 → v6 关联最终回答投递状态,v6 → v7 区分部分取消,
+    v7 → v8 增加原始平台消息归属索引，v8 → v9 增加 Gateway 运行租约。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -631,6 +851,30 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
             conn.commit()
             current = 7
 
+    if current < 8:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v7_to_v8(conn)
+            _set_schema_version(conn, 8)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 8
+
+    if current < 9:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v8_to_v9(conn)
+            _set_schema_version(conn, 9)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 9
+
     return current
 
 
@@ -668,7 +912,7 @@ def reconcile_gateway_terminal_deliveries(conn: sqlite3.Connection) -> int:
         """
         SELECT o.id, o.route_key, o.source_message_id, o.status,
                o.next_chunk_index, o.payloads_json,
-               q.status
+               q.status, o.event_json
         FROM gateway_outbox AS o
         LEFT JOIN gateway_message_queue AS q
           ON q.route_key=o.route_key
@@ -703,6 +947,7 @@ def reconcile_gateway_terminal_deliveries(conn: sqlite3.Connection) -> int:
             next_chunk_index,
             payloads_json,
             queue_status,
+            event_json,
         ) in rows:
             status = str(stored_status)
             if status in {"cancelled", "partial_cancelled"}:
@@ -741,6 +986,15 @@ def reconcile_gateway_terminal_deliveries(conn: sqlite3.Connection) -> int:
                 now,
                 route_key=str(route_key),
                 source_message_id=str(source_message_id),
+            )
+            _update_gateway_outbox_ownership_status(
+                conn,
+                outbox_id=str(outbox_id),
+                route_key=str(route_key),
+                source_message_id=str(source_message_id),
+                event_json=str(event_json),
+                status=status,
+                updated_at=now,
             )
             if queue_status == "reply_pending":
                 if status == "permanent_failed":
@@ -790,7 +1044,6 @@ def init_db(db_path: str) -> sqlite3.Connection:
             _migrate(conn, current)
 
         conn.commit()
-        reconcile_gateway_terminal_deliveries(conn)
         return conn
     except Exception:
         conn.close()
@@ -856,6 +1109,117 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
     # 管理冲突。
     with conn:
         yield
+
+
+@contextmanager
+def _immediate_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """以写锁开始事务，供跨进程竞争同一租约行。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+def _gateway_runtime_lease_values(
+    lease_name: str,
+    instance_id: str,
+    ttl_seconds: float,
+) -> tuple[str, str, float]:
+    """校验租约标识和 TTL，避免写入不可接管的无效记录。"""
+    if not isinstance(lease_name, str) or not lease_name:
+        raise DBError("gateway runtime lease_name must not be empty")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise DBError("gateway runtime instance_id must not be empty")
+    if isinstance(ttl_seconds, bool):
+        raise DBError("gateway runtime lease ttl must be greater than 0")
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError) as exc:
+        raise DBError("gateway runtime lease ttl must be a number") from exc
+    if ttl <= 0:
+        raise DBError("gateway runtime lease ttl must be greater than 0")
+    return lease_name, instance_id, ttl
+
+
+def acquire_gateway_runtime_lease(
+    conn: sqlite3.Connection,
+    lease_name: str,
+    instance_id: str,
+    ttl_seconds: float,
+) -> bool:
+    """原子获取、接管过期租约，或为同一实例续租。"""
+    lease_name, instance_id, ttl = _gateway_runtime_lease_values(
+        lease_name,
+        instance_id,
+        ttl_seconds,
+    )
+    now = time.time()
+    with _immediate_transaction(conn):
+        cursor = conn.execute(
+            """
+            INSERT INTO gateway_runtime_lease (
+                lease_name, instance_id, heartbeat_at, expires_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(lease_name) DO UPDATE SET
+                instance_id=excluded.instance_id,
+                heartbeat_at=excluded.heartbeat_at,
+                expires_at=excluded.expires_at
+            WHERE gateway_runtime_lease.instance_id=excluded.instance_id
+               OR gateway_runtime_lease.expires_at<=excluded.heartbeat_at
+            """,
+            (lease_name, instance_id, now, now + ttl),
+        )
+        return cursor.rowcount == 1
+
+
+def renew_gateway_runtime_lease(
+    conn: sqlite3.Connection,
+    lease_name: str,
+    instance_id: str,
+    ttl_seconds: float,
+) -> bool:
+    """仅允许当前持有者刷新 heartbeat 和过期时间。"""
+    lease_name, instance_id, ttl = _gateway_runtime_lease_values(
+        lease_name,
+        instance_id,
+        ttl_seconds,
+    )
+    now = time.time()
+    with _immediate_transaction(conn):
+        cursor = conn.execute(
+            """
+            UPDATE gateway_runtime_lease
+            SET heartbeat_at=?, expires_at=?
+            WHERE lease_name=? AND instance_id=?
+            """,
+            (now, now + ttl, lease_name, instance_id),
+        )
+        return cursor.rowcount == 1
+
+
+def release_gateway_runtime_lease(
+    conn: sqlite3.Connection,
+    lease_name: str,
+    instance_id: str,
+) -> bool:
+    """仅删除当前实例持有的租约，不影响已经接管的新实例。"""
+    if not isinstance(lease_name, str) or not lease_name:
+        raise DBError("gateway runtime lease_name must not be empty")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise DBError("gateway runtime instance_id must not be empty")
+    with _immediate_transaction(conn):
+        cursor = conn.execute(
+            """
+            DELETE FROM gateway_runtime_lease
+            WHERE lease_name=? AND instance_id=?
+            """,
+            (lease_name, instance_id),
+        )
+        return cursor.rowcount == 1
 
 
 # ===========================================================================
@@ -925,18 +1289,137 @@ def enqueue_gateway_message(
     route_key: str,
     message_id: str,
     event_json: str,
-) -> None:
-    """持久化 Runner 已接受的消息,重复 message_id 保持原记录。"""
-    now = time.time()
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO gateway_message_queue
-            (route_key, message_id, event_json, status, created_at, updated_at)
-        VALUES (?, ?, ?, 'queued', ?, ?)
-        """,
-        (route_key, message_id, event_json, now, now),
+) -> bool:
+    """原子写入 Runner queue 与全部原始消息的 Queue 归属。"""
+    incoming_source_ids = gateway_event_source_message_ids(
+        event_json,
+        message_id,
     )
-    conn.commit()
+    now = time.time()
+    with transaction(conn):
+        placeholders = ",".join("?" for _ in incoming_source_ids)
+        existing_owners = conn.execute(
+            f"""
+            SELECT source_message_id, owner_kind, owner_id
+            FROM gateway_source_message_ownership
+            WHERE route_key=?
+              AND source_message_id IN ({placeholders})
+            """,
+            (route_key, *incoming_source_ids),
+        ).fetchall()
+        for _source_message_id, owner_kind, owner_id in existing_owners:
+            if str(owner_kind) == "outbox" or str(owner_id) != message_id:
+                return False
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO gateway_message_queue
+                (route_key, message_id, event_json, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'queued', ?, ?)
+            """,
+            (route_key, message_id, event_json, now, now),
+        )
+        row = conn.execute(
+            """
+            SELECT event_json, status, created_at, updated_at
+            FROM gateway_message_queue
+            WHERE route_key=? AND message_id=?
+            """,
+            (route_key, message_id),
+        ).fetchone()
+        if row is None:
+            raise DBError("gateway queue insert did not create a row")
+        source_message_ids = gateway_event_source_message_ids(
+            str(row[0]),
+            message_id,
+        )
+        _upsert_gateway_source_message_ownership(
+            conn,
+            route_key,
+            source_message_ids,
+            owner_kind="queue",
+            owner_id=message_id,
+            status=str(row[1]),
+            created_at=float(row[2]),
+            updated_at=float(row[3]),
+        )
+    return True
+
+
+def _update_gateway_source_message_ownership_status(
+    conn: sqlite3.Connection,
+    *,
+    route_key: str,
+    event_json: str,
+    fallback_message_id: str,
+    owner_kind: str,
+    owner_id: str,
+    status: str,
+    updated_at: float,
+) -> None:
+    """只更新仍属于指定 owner 的原始消息，避免旧任务覆盖新所有者。"""
+    source_message_ids = gateway_event_source_message_ids(
+        event_json,
+        fallback_message_id,
+    )
+    for source_message_id in source_message_ids:
+        conn.execute(
+            """
+            UPDATE gateway_source_message_ownership
+            SET status=?, updated_at=?
+            WHERE route_key=? AND source_message_id=?
+              AND owner_kind=? AND owner_id=?
+            """,
+            (
+                status,
+                float(updated_at),
+                route_key,
+                source_message_id,
+                owner_kind,
+                owner_id,
+            ),
+        )
+
+
+def _set_gateway_queue_status(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_id: str,
+    status: str,
+    now: float,
+) -> bool:
+    """更新 Queue 及其原始消息归属；调用方负责事务。"""
+    row = conn.execute(
+        """
+        SELECT event_json
+        FROM gateway_message_queue
+        WHERE route_key=? AND message_id=?
+        """,
+        (route_key, message_id),
+    ).fetchone()
+    if row is None:
+        return False
+    cursor = conn.execute(
+        """
+        UPDATE gateway_message_queue
+        SET status=?, updated_at=?
+        WHERE route_key=? AND message_id=?
+        """,
+        (status, now, route_key, message_id),
+    )
+    if cursor.rowcount <= 0:
+        return False
+    _update_gateway_source_message_ownership_status(
+        conn,
+        route_key=route_key,
+        event_json=str(row[0]),
+        fallback_message_id=message_id,
+        owner_kind="queue",
+        owner_id=message_id,
+        status=status,
+        updated_at=now,
+    )
+    return True
 
 
 def mark_gateway_message_processing(
@@ -945,15 +1428,14 @@ def mark_gateway_message_processing(
     message_id: str,
 ) -> None:
     """标记消息已由当前 worker 开始处理。"""
-    conn.execute(
-        """
-        UPDATE gateway_message_queue
-        SET status='processing', updated_at=?
-        WHERE route_key=? AND message_id=?
-        """,
-        (time.time(), route_key, message_id),
-    )
-    conn.commit()
+    with transaction(conn):
+        _set_gateway_queue_status(
+            conn,
+            route_key,
+            message_id,
+            "processing",
+            time.time(),
+        )
 
 
 def mark_gateway_message_reply_pending(
@@ -962,15 +1444,14 @@ def mark_gateway_message_reply_pending(
     message_id: str,
 ) -> None:
     """模型已完成,入站消息等待对应 outbox 完整送达。"""
-    conn.execute(
-        """
-        UPDATE gateway_message_queue
-        SET status='reply_pending', updated_at=?
-        WHERE route_key=? AND message_id=?
-        """,
-        (time.time(), route_key, message_id),
-    )
-    conn.commit()
+    with transaction(conn):
+        _set_gateway_queue_status(
+            conn,
+            route_key,
+            message_id,
+            "reply_pending",
+            time.time(),
+        )
 
 
 def mark_gateway_message_delivery_failed(
@@ -979,15 +1460,14 @@ def mark_gateway_message_delivery_failed(
     message_id: str,
 ) -> None:
     """出站永久失败后保留入站审计记录,但不再重新调用模型。"""
-    conn.execute(
-        """
-        UPDATE gateway_message_queue
-        SET status='delivery_failed', updated_at=?
-        WHERE route_key=? AND message_id=?
-        """,
-        (time.time(), route_key, message_id),
-    )
-    conn.commit()
+    with transaction(conn):
+        _set_gateway_queue_status(
+            conn,
+            route_key,
+            message_id,
+            "delivery_failed",
+            time.time(),
+        )
 
 
 def complete_gateway_message(
@@ -995,15 +1475,36 @@ def complete_gateway_message(
     route_key: str,
     message_id: str,
 ) -> None:
-    """消息处理结束后从恢复队列删除。"""
-    conn.execute(
-        """
-        DELETE FROM gateway_message_queue
-        WHERE route_key=? AND message_id=?
-        """,
-        (route_key, message_id),
-    )
-    conn.commit()
+    """删除 Queue 行，但保留 completed ownership 作为长期去重事实。"""
+    with transaction(conn):
+        row = conn.execute(
+            """
+            SELECT event_json
+            FROM gateway_message_queue
+            WHERE route_key=? AND message_id=?
+            """,
+            (route_key, message_id),
+        ).fetchone()
+        if row is None:
+            return
+        now = time.time()
+        _update_gateway_source_message_ownership_status(
+            conn,
+            route_key=route_key,
+            event_json=str(row[0]),
+            fallback_message_id=message_id,
+            owner_kind="queue",
+            owner_id=message_id,
+            status="completed",
+            updated_at=now,
+        )
+        conn.execute(
+            """
+            DELETE FROM gateway_message_queue
+            WHERE route_key=? AND message_id=?
+            """,
+            (route_key, message_id),
+        )
 
 
 def delete_gateway_messages(
@@ -1011,31 +1512,70 @@ def delete_gateway_messages(
     route_key: str,
     message_ids: list[str],
 ) -> None:
-    """删除被 /new 明确取消的旧 pending 消息。"""
+    """删除被 /new 取消的 Queue 行，并保留 cancelled ownership。"""
     if not message_ids:
         return
     placeholders = ",".join("?" for _ in message_ids)
-    conn.execute(
-        f"""
-        DELETE FROM gateway_message_queue
-        WHERE route_key=? AND message_id IN ({placeholders})
-        """,
-        (route_key, *message_ids),
-    )
-    conn.commit()
+    with transaction(conn):
+        rows = conn.execute(
+            f"""
+            SELECT message_id, event_json
+            FROM gateway_message_queue
+            WHERE route_key=? AND message_id IN ({placeholders})
+            """,
+            (route_key, *message_ids),
+        ).fetchall()
+        now = time.time()
+        for stored_message_id, event_json in rows:
+            _update_gateway_source_message_ownership_status(
+                conn,
+                route_key=route_key,
+                event_json=str(event_json),
+                fallback_message_id=str(stored_message_id),
+                owner_kind="queue",
+                owner_id=str(stored_message_id),
+                status="cancelled",
+                updated_at=now,
+            )
+        conn.execute(
+            f"""
+            DELETE FROM gateway_message_queue
+            WHERE route_key=? AND message_id IN ({placeholders})
+            """,
+            (route_key, *message_ids),
+        )
 
 
 def reset_gateway_processing_messages(conn: sqlite3.Connection) -> None:
     """启动恢复前把上次中断的 processing 重新置为 queued。"""
-    conn.execute(
-        """
-        UPDATE gateway_message_queue
-        SET status='queued', updated_at=?
-        WHERE status='processing'
-        """,
-        (time.time(),),
-    )
-    conn.commit()
+    with transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT route_key, message_id, event_json
+            FROM gateway_message_queue
+            WHERE status='processing'
+            """
+        ).fetchall()
+        now = time.time()
+        conn.execute(
+            """
+            UPDATE gateway_message_queue
+            SET status='queued', updated_at=?
+            WHERE status='processing'
+            """,
+            (now,),
+        )
+        for route_key, message_id, event_json in rows:
+            _update_gateway_source_message_ownership_status(
+                conn,
+                route_key=str(route_key),
+                event_json=str(event_json),
+                fallback_message_id=str(message_id),
+                owner_kind="queue",
+                owner_id=str(message_id),
+                status="queued",
+                updated_at=now,
+            )
 
 
 def get_gateway_queued_messages(conn: sqlite3.Connection) -> list[dict]:
@@ -1059,87 +1599,27 @@ def get_gateway_queued_messages(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def _gateway_event_contains_message(event_json: str, message_id: str) -> bool:
-    """判断批处理后的 Gateway event 是否包含某个原始平台消息 ID。"""
-    try:
-        payload = json.loads(event_json)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    if str(payload.get("message_id", "")) == message_id:
-        return True
-    metadata = payload.get("metadata", {})
-    if not isinstance(metadata, dict):
-        return False
-    source_ids = metadata.get("source_message_ids", [])
-    return isinstance(source_ids, list) and message_id in {
-        str(item) for item in source_ids
-    }
-
-
 def get_gateway_message_persistence_state(
     conn: sqlite3.Connection,
     route_key: str,
     message_id: str,
 ) -> dict | None:
-    """查询平台消息是否已经进入 Gateway queue 或 Outbox。
-
-    Outbox 优先于 queue：只要存在 Outbox，就说明模型阶段已经结束，调用方
-    绝不能再次提交模型任务。批量飞书消息还会检查 event metadata 中保存的
-    ``source_message_ids``，覆盖 Runner 已落库但 Inbox 尚未来得及完成的窗口。
-    """
-    direct_outbox = conn.execute(
+    """通过规范化 ownership 主键查询平台消息的持久层归属。"""
+    row = conn.execute(
         """
-        SELECT status
-        FROM gateway_outbox
+        SELECT owner_kind, status, owner_id
+        FROM gateway_source_message_ownership
         WHERE route_key=? AND source_message_id=?
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
         """,
         (route_key, message_id),
     ).fetchone()
-    if direct_outbox is not None:
-        return {"layer": "outbox", "status": str(direct_outbox[0])}
-
-    outbox_rows = conn.execute(
-        """
-        SELECT status, event_json
-        FROM gateway_outbox
-        WHERE route_key=?
-        ORDER BY created_at DESC, id DESC
-        """,
-        (route_key,),
-    ).fetchall()
-    for status, event_json in outbox_rows:
-        if _gateway_event_contains_message(event_json, message_id):
-            return {"layer": "outbox", "status": str(status)}
-
-    direct_queue = conn.execute(
-        """
-        SELECT status
-        FROM gateway_message_queue
-        WHERE route_key=? AND message_id=?
-        LIMIT 1
-        """,
-        (route_key, message_id),
-    ).fetchone()
-    if direct_queue is not None:
-        return {"layer": "queue", "status": str(direct_queue[0])}
-
-    queue_rows = conn.execute(
-        """
-        SELECT status, event_json
-        FROM gateway_message_queue
-        WHERE route_key=?
-        ORDER BY id DESC
-        """,
-        (route_key,),
-    ).fetchall()
-    for status, event_json in queue_rows:
-        if _gateway_event_contains_message(event_json, message_id):
-            return {"layer": "queue", "status": str(status)}
-    return None
+    if row is None:
+        return None
+    return {
+        "layer": str(row[0]),
+        "status": str(row[1]),
+        "owner_id": str(row[2]),
+    }
 
 
 def _serialize_gateway_json(value, field_name: str) -> str:
@@ -1198,7 +1678,8 @@ def _insert_gateway_outbox(
     )
     row = conn.execute(
         """
-        SELECT id FROM gateway_outbox
+        SELECT id, event_json, status, created_at, updated_at
+        FROM gateway_outbox
         WHERE route_key=? AND source_message_id=? AND delivery_kind=?
         """,
         (
@@ -1209,7 +1690,22 @@ def _insert_gateway_outbox(
     ).fetchone()
     if row is None:
         raise DBError("gateway outbox insert did not create a row")
-    return str(row[0])
+    outbox_id = str(row[0])
+    source_message_ids = gateway_event_source_message_ids(
+        str(row[1]),
+        str(outbox["source_message_id"]),
+    )
+    _upsert_gateway_source_message_ownership(
+        conn,
+        str(outbox["route_key"]),
+        source_message_ids,
+        owner_kind="outbox",
+        owner_id=outbox_id,
+        status=str(row[2]),
+        created_at=float(row[3]),
+        updated_at=float(row[4]),
+    )
+    return outbox_id
 
 
 def enqueue_gateway_outbox(
@@ -1335,6 +1831,20 @@ def get_recoverable_gateway_outbox(
     return recovered
 
 
+def get_gateway_routes_with_pending_outbox(
+    conn: sqlite3.Connection,
+) -> set[str]:
+    """返回仍有待投递 Outbox 的 route，供内存会话清理保护。"""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT route_key
+        FROM gateway_outbox
+        WHERE status IN ('pending', 'sending', 'retry_wait')
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def get_next_recoverable_gateway_outbox_for_route(
     conn: sqlite3.Connection,
     route_key: str,
@@ -1353,33 +1863,100 @@ def get_next_recoverable_gateway_outbox_for_route(
     return _gateway_outbox_row(row)
 
 
+def _update_gateway_outbox_ownership_status(
+    conn: sqlite3.Connection,
+    *,
+    outbox_id: str,
+    route_key: str,
+    source_message_id: str,
+    event_json: str,
+    status: str,
+    updated_at: float,
+) -> None:
+    """同步仍由指定 Outbox 管理的全部原始消息状态。"""
+    _update_gateway_source_message_ownership_status(
+        conn,
+        route_key=route_key,
+        event_json=event_json,
+        fallback_message_id=source_message_id,
+        owner_kind="outbox",
+        owner_id=outbox_id,
+        status=status,
+        updated_at=updated_at,
+    )
+
+
 def reset_gateway_sending_outbox(conn: sqlite3.Connection) -> None:
     """重启时把中断的 sending 恢复为 pending。"""
-    conn.execute(
-        """
-        UPDATE gateway_outbox
-        SET status='pending', next_attempt_at=NULL, updated_at=?
-        WHERE status='sending'
-        """,
-        (time.time(),),
-    )
-    conn.commit()
+    with transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT id, route_key, source_message_id, event_json
+            FROM gateway_outbox
+            WHERE status='sending'
+            """
+        ).fetchall()
+        now = time.time()
+        conn.execute(
+            """
+            UPDATE gateway_outbox
+            SET status='pending', next_attempt_at=NULL, updated_at=?
+            WHERE status='sending'
+            """,
+            (now,),
+        )
+        for outbox_id, route_key, source_message_id, event_json in rows:
+            _update_gateway_outbox_ownership_status(
+                conn,
+                outbox_id=str(outbox_id),
+                route_key=str(route_key),
+                source_message_id=str(source_message_id),
+                event_json=str(event_json),
+                status="pending",
+                updated_at=now,
+            )
 
 
 def mark_gateway_outbox_sending(
     conn: sqlite3.Connection,
     outbox_id: str,
 ) -> bool:
-    cursor = conn.execute(
-        """
-        UPDATE gateway_outbox
-        SET status='sending', updated_at=?
-        WHERE id=? AND status IN ('pending', 'sending', 'retry_wait')
-        """,
-        (time.time(), outbox_id),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
+    with transaction(conn):
+        row = conn.execute(
+            """
+            SELECT route_key, source_message_id, event_json, status
+            FROM gateway_outbox
+            WHERE id=?
+            """,
+            (outbox_id,),
+        ).fetchone()
+        if row is None or str(row[3]) not in {
+            "pending",
+            "sending",
+            "retry_wait",
+        }:
+            return False
+        now = time.time()
+        cursor = conn.execute(
+            """
+            UPDATE gateway_outbox
+            SET status='sending', updated_at=?
+            WHERE id=? AND status=?
+            """,
+            (now, outbox_id, str(row[3])),
+        )
+        if cursor.rowcount <= 0:
+            return False
+        _update_gateway_outbox_ownership_status(
+            conn,
+            outbox_id=outbox_id,
+            route_key=str(row[0]),
+            source_message_id=str(row[1]),
+            event_json=str(row[2]),
+            status="sending",
+            updated_at=now,
+        )
+    return True
 
 
 def mark_gateway_outbox_chunk_sent(
@@ -1441,23 +2018,45 @@ def mark_gateway_outbox_retry(
     error_code: str | None,
     next_attempt_at: float,
 ) -> bool:
-    cursor = conn.execute(
-        """
-        UPDATE gateway_outbox
-        SET status='retry_wait', attempt_count=attempt_count + 1,
-            next_attempt_at=?, last_error=?, last_error_code=?, updated_at=?
-        WHERE id=? AND status='sending'
-        """,
-        (
-            next_attempt_at,
-            error,
-            error_code,
-            time.time(),
-            outbox_id,
-        ),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
+    with transaction(conn):
+        row = conn.execute(
+            """
+            SELECT route_key, source_message_id, event_json, status
+            FROM gateway_outbox
+            WHERE id=?
+            """,
+            (outbox_id,),
+        ).fetchone()
+        if row is None or str(row[3]) != "sending":
+            return False
+        now = time.time()
+        cursor = conn.execute(
+            """
+            UPDATE gateway_outbox
+            SET status='retry_wait', attempt_count=attempt_count + 1,
+                next_attempt_at=?, last_error=?, last_error_code=?, updated_at=?
+            WHERE id=? AND status='sending'
+            """,
+            (
+                next_attempt_at,
+                error,
+                error_code,
+                now,
+                outbox_id,
+            ),
+        )
+        if cursor.rowcount <= 0:
+            return False
+        _update_gateway_outbox_ownership_status(
+            conn,
+            outbox_id=outbox_id,
+            route_key=str(row[0]),
+            source_message_id=str(row[1]),
+            event_json=str(row[2]),
+            status="retry_wait",
+            updated_at=now,
+        )
+    return True
 
 
 def _gateway_terminal_outbox_row(
@@ -1467,7 +2066,7 @@ def _gateway_terminal_outbox_row(
     return conn.execute(
         """
         SELECT route_key, source_message_id, status,
-               next_chunk_index, payloads_json
+               next_chunk_index, payloads_json, event_json
         FROM gateway_outbox
         WHERE id=?
         """,
@@ -1551,6 +2150,15 @@ def complete_gateway_delivery(
             route_key=route_key,
             source_message_id=source_message_id,
         )
+        _update_gateway_outbox_ownership_status(
+            conn,
+            outbox_id=outbox_id,
+            route_key=route_key,
+            source_message_id=source_message_id,
+            event_json=str(row[5]),
+            status="delivered",
+            updated_at=now,
+        )
         conn.execute(
             """
             DELETE FROM gateway_message_queue
@@ -1612,6 +2220,15 @@ def fail_gateway_delivery(
             now,
             route_key=route_key,
             source_message_id=source_message_id,
+        )
+        _update_gateway_outbox_ownership_status(
+            conn,
+            outbox_id=outbox_id,
+            route_key=route_key,
+            source_message_id=source_message_id,
+            event_json=str(row[5]),
+            status="permanent_failed",
+            updated_at=now,
         )
         conn.execute(
             """
@@ -1689,6 +2306,15 @@ def cancel_gateway_delivery(
             now,
             route_key=route_key,
             source_message_id=source_message_id,
+        )
+        _update_gateway_outbox_ownership_status(
+            conn,
+            outbox_id=outbox_id,
+            route_key=route_key,
+            source_message_id=source_message_id,
+            event_json=str(row[5]),
+            status=status,
+            updated_at=now,
         )
         conn.execute(
             """

@@ -1,0 +1,105 @@
+# Hermes 配置示例。建议将敏感值放入 .env，再通过 ${VAR} 引用。
+model: gpt-5
+base_url: https://api.openai.com/v1
+api_key: ${OPENAI_API_KEY}
+
+fallback:
+  model: ""
+  base_url: ""
+  api_key: ""
+
+limits:
+  max_iterations: 50
+  max_child_iterations: 30
+  max_retries: 3
+  max_continuations: 3
+  model_timeout_seconds: 120
+
+compression:
+  threshold: 120000
+  protect_first: 4
+  keep_recent_tool_results: 5
+  tail_token_budget: 50000
+
+memory:
+  memory_char_limit: 12000
+  user_char_limit: 12000
+
+db_path: database/hermes.db
+
+terminal:
+  backend: local
+  docker_image: ""
+  ssh_host: ""
+  ssh_user: ""
+  ssh_key: ""
+
+gateway:
+  agent_name: main
+  session_idle_timeout: 86400
+  max_pending_messages: 20
+  max_concurrent_llm_requests: 4
+  runtime_lease_ttl_seconds: 30
+  runtime_lease_heartbeat_seconds: 10
+  session_cleanup_interval_seconds: 600
+  delivery_max_attempts: 20
+  delivery_retry_base_delay: 2.0
+  delivery_retry_max_delay: 60.0
+  delivery_retry_jitter_ratio: 0.2
+  queue_full_reply_max_attempts: 3
+
+  # Gateway 远程会话的只读上下文暴露策略。值必须是 YAML 布尔值，
+  # 不能写成带引号的 "true" 或 "false"。
+  context:
+    include_soul: true
+    include_memory: true
+    include_user_profile: true
+    include_project_context: false
+
+  platforms:
+    cli:
+      enabled: false
+
+    feishu:
+      enabled: false
+      app_id: ${FEISHU_APP_ID}
+      app_secret: ${FEISHU_APP_SECRET}
+      verification_token: ${FEISHU_VERIFICATION_TOKEN}
+      encrypt_key: ""
+      bot_open_id: ""
+      is_lark: false
+      dm_only: true
+      require_mention: true
+      allow_all: false
+      allowed_users: []
+      allowed_chats: []
+
+      webhook_host: 127.0.0.1
+      webhook_port: 8787
+      webhook_path: /feishu/webhook
+      webhook_max_body_bytes: 1048576
+      webhook_read_timeout_seconds: 5.0
+      webhook_max_concurrent_requests: 32
+      webhook_rate_limit:
+        window_seconds: 60.0
+        max_requests: 120
+        max_tracked_ips: 2048
+      webhook_trusted_proxies: []
+
+      # Adapter 内只做少量快速尝试；长期故障由 Gateway Outbox 持久重试。
+      send_total_attempts: 3
+      send_retry_base_delay_seconds: 0.5
+      send_retry_max_delay_seconds: 3.0
+      adapter_retry_after_max_seconds: 5.0
+      send_rate_limit_per_chat: 5
+      send_rate_limit_cache_idle_ttl_seconds: 600.0
+      send_rate_limit_max_tracked_chats: 1024
+
+    weixin:
+      enabled: false
+      account_id: ""
+      token: ""
+      base_url: ""
+      user_id: ""
+      allow_all: false
+      allowed_users: []

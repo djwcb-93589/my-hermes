@@ -30,6 +30,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import urlsplit
@@ -72,6 +73,31 @@ FEISHU_PERMISSION_ERROR_CODES = frozenset({
     230035,  # 没有发送消息权限
     99991672,
 })
+# Token 接口只对明确的限流或平台内部错误开放重试；未知业务码默认拒绝。
+FEISHU_TOKEN_REJECTED_ERROR_CODES = frozenset({
+    10005,     # 应用鉴权信息无效
+    10014,     # 应用状态不可用
+    10015,     # App Secret 错误
+    20002,     # app_id 与 app_secret 不匹配
+    20009,     # 租户未安装应用
+    20025,     # 缺少 app_id 或 app_secret
+    20028,     # app_id 无效
+    99991662,  # 应用已停用
+    99991672,  # 应用缺少所需权限
+})
+FEISHU_TOKEN_TRANSIENT_ERROR_CODES = frozenset({
+    1500,
+    1503,
+    1551,
+    1557,
+    4006,
+    5000,
+    10101,
+    10105,
+    20050,
+    95001,
+    96001,
+})
 FEISHU_BATCH_QUIET_SECONDS = 0.6  # 连续文本静默多久后提交
 FEISHU_BATCH_MAX_WAIT_SECONDS = 2.0  # 单批消息最长累计等待时间
 FEISHU_BATCH_SEPARATOR = "\n"
@@ -82,6 +108,18 @@ FEISHU_WEBHOOK_READ_CHUNK_BYTES = 64 * 1024
 FEISHU_DEDUP_TTL_SECONDS = 72 * 60 * 60  # 已处理消息保留 72 小时
 FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _IMMEDIATE_COMMANDS = frozenset({"/new", "/stop", "/status"})
+
+
+@dataclass(frozen=True)
+class TokenResult:
+    """tenant access token 获取结果，不用空字符串承载错误语义。"""
+
+    success: bool
+    token: str = ""
+    error: str | None = None
+    error_code: str | None = None
+    retryable: bool = False
+    retry_after_seconds: float | None = None
 
 
 class FeishuAdapter(BasePlatformAdapter):
@@ -234,7 +272,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._batch_started_at: dict[str, float] = {}
         self._batch_tasks: dict[str, asyncio.Task] = {}
         self._batch_waiters: dict[str, list[asyncio.Future]] = {}
-        self._inflight_messages: dict[str, asyncio.Future] = {}
+        self._message_tasks: dict[str, asyncio.Task] = {}
         self._send_rate_locks: dict[str, asyncio.Lock] = {}
         self._send_timestamps: dict[str, deque[float]] = {}
         self._send_rate_last_used: dict[str, float] = {}
@@ -445,8 +483,15 @@ class FeishuAdapter(BasePlatformAdapter):
         self._running = False
 
         # 关闭时取消尚未提交的文本批次,避免 Adapter 停止后继续处理消息。
-        for task in self._batch_tasks.values():
+        managed_tasks = list({
+            *self._message_tasks.values(),
+            *self._batch_tasks.values(),
+        })
+        for task in managed_tasks:
             task.cancel()
+        if managed_tasks:
+            await asyncio.gather(*managed_tasks, return_exceptions=True)
+        self._message_tasks.clear()
         self._batch_tasks.clear()
         self._batch_buffers.clear()
         self._batch_events.clear()
@@ -456,15 +501,8 @@ class FeishuAdapter(BasePlatformAdapter):
         for waiters in self._batch_waiters.values():
             for waiter in waiters:
                 if not waiter.done():
-                    waiter.set_exception(RuntimeError("feishu adapter stopped"))
+                    waiter.cancel()
         self._batch_waiters.clear()
-        for waiter in self._inflight_messages.values():
-            if not waiter.done():
-                waiter.set_exception(RuntimeError("feishu adapter stopped"))
-            # 主处理协程不等待此 Future,主动读取异常避免 asyncio 告警。
-            waiter.exception()
-        self._inflight_messages.clear()
-
         if self._server:
             server = self._server
             self._server = None
@@ -557,22 +595,42 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         self._last_dedup_cleanup = now
 
-    def _is_message_completed(self, message_id: str) -> bool:
+    def _message_inbox_status(self, message_id: str) -> str | None:
+        """读取 Inbox 状态；调用方据此区分终态与可恢复 pending。"""
         if not self._reliability_db:
             raise RuntimeError("feishu reliability store is unavailable")
-        cutoff = time.time() - FEISHU_DEDUP_TTL_SECONDS
         row = self._reliability_db.execute(
             """
-            SELECT 1
+            SELECT status
             FROM feishu_message_inbox
             WHERE app_id = ?
               AND message_id = ?
-              AND status != 'pending'
-              AND completed_at >= ?
             """,
-            (self.app_id, message_id, cutoff),
+            (self.app_id, message_id),
         ).fetchone()
-        return row is not None
+        return str(row[0]) if row is not None else None
+
+    def _load_pending_message_payload(self, message_id: str) -> dict | None:
+        """按 message_id 读取仍为 pending 的原始事件。"""
+        if not self._reliability_db:
+            raise RuntimeError("feishu reliability store is unavailable")
+        row = self._reliability_db.execute(
+            """
+            SELECT payload
+            FROM feishu_message_inbox
+            WHERE app_id = ? AND message_id = ? AND status = 'pending'
+            """,
+            (self.app_id, message_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid Feishu Inbox payload") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Feishu Inbox payload must be an object")
+        return payload
 
     def _store_pending_message(self, message_id: str, payload: dict) -> None:
         """先持久化原始事件,成功交给 Runner 后再标记完成。"""
@@ -623,35 +681,27 @@ class FeishuAdapter(BasePlatformAdapter):
             )
 
     async def _restore_pending_messages(self) -> None:
-        """启动时恢复上次未完成的飞书消息,按接收顺序重新提交。"""
+        """启动时按接收顺序注册上次未完成消息的统一处理任务。"""
         if not self._reliability_db:
             return
         rows = self._reliability_db.execute(
             """
-            SELECT payload
+            SELECT message_id
             FROM feishu_message_inbox
             WHERE app_id = ? AND status = 'pending'
             ORDER BY received_at, message_id
             """,
             (self.app_id,),
         ).fetchall()
-        tasks = []
+        registered = 0
         for row in rows:
-            try:
-                payload = json.loads(row[0])
-            except (TypeError, json.JSONDecodeError):
-                print("  [feishu] invalid pending payload skipped")
-                continue
-            tasks.append(asyncio.create_task(self._handle_payload(payload)))
-        if not tasks:
-            return
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        failed = sum(isinstance(result, BaseException) for result in results)
-        if failed:
-            print(f"  [feishu] pending recovery failed: {failed}")
-        else:
-            print(f"  [feishu] restored pending messages: {len(tasks)}")
+            if self._register_message_task(str(row[0])):
+                registered += 1
+        if registered:
+            # 让按接收顺序创建的任务至少进入各自的统一处理入口；不等待
+            # 静默窗口、Runner handoff 或模型执行完成。
+            await asyncio.sleep(0)
+            print(f"  [feishu] restored pending messages: {registered}")
 
     # ===================== Webhook HTTP 服务 =====================
 
@@ -992,7 +1042,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     self._send_json(200, {"ok": True, "ignored": True})
                     return
 
-                # 只等待事件安全进入 Gateway，不等待模型最终回答。
+                # 只等待 Inbox 持久化和受管后台任务注册，不等待批处理或 Runner。
                 future = adapter._submit_payload(payload)
                 if future is None:
                     self._send_json(
@@ -1012,12 +1062,20 @@ class FeishuAdapter(BasePlatformAdapter):
                         reason="gateway_timeout",
                     )
                     return
+                except ValueError as exc:
+                    self._response_exception_type = type(exc).__name__
+                    self._send_json(
+                        400,
+                        {"ok": False, "error": "invalid event"},
+                        reason="invalid_event",
+                    )
+                    return
                 except Exception as exc:
                     self._response_exception_type = type(exc).__name__
                     self._send_json(
                         500,
-                        {"ok": False, "error": "processing failed"},
-                        reason="processing_failed",
+                        {"ok": False, "error": "acceptance failed"},
+                        reason="acceptance_failed",
                     )
                     return
 
@@ -1154,7 +1212,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _submit_payload(self, payload: dict) -> Future | None:
         if not self._loop or not self._running:
             return None
-        coroutine = self._handle_payload(payload)
+        coroutine = self._accept_payload(payload)
         try:
             return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
         except RuntimeError:
@@ -1163,34 +1221,36 @@ class FeishuAdapter(BasePlatformAdapter):
 
     # ===================== 消息入站 =====================
 
-    async def _handle_payload(self, payload: dict) -> None:
-        """飞书 webhook payload -> MessageEvent。"""
+    def _parse_message_event(self, payload: dict) -> MessageEvent | None:
+        """校验业务事件并转换为 MessageEvent；明确忽略时返回 None。"""
         header = payload.get("header", {})
         if not isinstance(header, dict):
-            header = {}
+            raise ValueError("Feishu event header must be an object")
         event_type = self._extract_event_type(payload)
         if event_type != "im.message.receive_v1":
-            return
+            raise ValueError("unsupported Feishu Inbox event type")
 
         event = payload.get("event", {})
         if not isinstance(event, dict):
-            return
+            raise ValueError("Feishu event must be an object")
         message = event.get("message", {})
         if not isinstance(message, dict):
-            return
+            raise ValueError("Feishu message must be an object")
         sender = event.get("sender", {})
         if not isinstance(sender, dict):
-            sender = {}
+            raise ValueError("Feishu sender must be an object")
 
         # 单聊也可能收到机器人 / 应用侧消息。只接受真实用户消息,
         # 避免把机器人自己的回复再次送入会话形成自触发循环。
         sender_type = str(sender.get("sender_type", "") or "")
+        if not sender_type:
+            raise ValueError("Feishu sender_type is required")
         if sender_type != "user":
             return
 
         sender_ids = sender.get("sender_id", {})
         if not isinstance(sender_ids, dict):
-            sender_ids = {}
+            raise ValueError("Feishu sender_id must be an object")
 
         msg_id = str(message.get("message_id", "") or "")
         chat_id = str(message.get("chat_id", "") or "")
@@ -1200,10 +1260,12 @@ class FeishuAdapter(BasePlatformAdapter):
             or ""
         )
         if not msg_id or not chat_id or not sender_id:
-            return
+            raise ValueError("Feishu message identity is incomplete")
 
         # 当前 Gateway 飞书链路严格只处理文本消息。
         msg_type = str(message.get("message_type") or message.get("msg_type") or "")
+        if not msg_type:
+            raise ValueError("Feishu message_type is required")
         if msg_type != "text":
             return
         text = self._parse_text(message)
@@ -1252,70 +1314,116 @@ class FeishuAdapter(BasePlatformAdapter):
             },
         )
 
-        # 同一消息在首个请求仍处理中被飞书重推时,共享首个请求的
-        # 处理结果,不能因简单去重而提前向重推请求返回 200。
-        inflight = self._inflight_messages.get(msg_id)
-        if inflight:
-            await asyncio.shield(inflight)
-            return
-        if self._is_message_completed(msg_id):
+        return event_obj
+
+    async def _accept_payload(self, payload: dict) -> None:
+        """校验事件、持久化 Inbox 并注册处理 Task，随后即可确认 HTTP。"""
+        if not self._initialized or not self._running:
+            raise RuntimeError("feishu adapter is not receiving")
+        event = self._parse_message_event(payload)
+        if event is None:
             return
 
-        # Inbox 只负责尚未交给 Runner 的原始事件。数据库显示该消息已经
-        # 进入 queue 或 Outbox 时，直接完成 Inbox，绝不再次提交模型任务。
-        persisted = self.persisted_message_state(event_obj)
+        message_id = event.message_id
+        status = self._message_inbox_status(message_id)
+        if status in {"processed", "cancelled"}:
+            return
+        if status not in {None, "pending"}:
+            raise RuntimeError("invalid Feishu Inbox status")
+        if status is None:
+            self._store_pending_message(message_id, payload)
+
+        # pending 重推只确认当前实例已经有受管 Task，不等待该 Task 完成。
+        self._register_message_task(message_id)
+
+    async def _handle_payload(self, payload: dict) -> None:
+        """兼容旧内部入口；其语义现为持久化并注册后台处理。"""
+        await self._accept_payload(payload)
+
+    def _register_message_task(self, message_id: str) -> bool:
+        """确保同一 message_id 同时最多存在一个处理 Task。"""
+        existing = self._message_tasks.get(message_id)
+        if existing is not None and not existing.done():
+            return False
+
+        task = asyncio.create_task(
+            self._process_accepted_message(message_id),
+            name="feishu-inbox-message",
+        )
+        self._message_tasks[message_id] = task
+        task.add_done_callback(
+            lambda completed, mid=message_id: self._on_message_task_done(
+                mid,
+                completed,
+            )
+        )
+        return True
+
+    def _on_message_task_done(
+        self,
+        message_id: str,
+        task: asyncio.Task,
+    ) -> None:
+        """移除任务身份并读取异常，避免 fire-and-forget 警告。"""
+        if self._message_tasks.get(message_id) is task:
+            self._message_tasks.pop(message_id, None)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            print(
+                "  [feishu] inbox message processing failed: "
+                f"{type(exc).__name__}"
+            )
+
+    async def _process_accepted_message(self, message_id: str) -> None:
+        """从 pending Inbox 读取事件并执行统一的命令或文本处理路径。"""
+        payload = self._load_pending_message_payload(message_id)
+        if payload is None:
+            return
+        event = self._parse_message_event(payload)
+        if event is None:
+            self._complete_messages(
+                [message_id],
+                status="processed",
+                batch_message_id=message_id,
+            )
+            return
+        if event.message_id != message_id:
+            raise ValueError("Feishu Inbox message_id mismatch")
+
+        # Runner Queue / Outbox 已接管时只收敛 Inbox，不重新提交模型任务。
+        persisted = self.persisted_message_state(event)
         if persisted is not None:
             self._complete_messages(
-                [msg_id],
+                [message_id],
                 status="processed",
-                batch_message_id=msg_id,
-            )
-            print(
-                "  [feishu] inbox already owned by gateway "
-                f"(message_id={msg_id}, layer={persisted['layer']})"
+                batch_message_id=message_id,
             )
             return
-        self._store_pending_message(msg_id, payload)
+        if not self._on_message:
+            raise RuntimeError("gateway runner is unavailable")
 
-        accepted = asyncio.get_running_loop().create_future()
-        self._inflight_messages[msg_id] = accepted
-        try:
-            if not self._on_message:
-                raise RuntimeError("gateway runner is unavailable")
-
-            command = text.strip().lower()
-            if command in _IMMEDIATE_COMMANDS:
-                batch_key = self._build_batch_key(event_obj)
-                if command in ("/new", "/stop"):
-                    # 新建或停止会话时取消尚未提交的普通文本,避免命令
-                    # 执行后旧批次反而启动并进入错误的会话。
-                    await self._discard_batch(batch_key)
-                else:
-                    # /status 前先提交旧批次,让状态包含刚发送的任务。
-                    await self._flush_batch(batch_key)
-                await self.handle_message(event_obj)
-                self._complete_messages(
-                    [msg_id],
-                    batch_message_id=msg_id,
-                )
+        command = event.text.strip().lower()
+        if command in _IMMEDIATE_COMMANDS:
+            batch_key = self._build_batch_key(event)
+            if command in ("/new", "/stop"):
+                # 新建或停止会话时丢弃尚未提交的普通文本批次。
+                await self._discard_batch(batch_key)
             else:
-                await self._enqueue_text(event_obj)
-        except asyncio.CancelledError:
-            if not accepted.done():
-                accepted.cancel()
-            raise
-        except Exception as exc:
-            if not accepted.done():
-                accepted.set_exception(exc)
-                # 没有并发重推等待时也要主动读取异常。
-                accepted.exception()
-            raise
-        else:
-            if not accepted.done():
-                accepted.set_result(None)
-        finally:
-            if self._inflight_messages.get(msg_id) is accepted:
-                self._inflight_messages.pop(msg_id, None)
+                # /status 前先提交旧批次，使状态包含刚发送的任务。
+                await self._flush_batch(batch_key)
+            await self.handle_message(event)
+            self._complete_messages(
+                [message_id],
+                batch_message_id=message_id,
+            )
+            return
+
+        await self._enqueue_text(event)
 
     async def _enqueue_text(self, event: MessageEvent) -> None:
         """把同一来源短时间内的连续文本加入同一批次。"""
@@ -1462,13 +1570,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _parse_text(message: dict) -> str:
+        if "content" not in message:
+            raise ValueError("Feishu text content is required")
         raw = message.get("content", "{}")
         try:
             content = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, json.JSONDecodeError):
-            return ""
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid Feishu text content") from exc
         if not isinstance(content, dict):
-            return ""
+            raise ValueError("Feishu text content must be an object")
         return str(content.get("text", "") or "")
 
     def _bot_mentioned(self, message: dict) -> bool:
@@ -1506,13 +1616,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
     # ===================== 消息出站 =====================
 
-    async def _refresh_token(self, *, force: bool = False) -> str:
+    async def _refresh_token(self, *, force: bool = False) -> TokenResult:
         if (
             not force
             and self._tenant_token
             and time.time() < self._token_expires_at
         ):
-            return self._tenant_token
+            return TokenResult(success=True, token=self._tenant_token)
 
         async with self._token_lock:
             if (
@@ -1520,9 +1630,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 and self._tenant_token
                 and time.time() < self._token_expires_at
             ):
-                return self._tenant_token
+                return TokenResult(success=True, token=self._tenant_token)
             if not self._http:
-                return ""
+                return TokenResult(
+                    success=False,
+                    error="token_unavailable",
+                    retryable=True,
+                )
 
             try:
                 response = await self._http.post(
@@ -1532,22 +1646,155 @@ class FeishuAdapter(BasePlatformAdapter):
                         "app_secret": self.app_secret,
                     },
                 )
-                data = response.json()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 print(
-                    "  [feishu] tenant token request failed "
+                    "  [feishu] token request failed "
                     f"({type(exc).__name__})"
                 )
-                return ""
+                return self._classify_token_transport_exception(exc)
 
-            if data.get("code") != 0:
-                print("  [feishu] tenant token rejected")
-                return ""
+            try:
+                status_code = int(response.status_code)
+            except (AttributeError, TypeError, ValueError):
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    retryable=False,
+                )
 
-            self._tenant_token = str(data.get("tenant_access_token", "") or "")
-            expires = int(data.get("expire", 7200) or 7200)
+            retry_after = self._parse_retry_after(
+                getattr(response, "headers", None),
+            )
+            if status_code == 429:
+                return TokenResult(
+                    success=False,
+                    error="token_rate_limited",
+                    error_code=str(status_code),
+                    retryable=True,
+                    retry_after_seconds=retry_after,
+                )
+            if 500 <= status_code < 600:
+                return TokenResult(
+                    success=False,
+                    error="token_server_error",
+                    error_code=str(status_code),
+                    retryable=True,
+                )
+            if status_code in {401, 403}:
+                print("  [feishu] token rejected")
+                return TokenResult(
+                    success=False,
+                    error="token_rejected",
+                    error_code=str(status_code),
+                    retryable=False,
+                )
+            if 400 <= status_code < 500:
+                print("  [feishu] token rejected")
+                return TokenResult(
+                    success=False,
+                    error="token_request_invalid",
+                    error_code=str(status_code),
+                    retryable=False,
+                )
+            if not 200 <= status_code < 300:
+                print("  [feishu] token rejected")
+                return TokenResult(
+                    success=False,
+                    error="token_request_invalid",
+                    error_code=str(status_code),
+                    retryable=False,
+                )
+
+            try:
+                data = response.json()
+            except Exception:
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    retryable=False,
+                )
+            if not isinstance(data, dict):
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    retryable=False,
+                )
+
+            raw_code = data.get("code")
+            code = self._normalize_error_code(raw_code)
+            error_code = str(raw_code) if raw_code is not None else None
+            if code is None:
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    error_code=error_code,
+                    retryable=False,
+                )
+            if code != 0:
+                if code in FEISHU_RATE_LIMIT_ERROR_CODES:
+                    return TokenResult(
+                        success=False,
+                        error="token_rate_limited",
+                        error_code=error_code,
+                        retryable=True,
+                        retry_after_seconds=retry_after,
+                    )
+                if code in FEISHU_TOKEN_TRANSIENT_ERROR_CODES:
+                    return TokenResult(
+                        success=False,
+                        error="token_server_error",
+                        error_code=error_code,
+                        retryable=True,
+                    )
+                print("  [feishu] token rejected")
+                return TokenResult(
+                    success=False,
+                    error=(
+                        "token_rejected"
+                        if code in FEISHU_TOKEN_REJECTED_ERROR_CODES
+                        else "token_request_invalid"
+                    ),
+                    error_code=error_code,
+                    retryable=False,
+                )
+
+            token = data.get("tenant_access_token")
+            if not isinstance(token, str) or not token:
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    error_code=error_code,
+                    retryable=False,
+                )
+            try:
+                expires = int(data.get("expire", 7200) or 7200)
+            except (TypeError, ValueError):
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    error_code=error_code,
+                    retryable=False,
+                )
+            if expires <= 0:
+                print("  [feishu] token response invalid")
+                return TokenResult(
+                    success=False,
+                    error="token_invalid_response",
+                    error_code=error_code,
+                    retryable=False,
+                )
+
+            self._tenant_token = token
             self._token_expires_at = time.time() + max(60, expires - 300)
-            return self._tenant_token
+            return TokenResult(success=True, token=token)
 
     async def _invalidate_token(self, rejected_token: str) -> None:
         """只清除本次被拒绝的 token,避免覆盖并发刷新出的新 token。"""
@@ -1646,6 +1893,7 @@ class FeishuAdapter(BasePlatformAdapter):
         else:
             delivery_mode = "direct"
         token_refreshed = False
+        force_token_refresh = False
         attempts_used = 0
         retry_after = None
         last_result = SendResult(
@@ -1655,15 +1903,21 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
         while attempts_used < self.send_total_attempts:
-            token = await self._refresh_token()
-            if not token:
+            token_result = await self._refresh_token(
+                force=force_token_refresh,
+            )
+            force_token_refresh = False
+            if not token_result.success:
                 # token 获取可能跨越较长故障窗口，不在 Adapter 内忙等，直接
                 # 交给 Runner 记录 next_attempt_at 并持久化恢复。
                 return SendResult(
                     success=False,
-                    error="token_unavailable",
-                    retryable=True,
+                    error=token_result.error or "token_unavailable",
+                    error_code=token_result.error_code,
+                    retryable=token_result.retryable,
+                    retry_after_seconds=token_result.retry_after_seconds,
                 )
+            token = token_result.token
 
             try:
                 await self._wait_send_slot(chat_id)
@@ -1751,6 +2005,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if refresh_token and not token_refreshed:
                     await self._invalidate_token(token)
                     token_refreshed = True
+                    force_token_refresh = True
                     continue
                 if not retryable:
                     return last_result
@@ -1923,6 +2178,36 @@ class FeishuAdapter(BasePlatformAdapter):
             return int(code)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _classify_token_transport_exception(exc: Exception) -> TokenResult:
+        """Token 获取只对明确的 httpx 传输故障开放重试。"""
+        try:
+            import httpx
+        except ImportError:
+            return TokenResult(
+                success=False,
+                error="token_request_invalid",
+                retryable=False,
+            )
+        if isinstance(
+            exc,
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ),
+        ):
+            return TokenResult(
+                success=False,
+                error="token_unavailable",
+                retryable=True,
+            )
+        return TokenResult(
+            success=False,
+            error="token_request_invalid",
+            retryable=False,
+        )
 
     @staticmethod
     def _classify_transport_exception(exc: Exception) -> SendResult:

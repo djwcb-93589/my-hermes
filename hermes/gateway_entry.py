@@ -23,6 +23,8 @@ async def run_gateway():
     # Runner 会对 prompt、API tools 和 dispatch 同时显式传入空工具集；
     # 这里不再把“未调用 register_all()”当作安全边界。
 
+    # Runner 构造阶段统一校验 Gateway 上下文策略；非法配置会在任何
+    # Adapter 初始化或 Webhook 监听开始前直接终止启动。
     runner = GatewayRunner(config=_config, db_path=DB_PATH)
 
     platforms = _config.get("gateway", {}).get("platforms", {})

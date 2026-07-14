@@ -34,6 +34,11 @@ def find_project_context(cwd: str) -> str:
 def build_system_prompt(
     cwd: str,
     enabled_toolsets: list[str] | None = None,
+    *,
+    include_soul: bool = True,
+    include_memory: bool = True,
+    include_user_profile: bool = True,
+    include_project_context: bool = True,
 ) -> str:
     """按会话能力组装 system prompt；空列表表示显式无工具。"""
     parts = []
@@ -44,23 +49,34 @@ def build_system_prompt(
     )
     no_tool_capabilities = None
 
-    soul_path = HERMES_HOME / "SOUL.md"
-    if soul_path.exists():
-        parts.append(soul_path.read_text(encoding="utf-8")[:20000])
+    if include_soul:
+        soul_path = HERMES_HOME / "SOUL.md"
+        if soul_path.exists():
+            parts.append(soul_path.read_text(encoding="utf-8")[:20000])
+        else:
+            parts.append("You are a helpful assistant.")
     else:
         parts.append("You are a helpful assistant.")
 
-    memory_entries = load_memory(MEMORY_FILE)
-    if memory_entries:
-        used = _current_chars(MEMORY_FILE)
-        header = f"# Memory ({len(memory_entries)} entries, {used}/{MEMORY_CHAR_LIMIT} chars)"
-        parts.append(header + "\n" + render_entries(memory_entries))
+    if include_memory:
+        memory_entries = load_memory(MEMORY_FILE)
+        if memory_entries:
+            used = _current_chars(MEMORY_FILE)
+            header = (
+                f"# Memory ({len(memory_entries)} entries, "
+                f"{used}/{MEMORY_CHAR_LIMIT} chars)"
+            )
+            parts.append(header + "\n" + render_entries(memory_entries))
 
-    user_entries = load_memory(USER_FILE)
-    if user_entries:
-        used = _current_chars(USER_FILE)
-        header = f"# User Profile ({len(user_entries)} entries, {used}/{USER_CHAR_LIMIT} chars)"
-        parts.append(header + "\n" + render_entries(user_entries))
+    if include_user_profile:
+        user_entries = load_memory(USER_FILE)
+        if user_entries:
+            used = _current_chars(USER_FILE)
+            header = (
+                f"# User Profile ({len(user_entries)} entries, "
+                f"{used}/{USER_CHAR_LIMIT} chars)"
+            )
+            parts.append(header + "\n" + render_entries(user_entries))
 
     skill_enabled = (
         selected_toolsets is None
@@ -134,12 +150,10 @@ def build_system_prompt(
         if tool_lines:
             parts.append("# Tool Use\n" + "\n".join(tool_lines))
 
-    project = find_project_context(cwd)
-    if project:
-        parts.append(f"# Project Context\n{project}")
-    if no_tool_capabilities is not None:
-        # 能力边界放在可选项目上下文之后，避免只读上下文产生越权暗示。
-        parts.append(no_tool_capabilities)
+    if include_project_context:
+        project = find_project_context(cwd)
+        if project:
+            parts.append(f"# Project Context\n{project}")
 
     environment = f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     if selected_toolsets is None or selected_toolsets:
@@ -148,5 +162,8 @@ def build_system_prompt(
             f"\nHermes home: {HERMES_HOME}"
         )
     parts.append(environment)
+    if no_tool_capabilities is not None:
+        # 能力边界始终放在全部只读上下文之后，避免前文产生越权暗示。
+        parts.append(no_tool_capabilities)
 
     return "\n\n".join(parts)
