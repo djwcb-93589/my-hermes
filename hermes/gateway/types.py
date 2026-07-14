@@ -61,6 +61,9 @@ class SendResult:
     error: str | None = None
     error_code: str | None = None
     retryable: bool = False
+    # Adapter 不应自行长时间 sleep；平台建议的等待由 Runner 限幅后写入
+    # Outbox next_attempt_at，因而可以跨 shutdown 恢复。
+    retry_after_seconds: float | None = None
     sent_chunks: int = 0
     total_chunks: int = 0
     failed_chunk_index: int | None = None

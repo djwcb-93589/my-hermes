@@ -1,9 +1,10 @@
 """
 平台 adapter 基类。
 
-子类实现 connect / disconnect / send。send 统一返回 ``SendResult``,
-让上层(GatewayRunner)能判断发送是否成功并决定是否重试。
-_on_message 由 GatewayRunner 启动时注入。
+Adapter 生命周期分为 initialize / restore_pending / start_receiving / disconnect。
+旧 Adapter 的 start_receiving 默认复用 connect,保持向后兼容。send 统一返回
+``SendResult``,让上层(GatewayRunner)能判断发送是否成功并决定是否重试。
+消息回调和持久状态查询由 GatewayRunner 启动时注入。
 """
 
 from __future__ import annotations
@@ -17,16 +18,31 @@ from hermes.gateway.types import MessageEvent, SendResult
 class BasePlatformAdapter(ABC):
     """所有平台 adapter 必须满足的契约。
 
-    子类实现:
-      - ``connect()``     开始接收消息,返 True/False
-      - ``disconnect()``  停止 + 清理
-      - ``send(...)``     发回复,返 ``SendResult``
+    分阶段契约:
+      - ``initialize()``       初始化发送端和本地资源,不得接收外部新事件
+      - ``restore_pending()``  恢复平台自己的 Inbox
+      - ``start_receiving()``  开始接收外部新事件
+      - ``disconnect()``       停止 + 清理
+
+    旧子类只需继续实现 ``connect()``；默认 ``start_receiving()`` 会调用它。
     """
 
     def __init__(self, platform_name: str):
         self.platform_name = platform_name
         self._on_message: Callable | None = None  # GatewayRunner 注入
+        self._message_state_lookup: Callable | None = None
         self._running = False
+
+    async def initialize(self) -> bool:
+        """初始化资源但不开始接收；旧 Adapter 默认无需单独初始化。"""
+        return True
+
+    async def restore_pending(self) -> None:
+        """恢复平台 Inbox；没有独立 Inbox 的 Adapter 默认无操作。"""
+
+    async def start_receiving(self) -> bool:
+        """开始接收外部事件；旧 Adapter 兼容调用原 ``connect()``。"""
+        return await self.connect()
 
     @abstractmethod
     async def connect(self) -> bool:
@@ -80,3 +96,9 @@ class BasePlatformAdapter(ABC):
         """把翻译好的 event 转发给 GatewayRunner 回调。"""
         if self._on_message:
             await self._on_message(event)
+
+    def persisted_message_state(self, event: MessageEvent) -> dict | None:
+        """查询该平台消息是否已经进入 Gateway queue / Outbox。"""
+        if self._message_state_lookup is None:
+            return None
+        return self._message_state_lookup(event)

@@ -2,7 +2,8 @@
 统一 Gateway 启动入口。
 
 根据 ``config['gateway']['platforms']`` 创建 CLI / Feishu / Weixin adapter。
-单个平台连接失败不阻止其他平台。关闭时停止全部 adapter + 清理 backend。
+Runner 统一编排初始化、Gateway 恢复、Adapter Inbox 恢复和开放接收；单个平台
+启动失败不阻止其他平台。关闭时停止全部 adapter + 清理 backend。
 """
 
 from __future__ import annotations
@@ -38,12 +39,39 @@ async def run_gateway():
     if feishu_cfg.get("enabled", False):
         try:
             from hermes.gateway.adapters.feishu import FeishuAdapter
+            rate_limit_cfg = feishu_cfg.get("webhook_rate_limit", {})
+            if not isinstance(rate_limit_cfg, dict):
+                raise ValueError("feishu webhook_rate_limit must be a mapping")
             runner.add_adapter(FeishuAdapter(
                 app_id=feishu_cfg.get("app_id", ""),
                 app_secret=feishu_cfg.get("app_secret", ""),
                 db_path=DB_PATH,
-                webhook_host=feishu_cfg.get("webhook_host", "0.0.0.0"),
+                webhook_host=feishu_cfg.get("webhook_host", "127.0.0.1"),
                 webhook_port=feishu_cfg.get("webhook_port", 8787),
+                webhook_path=feishu_cfg.get(
+                    "webhook_path", "/feishu/webhook",
+                ),
+                webhook_max_body_bytes=feishu_cfg.get(
+                    "webhook_max_body_bytes", 1024 * 1024,
+                ),
+                webhook_read_timeout_seconds=feishu_cfg.get(
+                    "webhook_read_timeout_seconds", 5.0,
+                ),
+                webhook_max_concurrent_requests=feishu_cfg.get(
+                    "webhook_max_concurrent_requests", 32,
+                ),
+                webhook_rate_limit_window_seconds=rate_limit_cfg.get(
+                    "window_seconds", 60.0,
+                ),
+                webhook_rate_limit_max_requests=rate_limit_cfg.get(
+                    "max_requests", 120,
+                ),
+                webhook_rate_limit_max_tracked_ips=rate_limit_cfg.get(
+                    "max_tracked_ips", 2048,
+                ),
+                webhook_trusted_proxies=feishu_cfg.get(
+                    "webhook_trusted_proxies", [],
+                ),
                 verification_token=feishu_cfg.get("verification_token", ""),
                 encrypt_key=feishu_cfg.get("encrypt_key", ""),
                 bot_open_id=feishu_cfg.get("bot_open_id", ""),
@@ -53,15 +81,36 @@ async def run_gateway():
                 allow_all=feishu_cfg.get("allow_all", False),
                 allowed_users=feishu_cfg.get("allowed_users", []),
                 allowed_chats=feishu_cfg.get("allowed_chats", []),
-                send_max_retries=feishu_cfg.get("send_max_retries", 3),
-                send_retry_base_delay=feishu_cfg.get("send_retry_base_delay", 1.0),
+                send_total_attempts=feishu_cfg.get(
+                    "send_total_attempts",
+                    feishu_cfg.get("send_max_retries", 3),
+                ),
+                send_retry_base_delay_seconds=feishu_cfg.get(
+                    "send_retry_base_delay_seconds",
+                    feishu_cfg.get("send_retry_base_delay", 0.5),
+                ),
+                send_retry_max_delay_seconds=feishu_cfg.get(
+                    "send_retry_max_delay_seconds", 3.0,
+                ),
+                adapter_retry_after_max_seconds=feishu_cfg.get(
+                    "adapter_retry_after_max_seconds", 5.0,
+                ),
                 send_rate_limit_per_chat=feishu_cfg.get(
                     "send_rate_limit_per_chat", 5,
+                ),
+                send_rate_limit_cache_idle_ttl_seconds=feishu_cfg.get(
+                    "send_rate_limit_cache_idle_ttl_seconds", 600.0,
+                ),
+                send_rate_limit_max_tracked_chats=feishu_cfg.get(
+                    "send_rate_limit_max_tracked_chats", 1024,
                 ),
             ))
             print("  [gateway] Feishu adapter added")
         except Exception as exc:
-            print(f"  [gateway] Feishu adapter failed to init: {exc!r}")
+            print(
+                "  [gateway] Feishu adapter failed to init: "
+                f"{type(exc).__name__}"
+            )
 
     # 个人微信
     weixin_cfg = platforms.get("weixin", {})
@@ -84,10 +133,11 @@ async def run_gateway():
         print("  [gateway] WARNING: no adapters enabled. Check config.yaml.")
         return
 
-    await runner.start()
-
-    # 等待所有 adapter 停止(CLI /quit 或信号)
     try:
+        # start() 内部严格分阶段；返回前飞书 Webhook 不会接收业务事件。
+        await runner.start()
+
+        # 等待所有 adapter 停止(CLI /quit 或信号)
         while runner.adapters:
             # CLI adapter 的 _should_quit 被设置后退出
             cli = runner.adapters.get("cli")

@@ -35,7 +35,11 @@ from hermes.config import (
     COMPRESSION_THRESHOLD,
     CONTINUE_MESSAGE,
 )
-from hermes.db import add_messages, get_session_messages
+from hermes.db import (
+    add_messages,
+    get_gateway_visible_session_messages,
+    get_session_messages,
+)
 from hermes.errors import (
     classify_error,
     jittered_backoff,
@@ -598,7 +602,7 @@ async def run_conversation_async(
     loop = None
     try:
         try:
-            existing = get_session_messages(conn, session_id)
+            existing = get_gateway_visible_session_messages(conn, session_id)
             user_msg = {"role": "user", "content": user_message}
             add_messages(conn, session_id, [user_msg])
         except Exception as exc:
