@@ -1878,7 +1878,7 @@ def get_feishu_inbox_dispatch_routes(
             FROM feishu_message_inbox AS current
             WHERE current.app_id=?
               AND current.status IN (
-                  'pending', 'processing', 'retry_wait', 'permanent_failed'
+                  'pending', 'processing', 'retry_wait'
               )
               AND NOT EXISTS (
                   SELECT 1
@@ -1886,8 +1886,7 @@ def get_feishu_inbox_dispatch_routes(
                   WHERE prior.app_id=current.app_id
                     AND prior.route_key=current.route_key
                     AND prior.status IN (
-                        'pending', 'processing', 'retry_wait',
-                        'permanent_failed'
+                        'pending', 'processing', 'retry_wait'
                     )
                     AND (
                         prior.received_at < current.received_at
@@ -1932,7 +1931,7 @@ def get_feishu_inbox_route_next(
                received_at, receive_sequence
         FROM feishu_message_inbox
         WHERE app_id=? AND route_key=?
-          AND status IN ('pending', 'retry_wait', 'permanent_failed')
+          AND status IN ('pending', 'retry_wait')
         ORDER BY received_at, receive_sequence
         LIMIT 1
         """,
@@ -1983,7 +1982,7 @@ def claim_feishu_inbox_route_message(
             SELECT message_id
             FROM feishu_message_inbox
             WHERE app_id=? AND route_key=?
-              AND status IN ('pending', 'retry_wait', 'permanent_failed')
+              AND status IN ('pending', 'retry_wait')
             ORDER BY received_at, receive_sequence
             LIMIT 1
             """,
@@ -2282,7 +2281,7 @@ def prune_feishu_inbox_messages(
     completed_before: float,
     limit: int = 200,
 ) -> int:
-    """分批清理终态 Inbox；仍阻挡活跃后继的永久失败记录继续保留。"""
+    """分批清理超过保留期的 Inbox 终态审计记录。"""
     if not isinstance(app_id, str) or not app_id:
         raise DBError("Feishu Inbox app_id must not be empty")
     batch_limit = _cleanup_batch_limit(limit, "Feishu Inbox")
@@ -2294,28 +2293,8 @@ def prune_feishu_inbox_messages(
             FROM feishu_message_inbox AS candidate
             WHERE candidate.app_id=?
               AND candidate.completed_at < ?
-              AND (
-                  candidate.status IN ('processed', 'cancelled')
-                  OR (
-                      candidate.status='permanent_failed'
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM feishu_message_inbox AS later
-                          WHERE later.app_id=candidate.app_id
-                            AND later.route_key=candidate.route_key
-                            AND later.status IN (
-                                'pending', 'processing', 'retry_wait'
-                            )
-                            AND (
-                                later.received_at > candidate.received_at
-                                OR (
-                                    later.received_at=candidate.received_at
-                                    AND later.receive_sequence
-                                        > candidate.receive_sequence
-                                )
-                            )
-                      )
-                  )
+              AND candidate.status IN (
+                  'processed', 'cancelled', 'permanent_failed'
               )
             ORDER BY candidate.completed_at, candidate.receive_sequence
             LIMIT ?

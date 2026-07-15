@@ -1434,14 +1434,6 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                     return
 
-                if not adapter._running:
-                    self._send_json(
-                        503,
-                        {"ok": False, "error": "gateway unavailable"},
-                        reason="webhook_not_ready",
-                    )
-                    return
-
                 if not self._rate_limit_allowed():
                     self._send_json(
                         429,
@@ -1548,6 +1540,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 if event_type != "im.message.receive_v1":
                     # 合法但未订阅的事件返回 200，避免平台无意义重试。
                     self._send_json(200, {"ok": True, "ignored": True})
+                    return
+
+                if not adapter._running:
+                    self._send_json(
+                        503,
+                        {"ok": False, "error": "gateway unavailable"},
+                        reason="webhook_not_ready",
+                    )
                     return
 
                 # 只等待 Inbox 持久化和受管后台任务注册，不等待批处理或 Runner。
@@ -1914,14 +1914,14 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         allow_existing_processing: bool,
     ) -> dict | None:
-        """查看并条件 claim route 队首；永久失败和未到期重试均返回 None。"""
+        """查看并条件 claim route 队首；未到期重试由数据库拒绝。"""
         persistence = self._require_persistence()
         head = await persistence.call(
             get_feishu_inbox_route_next,
             self.app_id,
             route_key,
         )
-        if head is None or head["status"] == "permanent_failed":
+        if head is None:
             return None
         return await persistence.call(
             claim_feishu_inbox_route_message,
@@ -2095,8 +2095,7 @@ class FeishuAdapter(BasePlatformAdapter):
             status = str(head["status"])
             next_attempt_at = head["next_attempt_at"]
             if (
-                status == "permanent_failed"
-                or status == "retry_wait"
+                status == "retry_wait"
                 and (
                     next_attempt_at is None
                     or float(next_attempt_at) > time.time()

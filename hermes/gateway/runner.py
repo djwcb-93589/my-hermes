@@ -235,7 +235,10 @@ def _load_retention_config(gateway_cfg: dict) -> dict[str, float | int]:
 
 
 class GatewayRunner:
-    """启动 adapter、路由消息、跑 agent、回发结果。"""
+    """启动 adapter、路由消息、跑 agent、回发结果。
+
+    每个实例只能启动一次；停止或启动失败后必须创建新的 Runner 实例。
+    """
 
     def __init__(self, config: dict, db_path: str):
         self.config = config
@@ -892,8 +895,12 @@ class GatewayRunner:
         for adapter in self.adapters.values():
             try:
                 await adapter.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(
+                    "  [gateway] startup adapter disconnect failed: "
+                    f"platform={adapter.platform_name} "
+                    f"exception={type(exc).__name__}"
+                )
         if self._runtime_lease_acquired:
             try:
                 if self._runtime_lease_epoch is not None:
@@ -914,8 +921,11 @@ class GatewayRunner:
 
     async def start(self):
         """按初始化、终态收敛、持久恢复、接收阶段启动 Gateway。"""
-        if self._startup_in_progress or self._lifecycle_phase == "running":
-            raise RuntimeError("gateway runner is already starting or running")
+        if self._lifecycle_phase != "created":
+            raise RuntimeError(
+                "GatewayRunner instances are single-use; create a new "
+                "instance after stop or failed startup."
+            )
         self._startup_in_progress = True
         self._accepting_external_messages = False
         self._inbox_restored_adapters.clear()
@@ -1056,7 +1066,20 @@ class GatewayRunner:
             self._accepting_external_messages = False
             self._runtime_lease_valid = False
 
-            # 先停止 heartbeat / housekeeping，再等待 route worker 收尾。
+            # 先同步关闭所有外部入站资格，不能在等待 worker 时继续落库。
+            for name, adapter in self.adapters.items():
+                try:
+                    adapter.revoke_receiving()
+                except Exception as exc:
+                    print(
+                        f"  [gateway] {name} receive revoke failed: "
+                        f"{type(exc).__name__}"
+                    )
+                finally:
+                    self._receiving_adapters.discard(name)
+            self._receiving_adapters.clear()
+
+            # 入站关闭后再停止 heartbeat / housekeeping 和 route worker。
             await self._cancel_background_tasks()
             active_tasks = self.sessions.cancel_all(reason="shutdown")
             if active_tasks:
@@ -1065,8 +1088,12 @@ class GatewayRunner:
             for adapter in self.adapters.values():
                 try:
                     await adapter.disconnect()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(
+                        "  [gateway] adapter disconnect failed: "
+                        f"platform={adapter.platform_name} "
+                        f"exception={type(exc).__name__}"
+                    )
 
             if self._runtime_lease_acquired:
                 try:
@@ -1089,8 +1116,11 @@ class GatewayRunner:
             if self._async_client is not None:
                 try:
                     await self._async_client.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(
+                        "  [gateway] model client close failed: "
+                        f"{type(exc).__name__}"
+                    )
                 finally:
                     self._async_client = None
             from hermes.backends import cleanup_all_backends
