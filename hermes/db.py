@@ -24,10 +24,20 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 12
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
+
+# Feishu Inbox 状态由数据库层统一约束，Adapter 只使用这里暴露的访问接口。
+FEISHU_INBOX_STATUSES = frozenset({
+    "pending",
+    "processing",
+    "retry_wait",
+    "processed",
+    "cancelled",
+    "permanent_failed",
+})
 
 
 class DBError(Exception):
@@ -37,6 +47,10 @@ class DBError(Exception):
 class InvalidMessageError(DBError):
     """消息结构非法(role 不允许 / 缺 session_id / 缺 tool_call_id / JSON
     序列化失败等)。"""
+
+
+class InvalidFeishuInboxPayloadError(DBError):
+    """Feishu Inbox payload 已损坏或不是 JSON 对象。"""
 
 
 # ===========================================================================
@@ -137,8 +151,14 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             next_attempt_at REAL,
             last_error TEXT,
             last_error_code TEXT,
+            claimed_by TEXT,
+            claim_epoch INTEGER CHECK (claim_epoch IS NULL OR claim_epoch > 0),
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
+            CHECK (
+                (claimed_by IS NULL AND claim_epoch IS NULL)
+                OR (claimed_by IS NOT NULL AND claim_epoch IS NOT NULL)
+            ),
             UNIQUE(route_key, source_message_id, delivery_kind)
         );
 
@@ -172,6 +192,8 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     )
     _create_gateway_source_message_ownership_schema(conn)
     _create_gateway_runtime_lease_schema(conn)
+    _create_gateway_fencing_triggers(conn)
+    _create_feishu_inbox_schema(conn)
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -209,6 +231,14 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    """返回表的列名集合，仅供受控的 schema migration 使用。"""
+    return {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
 
 
 def _count_rows(conn: sqlite3.Connection, sql: str) -> int:
@@ -261,6 +291,75 @@ def gateway_event_source_message_ids(
     return result
 
 
+def build_feishu_inbox_route_key(
+    account_id: str,
+    chat_type: str,
+    chat_id: str,
+    user_id: str,
+    thread_id: str | None,
+) -> str:
+    """编码无歧义的 Feishu Inbox 路由身份。"""
+    normalized_account_id = str(account_id or "")
+    if not normalized_account_id:
+        raise DBError("Feishu Inbox account_id must not be empty")
+    identity = (
+        "feishu",
+        normalized_account_id,
+        str(chat_type or ""),
+        str(chat_id or ""),
+        str(user_id or ""),
+        str(thread_id or ""),
+    )
+    return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+
+
+def _derive_feishu_inbox_route_key(
+    app_id: str,
+    message_id: str,
+    encoded_payload: str,
+) -> str:
+    """从旧 Inbox payload 回填路由；不可识别记录进入独立隔离路由。"""
+    try:
+        payload = json.loads(encoded_payload)
+        event = payload.get("event", {})
+        message = event.get("message", {})
+        sender = event.get("sender", {})
+        sender_ids = sender.get("sender_id", {})
+        if not all(
+            isinstance(value, dict)
+            for value in (payload, event, message, sender, sender_ids)
+        ):
+            raise ValueError("invalid Feishu Inbox route payload")
+        chat_id = str(message.get("chat_id", "") or "")
+        user_id = str(
+            sender_ids.get("open_id")
+            or sender_ids.get("user_id")
+            or ""
+        )
+        if not chat_id or not user_id:
+            raise ValueError("incomplete Feishu Inbox route identity")
+        raw_chat_type = str(message.get("chat_type", "p2p") or "p2p")
+        chat_type = "dm" if raw_chat_type == "p2p" else raw_chat_type
+        thread_id = message.get("thread_id") or message.get("root_id")
+        return build_feishu_inbox_route_key(
+            app_id,
+            chat_type,
+            chat_id,
+            user_id,
+            str(thread_id) if thread_id else None,
+        )
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        # 旧损坏数据无法可靠恢复真实路由，只能按消息隔离；新写入会在 ACK
+        # 前保存从已校验 MessageEvent 得到的 route_key，不存在这一信息缺口。
+        return build_feishu_inbox_route_key(
+            app_id,
+            "invalid",
+            f"inbox:{message_id}",
+            "",
+            None,
+        )
+
+
 def _create_gateway_source_message_ownership_schema(
     conn: sqlite3.Connection,
 ) -> None:
@@ -296,11 +395,186 @@ def _create_gateway_runtime_lease_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS gateway_runtime_lease (
             lease_name TEXT PRIMARY KEY,
             instance_id TEXT NOT NULL,
+            lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
             heartbeat_at REAL NOT NULL,
             expires_at REAL NOT NULL
         )
         """
     )
+
+
+def _create_gateway_fencing_triggers(conn: sqlite3.Connection) -> None:
+    """让迁移表与全新表保持相同的 fencing 字段约束。"""
+    lease_columns = _table_columns(conn, "gateway_runtime_lease")
+    if "lease_epoch" in lease_columns:
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_gateway_lease_epoch_insert
+            BEFORE INSERT ON gateway_runtime_lease
+            WHEN NEW.lease_epoch IS NULL OR NEW.lease_epoch <= 0
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Gateway lease epoch');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_gateway_lease_epoch_update
+            BEFORE UPDATE OF lease_epoch ON gateway_runtime_lease
+            WHEN NEW.lease_epoch IS NULL OR NEW.lease_epoch <= 0
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Gateway lease epoch');
+            END
+            """
+        )
+
+    outbox_columns = _table_columns(conn, "gateway_outbox")
+    if {"claimed_by", "claim_epoch"} <= outbox_columns:
+        claim_condition = """
+            (NEW.claimed_by IS NULL AND NEW.claim_epoch IS NOT NULL)
+            OR (NEW.claimed_by IS NOT NULL AND NEW.claim_epoch IS NULL)
+            OR (NEW.claim_epoch IS NOT NULL AND NEW.claim_epoch <= 0)
+        """
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS trg_gateway_outbox_claim_insert
+            BEFORE INSERT ON gateway_outbox
+            WHEN {claim_condition}
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Gateway Outbox claim');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS trg_gateway_outbox_claim_update
+            BEFORE UPDATE OF claimed_by, claim_epoch ON gateway_outbox
+            WHEN {claim_condition}
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Gateway Outbox claim');
+            END
+            """
+        )
+
+
+def _create_feishu_inbox_indexes_and_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    """创建 Feishu Inbox 的顺序、恢复、重试和状态约束对象。"""
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_inbox_receive_sequence
+        ON feishu_message_inbox(app_id, receive_sequence)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_feishu_inbox_completed
+        ON feishu_message_inbox(app_id, completed_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_feishu_inbox_recovery
+        ON feishu_message_inbox(app_id, status, receive_sequence)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_feishu_inbox_retry
+        ON feishu_message_inbox(
+            app_id, status, next_attempt_at, receive_sequence
+        )
+        """
+    )
+    if "route_key" in _table_columns(conn, "feishu_message_inbox"):
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_feishu_inbox_route_order
+            ON feishu_message_inbox(
+                app_id, route_key, received_at, receive_sequence
+            )
+            """
+        )
+    # 旧表无法通过 ALTER TABLE 补表级 CHECK，触发器让迁移库与新库保持
+    # 相同的状态集合约束；新库上的 CHECK 则提供双重保护。
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_feishu_inbox_status_insert
+        BEFORE INSERT ON feishu_message_inbox
+        WHEN NEW.status NOT IN (
+            'pending', 'processing', 'retry_wait', 'processed',
+            'cancelled', 'permanent_failed'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid Feishu Inbox status');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_feishu_inbox_status_update
+        BEFORE UPDATE OF status ON feishu_message_inbox
+        WHEN NEW.status NOT IN (
+            'pending', 'processing', 'retry_wait', 'processed',
+            'cancelled', 'permanent_failed'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid Feishu Inbox status');
+        END
+        """
+    )
+    if "route_key" in _table_columns(conn, "feishu_message_inbox"):
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_feishu_inbox_route_insert
+            BEFORE INSERT ON feishu_message_inbox
+            WHEN NEW.route_key IS NULL OR NEW.route_key=''
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Feishu Inbox route key');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_feishu_inbox_route_update
+            BEFORE UPDATE OF route_key ON feishu_message_inbox
+            WHEN NEW.route_key IS NULL OR NEW.route_key=''
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Feishu Inbox route key');
+            END
+            """
+        )
+
+
+def _create_feishu_inbox_schema(conn: sqlite3.Connection) -> None:
+    """创建最新版 Feishu Inbox schema。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feishu_message_inbox (
+            app_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            route_key TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            received_at REAL NOT NULL,
+            receive_sequence INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'processing', 'retry_wait', 'processed',
+                    'cancelled', 'permanent_failed'
+                )
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            next_attempt_at REAL,
+            last_error TEXT,
+            updated_at REAL NOT NULL,
+            completed_at REAL,
+            batch_message_id TEXT,
+            PRIMARY KEY (app_id, message_id)
+        )
+        """
+    )
+    _create_feishu_inbox_indexes_and_triggers(conn)
 
 
 def _upsert_gateway_source_message_ownership(
@@ -671,6 +945,229 @@ def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
     _create_gateway_runtime_lease_schema(conn)
 
 
+def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+    """把 Adapter 旧 Inbox 原地升级为正式 schema，并保留全部记录。"""
+    if not _table_exists(conn, "feishu_message_inbox"):
+        _create_feishu_inbox_schema(conn)
+        return
+
+    columns = _table_columns(conn, "feishu_message_inbox")
+    required_legacy_columns = {
+        "app_id",
+        "message_id",
+        "payload",
+        "received_at",
+        "status",
+    }
+    missing_legacy_columns = required_legacy_columns - columns
+    if missing_legacy_columns:
+        missing = ", ".join(sorted(missing_legacy_columns))
+        raise DBError(f"Feishu Inbox missing required columns: {missing}")
+
+    # SQLite 不能给旧表补表级 CHECK；先原地补列，后续用触发器约束状态。
+    additions = (
+        ("receive_sequence", "INTEGER NOT NULL DEFAULT 0"),
+        ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at", "REAL"),
+        ("last_error", "TEXT"),
+        ("updated_at", "REAL NOT NULL DEFAULT 0"),
+        ("completed_at", "REAL"),
+        ("batch_message_id", "TEXT"),
+    )
+    for column_name, definition in additions:
+        if column_name in columns:
+            continue
+        conn.execute(
+            f"ALTER TABLE feishu_message_inbox "
+            f"ADD COLUMN {column_name} {definition}"
+        )
+        columns.add(column_name)
+
+    invalid_status = conn.execute(
+        """
+        SELECT status
+        FROM feishu_message_inbox
+        WHERE status IS NULL OR status NOT IN (
+            'pending', 'processing', 'retry_wait', 'processed',
+            'cancelled', 'permanent_failed'
+        )
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_status is not None:
+        raise DBError(
+            "cannot migrate Feishu Inbox with invalid status: "
+            f"{invalid_status[0]}"
+        )
+
+    invalid_attempt_count = conn.execute(
+        """
+        SELECT 1
+        FROM feishu_message_inbox
+        WHERE attempt_count IS NULL OR attempt_count < 0
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_attempt_count is not None:
+        raise DBError("cannot migrate Feishu Inbox with invalid attempt_count")
+
+    # 旧恢复逻辑按 received_at、message_id 排序；首次回填沿用该顺序，
+    # 此后 receive_sequence 不再重算，保证重启前后顺序稳定。
+    invalid_sequence = conn.execute(
+        """
+        SELECT 1
+        FROM feishu_message_inbox
+        WHERE receive_sequence IS NULL OR receive_sequence <= 0
+        LIMIT 1
+        """
+    ).fetchone()
+    duplicate_sequence = conn.execute(
+        """
+        SELECT 1
+        FROM feishu_message_inbox
+        GROUP BY app_id, receive_sequence
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_sequence is not None or duplicate_sequence is not None:
+        rows = conn.execute(
+            """
+            SELECT app_id, message_id
+            FROM feishu_message_inbox
+            ORDER BY app_id, received_at, message_id
+            """
+        ).fetchall()
+        sequence_by_app: dict[str, int] = {}
+        sequence_rows = []
+        for app_id, message_id in rows:
+            normalized_app_id = str(app_id)
+            sequence = sequence_by_app.get(normalized_app_id, 0) + 1
+            sequence_by_app[normalized_app_id] = sequence
+            sequence_rows.append((sequence, app_id, message_id))
+        conn.executemany(
+            """
+            UPDATE feishu_message_inbox
+            SET receive_sequence=?
+            WHERE app_id=? AND message_id=?
+            """,
+            sequence_rows,
+        )
+
+    conn.execute(
+        """
+        UPDATE feishu_message_inbox
+        SET updated_at=COALESCE(completed_at, received_at)
+        WHERE updated_at IS NULL OR updated_at <= 0
+        """
+    )
+    _create_feishu_inbox_indexes_and_triggers(conn)
+
+
+def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    """为 Inbox 原地补充持久 route_key，并按旧 payload 回填。"""
+    if not _table_exists(conn, "feishu_message_inbox"):
+        _create_feishu_inbox_schema(conn)
+        return
+
+    columns = _table_columns(conn, "feishu_message_inbox")
+    if "route_key" not in columns:
+        conn.execute(
+            "ALTER TABLE feishu_message_inbox "
+            "ADD COLUMN route_key TEXT NOT NULL DEFAULT ''"
+        )
+
+    rows = conn.execute(
+        """
+        SELECT app_id, message_id, payload
+        FROM feishu_message_inbox
+        WHERE route_key IS NULL OR route_key=''
+        ORDER BY app_id, received_at, receive_sequence
+        """
+    ).fetchall()
+    route_rows = [
+        (
+            _derive_feishu_inbox_route_key(
+                str(app_id),
+                str(message_id),
+                str(payload),
+            ),
+            app_id,
+            message_id,
+        )
+        for app_id, message_id, payload in rows
+    ]
+    if route_rows:
+        conn.executemany(
+            """
+            UPDATE feishu_message_inbox
+            SET route_key=?
+            WHERE app_id=? AND message_id=?
+            """,
+            route_rows,
+        )
+
+    invalid_route = conn.execute(
+        """
+        SELECT 1
+        FROM feishu_message_inbox
+        WHERE route_key IS NULL OR route_key=''
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_route is not None:
+        raise DBError("cannot migrate Feishu Inbox with invalid route_key")
+    _create_feishu_inbox_indexes_and_triggers(conn)
+
+
+def _migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
+    """为 Gateway lease 和 Outbox claim 原地补充 fencing epoch。"""
+    if not _table_exists(conn, "gateway_runtime_lease"):
+        _create_gateway_runtime_lease_schema(conn)
+    else:
+        lease_columns = _table_columns(conn, "gateway_runtime_lease")
+        if "lease_epoch" not in lease_columns:
+            conn.execute(
+                "ALTER TABLE gateway_runtime_lease "
+                "ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 1"
+            )
+
+    if not _table_exists(conn, "gateway_outbox"):
+        raise DBError("Gateway Outbox table is missing during v12 migration")
+    outbox_columns = _table_columns(conn, "gateway_outbox")
+    if "claimed_by" not in outbox_columns:
+        conn.execute(
+            "ALTER TABLE gateway_outbox ADD COLUMN claimed_by TEXT"
+        )
+    if "claim_epoch" not in outbox_columns:
+        conn.execute(
+            "ALTER TABLE gateway_outbox ADD COLUMN claim_epoch INTEGER"
+        )
+
+    invalid_lease = conn.execute(
+        """
+        SELECT 1
+        FROM gateway_runtime_lease
+        WHERE lease_epoch IS NULL OR lease_epoch <= 0
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_lease is not None:
+        raise DBError("cannot migrate Gateway runtime lease with invalid epoch")
+    invalid_claim = conn.execute(
+        """
+        SELECT 1
+        FROM gateway_outbox
+        WHERE (claimed_by IS NULL) != (claim_epoch IS NULL)
+           OR (claim_epoch IS NOT NULL AND claim_epoch <= 0)
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_claim is not None:
+        raise DBError("cannot migrate Gateway Outbox with invalid claim")
+    _create_gateway_fencing_triggers(conn)
+
+
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
@@ -678,7 +1175,9 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     约束对既有数据库也生效。v2 → v3 新增 Gateway 当前会话映射,
     v3 → v4 新增 Gateway 待处理消息队列,v4 → v5 新增出站回复队列,
     v5 → v6 关联最终回答投递状态,v6 → v7 区分部分取消,
-    v7 → v8 增加原始平台消息归属索引，v8 → v9 增加 Gateway 运行租约。
+    v7 → v8 增加原始平台消息归属索引，v8 → v9 增加 Gateway 运行租约，
+    v9 → v10 正式接管 Feishu Inbox schema，v10 → v11 持久化 Inbox
+    route_key，v11 → v12 增加运行租约 epoch 与 Outbox claim fencing。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -875,6 +1374,42 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
             conn.commit()
             current = 9
 
+    if current < 10:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v9_to_v10(conn)
+            _set_schema_version(conn, 10)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 10
+
+    if current < 11:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v10_to_v11(conn)
+            _set_schema_version(conn, 11)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 11
+
+    if current < 12:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v11_to_v12(conn)
+            _set_schema_version(conn, 12)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 12
+
     return current
 
 
@@ -901,44 +1436,65 @@ def _infer_cancelled_gateway_outbox_status(
     return "partial_cancelled"
 
 
-def reconcile_gateway_terminal_deliveries(conn: sqlite3.Connection) -> int:
+def reconcile_gateway_terminal_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+) -> int:
     """收敛旧版本遗留的终态 Outbox 与 ``reply_pending`` queue。
 
     新代码通过统一终态函数一次提交三层状态；这里仅修复升级前已经形成的
     孤儿记录，以及“取消先提交、最后一个平台成功随后落进度”留下的可推导
     状态。终态审计行不会被删除。
     """
-    rows = conn.execute(
-        """
-        SELECT o.id, o.route_key, o.source_message_id, o.status,
-               o.next_chunk_index, o.payloads_json,
-               q.status, o.event_json
-        FROM gateway_outbox AS o
-        LEFT JOIN gateway_message_queue AS q
-          ON q.route_key=o.route_key
-         AND q.message_id=o.source_message_id
-        WHERE (
-            o.status IN (
-                'delivered', 'permanent_failed',
-                'cancelled', 'partial_cancelled'
-            )
-            AND q.status='reply_pending'
-        )
-        OR (o.status='cancelled' AND o.next_chunk_index > 0)
-        OR (
-            o.status='partial_cancelled'
-            AND json_valid(o.payloads_json)=1
-            AND o.next_chunk_index >= json_array_length(o.payloads_json)
-        )
-        ORDER BY o.created_at, o.id
-        """
-    ).fetchall()
-    if not rows:
-        return 0
-
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    manager = (
+        _immediate_transaction(conn)
+        if fence is not None
+        else transaction(conn)
+    )
     reconciled = 0
-    now = time.time()
-    with transaction(conn):
+    with manager:
+        now = time.time()
+        if fence is not None and not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            return 0
+        rows = conn.execute(
+            """
+            SELECT o.id, o.route_key, o.source_message_id, o.status,
+                   o.next_chunk_index, o.payloads_json,
+                   q.status, o.event_json
+            FROM gateway_outbox AS o
+            LEFT JOIN gateway_message_queue AS q
+              ON q.route_key=o.route_key
+             AND q.message_id=o.source_message_id
+            WHERE (
+                o.status IN (
+                    'delivered', 'permanent_failed',
+                    'cancelled', 'partial_cancelled'
+                )
+                AND q.status='reply_pending'
+            )
+            OR (o.status='cancelled' AND o.next_chunk_index > 0)
+            OR (
+                o.status='partial_cancelled'
+                AND json_valid(o.payloads_json)=1
+                AND o.next_chunk_index >= json_array_length(o.payloads_json)
+            )
+            ORDER BY o.created_at, o.id
+            """
+        ).fetchall()
         for (
             outbox_id,
             route_key,
@@ -956,24 +1512,36 @@ def reconcile_gateway_terminal_deliveries(conn: sqlite3.Connection) -> int:
                     str(payloads_json),
                 )
             if status != stored_status:
+                lease_clause, lease_params = _gateway_outbox_lease_clause(
+                    fence,
+                    now,
+                )
+                claim_assignment = ""
+                claim_params: tuple = ()
+                if fence is not None:
+                    claim_assignment = ", claimed_by=?, claim_epoch=?"
+                    claim_params = (fence[1], fence[2])
                 cursor = conn.execute(
-                    """
+                    f"""
                     UPDATE gateway_outbox
                     SET status=?, next_attempt_at=NULL,
                         last_error=CASE WHEN ?='delivered' THEN NULL
                                         ELSE last_error END,
                         last_error_code=CASE WHEN ?='delivered' THEN NULL
                                              ELSE last_error_code END,
-                        updated_at=?
+                        updated_at=? {claim_assignment}
                     WHERE id=? AND status=?
+                    {lease_clause}
                     """,
                     (
                         status,
                         status,
                         status,
                         now,
+                        *claim_params,
                         outbox_id,
                         stored_status,
+                        *lease_params,
                     ),
                 )
                 if cursor.rowcount <= 0:
@@ -1111,9 +1679,668 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
         yield
 
 
+# ===========================================================================
+# Feishu Inbox
+# ===========================================================================
+
+def _validate_feishu_inbox_identity(app_id: str, message_id: str) -> None:
+    """校验 Inbox 复合身份，避免写入不可寻址记录。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    if not isinstance(message_id, str) or not message_id:
+        raise DBError("Feishu Inbox message_id must not be empty")
+
+
+def _validate_feishu_inbox_status(status: str) -> None:
+    """校验 Inbox 状态，错误在进入 SQL 前显式暴露。"""
+    if status not in FEISHU_INBOX_STATUSES:
+        raise DBError(f"invalid Feishu Inbox status: {status}")
+
+
+def insert_feishu_inbox_message(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_id: str,
+    payload: dict,
+    *,
+    route_key: str | None = None,
+    received_at: float | None = None,
+) -> bool:
+    """幂等插入 pending 消息，并原子分配应用内接收序号。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    if not isinstance(payload, dict):
+        raise DBError("Feishu Inbox payload must contain an object")
+    try:
+        encoded_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise DBError("Feishu Inbox payload JSON serialization failed") from exc
+    normalized_route_key = str(route_key or "")
+    if not normalized_route_key:
+        normalized_route_key = _derive_feishu_inbox_route_key(
+            app_id,
+            message_id,
+            encoded_payload,
+        )
+
+    timestamp = time.time() if received_at is None else float(received_at)
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            INSERT INTO feishu_message_inbox (
+                app_id, message_id, route_key, payload, received_at,
+                receive_sequence,
+                status, attempt_count, next_attempt_at, last_error,
+                updated_at, completed_at, batch_message_id
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                COALESCE((
+                    SELECT MAX(receive_sequence) + 1
+                    FROM feishu_message_inbox
+                    WHERE app_id = ?
+                ), 1),
+                'pending', 0, NULL, NULL, ?, NULL, NULL
+            )
+            ON CONFLICT(app_id, message_id) DO NOTHING
+            """,
+            (
+                app_id,
+                message_id,
+                normalized_route_key,
+                encoded_payload,
+                timestamp,
+                app_id,
+                timestamp,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def get_feishu_inbox_status(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_id: str,
+) -> str | None:
+    """读取单条 Inbox 状态。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    row = conn.execute(
+        """
+        SELECT status
+        FROM feishu_message_inbox
+        WHERE app_id=? AND message_id=?
+        """,
+        (app_id, message_id),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def get_feishu_inbox_payload(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_id: str,
+    *,
+    status: str | None = None,
+) -> dict | None:
+    """按身份和可选状态读取、反序列化 Inbox 原始事件。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    if status is None:
+        row = conn.execute(
+            """
+            SELECT payload
+            FROM feishu_message_inbox
+            WHERE app_id=? AND message_id=?
+            """,
+            (app_id, message_id),
+        ).fetchone()
+    else:
+        _validate_feishu_inbox_status(status)
+        row = conn.execute(
+            """
+            SELECT payload
+            FROM feishu_message_inbox
+            WHERE app_id=? AND message_id=? AND status=?
+            """,
+            (app_id, message_id, status),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError) as exc:
+        raise InvalidFeishuInboxPayloadError(
+            "Feishu Inbox payload JSON deserialization failed"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise InvalidFeishuInboxPayloadError(
+            "Feishu Inbox payload must contain an object"
+        )
+    return payload
+
+
+def get_feishu_inbox_dispatch_candidates(
+    conn: sqlite3.Connection,
+    app_id: str,
+    *,
+    now: float | None = None,
+    limit: int = 64,
+) -> list[str]:
+    """按接收顺序读取当前可执行的 pending 或到期 retry_wait 记录。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    normalized_limit = int(limit)
+    if normalized_limit <= 0:
+        raise DBError("Feishu Inbox dispatch limit must be greater than 0")
+    timestamp = time.time() if now is None else float(now)
+    rows = conn.execute(
+        """
+        SELECT message_id
+        FROM feishu_message_inbox
+        WHERE app_id=?
+          AND (
+              status='pending'
+              OR (
+                  status='retry_wait'
+                  AND next_attempt_at IS NOT NULL
+                  AND next_attempt_at<=?
+              )
+          )
+        ORDER BY received_at, receive_sequence
+        LIMIT ?
+        """,
+        (app_id, timestamp, normalized_limit),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def get_feishu_inbox_dispatch_routes(
+    conn: sqlite3.Connection,
+    app_id: str,
+    *,
+    now: float | None = None,
+    limit: int = 64,
+) -> list[str]:
+    """读取每个路由严格队首中当前可执行的 route_key。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    normalized_limit = int(limit)
+    if normalized_limit <= 0:
+        raise DBError("Feishu Inbox dispatch limit must be greater than 0")
+    timestamp = time.time() if now is None else float(now)
+    rows = conn.execute(
+        """
+        WITH route_heads AS (
+            SELECT current.route_key, current.status,
+                   current.next_attempt_at, current.received_at,
+                   current.receive_sequence
+            FROM feishu_message_inbox AS current
+            WHERE current.app_id=?
+              AND current.status IN (
+                  'pending', 'processing', 'retry_wait', 'permanent_failed'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM feishu_message_inbox AS prior
+                  WHERE prior.app_id=current.app_id
+                    AND prior.route_key=current.route_key
+                    AND prior.status IN (
+                        'pending', 'processing', 'retry_wait',
+                        'permanent_failed'
+                    )
+                    AND (
+                        prior.received_at < current.received_at
+                        OR (
+                            prior.received_at = current.received_at
+                            AND prior.receive_sequence
+                                < current.receive_sequence
+                        )
+                    )
+              )
+        )
+        SELECT route_key
+        FROM route_heads
+        WHERE status='pending'
+           OR (
+               status='retry_wait'
+               AND next_attempt_at IS NOT NULL
+               AND next_attempt_at<=?
+           )
+        ORDER BY received_at, receive_sequence
+        LIMIT ?
+        """,
+        (app_id, timestamp, normalized_limit),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def get_feishu_inbox_route_next(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+) -> dict | None:
+    """查看路由中尚未终结且未被当前消费者 claim 的严格队首。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    normalized_route_key = str(route_key or "")
+    if not normalized_route_key:
+        raise DBError("Feishu Inbox route_key must not be empty")
+    row = conn.execute(
+        """
+        SELECT message_id, status, attempt_count, next_attempt_at,
+               received_at, receive_sequence
+        FROM feishu_message_inbox
+        WHERE app_id=? AND route_key=?
+          AND status IN ('pending', 'retry_wait', 'permanent_failed')
+        ORDER BY received_at, receive_sequence
+        LIMIT 1
+        """,
+        (app_id, normalized_route_key),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "message_id": str(row[0]),
+        "status": str(row[1]),
+        "attempt_count": int(row[2]),
+        "next_attempt_at": None if row[3] is None else float(row[3]),
+        "received_at": float(row[4]),
+        "receive_sequence": int(row[5]),
+    }
+
+
+def claim_feishu_inbox_route_message(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+    message_id: str,
+    *,
+    now: float | None = None,
+    allow_existing_processing: bool = False,
+) -> dict | None:
+    """仅 claim 路由未终结队首，并原子切换为 processing。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    normalized_route_key = str(route_key or "")
+    if not normalized_route_key:
+        raise DBError("Feishu Inbox route_key must not be empty")
+    timestamp = time.time() if now is None else float(now)
+    with _immediate_transaction(conn):
+        if not allow_existing_processing:
+            processing = conn.execute(
+                """
+                SELECT 1
+                FROM feishu_message_inbox
+                WHERE app_id=? AND route_key=? AND status='processing'
+                LIMIT 1
+                """,
+                (app_id, normalized_route_key),
+            ).fetchone()
+            if processing is not None:
+                return None
+        head = conn.execute(
+            """
+            SELECT message_id
+            FROM feishu_message_inbox
+            WHERE app_id=? AND route_key=?
+              AND status IN ('pending', 'retry_wait', 'permanent_failed')
+            ORDER BY received_at, receive_sequence
+            LIMIT 1
+            """,
+            (app_id, normalized_route_key),
+        ).fetchone()
+        if head is None or str(head[0]) != message_id:
+            return None
+        row = conn.execute(
+            """
+            UPDATE feishu_message_inbox
+            SET status='processing', updated_at=?, next_attempt_at=NULL,
+                completed_at=NULL
+            WHERE app_id=? AND route_key=? AND message_id=?
+              AND (
+                  status='pending'
+                  OR (
+                      status='retry_wait'
+                      AND next_attempt_at IS NOT NULL
+                      AND next_attempt_at<=?
+                  )
+              )
+            RETURNING attempt_count, received_at, receive_sequence
+            """,
+            (
+                timestamp,
+                app_id,
+                normalized_route_key,
+                message_id,
+                timestamp,
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "message_id": message_id,
+        "route_key": normalized_route_key,
+        "attempt_count": int(row[0]),
+        "received_at": float(row[1]),
+        "receive_sequence": int(row[2]),
+    }
+
+
+def claim_feishu_inbox_message(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_id: str,
+    *,
+    now: float | None = None,
+) -> dict | None:
+    """条件 claim 可执行记录并切换为 processing，竞争失败返回 None。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    timestamp = time.time() if now is None else float(now)
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            UPDATE feishu_message_inbox
+            SET status='processing', updated_at=?, next_attempt_at=NULL,
+                completed_at=NULL
+            WHERE app_id=? AND message_id=?
+              AND (
+                  status='pending'
+                  OR (
+                      status='retry_wait'
+                      AND next_attempt_at IS NOT NULL
+                      AND next_attempt_at<=?
+                  )
+              )
+            """,
+            (timestamp, app_id, message_id, timestamp),
+        )
+        if cursor.rowcount != 1:
+            return None
+        row = conn.execute(
+            """
+            SELECT attempt_count, receive_sequence
+            FROM feishu_message_inbox
+            WHERE app_id=? AND message_id=? AND status='processing'
+            """,
+            (app_id, message_id),
+        ).fetchone()
+        if row is None:
+            raise DBError("claimed Feishu Inbox message disappeared")
+    return {
+        "message_id": message_id,
+        "attempt_count": int(row[0]),
+        "receive_sequence": int(row[1]),
+    }
+
+
+def update_feishu_inbox_status(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_ids: list[str],
+    status: str,
+    *,
+    completed_at: float | None = None,
+    batch_message_id: str | None = None,
+    updated_at: float | None = None,
+    expected_statuses: tuple[str, ...] | None = None,
+) -> int:
+    """原子更新一组 Inbox 消息的状态和当前批次追踪信息。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    _validate_feishu_inbox_status(status)
+    if not message_ids:
+        return 0
+    normalized_message_ids = []
+    for message_id in message_ids:
+        _validate_feishu_inbox_identity(app_id, message_id)
+        normalized_message_ids.append(message_id)
+    timestamp = time.time() if updated_at is None else float(updated_at)
+    normalized_completed_at = (
+        None if completed_at is None else float(completed_at)
+    )
+    normalized_expected_statuses = None
+    if expected_statuses is not None:
+        normalized_expected_statuses = tuple(dict.fromkeys(expected_statuses))
+        if not normalized_expected_statuses:
+            return 0
+        for expected_status in normalized_expected_statuses:
+            _validate_feishu_inbox_status(expected_status)
+    status_clause = ""
+    status_params: tuple[str, ...] = ()
+    if normalized_expected_statuses is not None:
+        placeholders = ", ".join("?" for _ in normalized_expected_statuses)
+        status_clause = f" AND status IN ({placeholders})"
+        status_params = normalized_expected_statuses
+    with transaction(conn):
+        cursor = conn.executemany(
+            f"""
+            UPDATE feishu_message_inbox
+            SET status=?, updated_at=?, completed_at=?, batch_message_id=?,
+                next_attempt_at=NULL
+            WHERE app_id=? AND message_id=?
+            {status_clause}
+            """,
+            [
+                (
+                    status,
+                    timestamp,
+                    normalized_completed_at,
+                    batch_message_id,
+                    app_id,
+                    message_id,
+                    *status_params,
+                )
+                for message_id in normalized_message_ids
+            ],
+        )
+    return max(0, cursor.rowcount)
+
+
+def fail_feishu_inbox_message(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_id: str,
+    *,
+    last_error: str,
+    next_attempt_at: float | None,
+    max_attempts: int,
+    permanent: bool = False,
+    now: float | None = None,
+) -> dict | None:
+    """记录一次失败，并按永久性或最大次数决定 retry_wait/终态。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    normalized_max_attempts = int(max_attempts)
+    if normalized_max_attempts <= 0:
+        raise DBError("Feishu Inbox max_attempts must be greater than 0")
+    normalized_error = str(last_error or "inbox_failure")[:256]
+    timestamp = time.time() if now is None else float(now)
+    normalized_next_attempt = (
+        None if next_attempt_at is None else float(next_attempt_at)
+    )
+    with transaction(conn):
+        row = conn.execute(
+            """
+            UPDATE feishu_message_inbox
+            SET attempt_count=attempt_count + 1,
+                status=CASE
+                    WHEN ? OR attempt_count + 1 >= ?
+                    THEN 'permanent_failed'
+                    ELSE 'retry_wait'
+                END,
+                next_attempt_at=CASE
+                    WHEN ? OR attempt_count + 1 >= ?
+                    THEN NULL
+                    ELSE ?
+                END,
+                last_error=?,
+                updated_at=?,
+                completed_at=CASE
+                    WHEN ? OR attempt_count + 1 >= ?
+                    THEN ?
+                    ELSE NULL
+                END
+            WHERE app_id=? AND message_id=? AND status='processing'
+            RETURNING status, attempt_count, next_attempt_at
+            """,
+            (
+                bool(permanent),
+                normalized_max_attempts,
+                bool(permanent),
+                normalized_max_attempts,
+                normalized_next_attempt,
+                normalized_error,
+                timestamp,
+                bool(permanent),
+                normalized_max_attempts,
+                timestamp,
+                app_id,
+                message_id,
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "status": str(row[0]),
+        "attempt_count": int(row[1]),
+        "next_attempt_at": (
+            None if row[2] is None else float(row[2])
+        ),
+    }
+
+
+def reset_feishu_inbox_processing(
+    conn: sqlite3.Connection,
+    app_id: str,
+    *,
+    now: float | None = None,
+) -> int:
+    """启动时把异常退出遗留的 processing 收敛为立即可恢复状态。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    timestamp = time.time() if now is None else float(now)
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            UPDATE feishu_message_inbox
+            SET status='retry_wait', next_attempt_at=?, updated_at=?,
+                completed_at=NULL,
+                last_error='gateway_restart:processing_recovered'
+            WHERE app_id=? AND status='processing'
+            """,
+            (timestamp, timestamp, app_id),
+        )
+    return cursor.rowcount
+
+
+def release_feishu_inbox_processing_message(
+    conn: sqlite3.Connection,
+    app_id: str,
+    message_id: str,
+    *,
+    last_error: str,
+    now: float | None = None,
+) -> bool:
+    """不增加尝试次数地释放 processing，供有序 shutdown 恢复。"""
+    _validate_feishu_inbox_identity(app_id, message_id)
+    timestamp = time.time() if now is None else float(now)
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            UPDATE feishu_message_inbox
+            SET status='retry_wait', next_attempt_at=?, updated_at=?,
+                completed_at=NULL, last_error=?
+            WHERE app_id=? AND message_id=? AND status='processing'
+            """,
+            (
+                timestamp,
+                timestamp,
+                str(last_error or "gateway_stopping")[:256],
+                app_id,
+                message_id,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def _cleanup_batch_limit(value, label: str) -> int:
+    """统一校验清理批次，避免布尔值或非法字符串进入 LIMIT。"""
+    if isinstance(value, bool):
+        raise DBError(f"{label} cleanup limit must be positive")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise DBError(f"{label} cleanup limit must be positive") from exc
+    if normalized <= 0:
+        raise DBError(f"{label} cleanup limit must be positive")
+    return normalized
+
+
+def prune_feishu_inbox_messages(
+    conn: sqlite3.Connection,
+    app_id: str,
+    *,
+    completed_before: float,
+    limit: int = 200,
+) -> int:
+    """分批清理终态 Inbox；仍阻挡活跃后继的永久失败记录继续保留。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu Inbox app_id must not be empty")
+    batch_limit = _cleanup_batch_limit(limit, "Feishu Inbox")
+    cutoff = float(completed_before)
+    with _immediate_transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT candidate.message_id
+            FROM feishu_message_inbox AS candidate
+            WHERE candidate.app_id=?
+              AND candidate.completed_at < ?
+              AND (
+                  candidate.status IN ('processed', 'cancelled')
+                  OR (
+                      candidate.status='permanent_failed'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM feishu_message_inbox AS later
+                          WHERE later.app_id=candidate.app_id
+                            AND later.route_key=candidate.route_key
+                            AND later.status IN (
+                                'pending', 'processing', 'retry_wait'
+                            )
+                            AND (
+                                later.received_at > candidate.received_at
+                                OR (
+                                    later.received_at=candidate.received_at
+                                    AND later.receive_sequence
+                                        > candidate.receive_sequence
+                                )
+                            )
+                      )
+                  )
+              )
+            ORDER BY candidate.completed_at, candidate.receive_sequence
+            LIMIT ?
+            """,
+            (app_id, cutoff, batch_limit),
+        ).fetchall()
+        removed = 0
+        for (message_id,) in rows:
+            cursor = conn.execute(
+                """
+                DELETE FROM feishu_message_inbox
+                WHERE app_id=? AND message_id=? AND completed_at < ?
+                  AND status IN (
+                      'processed', 'cancelled', 'permanent_failed'
+                  )
+                """,
+                (app_id, str(message_id), cutoff),
+            )
+            removed += cursor.rowcount
+    return removed
+
+
 @contextmanager
 def _immediate_transaction(conn: sqlite3.Connection) -> Iterator[None]:
-    """以写锁开始事务，供跨进程竞争同一租约行。"""
+    """以写锁开始短事务，供 lease 竞争、探针和有界清理使用。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -1122,6 +2349,154 @@ def _immediate_transaction(conn: sqlite3.Connection) -> Iterator[None]:
         raise
     else:
         conn.commit()
+
+
+def prune_gateway_terminal_ownership(
+    conn: sqlite3.Connection,
+    *,
+    updated_before: float,
+    limit: int = 200,
+) -> int:
+    """分批删除无 Queue/Outbox 引用的终态 ownership。"""
+    batch_limit = _cleanup_batch_limit(limit, "gateway ownership")
+    cutoff = float(updated_before)
+    with _immediate_transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT ownership.route_key, ownership.source_message_id
+            FROM gateway_source_message_ownership AS ownership
+            WHERE ownership.updated_at < ?
+              AND ownership.status IN (
+                  'completed', 'cancelled', 'delivery_failed', 'delivered',
+                  'partial_cancelled', 'permanent_failed'
+              )
+              AND (
+                  (
+                      ownership.owner_kind='queue'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gateway_message_queue AS queue
+                          WHERE queue.route_key=ownership.route_key
+                            AND queue.message_id=ownership.owner_id
+                      )
+                  )
+                  OR (
+                      ownership.owner_kind='outbox'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gateway_outbox AS outbox
+                          WHERE outbox.id=ownership.owner_id
+                      )
+                  )
+              )
+            ORDER BY ownership.updated_at, ownership.route_key,
+                     ownership.source_message_id
+            LIMIT ?
+            """,
+            (cutoff, batch_limit),
+        ).fetchall()
+        removed = 0
+        for route_key, source_message_id in rows:
+            cursor = conn.execute(
+                """
+                DELETE FROM gateway_source_message_ownership
+                WHERE route_key=? AND source_message_id=?
+                  AND updated_at < ?
+                  AND status IN (
+                      'completed', 'cancelled', 'delivery_failed',
+                      'delivered', 'partial_cancelled', 'permanent_failed'
+                  )
+                """,
+                (str(route_key), str(source_message_id), cutoff),
+            )
+            removed += cursor.rowcount
+    return removed
+
+
+def prune_gateway_terminal_outbox(
+    conn: sqlite3.Connection,
+    *,
+    updated_before: float,
+    limit: int = 200,
+) -> int:
+    """分批删除安全的终态 Outbox 审计，并保持消息可见性语义。"""
+    batch_limit = _cleanup_batch_limit(limit, "gateway Outbox")
+    cutoff = float(updated_before)
+    terminal_statuses = (
+        "delivered",
+        "cancelled",
+        "partial_cancelled",
+        "permanent_failed",
+    )
+    with _immediate_transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT outbox.id, outbox.route_key, outbox.source_message_id
+            FROM gateway_outbox AS outbox
+            WHERE outbox.updated_at < ?
+              AND outbox.status IN (
+                  'delivered', 'cancelled', 'partial_cancelled',
+                  'permanent_failed'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM gateway_message_queue AS queue
+                  WHERE queue.route_key=outbox.route_key
+                    AND queue.message_id=outbox.source_message_id
+                    AND queue.status IN (
+                        'queued', 'processing', 'reply_pending'
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM gateway_message_deliveries AS delivery
+                  WHERE delivery.delivery_id=outbox.id
+                    AND delivery.status != outbox.status
+              )
+            ORDER BY outbox.updated_at, outbox.id
+            LIMIT ?
+            """,
+            (cutoff, batch_limit),
+        ).fetchall()
+        removed = 0
+        for outbox_id, route_key, source_message_id in rows:
+            delivery = conn.execute(
+                """
+                SELECT assistant_message_id, status
+                FROM gateway_message_deliveries
+                WHERE delivery_id=?
+                """,
+                (str(outbox_id),),
+            ).fetchone()
+            if delivery is not None and str(delivery[1]) != "delivered":
+                # 未送达回答原本由 delivery 状态隐藏；删除审计前同时删除
+                # 对应 assistant，避免历史读取时错误地重新显示。
+                conn.execute(
+                    "DELETE FROM messages WHERE id=?",
+                    (int(delivery[0]),),
+                )
+            conn.execute(
+                "DELETE FROM gateway_message_deliveries WHERE delivery_id=?",
+                (str(outbox_id),),
+            )
+            conn.execute(
+                """
+                DELETE FROM gateway_message_queue
+                WHERE route_key=? AND message_id=?
+                  AND status='delivery_failed'
+                """,
+                (str(route_key), str(source_message_id)),
+            )
+            cursor = conn.execute(
+                """
+                DELETE FROM gateway_outbox
+                WHERE id=? AND updated_at < ?
+                  AND status IN (?, ?, ?, ?)
+                """,
+                (str(outbox_id), cutoff, *terminal_statuses),
+            )
+            removed += cursor.rowcount
+    return removed
 
 
 def _gateway_runtime_lease_values(
@@ -1145,58 +2520,119 @@ def _gateway_runtime_lease_values(
     return lease_name, instance_id, ttl
 
 
+def _gateway_lease_epoch_value(lease_epoch: int) -> int:
+    """校验 fencing epoch，布尔值不能伪装成整数世代。"""
+    if isinstance(lease_epoch, bool):
+        raise DBError("gateway runtime lease_epoch must be greater than 0")
+    try:
+        normalized = int(lease_epoch)
+    except (TypeError, ValueError) as exc:
+        raise DBError("gateway runtime lease_epoch must be an integer") from exc
+    if normalized <= 0:
+        raise DBError("gateway runtime lease_epoch must be greater than 0")
+    return normalized
+
+
 def acquire_gateway_runtime_lease(
     conn: sqlite3.Connection,
     lease_name: str,
     instance_id: str,
     ttl_seconds: float,
-) -> bool:
-    """原子获取、接管过期租约，或为同一实例续租。"""
+) -> dict | None:
+    """原子获取或接管租约，成功返回实例身份和单调 fencing epoch。"""
     lease_name, instance_id, ttl = _gateway_runtime_lease_values(
         lease_name,
         instance_id,
         ttl_seconds,
     )
-    now = time.time()
     with _immediate_transaction(conn):
-        cursor = conn.execute(
+        # BEGIN IMMEDIATE 可能等待其他写事务；拿到写锁后再取时间，避免
+        # 用等待前的旧时间错误续活或接管 lease。
+        now = time.time()
+        row = conn.execute(
             """
-            INSERT INTO gateway_runtime_lease (
-                lease_name, instance_id, heartbeat_at, expires_at
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(lease_name) DO UPDATE SET
-                instance_id=excluded.instance_id,
-                heartbeat_at=excluded.heartbeat_at,
-                expires_at=excluded.expires_at
-            WHERE gateway_runtime_lease.instance_id=excluded.instance_id
-               OR gateway_runtime_lease.expires_at<=excluded.heartbeat_at
+            SELECT instance_id, lease_epoch, expires_at
+            FROM gateway_runtime_lease
+            WHERE lease_name=?
             """,
-            (lease_name, instance_id, now, now + ttl),
-        )
-        return cursor.rowcount == 1
+            (lease_name,),
+        ).fetchone()
+        if row is None:
+            lease_epoch = 1
+            conn.execute(
+                """
+                INSERT INTO gateway_runtime_lease (
+                    lease_name, instance_id, lease_epoch,
+                    heartbeat_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (lease_name, instance_id, lease_epoch, now, now + ttl),
+            )
+        else:
+            current_instance = str(row[0])
+            current_epoch = _gateway_lease_epoch_value(row[1])
+            current_expires_at = float(row[2])
+            if current_instance == instance_id and current_expires_at > now:
+                lease_epoch = current_epoch
+            elif current_expires_at <= now:
+                lease_epoch = current_epoch + 1
+            else:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE gateway_runtime_lease
+                SET instance_id=?, lease_epoch=?, heartbeat_at=?, expires_at=?
+                WHERE lease_name=? AND instance_id=? AND lease_epoch=?
+                """,
+                (
+                    instance_id,
+                    lease_epoch,
+                    now,
+                    now + ttl,
+                    lease_name,
+                    current_instance,
+                    current_epoch,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+    return {
+        "instance_id": instance_id,
+        "lease_epoch": lease_epoch,
+    }
 
 
 def renew_gateway_runtime_lease(
     conn: sqlite3.Connection,
     lease_name: str,
     instance_id: str,
+    lease_epoch: int,
     ttl_seconds: float,
 ) -> bool:
-    """仅允许当前持有者刷新 heartbeat 和过期时间。"""
+    """仅允许当前 owner 和 epoch 续租，续租不改变 epoch。"""
     lease_name, instance_id, ttl = _gateway_runtime_lease_values(
         lease_name,
         instance_id,
         ttl_seconds,
     )
-    now = time.time()
+    normalized_epoch = _gateway_lease_epoch_value(lease_epoch)
     with _immediate_transaction(conn):
+        now = time.time()
         cursor = conn.execute(
             """
             UPDATE gateway_runtime_lease
             SET heartbeat_at=?, expires_at=?
-            WHERE lease_name=? AND instance_id=?
+            WHERE lease_name=? AND instance_id=? AND lease_epoch=?
+              AND expires_at > ?
             """,
-            (now, now + ttl, lease_name, instance_id),
+            (
+                now,
+                now + ttl,
+                lease_name,
+                instance_id,
+                normalized_epoch,
+                now,
+            ),
         )
         return cursor.rowcount == 1
 
@@ -1205,21 +2641,167 @@ def release_gateway_runtime_lease(
     conn: sqlite3.Connection,
     lease_name: str,
     instance_id: str,
+    lease_epoch: int,
 ) -> bool:
-    """仅删除当前实例持有的租约，不影响已经接管的新实例。"""
+    """仅让当前 epoch 立即过期，并保留世代供下次接管递增。"""
     if not isinstance(lease_name, str) or not lease_name:
         raise DBError("gateway runtime lease_name must not be empty")
     if not isinstance(instance_id, str) or not instance_id:
         raise DBError("gateway runtime instance_id must not be empty")
+    normalized_epoch = _gateway_lease_epoch_value(lease_epoch)
     with _immediate_transaction(conn):
+        now = time.time()
         cursor = conn.execute(
             """
-            DELETE FROM gateway_runtime_lease
-            WHERE lease_name=? AND instance_id=?
+            UPDATE gateway_runtime_lease
+            SET heartbeat_at=?, expires_at=0
+            WHERE lease_name=? AND instance_id=? AND lease_epoch=?
             """,
-            (lease_name, instance_id),
+            (
+                now,
+                lease_name,
+                instance_id,
+                normalized_epoch,
+            ),
         )
         return cursor.rowcount == 1
+
+
+def gateway_runtime_lease_is_valid(
+    conn: sqlite3.Connection,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    """同时校验 lease owner、epoch 和有效期。"""
+    if not isinstance(lease_name, str) or not lease_name:
+        raise DBError("gateway runtime lease_name must not be empty")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise DBError("gateway runtime instance_id must not be empty")
+    normalized_epoch = _gateway_lease_epoch_value(lease_epoch)
+    timestamp = time.time() if now is None else float(now)
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM gateway_runtime_lease
+        WHERE lease_name=? AND instance_id=? AND lease_epoch=?
+          AND expires_at>?
+        """,
+        (lease_name, instance_id, normalized_epoch, timestamp),
+    ).fetchone()
+    return row is not None
+
+
+def check_gateway_runtime_readiness(
+    conn: sqlite3.Connection,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    """在一个轻量写事务内检查数据库可读写且当前 fencing lease 有效。"""
+    if not isinstance(lease_name, str) or not lease_name:
+        raise DBError("gateway runtime lease_name must not be empty")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise DBError("gateway runtime instance_id must not be empty")
+    normalized_epoch = _gateway_lease_epoch_value(lease_epoch)
+    timestamp = time.time() if now is None else float(now)
+    with _immediate_transaction(conn):
+        schema_row = conn.execute(
+            "SELECT 1 FROM schema_version WHERE version=?",
+            (LATEST_SCHEMA_VERSION,),
+        ).fetchone()
+        if schema_row is None:
+            return False
+        # 只刷新观测时间，不延长 expires_at；健康请求不能替代正式续租。
+        cursor = conn.execute(
+            """
+            UPDATE gateway_runtime_lease
+            SET heartbeat_at=?
+            WHERE lease_name=? AND instance_id=? AND lease_epoch=?
+              AND expires_at>?
+            """,
+            (
+                timestamp,
+                lease_name,
+                instance_id,
+                normalized_epoch,
+                timestamp,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def _gateway_outbox_fence_values(
+    lease_name: str | None,
+    instance_id: str | None,
+    lease_epoch: int | None,
+) -> tuple[str, str, int] | None:
+    """规范化可选 fencing；全空仅保留旧嵌入式调用兼容。"""
+    values = (lease_name, instance_id, lease_epoch)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise DBError("gateway Outbox fencing identity is incomplete")
+    normalized_name = str(lease_name or "")
+    normalized_instance = str(instance_id or "")
+    if not normalized_name or not normalized_instance:
+        raise DBError("gateway Outbox fencing identity must not be empty")
+    return (
+        normalized_name,
+        normalized_instance,
+        _gateway_lease_epoch_value(lease_epoch),
+    )
+
+
+def gateway_outbox_claim_is_valid(
+    conn: sqlite3.Connection,
+    outbox_id: str,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    """确认数据库租约和 Outbox claim 同时属于当前 fencing 身份。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    assert fence is not None
+    timestamp = time.time() if now is None else float(now)
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM gateway_outbox AS outbox
+        WHERE outbox.id=?
+          AND outbox.status='sending'
+          AND outbox.claimed_by=?
+          AND outbox.claim_epoch=?
+          AND EXISTS (
+              SELECT 1
+              FROM gateway_runtime_lease AS lease
+              WHERE lease.lease_name=?
+                AND lease.instance_id=?
+                AND lease.lease_epoch=?
+                AND lease.expires_at>?
+          )
+        """,
+        (
+            outbox_id,
+            fence[1],
+            fence[2],
+            fence[0],
+            fence[1],
+            fence[2],
+            timestamp,
+        ),
+    ).fetchone()
+    return row is not None
 
 
 # ===========================================================================
@@ -1632,6 +3214,10 @@ def _serialize_gateway_json(value, field_name: str) -> str:
 def _insert_gateway_outbox(
     conn: sqlite3.Connection,
     outbox: dict,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> str:
     """插入一条 outbox,不 commit,返回实际使用的 delivery id。"""
     required = (
@@ -1650,42 +3236,84 @@ def _insert_gateway_outbox(
     if not isinstance(outbox["payloads"], list):
         raise DBError("gateway outbox payloads must be a list")
 
-    now = time.time()
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO gateway_outbox (
-            id, route_key, source_message_id, event_json, platform, chat_id,
-            reply_to_message_id, thread_id, delivery_kind, payloads_json,
-            next_chunk_index, message_ids_json, status, attempt_count,
-            next_attempt_at, last_error, last_error_code, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
-                  NULL, NULL, NULL, ?, ?)
-        """,
-        (
-            str(outbox["id"]),
-            str(outbox["route_key"]),
-            str(outbox["source_message_id"]),
-            str(outbox["event_json"]),
-            str(outbox["platform"]),
-            str(outbox["chat_id"]),
-            outbox.get("reply_to_message_id"),
-            outbox.get("thread_id"),
-            str(outbox["delivery_kind"]),
-            _serialize_gateway_json(outbox["payloads"], "payloads"),
-            now,
-            now,
-        ),
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
     )
-    row = conn.execute(
+    now = time.time()
+    values = (
+        str(outbox["id"]),
+        str(outbox["route_key"]),
+        str(outbox["source_message_id"]),
+        str(outbox["event_json"]),
+        str(outbox["platform"]),
+        str(outbox["chat_id"]),
+        outbox.get("reply_to_message_id"),
+        outbox.get("thread_id"),
+        str(outbox["delivery_kind"]),
+        _serialize_gateway_json(outbox["payloads"], "payloads"),
+        now,
+        now,
+    )
+    if fence is None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO gateway_outbox (
+                id, route_key, source_message_id, event_json, platform,
+                chat_id, reply_to_message_id, thread_id, delivery_kind,
+                payloads_json, next_chunk_index, message_ids_json, status,
+                attempt_count, next_attempt_at, last_error, last_error_code,
+                claimed_by, claim_epoch, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
+                      NULL, NULL, NULL, NULL, NULL, ?, ?)
+            """,
+            values,
+        )
+        fence_clause = ""
+        fence_params: tuple = ()
+    else:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO gateway_outbox (
+                id, route_key, source_message_id, event_json, platform,
+                chat_id, reply_to_message_id, thread_id, delivery_kind,
+                payloads_json, next_chunk_index, message_ids_json, status,
+                attempt_count, next_attempt_at, last_error, last_error_code,
+                claimed_by, claim_epoch, created_at, updated_at
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
+                   NULL, NULL, NULL, NULL, NULL, ?, ?
+            WHERE EXISTS (
+                SELECT 1
+                FROM gateway_runtime_lease
+                WHERE lease_name=? AND instance_id=? AND lease_epoch=?
+                  AND expires_at>?
+            )
+            """,
+            (*values, fence[0], fence[1], fence[2], now),
+        )
+        fence_clause = """
+            AND EXISTS (
+                SELECT 1
+                FROM gateway_runtime_lease
+                WHERE lease_name=? AND instance_id=? AND lease_epoch=?
+                  AND expires_at>?
+            )
         """
+        fence_params = (fence[0], fence[1], fence[2], now)
+    row = conn.execute(
+        f"""
         SELECT id, event_json, status, created_at, updated_at
         FROM gateway_outbox
         WHERE route_key=? AND source_message_id=? AND delivery_kind=?
+        {fence_clause}
         """,
         (
             str(outbox["route_key"]),
             str(outbox["source_message_id"]),
             str(outbox["delivery_kind"]),
+            *fence_params,
         ),
     ).fetchone()
     if row is None:
@@ -1711,10 +3339,20 @@ def _insert_gateway_outbox(
 def enqueue_gateway_outbox(
     conn: sqlite3.Connection,
     outbox: dict,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> str:
     """持久化回复并把对应入站消息切换到 reply_pending。"""
     with transaction(conn):
-        outbox_id = _insert_gateway_outbox(conn, outbox)
+        outbox_id = _insert_gateway_outbox(
+            conn,
+            outbox,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
         conn.execute(
             """
             UPDATE gateway_message_queue
@@ -1751,6 +3389,8 @@ def _gateway_outbox_row(row) -> dict | None:
         next_attempt_at,
         last_error,
         last_error_code,
+        claimed_by,
+        claim_epoch,
     ) = row
     try:
         payloads = json.loads(payloads_json)
@@ -1777,6 +3417,8 @@ def _gateway_outbox_row(row) -> dict | None:
         "next_attempt_at": next_attempt_at,
         "last_error": last_error,
         "last_error_code": last_error_code,
+        "claimed_by": claimed_by,
+        "claim_epoch": None if claim_epoch is None else int(claim_epoch),
     }
 
 
@@ -1784,7 +3426,7 @@ _GATEWAY_OUTBOX_COLUMNS = """
     id, route_key, source_message_id, event_json, platform, chat_id,
     reply_to_message_id, thread_id, delivery_kind, payloads_json,
     next_chunk_index, message_ids_json, status, attempt_count,
-    next_attempt_at, last_error, last_error_code
+    next_attempt_at, last_error, last_error_code, claimed_by, claim_epoch
 """
 
 
@@ -1886,25 +3528,75 @@ def _update_gateway_outbox_ownership_status(
     )
 
 
-def reset_gateway_sending_outbox(conn: sqlite3.Connection) -> None:
-    """重启时把中断的 sending 恢复为 pending。"""
-    with transaction(conn):
-        rows = conn.execute(
-            """
-            SELECT id, route_key, source_message_id, event_json
-            FROM gateway_outbox
-            WHERE status='sending'
-            """
-        ).fetchall()
-        now = time.time()
-        conn.execute(
-            """
-            UPDATE gateway_outbox
-            SET status='pending', next_attempt_at=NULL, updated_at=?
-            WHERE status='sending'
-            """,
-            (now,),
+def _gateway_outbox_lease_clause(
+    fence: tuple[str, str, int] | None,
+    timestamp: float,
+) -> tuple[str, tuple]:
+    """生成必须在同一 UPDATE 中成立的数据库租约条件。"""
+    if fence is None:
+        return "", ()
+    return (
+        """
+        AND EXISTS (
+            SELECT 1
+            FROM gateway_runtime_lease AS lease
+            WHERE lease.lease_name=?
+              AND lease.instance_id=?
+              AND lease.lease_epoch=?
+              AND lease.expires_at>?
         )
+        """,
+        (fence[0], fence[1], fence[2], timestamp),
+    )
+
+
+def _gateway_outbox_claim_clause(
+    fence: tuple[str, str, int] | None,
+    timestamp: float,
+) -> tuple[str, tuple]:
+    """生成 claim 身份与当前数据库租约同时成立的条件。"""
+    if fence is None:
+        return "", ()
+    lease_clause, lease_params = _gateway_outbox_lease_clause(
+        fence,
+        timestamp,
+    )
+    return (
+        f"""
+        AND claimed_by=? AND claim_epoch=?
+        {lease_clause}
+        """,
+        (fence[1], fence[2], *lease_params),
+    )
+
+
+def reset_gateway_sending_outbox(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+) -> int:
+    """由当前 epoch 接管启动遗留的 sending，并恢复为 pending。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    with transaction(conn):
+        now = time.time()
+        lease_clause, lease_params = _gateway_outbox_lease_clause(fence, now)
+        rows = conn.execute(
+            f"""
+            UPDATE gateway_outbox
+            SET status='pending', next_attempt_at=NULL,
+                claimed_by=NULL, claim_epoch=NULL, updated_at=?
+            WHERE status='sending'
+            {lease_clause}
+            RETURNING id, route_key, source_message_id, event_json
+            """,
+            (now, *lease_params),
+        ).fetchall()
         for outbox_id, route_key, source_message_id, event_json in rows:
             _update_gateway_outbox_ownership_status(
                 conn,
@@ -1915,12 +3607,23 @@ def reset_gateway_sending_outbox(conn: sqlite3.Connection) -> None:
                 status="pending",
                 updated_at=now,
             )
+    return len(rows)
 
 
 def mark_gateway_outbox_sending(
     conn: sqlite3.Connection,
     outbox_id: str,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> bool:
+    """由当前有效 epoch claim Outbox 并切换为 sending。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
     with transaction(conn):
         row = conn.execute(
             """
@@ -1937,13 +3640,26 @@ def mark_gateway_outbox_sending(
         }:
             return False
         now = time.time()
+        lease_clause, lease_params = _gateway_outbox_lease_clause(fence, now)
+        claim_assignment = ""
+        claim_params: tuple = ()
+        if fence is not None:
+            claim_assignment = ", claimed_by=?, claim_epoch=?"
+            claim_params = (fence[1], fence[2])
         cursor = conn.execute(
-            """
+            f"""
             UPDATE gateway_outbox
-            SET status='sending', updated_at=?
+            SET status='sending', updated_at=? {claim_assignment}
             WHERE id=? AND status=?
+            {lease_clause}
             """,
-            (now, outbox_id, str(row[3])),
+            (
+                now,
+                *claim_params,
+                outbox_id,
+                str(row[3]),
+                *lease_params,
+            ),
         )
         if cursor.rowcount <= 0:
             return False
@@ -1965,8 +3681,17 @@ def mark_gateway_outbox_chunk_sent(
     next_chunk_index: int,
     message_ids: list[str],
     total_chunks: int | None = None,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> bool:
     """只记录平台成功事实；终态由统一 delivery 事务负责收敛。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
     saved_index = int(next_chunk_index)
     if total_chunks is None:
         row = conn.execute(
@@ -1988,8 +3713,10 @@ def mark_gateway_outbox_chunk_sent(
     if saved_index <= 0 or saved_index > total_chunks:
         raise DBError("gateway outbox chunk progress is out of range")
 
+    now = time.time()
+    claim_clause, claim_params = _gateway_outbox_claim_clause(fence, now)
     cursor = conn.execute(
-        """
+        f"""
         UPDATE gateway_outbox
         SET next_chunk_index=?, message_ids_json=?, updated_at=?
         WHERE id=?
@@ -1998,13 +3725,15 @@ def mark_gateway_outbox_chunk_sent(
               'pending', 'sending', 'retry_wait',
               'cancelled', 'partial_cancelled'
           )
+          {claim_clause}
         """,
         (
             saved_index,
             _serialize_gateway_json(message_ids, "message_ids"),
-            time.time(),
+            now,
             outbox_id,
             saved_index,
+            *claim_params,
         ),
     )
     conn.commit()
@@ -2017,7 +3746,16 @@ def mark_gateway_outbox_retry(
     error: str,
     error_code: str | None,
     next_attempt_at: float,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> bool:
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
     with transaction(conn):
         row = conn.execute(
             """
@@ -2030,12 +3768,14 @@ def mark_gateway_outbox_retry(
         if row is None or str(row[3]) != "sending":
             return False
         now = time.time()
+        claim_clause, claim_params = _gateway_outbox_claim_clause(fence, now)
         cursor = conn.execute(
-            """
+            f"""
             UPDATE gateway_outbox
             SET status='retry_wait', attempt_count=attempt_count + 1,
                 next_attempt_at=?, last_error=?, last_error_code=?, updated_at=?
             WHERE id=? AND status='sending'
+            {claim_clause}
             """,
             (
                 next_attempt_at,
@@ -2043,6 +3783,7 @@ def mark_gateway_outbox_retry(
                 error_code,
                 now,
                 outbox_id,
+                *claim_params,
             ),
         )
         if cursor.rowcount <= 0:
@@ -2066,7 +3807,8 @@ def _gateway_terminal_outbox_row(
     return conn.execute(
         """
         SELECT route_key, source_message_id, status,
-               next_chunk_index, payloads_json, event_json
+               next_chunk_index, payloads_json, event_json,
+               claimed_by, claim_epoch
         FROM gateway_outbox
         WHERE id=?
         """,
@@ -2092,8 +3834,17 @@ def complete_gateway_delivery(
     outbox_id: str,
     route_key: str,
     source_message_id: str,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> bool:
     """原子完成 Outbox、assistant delivery，并删除对应入站 queue。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
     now = time.time()
     with transaction(conn):
         row = _gateway_terminal_outbox_row(conn, outbox_id)
@@ -2125,12 +3876,14 @@ def complete_gateway_delivery(
         if int(row[3]) < len(payloads):
             return False
 
+        claim_clause, claim_params = _gateway_outbox_claim_clause(fence, now)
         cursor = conn.execute(
-            """
+            f"""
             UPDATE gateway_outbox
             SET status='delivered', next_attempt_at=NULL,
                 last_error=NULL, last_error_code=NULL, updated_at=?
             WHERE id=? AND route_key=? AND source_message_id=? AND status=?
+            {claim_clause}
             """,
             (
                 now,
@@ -2138,6 +3891,7 @@ def complete_gateway_delivery(
                 route_key,
                 source_message_id,
                 old_status,
+                *claim_params,
             ),
         )
         if cursor.rowcount <= 0:
@@ -2176,8 +3930,17 @@ def fail_gateway_delivery(
     source_message_id: str,
     error: str,
     error_code: str | None,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> bool:
     """原子持久化永久失败，并把入站 queue 留作失败审计。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
     safe_error = str(error)[:120]
     safe_error_code = str(error_code)[:120] if error_code is not None else None
     now = time.time()
@@ -2194,12 +3957,14 @@ def fail_gateway_delivery(
         old_status = str(row[2])
         if old_status not in {"pending", "sending", "retry_wait"}:
             return False
+        claim_clause, claim_params = _gateway_outbox_claim_clause(fence, now)
         cursor = conn.execute(
-            """
+            f"""
             UPDATE gateway_outbox
             SET status='permanent_failed', last_error=?, last_error_code=?,
                 next_attempt_at=NULL, updated_at=?
             WHERE id=? AND route_key=? AND source_message_id=? AND status=?
+            {claim_clause}
             """,
             (
                 safe_error,
@@ -2209,6 +3974,7 @@ def fail_gateway_delivery(
                 route_key,
                 source_message_id,
                 old_status,
+                *claim_params,
             ),
         )
         if cursor.rowcount <= 0:
@@ -2246,8 +4012,17 @@ def cancel_gateway_delivery(
     outbox_id: str,
     route_key: str,
     source_message_id: str,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> bool:
     """按成功进度原子取消剩余投递，并删除对应入站 queue。"""
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
     now = time.time()
     with transaction(conn):
         row = _gateway_terminal_outbox_row(conn, outbox_id)
@@ -2275,26 +4050,35 @@ def cancel_gateway_delivery(
         if status == old_status:
             return False
 
+        lease_clause, lease_params = _gateway_outbox_lease_clause(fence, now)
+        claim_assignment = ""
+        claim_params: tuple = ()
+        if fence is not None:
+            claim_assignment = ", claimed_by=?, claim_epoch=?"
+            claim_params = (fence[1], fence[2])
         cursor = conn.execute(
-            """
+            f"""
             UPDATE gateway_outbox
             SET status=?, next_attempt_at=NULL,
                 last_error=CASE WHEN ?='delivered' THEN NULL
                                 ELSE last_error END,
                 last_error_code=CASE WHEN ?='delivered' THEN NULL
                                      ELSE last_error_code END,
-                updated_at=?
+                updated_at=? {claim_assignment}
             WHERE id=? AND route_key=? AND source_message_id=? AND status=?
+            {lease_clause}
             """,
             (
                 status,
                 status,
                 status,
                 now,
+                *claim_params,
                 outbox_id,
                 route_key,
                 source_message_id,
                 old_status,
+                *lease_params,
             ),
         )
         if cursor.rowcount <= 0:
@@ -2533,6 +4317,10 @@ def add_final_message_with_gateway_outbox(
     session_id: str,
     msg: dict,
     outbox: dict,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> str:
     """原子写入最终 assistant 消息、outbox 和 reply_pending 状态。"""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -2541,7 +4329,13 @@ def add_final_message_with_gateway_outbox(
         )
     with transaction(conn):
         assistant_message_id = _insert_message(conn, session_id, msg)
-        outbox_id = _insert_gateway_outbox(conn, outbox)
+        outbox_id = _insert_gateway_outbox(
+            conn,
+            outbox,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
         _insert_gateway_message_delivery(
             conn,
             delivery_id=outbox_id,

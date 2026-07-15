@@ -47,6 +47,14 @@ gateway:
   delivery_retry_max_delay: 60.0
   delivery_retry_jitter_ratio: 0.2
   queue_full_reply_max_attempts: 3
+  readiness_probe_cache_seconds: 1.0
+  # 终态记录按小批次清理；非终态和仍被 Queue/Outbox 引用的数据始终保留。
+  retention:
+    feishu_inbox_seconds: 259200
+    ownership_seconds: 2592000
+    outbox_seconds: 2592000
+    cleanup_interval_seconds: 3600
+    cleanup_batch_size: 200
 
   # Gateway 远程会话的只读上下文暴露策略。值必须是 YAML 布尔值，
   # 不能写成带引号的 "true" 或 "false"。

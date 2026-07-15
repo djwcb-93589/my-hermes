@@ -51,6 +51,9 @@ class SessionContext:
     pending: deque = field(default_factory=deque)
     # 是否正在处理(同一会话串行,不同会话并行)
     busy: bool = False
+    # worker 已经完成业务收尾、但尚未在 route admission
+    # 临界区内接力 pending。该阶段仍要阻止新消息越过队头。
+    dispatching: bool = False
 
 
 class SessionStore:
@@ -61,10 +64,13 @@ class SessionStore:
         idle_timeout: float = 86400,
         db_path: str | None = None,
         max_pending_messages: int = 20,
+        persistence=None,
     ):
         self._contexts: dict[str, SessionContext] = {}
+        self._context_locks: dict[str, asyncio.Lock] = {}
         self.idle_timeout = idle_timeout
         self.db_path = db_path
+        self.persistence = persistence
         self.max_pending_messages = max(1, int(max_pending_messages))
 
     def _load_conversation_id(self, route_key: str) -> str:
@@ -114,6 +120,38 @@ class SessionStore:
         ctx.last_activity = time.time()
         return ctx
 
+    async def get_or_create_async(
+        self,
+        route_key: str,
+        system_prompt: str,
+    ) -> SessionContext:
+        """异步恢复会话映射，不在事件循环线程等待 SQLite。"""
+        ctx = self._contexts.get(route_key)
+        if ctx is not None:
+            ctx.last_activity = time.time()
+            return ctx
+        lock = self._context_locks.setdefault(route_key, asyncio.Lock())
+        async with lock:
+            ctx = self._contexts.get(route_key)
+            if ctx is None:
+                conversation_id = route_key
+                if self.db_path and self.persistence is not None:
+                    from hermes.db import get_gateway_conversation_id
+
+                    persisted = await self.persistence.call(
+                        get_gateway_conversation_id,
+                        route_key,
+                    )
+                    conversation_id = persisted or route_key
+                ctx = SessionContext(
+                    route_key=route_key,
+                    conversation_id=conversation_id,
+                    system_prompt=system_prompt,
+                )
+                self._contexts[route_key] = ctx
+            ctx.last_activity = time.time()
+            return ctx
+
     def new_conversation(self, route_key: str, system_prompt: str) -> SessionContext:
         """/new:仅在会话空闲时切换 UUID,保留命令后的 pending。"""
         ctx = self._contexts.get(route_key)
@@ -142,6 +180,45 @@ class SessionStore:
             ctx.invalidation_event = asyncio.Event()
         ctx.last_activity = time.time()
         return ctx
+
+    async def new_conversation_async(
+        self,
+        route_key: str,
+        system_prompt: str,
+    ) -> SessionContext:
+        """先异步持久化新会话映射，再切换内存上下文。"""
+        lock = self._context_locks.setdefault(route_key, asyncio.Lock())
+        async with lock:
+            ctx = self._contexts.get(route_key)
+            if ctx is not None and ctx.busy:
+                raise RuntimeError("cannot switch a busy conversation")
+            new_id = str(uuid.uuid4())
+            if self.db_path and self.persistence is not None:
+                from hermes.db import set_gateway_conversation_id
+
+                await self.persistence.call(
+                    set_gateway_conversation_id,
+                    route_key,
+                    new_id,
+                )
+            if ctx is None:
+                ctx = SessionContext(
+                    route_key=route_key,
+                    conversation_id=new_id,
+                    system_prompt=system_prompt,
+                )
+                self._contexts[route_key] = ctx
+            else:
+                ctx.invalidation_event.set()
+                ctx.generation += 1
+                ctx.conversation_id = new_id
+                ctx.system_prompt = system_prompt
+                ctx.cancel_requested = False
+                ctx.cancel_generation = None
+                ctx.cancel_reason = None
+                ctx.invalidation_event = asyncio.Event()
+            ctx.last_activity = time.time()
+            return ctx
 
     def get(self, route_key: str) -> SessionContext | None:
         """读取现有运行期上下文，不创建会话或刷新活跃时间。"""
@@ -272,4 +349,5 @@ class SessionStore:
         ]
         for k in expired:
             del self._contexts[k]
+            self._context_locks.pop(k, None)
         return len(expired)

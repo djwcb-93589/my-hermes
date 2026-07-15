@@ -83,6 +83,37 @@ async def run_gateway():
                 allow_all=feishu_cfg.get("allow_all", False),
                 allowed_users=feishu_cfg.get("allowed_users", []),
                 allowed_chats=feishu_cfg.get("allowed_chats", []),
+                group_authorization_mode=feishu_cfg.get(
+                    "group_authorization_mode",
+                    "and",
+                ),
+                inbox_retry_max_attempts=feishu_cfg.get(
+                    "inbox_retry_max_attempts", 5,
+                ),
+                inbox_retry_base_delay_seconds=feishu_cfg.get(
+                    "inbox_retry_base_delay_seconds", 1.0,
+                ),
+                inbox_retry_max_delay_seconds=feishu_cfg.get(
+                    "inbox_retry_max_delay_seconds", 60.0,
+                ),
+                inbox_retry_jitter_ratio=feishu_cfg.get(
+                    "inbox_retry_jitter_ratio", 0.2,
+                ),
+                inbox_retry_poll_interval_seconds=feishu_cfg.get(
+                    "inbox_retry_poll_interval_seconds", 1.0,
+                ),
+                inbox_retry_batch_size=feishu_cfg.get(
+                    "inbox_retry_batch_size", 64,
+                ),
+                inbox_retention_seconds=(
+                    runner.feishu_inbox_retention_seconds
+                ),
+                retention_cleanup_interval_seconds=(
+                    runner.retention_cleanup_interval_seconds
+                ),
+                retention_cleanup_batch_size=(
+                    runner.retention_cleanup_batch_size
+                ),
                 send_total_attempts=feishu_cfg.get(
                     "send_total_attempts",
                     feishu_cfg.get("send_max_retries", 3),

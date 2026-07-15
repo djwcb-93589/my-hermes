@@ -9,6 +9,7 @@ Adapter 生命周期分为 initialize / restore_pending / start_receiving / disc
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from typing import Callable
 
@@ -31,7 +32,51 @@ class BasePlatformAdapter(ABC):
         self.platform_name = platform_name
         self._on_message: Callable | None = None  # GatewayRunner 注入
         self._message_state_lookup: Callable | None = None
+        self._readiness_lookup: Callable | None = None
+        self._audit_context_lookup: Callable | None = None
+        self._persistence = None
         self._running = False
+
+    def bind_persistence(self, persistence) -> None:
+        """绑定由 GatewayRunner 管理的异步持久化边界。"""
+        self._persistence = persistence
+
+    def bind_readiness_lookup(self, callback: Callable) -> None:
+        """绑定 Runner 的平台级 readiness 聚合入口。"""
+        self._readiness_lookup = callback
+
+    def bind_audit_context_lookup(self, callback: Callable) -> None:
+        """绑定只读运行审计上下文，不让 Adapter 依赖 Runner 实现。"""
+        self._audit_context_lookup = callback
+
+    def audit_context(self) -> dict:
+        """返回不含凭据和消息正文的当前运行标识。"""
+        if self._audit_context_lookup is None:
+            return {}
+        context = self._audit_context_lookup()
+        return context if isinstance(context, dict) else {}
+
+    def readiness_snapshot(self) -> dict[str, bool]:
+        """返回 Adapter 本地状态；无 Inbox 的平台默认只检查接收资格。"""
+        return {
+            "adapter_receiving": bool(self._running),
+            "durable_dispatcher": True,
+        }
+
+    async def gateway_readiness_status(self) -> dict:
+        """读取完整 readiness；独立使用时退化为 Adapter 本地判断。"""
+        if self._readiness_lookup is None:
+            checks = self.readiness_snapshot()
+            return {
+                "ready": all(checks.values()),
+                "platform": self.platform_name,
+                "checks": checks,
+                "lease_epoch": None,
+            }
+        result = self._readiness_lookup(self.platform_name)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     async def initialize(self) -> bool:
         """初始化资源但不开始接收；旧 Adapter 默认无需单独初始化。"""
@@ -51,6 +96,10 @@ class BasePlatformAdapter(ABC):
     @abstractmethod
     async def disconnect(self):
         ...
+
+    def revoke_receiving(self) -> None:
+        """同步撤销外部接收资格，异步资源随后由 disconnect 完整回收。"""
+        self._running = False
 
     @abstractmethod
     async def send(
@@ -97,8 +146,11 @@ class BasePlatformAdapter(ABC):
         if self._on_message:
             await self._on_message(event)
 
-    def persisted_message_state(self, event: MessageEvent) -> dict | None:
+    async def persisted_message_state(self, event: MessageEvent) -> dict | None:
         """查询该平台消息是否已经进入 Gateway queue / Outbox。"""
         if self._message_state_lookup is None:
             return None
-        return self._message_state_lookup(event)
+        result = self._message_state_lookup(event)
+        if inspect.isawaitable(result):
+            return await result
+        return result

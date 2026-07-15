@@ -328,6 +328,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         model_kwargs: dict | None = None,
         cancel_checker=None,
         final_message_callback=None,
+        persistence_call=None,
         allowed_tool_names: set[str] | None = None,
     ):
         super().__init__(
@@ -358,6 +359,8 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         )
         # Gateway 可注入回调,把最终消息和 outbox 放进同一事务。
         self.final_message_callback = final_message_callback
+        # Gateway 注入异步数据库边界；CLI / 旧测试仍可使用调用方连接。
+        self.persistence_call = persistence_call
         # fallback 客户端由本循环创建,结束时单独关闭;主客户端归 Runner 管理。
         self._fallback_client = None
 
@@ -420,8 +423,14 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         finally:
             self._fallback_client = None
 
+    async def _persist(self, operation, *args):
+        """优先通过 Gateway 异步边界执行一个完整同步数据库操作。"""
+        if self.persistence_call is not None:
+            return await self.persistence_call(operation, *args)
+        return operation(self.conn, *args)
+
     async def on_assistant_message(self, msg_dict: dict, response) -> None:
-        add_messages(self.conn, self.db_session_id, [msg_dict])
+        await self._persist(add_messages, self.db_session_id, [msg_dict])
         self._retry_count = 0
 
     async def on_final_assistant_message(
@@ -430,7 +439,17 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         response,
     ) -> None:
         if self.final_message_callback is None:
-            add_messages(self.conn, self.db_session_id, [msg_dict])
+            await self._persist(
+                add_messages,
+                self.db_session_id,
+                [msg_dict],
+            )
+        elif self.persistence_call is not None:
+            await self.persistence_call(
+                self.final_message_callback,
+                self.db_session_id,
+                msg_dict,
+            )
         else:
             self.final_message_callback(
                 self.conn,
@@ -449,7 +468,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         return {"role": "user", "content": CONTINUE_MESSAGE}
 
     async def on_continuation_message(self, cont_msg: dict) -> None:
-        add_messages(self.conn, self.db_session_id, [cont_msg])
+        await self._persist(add_messages, self.db_session_id, [cont_msg])
 
     def on_tool_dispatch_start(self) -> None:
         self._continuation_count = 0
@@ -476,8 +495,8 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         tool_messages: list[dict],
         response,
     ) -> None:
-        add_messages(
-            self.conn,
+        await self._persist(
+            add_messages,
             self.db_session_id,
             [assistant_msg, *tool_messages],
         )
@@ -622,7 +641,7 @@ def run_conversation(
 
 async def run_conversation_async(
     user_message: str,
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None,
     session_id: str,
     cached_prompt: str,
     session_key: str | None = None,
@@ -630,6 +649,7 @@ async def run_conversation_async(
     *,
     async_client=None,
     final_message_callback=None,
+    persistence_call=None,
     enabled_toolsets: list[str] | None = None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。"""
@@ -640,9 +660,23 @@ async def run_conversation_async(
     loop = None
     try:
         try:
-            existing = get_gateway_visible_session_messages(conn, session_id)
             user_msg = {"role": "user", "content": user_message}
-            add_messages(conn, session_id, [user_msg])
+            if persistence_call is None:
+                existing = get_gateway_visible_session_messages(
+                    conn,
+                    session_id,
+                )
+                add_messages(conn, session_id, [user_msg])
+            else:
+                existing = await persistence_call(
+                    get_gateway_visible_session_messages,
+                    session_id,
+                )
+                await persistence_call(
+                    add_messages,
+                    session_id,
+                    [user_msg],
+                )
         except Exception as exc:
             return _persistence_error_response(exc)
 
@@ -666,6 +700,7 @@ async def run_conversation_async(
             model_kwargs=None,
             cancel_checker=cancel_checker,
             final_message_callback=final_message_callback,
+            persistence_call=persistence_call,
             allowed_tool_names=allowed_tool_names,
         )
         result: AgentLoopResult = await loop.run(user_message)

@@ -26,12 +26,15 @@ from hermes.db import (
     add_final_message_with_gateway_outbox,
     add_messages,
     cancel_gateway_delivery,
+    check_gateway_runtime_readiness,
     complete_gateway_delivery,
     complete_gateway_message,
     delete_gateway_messages,
     enqueue_gateway_outbox,
     enqueue_gateway_message,
     fail_gateway_delivery,
+    gateway_outbox_claim_is_valid,
+    gateway_runtime_lease_is_valid,
     get_gateway_message_persistence_state,
     get_gateway_routes_with_pending_outbox,
     get_next_recoverable_gateway_outbox_for_route,
@@ -44,6 +47,8 @@ from hermes.db import (
     mark_gateway_outbox_chunk_sent,
     mark_gateway_outbox_retry,
     mark_gateway_outbox_sending,
+    prune_gateway_terminal_outbox,
+    prune_gateway_terminal_ownership,
     reconcile_gateway_terminal_deliveries,
     release_gateway_runtime_lease,
     renew_gateway_runtime_lease,
@@ -51,6 +56,8 @@ from hermes.db import (
     reset_gateway_sending_outbox,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
+from hermes.gateway.observability import safe_route_digest
+from hermes.gateway.persistence import GatewayPersistence
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import (
     MessageEvent,
@@ -62,28 +69,99 @@ from hermes.gateway.types import (
 from hermes.prompt import build_system_prompt
 
 
-_GATEWAY_CONTEXT_DEFAULTS = {
-    "include_soul": True,
-    "include_memory": True,
-    "include_user_profile": True,
-    "include_project_context": False,
+_GATEWAY_CONTEXT_FIELDS = (
+    "include_soul",
+    "include_memory",
+    "include_user_profile",
+    "include_project_context",
+)
+_GATEWAY_CONTEXT_POLICY_DEFAULTS = {
+    "default": {
+        "include_soul": True,
+        "include_memory": False,
+        "include_user_profile": False,
+        "include_project_context": False,
+    },
+    "dm": {
+        "include_soul": True,
+        "include_memory": True,
+        "include_user_profile": True,
+        "include_project_context": False,
+    },
+    "group": {
+        "include_soul": True,
+        "include_memory": False,
+        "include_user_profile": False,
+        "include_project_context": False,
+    },
+    "topic": {
+        "include_soul": True,
+        "include_memory": False,
+        "include_user_profile": False,
+        "include_project_context": False,
+    },
 }
 _GATEWAY_RUNTIME_LEASE_NAME = "gateway-main"
 
 
-def _load_gateway_context_config(gateway_cfg: dict) -> dict[str, bool]:
-    """集中读取并严格校验 Gateway 的只读上下文暴露策略。"""
+def _load_gateway_context_values(
+    context_cfg: dict,
+    path: str,
+) -> dict[str, bool]:
+    """读取一层上下文开关，拒绝非布尔值。"""
+    selected: dict[str, bool] = {}
+    for name in _GATEWAY_CONTEXT_FIELDS:
+        if name not in context_cfg:
+            continue
+        value = context_cfg[name]
+        if not isinstance(value, bool):
+            raise ValueError(f"{path}.{name} must be a boolean")
+        selected[name] = value
+    return selected
+
+
+def _load_gateway_context_config(
+    gateway_cfg: dict,
+) -> dict[str, dict[str, bool]]:
+    """读取 default / DM / group / topic 的只读上下文策略。"""
     context_cfg = gateway_cfg.get("context", {})
     if not isinstance(context_cfg, dict):
         raise ValueError("gateway.context must be a mapping")
 
-    selected: dict[str, bool] = {}
-    for name, default in _GATEWAY_CONTEXT_DEFAULTS.items():
-        value = context_cfg.get(name, default)
-        if not isinstance(value, bool):
-            raise ValueError(f"gateway.context.{name} must be a boolean")
-        selected[name] = value
-    return selected
+    # 旧版扁平开关继续作为全局 default；新版的显式
+    # default 随后覆盖它，最后再应用各会话类型的局部值。
+    default_overrides = _load_gateway_context_values(
+        context_cfg,
+        "gateway.context",
+    )
+    nested_default = context_cfg.get("default", {})
+    if not isinstance(nested_default, dict):
+        raise ValueError("gateway.context.default must be a mapping")
+    default_overrides.update(
+        _load_gateway_context_values(
+            nested_default,
+            "gateway.context.default",
+        )
+    )
+
+    policies: dict[str, dict[str, bool]] = {}
+    for policy_name, builtin in _GATEWAY_CONTEXT_POLICY_DEFAULTS.items():
+        policy = dict(builtin)
+        policy.update(default_overrides)
+        if policy_name != "default":
+            policy_cfg = context_cfg.get(policy_name, {})
+            if not isinstance(policy_cfg, dict):
+                raise ValueError(
+                    f"gateway.context.{policy_name} must be a mapping"
+                )
+            policy.update(
+                _load_gateway_context_values(
+                    policy_cfg,
+                    f"gateway.context.{policy_name}",
+                )
+            )
+        policies[policy_name] = policy
+    return policies
 
 
 def _load_positive_seconds(
@@ -106,6 +184,56 @@ def _load_positive_seconds(
     return seconds
 
 
+def _load_retention_config(gateway_cfg: dict) -> dict[str, float | int]:
+    """读取长期审计清理配置，并在启动前拒绝无效批次或保留期。"""
+    retention_cfg = gateway_cfg.get("retention", {})
+    if not isinstance(retention_cfg, dict):
+        raise ValueError("gateway.retention must be a mapping")
+
+    defaults = {
+        "feishu_inbox_seconds": 72 * 60 * 60,
+        "ownership_seconds": 30 * 24 * 60 * 60,
+        "outbox_seconds": 30 * 24 * 60 * 60,
+        "cleanup_interval_seconds": 60 * 60,
+    }
+    loaded: dict[str, float | int] = {}
+    for name, default in defaults.items():
+        value = retention_cfg.get(name, default)
+        if isinstance(value, bool):
+            raise ValueError(
+                f"gateway.retention.{name} must be a positive number"
+            )
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"gateway.retention.{name} must be a positive number"
+            ) from exc
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(
+                f"gateway.retention.{name} must be a positive number"
+            )
+        loaded[name] = seconds
+
+    batch_size = retention_cfg.get("cleanup_batch_size", 200)
+    if isinstance(batch_size, bool):
+        raise ValueError(
+            "gateway.retention.cleanup_batch_size must be a positive integer"
+        )
+    try:
+        batch_size = int(batch_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "gateway.retention.cleanup_batch_size must be a positive integer"
+        ) from exc
+    if batch_size <= 0:
+        raise ValueError(
+            "gateway.retention.cleanup_batch_size must be a positive integer"
+        )
+    loaded["cleanup_batch_size"] = batch_size
+    return loaded
+
+
 class GatewayRunner:
     """启动 adapter、路由消息、跑 agent、回发结果。"""
 
@@ -116,7 +244,9 @@ class GatewayRunner:
         gateway_cfg = config.get("gateway", {})
         if not isinstance(gateway_cfg, dict):
             raise ValueError("gateway must be a mapping")
-        self._gateway_context = _load_gateway_context_config(gateway_cfg)
+        self._gateway_context_policies = _load_gateway_context_config(
+            gateway_cfg
+        )
         self.runtime_lease_ttl_seconds = _load_positive_seconds(
             gateway_cfg,
             "runtime_lease_ttl_seconds",
@@ -140,14 +270,35 @@ class GatewayRunner:
             "session_cleanup_interval_seconds",
             600.0,
         )
+        retention = _load_retention_config(gateway_cfg)
+        self.feishu_inbox_retention_seconds = float(
+            retention["feishu_inbox_seconds"]
+        )
+        self.ownership_retention_seconds = float(
+            retention["ownership_seconds"]
+        )
+        self.outbox_retention_seconds = float(retention["outbox_seconds"])
+        self.retention_cleanup_interval_seconds = float(
+            retention["cleanup_interval_seconds"]
+        )
+        self.retention_cleanup_batch_size = int(
+            retention["cleanup_batch_size"]
+        )
+        self.readiness_probe_cache_seconds = _load_positive_seconds(
+            gateway_cfg,
+            "readiness_probe_cache_seconds",
+            1.0,
+        )
         self.agent_name = gateway_cfg.get("agent_name", "main")
         idle_timeout = gateway_cfg.get("session_idle_timeout", 86400)
         max_pending = gateway_cfg.get("max_pending_messages", 20)
         max_concurrent = gateway_cfg.get("max_concurrent_llm_requests", 4)
+        self.persistence = GatewayPersistence(db_path)
         self.sessions = SessionStore(
             idle_timeout=idle_timeout,
             db_path=db_path,
             max_pending_messages=max_pending,
+            persistence=self.persistence,
         )
         self.max_concurrent_llm_requests = max(1, int(max_concurrent))
         self.delivery_max_attempts = max(
@@ -188,35 +339,177 @@ class GatewayRunner:
         self._runtime_instance_id = str(uuid.uuid4())
         self._runtime_lease_acquired = False
         self._runtime_lease_valid = False
+        self._runtime_lease_epoch: int | None = None
         self._lease_heartbeat_task: asyncio.Task | None = None
         self._session_cleanup_task: asyncio.Task | None = None
+        self._retention_cleanup_task: asyncio.Task | None = None
         self._lease_shutdown_task: asyncio.Task | None = None
+        self._readiness_probe_lock = asyncio.Lock()
+        self._readiness_probe_cached_at = 0.0
+        self._readiness_probe_cached_result = False
+        self._route_admission_locks: dict[str, asyncio.Lock] = {}
+        self._route_admission_users: dict[str, int] = {}
         self._stop_lock = asyncio.Lock()
         # 异步模型客户端按需创建,Gateway 停止时统一关闭。
         self._async_client = None
 
-    def _build_gateway_prompt(self) -> str:
-        """按统一暴露策略构造无本地工具能力的 Gateway prompt。"""
+    @staticmethod
+    def _gateway_context_policy_name(source: SessionSource) -> str:
+        """将平台会话信息收敛为稳定的上下文策略名。"""
+        chat_type = str(source.chat_type or "").strip().lower()
+        if chat_type == "topic" or source.thread_id:
+            return "topic"
+        if chat_type in {"dm", "p2p", "private"}:
+            return "dm"
+        if chat_type == "group":
+            return "group"
+        return "default"
+
+    def _build_gateway_prompt(self, source: SessionSource) -> str:
+        """按事件来源选择只读上下文，本地工具始终关闭。"""
+        policy_name = self._gateway_context_policy_name(source)
+        context_policy = self._gateway_context_policies[policy_name]
         return build_system_prompt(
             os.getcwd(),
             enabled_toolsets=[],
-            **self._gateway_context,
+            **context_policy,
         )
 
     def add_adapter(self, adapter: BasePlatformAdapter):
         adapter._on_message = self._handle_message
-        adapter._message_state_lookup = self._message_persistence_state
+        adapter._message_state_lookup = self._message_persistence_state_async
+        adapter.bind_persistence(self.persistence)
+        adapter.bind_readiness_lookup(self.readiness_status)
+        adapter.bind_audit_context_lookup(
+            lambda: {"lease_epoch": self._runtime_lease_epoch}
+        )
         self.adapters[adapter.platform_name] = adapter
+
+    async def _database_readiness_probe(self) -> bool:
+        """合并并短暂缓存轻量 DB 读写与 lease fencing 检查。"""
+        now = time.monotonic()
+        if (
+            now - self._readiness_probe_cached_at
+            < self.readiness_probe_cache_seconds
+        ):
+            return self._readiness_probe_cached_result
+        async with self._readiness_probe_lock:
+            now = time.monotonic()
+            if (
+                now - self._readiness_probe_cached_at
+                < self.readiness_probe_cache_seconds
+            ):
+                return self._readiness_probe_cached_result
+            if self._runtime_lease_epoch is None:
+                result = False
+            else:
+                try:
+                    result = await self.persistence.call(
+                        check_gateway_runtime_readiness,
+                        self._runtime_lease_name,
+                        self._runtime_instance_id,
+                        self._runtime_lease_epoch,
+                    )
+                except Exception as exc:
+                    result = False
+                    print(
+                        "  [gateway:audit] event=readiness_probe_failed "
+                        f"exception={type(exc).__name__} "
+                        f"lease_epoch={self._runtime_lease_epoch}"
+                    )
+            self._readiness_probe_cached_at = time.monotonic()
+            self._readiness_probe_cached_result = bool(result)
+            return bool(result)
+
+    async def _database_runtime_lease_status(self) -> tuple[bool, bool]:
+        """每次 readiness 都读取 lease；第二个返回值表示结果是否为确定判断。"""
+        if self._runtime_lease_epoch is None:
+            return False, True
+        try:
+            valid = await self.persistence.call(
+                gateway_runtime_lease_is_valid,
+                self._runtime_lease_name,
+                self._runtime_instance_id,
+                self._runtime_lease_epoch,
+            )
+        except Exception:
+            return False, False
+        return bool(valid), True
+
+    async def readiness_status(self, platform_name: str) -> dict:
+        """按平台聚合 lifecycle、lease、恢复、接收、dispatcher 与 DB 状态。"""
+        adapter = self.adapters.get(platform_name)
+        local = adapter.readiness_snapshot() if adapter is not None else {}
+        checks = {
+            "lifecycle_running": self._lifecycle_phase == "running",
+            "runtime_lease_local": bool(
+                self._runtime_lease_acquired
+                and self._runtime_lease_valid
+                and self._runtime_lease_epoch is not None
+            ),
+            "adapter_initialized": bool(
+                adapter is not None
+                and self._adapter_initialized.get(platform_name, False)
+            ),
+            "inbox_restored": platform_name in self._inbox_restored_adapters,
+            "webhook_receiving": bool(
+                self._accepting_external_messages
+                and platform_name in self._receiving_adapters
+                and local.get("adapter_receiving", False)
+            ),
+            "durable_inbox_dispatcher": bool(
+                local.get("durable_dispatcher", False)
+            ),
+            "runtime_lease_database": False,
+            "database_read_write": False,
+        }
+        local_ready = all(
+            value
+            for name, value in checks.items()
+            if name not in {
+                "runtime_lease_database",
+                "database_read_write",
+            }
+        )
+        if local_ready:
+            lease_valid, definitive = (
+                await self._database_runtime_lease_status()
+            )
+            checks["runtime_lease_database"] = lease_valid
+            if not lease_valid and definitive:
+                self._handle_runtime_lease_loss(None)
+                checks["lifecycle_running"] = False
+                checks["runtime_lease_local"] = False
+                checks["webhook_receiving"] = False
+            elif lease_valid:
+                checks["database_read_write"] = (
+                    await self._database_readiness_probe()
+                )
+        return {
+            "ready": all(checks.values()),
+            "platform": platform_name,
+            "checks": checks,
+            "lease_epoch": self._runtime_lease_epoch,
+        }
 
     def _reconcile_terminal_deliveries(self) -> int:
         """在 Gateway 恢复前一次性收敛旧终态记录。"""
         conn = init_db(self.db_path)
         try:
-            return reconcile_gateway_terminal_deliveries(conn)
+            return reconcile_gateway_terminal_deliveries(
+                conn,
+                **self._runtime_fence_kwargs(),
+            )
         finally:
             conn.close()
 
-    def _acquire_runtime_lease(self) -> bool:
+    async def _reconcile_terminal_deliveries_async(self) -> int:
+        return await self.persistence.call(
+            reconcile_gateway_terminal_deliveries,
+            **self._runtime_fence_kwargs(),
+        )
+
+    def _acquire_runtime_lease(self) -> dict | None:
         """在独立连接中争用当前数据库的 Gateway 单实例租约。"""
         conn = init_db(self.db_path)
         try:
@@ -231,12 +524,15 @@ class GatewayRunner:
 
     def _renew_runtime_lease(self) -> bool:
         """仅为当前实例持有的运行租约续期。"""
+        if self._runtime_lease_epoch is None:
+            return False
         conn = init_db(self.db_path)
         try:
             return renew_gateway_runtime_lease(
                 conn,
                 self._runtime_lease_name,
                 self._runtime_instance_id,
+                self._runtime_lease_epoch,
                 self.runtime_lease_ttl_seconds,
             )
         finally:
@@ -244,12 +540,15 @@ class GatewayRunner:
 
     def _release_runtime_lease(self) -> bool:
         """释放当前实例的租约；实例不匹配时不会删除其他持有者。"""
+        if self._runtime_lease_epoch is None:
+            return False
         conn = init_db(self.db_path)
         try:
             return release_gateway_runtime_lease(
                 conn,
                 self._runtime_lease_name,
                 self._runtime_instance_id,
+                self._runtime_lease_epoch,
             )
         finally:
             conn.close()
@@ -266,6 +565,98 @@ class GatewayRunner:
         """嵌入式私有调用保持兼容；正式启动后失租必须阻止投递。"""
         return self._runtime_lease_acquired and not self._runtime_lease_valid
 
+    def _runtime_fence_kwargs(self) -> dict:
+        """正式运行携带 fencing；未调用 start 的嵌入式路径保持兼容。"""
+        if not self._runtime_lease_acquired:
+            return {}
+        if self._runtime_lease_epoch is None:
+            raise RuntimeError("gateway runtime lease epoch is unavailable")
+        return {
+            "lease_name": self._runtime_lease_name,
+            "instance_id": self._runtime_instance_id,
+            "lease_epoch": self._runtime_lease_epoch,
+        }
+
+    def _database_delivery_fence_state(
+        self,
+        outbox_id: str,
+    ) -> tuple[bool, bool]:
+        """读取数据库 lease 与 Outbox claim 的当前匹配结果。"""
+        if not self._runtime_lease_acquired:
+            return True, True
+        if self._runtime_lease_epoch is None:
+            return False, False
+        conn = init_db(self.db_path)
+        try:
+            claim_valid = gateway_outbox_claim_is_valid(
+                conn,
+                outbox_id,
+                self._runtime_lease_name,
+                self._runtime_instance_id,
+                self._runtime_lease_epoch,
+            )
+            if claim_valid:
+                return True, True
+            lease_valid = gateway_runtime_lease_is_valid(
+                conn,
+                self._runtime_lease_name,
+                self._runtime_instance_id,
+                self._runtime_lease_epoch,
+            )
+            return lease_valid, False
+        finally:
+            conn.close()
+
+    async def _database_delivery_fence_state_async(
+        self,
+        outbox_id: str,
+    ) -> tuple[bool, bool]:
+        """异步读取数据库 lease 与 Outbox claim 的匹配结果。"""
+        if not self._runtime_lease_acquired:
+            return True, True
+        if self._runtime_lease_epoch is None:
+            return False, False
+        claim_valid = await self.persistence.call(
+            gateway_outbox_claim_is_valid,
+            outbox_id,
+            self._runtime_lease_name,
+            self._runtime_instance_id,
+            self._runtime_lease_epoch,
+        )
+        if claim_valid:
+            return True, True
+        lease_valid = await self.persistence.call(
+            gateway_runtime_lease_is_valid,
+            self._runtime_lease_name,
+            self._runtime_instance_id,
+            self._runtime_lease_epoch,
+        )
+        return lease_valid, False
+
+    def _outbox_send_fence_is_valid(self, outbox_id: str) -> bool:
+        """发送前同时确认本地资格、数据库租约和 Outbox claim。"""
+        if self._runtime_lease_blocks_delivery():
+            return False
+        lease_valid, claim_valid = self._database_delivery_fence_state(
+            outbox_id
+        )
+        if not lease_valid:
+            self._handle_runtime_lease_loss(None)
+            return False
+        return claim_valid
+
+    async def _outbox_send_fence_is_valid_async(self, outbox_id: str) -> bool:
+        """异步确认本地资格、数据库租约和 Outbox claim。"""
+        if self._runtime_lease_blocks_delivery():
+            return False
+        lease_valid, claim_valid = (
+            await self._database_delivery_fence_state_async(outbox_id)
+        )
+        if not lease_valid:
+            self._handle_runtime_lease_loss(None)
+            return False
+        return claim_valid
+
     def _handle_runtime_lease_loss(self, error_type: str | None) -> None:
         """先撤销运行资格，再调度不会自等待的统一安全停止。"""
         if not self._runtime_lease_valid:
@@ -275,13 +666,20 @@ class GatewayRunner:
         self._lifecycle_phase = "lease_lost"
         if error_type:
             print(
-                "  [gateway] runtime lease renewal failed: "
-                f"{error_type}"
+                "  [gateway:audit] event=runtime_lease_lost "
+                f"reason=renewal_failed exception={error_type} "
+                f"lease_epoch={self._runtime_lease_epoch}"
             )
         else:
-            print("  [gateway] runtime lease ownership lost")
+            print(
+                "  [gateway:audit] event=runtime_lease_lost "
+                "reason=ownership_lost "
+                f"lease_epoch={self._runtime_lease_epoch}"
+            )
 
         # 失租等同 shutdown：保留可恢复 Outbox，不把它误标为用户取消。
+        for adapter in self.adapters.values():
+            adapter.revoke_receiving()
         self.sessions.cancel_all(reason="shutdown")
         if (
             self._lease_shutdown_task is None
@@ -300,9 +698,16 @@ class GatewayRunner:
                 if not self._runtime_lease_valid:
                     return
                 try:
-                    renewed = await asyncio.to_thread(
-                        self._renew_runtime_lease
-                    )
+                    if self._runtime_lease_epoch is None:
+                        renewed = False
+                    else:
+                        renewed = await self.persistence.call(
+                            renew_gateway_runtime_lease,
+                            self._runtime_lease_name,
+                            self._runtime_instance_id,
+                            self._runtime_lease_epoch,
+                            self.runtime_lease_ttl_seconds,
+                        )
                 except Exception as exc:
                     self._handle_runtime_lease_loss(type(exc).__name__)
                     return
@@ -320,8 +725,8 @@ class GatewayRunner:
                 if self._lifecycle_phase != "running":
                     return
                 try:
-                    protected = await asyncio.to_thread(
-                        self._pending_outbox_route_keys
+                    protected = await self.persistence.call(
+                        get_gateway_routes_with_pending_outbox,
                     )
                     removed = self.sessions.cleanup_idle(protected)
                 except Exception as exc:
@@ -338,15 +743,106 @@ class GatewayRunner:
         except asyncio.CancelledError:
             raise
 
-    def _start_background_tasks(self) -> None:
-        """Runner 成功运行后统一创建长期后台任务。"""
+    async def _prune_retention_batches(
+        self,
+        operation,
+        *,
+        updated_before: float,
+    ) -> int:
+        """用多个独立小事务清理，单轮设置上限以免长期占用写锁。"""
+        total = 0
+        for _ in range(4):
+            removed = await self.persistence.call(
+                operation,
+                updated_before=updated_before,
+                limit=self.retention_cleanup_batch_size,
+            )
+            total += int(removed)
+            if int(removed) < self.retention_cleanup_batch_size:
+                break
+            await asyncio.sleep(0)
+        return total
+
+    async def _run_retention_cleanup(self) -> None:
+        """Outbox 先释放引用，再清理无引用 ownership；失败不影响运行。"""
+        now = time.time()
+        try:
+            outbox_removed = await self._prune_retention_batches(
+                prune_gateway_terminal_outbox,
+                updated_before=now - self.outbox_retention_seconds,
+            )
+            if outbox_removed:
+                print(
+                    "  [gateway:audit] event=retention_cleanup "
+                    f"kind=outbox removed={outbox_removed} "
+                    f"lease_epoch={self._runtime_lease_epoch}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=retention_cleanup_failed "
+                f"kind=outbox exception={type(exc).__name__} "
+                f"lease_epoch={self._runtime_lease_epoch}"
+            )
+
+        try:
+            ownership_removed = await self._prune_retention_batches(
+                prune_gateway_terminal_ownership,
+                updated_before=now - self.ownership_retention_seconds,
+            )
+            if ownership_removed:
+                print(
+                    "  [gateway:audit] event=retention_cleanup "
+                    f"kind=ownership removed={ownership_removed} "
+                    f"lease_epoch={self._runtime_lease_epoch}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=retention_cleanup_failed "
+                f"kind=ownership exception={type(exc).__name__} "
+                f"lease_epoch={self._runtime_lease_epoch}"
+            )
+
+    async def _retention_cleanup_loop(self) -> None:
+        """Gateway running 期间周期执行有界审计清理。"""
+        try:
+            while self._lifecycle_phase == "running":
+                await self._run_retention_cleanup()
+                await asyncio.sleep(self.retention_cleanup_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+    def _start_runtime_lease_heartbeat(self) -> None:
+        """获取 lease 后立即启动 heartbeat，覆盖整个初始化与恢复阶段。"""
+        task = self._lease_heartbeat_task
+        if task is not None and not task.done():
+            return
         self._lease_heartbeat_task = asyncio.create_task(
             self._runtime_lease_heartbeat_loop(),
             name="gateway-runtime-lease-heartbeat",
         )
+
+    def _start_session_cleanup(self) -> None:
+        """只有进入 running 后才启动会话空闲清理。"""
+        task = self._session_cleanup_task
+        if task is not None and not task.done():
+            return
         self._session_cleanup_task = asyncio.create_task(
             self._session_cleanup_loop(),
             name="gateway-session-cleanup",
+        )
+
+    def _start_retention_cleanup(self) -> None:
+        """进入 running 后启动可失败、可取消的分批保留期清理。"""
+        task = self._retention_cleanup_task
+        if task is not None and not task.done():
+            return
+        self._retention_cleanup_task = asyncio.create_task(
+            self._retention_cleanup_loop(),
+            name="gateway-retention-cleanup",
         )
 
     async def _cancel_background_tasks(self) -> None:
@@ -357,6 +853,7 @@ class GatewayRunner:
             for task in (
                 self._lease_heartbeat_task,
                 self._session_cleanup_task,
+                self._retention_cleanup_task,
             )
             if task is not None and task is not current and not task.done()
         ]
@@ -368,11 +865,27 @@ class GatewayRunner:
             self._lease_heartbeat_task = None
         if self._session_cleanup_task is not current:
             self._session_cleanup_task = None
+        if self._retention_cleanup_task is not current:
+            self._retention_cleanup_task = None
+
+    async def _require_startup_runtime_lease(self) -> None:
+        """启动阶段一旦失租，等待统一安全停止完成后终止启动。"""
+        if self._runtime_lease_valid:
+            return
+        shutdown_task = self._lease_shutdown_task
+        if (
+            shutdown_task is not None
+            and shutdown_task is not asyncio.current_task()
+        ):
+            await asyncio.gather(shutdown_task, return_exceptions=True)
+        self._startup_in_progress = False
+        raise RuntimeError("gateway runtime lease lost during startup")
 
     async def _abort_startup_after_lease(self) -> None:
         """启动恢复失败时停止已创建资源并尽早交还租约。"""
         self._accepting_external_messages = False
         self._runtime_lease_valid = False
+        await self._cancel_background_tasks()
         active_tasks = self.sessions.cancel_all(reason="shutdown")
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
@@ -383,7 +896,13 @@ class GatewayRunner:
                 pass
         if self._runtime_lease_acquired:
             try:
-                await asyncio.to_thread(self._release_runtime_lease)
+                if self._runtime_lease_epoch is not None:
+                    await self.persistence.call(
+                        release_gateway_runtime_lease,
+                        self._runtime_lease_name,
+                        self._runtime_instance_id,
+                        self._runtime_lease_epoch,
+                    )
             except Exception as exc:
                 print(
                     "  [gateway] runtime lease release failed: "
@@ -391,6 +910,7 @@ class GatewayRunner:
                 )
             finally:
                 self._runtime_lease_acquired = False
+                self._runtime_lease_epoch = None
 
     async def start(self):
         """按初始化、终态收敛、持久恢复、接收阶段启动 Gateway。"""
@@ -404,7 +924,12 @@ class GatewayRunner:
 
         self._lifecycle_phase = "acquire_runtime_lease"
         try:
-            acquired = await asyncio.to_thread(self._acquire_runtime_lease)
+            acquired = await self.persistence.call(
+                acquire_gateway_runtime_lease,
+                self._runtime_lease_name,
+                self._runtime_instance_id,
+                self.runtime_lease_ttl_seconds,
+            )
         except Exception as exc:
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
@@ -423,8 +948,12 @@ class GatewayRunner:
             raise RuntimeError(
                 "another active Gateway instance holds the runtime lease"
             )
+        if str(acquired["instance_id"]) != self._runtime_instance_id:
+            raise RuntimeError("gateway runtime lease identity mismatch")
+        self._runtime_lease_epoch = int(acquired["lease_epoch"])
         self._runtime_lease_acquired = True
         self._runtime_lease_valid = True
+        self._start_runtime_lease_heartbeat()
 
         self._lifecycle_phase = "adapter_initialize"
         for name, adapter in self.adapters.items():
@@ -441,10 +970,12 @@ class GatewayRunner:
                     f"  [gateway] {name} initialization failed: "
                     f"{type(exc).__name__}"
                 )
+            await self._require_startup_runtime_lease()
 
         self._lifecycle_phase = "gateway_terminal_reconcile"
         try:
-            self._reconcile_terminal_deliveries()
+            await self._reconcile_terminal_deliveries_async()
+            await self._require_startup_runtime_lease()
         except Exception as exc:
             # 终态无法收敛时不能继续恢复，也不能开放外部入口。
             print(
@@ -459,8 +990,10 @@ class GatewayRunner:
         try:
             self._lifecycle_phase = "gateway_outbox_restore"
             await self._restore_outbound_messages()
+            await self._require_startup_runtime_lease()
             self._lifecycle_phase = "gateway_queue_restore"
             await self._restore_queued_messages()
+            await self._require_startup_runtime_lease()
         except Exception:
             # Gateway 自身持久状态无法完成恢复时不能开放外部入口。
             await self._abort_startup_after_lease()
@@ -483,6 +1016,7 @@ class GatewayRunner:
                     f"  [gateway] {name} inbox recovery failed: "
                     f"{type(exc).__name__}"
                 )
+            await self._require_startup_runtime_lease()
 
         self._lifecycle_phase = "start_receiving"
         for name, adapter in self.adapters.items():
@@ -500,12 +1034,15 @@ class GatewayRunner:
                     f"  [gateway] {name} receive start failed: "
                     f"{type(exc).__name__}"
                 )
+            await self._require_startup_runtime_lease()
+        await self._require_startup_runtime_lease()
         self._startup_in_progress = False
         # 飞书 Inbox 已完成去重，此后实时事件重新以数据库和 Adapter 自身
         # completed 记录为准，不让启动快照变成长生命周期内存真相源。
         self._startup_message_states.clear()
         self._lifecycle_phase = "running"
-        self._start_background_tasks()
+        self._start_session_cleanup()
+        self._start_retention_cleanup()
 
     async def stop(self):
         """取消运行中任务,断开 adapter,关闭模型客户端并清理 backend。"""
@@ -533,7 +1070,13 @@ class GatewayRunner:
 
             if self._runtime_lease_acquired:
                 try:
-                    await asyncio.to_thread(self._release_runtime_lease)
+                    if self._runtime_lease_epoch is not None:
+                        await self.persistence.call(
+                            release_gateway_runtime_lease,
+                            self._runtime_lease_name,
+                            self._runtime_instance_id,
+                            self._runtime_lease_epoch,
+                        )
                 except Exception as exc:
                     print(
                         "  [gateway] runtime lease release failed: "
@@ -541,6 +1084,7 @@ class GatewayRunner:
                     )
                 finally:
                     self._runtime_lease_acquired = False
+                    self._runtime_lease_epoch = None
 
             if self._async_client is not None:
                 try:
@@ -554,6 +1098,7 @@ class GatewayRunner:
             self._receiving_adapters.clear()
             self._inbox_restored_adapters.clear()
             self._startup_in_progress = False
+            await self.persistence.close()
             self._lifecycle_phase = "stopped"
 
     # ----- 消息路由 -----
@@ -570,6 +1115,21 @@ class GatewayRunner:
             )
         finally:
             conn.close()
+        if persisted is not None:
+            return persisted
+        return self._startup_message_states.get((route_key, event.message_id))
+
+    async def _message_persistence_state_async(
+        self,
+        event: MessageEvent,
+    ) -> dict | None:
+        """异步查询平台消息是否已由 Gateway 持久层接管。"""
+        route_key = build_session_key(event.source, self.agent_name)
+        persisted = await self.persistence.call(
+            get_gateway_message_persistence_state,
+            route_key,
+            event.message_id,
+        )
         if persisted is not None:
             return persisted
         return self._startup_message_states.get((route_key, event.message_id))
@@ -605,7 +1165,11 @@ class GatewayRunner:
     @staticmethod
     def _route_has_active_worker(ctx) -> bool:
         worker = ctx.worker_task
-        return bool(ctx.busy or (worker is not None and not worker.done()))
+        return bool(
+            ctx.busy
+            or ctx.dispatching
+            or (worker is not None and not worker.done())
+        )
 
     @staticmethod
     def _serialize_event(event: MessageEvent) -> str:
@@ -674,6 +1238,22 @@ class GatewayRunner:
         self._accepted_messages.add((route_key, event.message_id))
         return True
 
+    async def _persist_event_async(
+        self,
+        route_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        accepted = await self.persistence.call(
+            enqueue_gateway_message,
+            route_key,
+            event.message_id,
+            self._serialize_event(event),
+        )
+        if not accepted:
+            return False
+        self._accepted_messages.add((route_key, event.message_id))
+        return True
+
     def _mark_event_processing(self, route_key: str, event: MessageEvent) -> None:
         conn = init_db(self.db_path)
         try:
@@ -682,6 +1262,17 @@ class GatewayRunner:
             )
         finally:
             conn.close()
+
+    async def _mark_event_processing_async(
+        self,
+        route_key: str,
+        event: MessageEvent,
+    ) -> None:
+        await self.persistence.call(
+            mark_gateway_message_processing,
+            route_key,
+            event.message_id,
+        )
 
     def _complete_event(self, route_key: str, event: MessageEvent) -> bool:
         """处理结束后删除恢复记录;失败时保留到下次重启。"""
@@ -693,6 +1284,27 @@ class GatewayRunner:
                 )
             finally:
                 conn.close()
+        except Exception as exc:
+            print(
+                f"  [gateway] {route_key}: queue completion failed "
+                f"({type(exc).__name__})"
+            )
+            return False
+        self._accepted_messages.discard((route_key, event.message_id))
+        return True
+
+    async def _complete_event_async(
+        self,
+        route_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        """异步删除已完成的 Queue 恢复记录。"""
+        try:
+            await self.persistence.call(
+                complete_gateway_message,
+                route_key,
+                event.message_id,
+            )
         except Exception as exc:
             print(
                 f"  [gateway] {route_key}: queue completion failed "
@@ -738,9 +1350,20 @@ class GatewayRunner:
     def _enqueue_outbox(self, outbox: dict) -> str:
         conn = init_db(self.db_path)
         try:
-            return enqueue_gateway_outbox(conn, outbox)
+            return enqueue_gateway_outbox(
+                conn,
+                outbox,
+                **self._runtime_fence_kwargs(),
+            )
         finally:
             conn.close()
+
+    async def _enqueue_outbox_async(self, outbox: dict) -> str:
+        return await self.persistence.call(
+            enqueue_gateway_outbox,
+            outbox,
+            **self._runtime_fence_kwargs(),
+        )
 
     def _load_outbox(self, outbox_id: str) -> dict | None:
         conn = init_db(self.db_path)
@@ -748,6 +1371,9 @@ class GatewayRunner:
             return get_gateway_outbox(conn, outbox_id)
         finally:
             conn.close()
+
+    async def _load_outbox_async(self, outbox_id: str) -> dict | None:
+        return await self.persistence.call(get_gateway_outbox, outbox_id)
 
     def _cancel_outbox(
         self,
@@ -770,6 +1396,7 @@ class GatewayRunner:
                 outbox_id,
                 expected_route,
                 expected_source,
+                **self._runtime_fence_kwargs(),
             )
             if not cancelled:
                 current = get_gateway_outbox(conn, outbox_id)
@@ -787,6 +1414,41 @@ class GatewayRunner:
             self._accepted_messages.discard((expected_route, expected_source))
         return cancelled
 
+    async def _cancel_outbox_async(
+        self,
+        outbox_id: str,
+        *,
+        route_key: str | None = None,
+        source_message_id: str | None = None,
+    ) -> bool:
+        outbox = await self._load_outbox_async(outbox_id)
+        if outbox is None:
+            return False
+        expected_route = route_key or str(outbox["route_key"])
+        expected_source = source_message_id or str(
+            outbox["source_message_id"]
+        )
+        cancelled = await self.persistence.call(
+            cancel_gateway_delivery,
+            outbox_id,
+            expected_route,
+            expected_source,
+            **self._runtime_fence_kwargs(),
+        )
+        if not cancelled:
+            current = await self._load_outbox_async(outbox_id)
+            cancelled = bool(
+                current
+                and current["status"] in {
+                    "cancelled",
+                    "partial_cancelled",
+                    "delivered",
+                }
+            )
+        if cancelled:
+            self._accepted_messages.discard((expected_route, expected_source))
+        return cancelled
+
     def _complete_outbox(
         self,
         outbox_id: str,
@@ -800,14 +1462,39 @@ class GatewayRunner:
                 outbox_id,
                 route_key,
                 event.message_id,
+                **self._runtime_fence_kwargs(),
             )
             if not completed:
                 current = get_gateway_outbox(conn, outbox_id)
                 completed = bool(
                     current and current["status"] == "delivered"
                 )
+                if not completed and self._runtime_lease_acquired:
+                    self._outbox_send_fence_is_valid(outbox_id)
         finally:
             conn.close()
+        if completed:
+            self._accepted_messages.discard((route_key, event.message_id))
+        return completed
+
+    async def _complete_outbox_async(
+        self,
+        outbox_id: str,
+        route_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        completed = await self.persistence.call(
+            complete_gateway_delivery,
+            outbox_id,
+            route_key,
+            event.message_id,
+            **self._runtime_fence_kwargs(),
+        )
+        if not completed:
+            current = await self._load_outbox_async(outbox_id)
+            completed = bool(current and current["status"] == "delivered")
+            if not completed and self._runtime_lease_acquired:
+                await self._outbox_send_fence_is_valid_async(outbox_id)
         if completed:
             self._accepted_messages.discard((route_key, event.message_id))
         return completed
@@ -829,9 +1516,28 @@ class GatewayRunner:
                 event.message_id,
                 error,
                 error_code,
+                **self._runtime_fence_kwargs(),
             )
         finally:
             conn.close()
+
+    async def _fail_outbox_async(
+        self,
+        outbox_id: str,
+        route_key: str,
+        event: MessageEvent,
+        error: str,
+        error_code: str | None,
+    ) -> bool:
+        return await self.persistence.call(
+            fail_gateway_delivery,
+            outbox_id,
+            route_key,
+            event.message_id,
+            error,
+            error_code,
+            **self._runtime_fence_kwargs(),
+        )
 
     def _request_session_cancel(self, route_key: str, reason: str) -> bool:
         """失效内存任务，并立即持久化终止当前未完成 Outbox。"""
@@ -840,6 +1546,22 @@ class GatewayRunner:
         cancelled = self.sessions.request_cancel(route_key, reason=reason)
         if cancelled and reason != "shutdown" and delivery_id:
             self._cancel_outbox(delivery_id, route_key=route_key)
+        return cancelled
+
+    async def _request_session_cancel_async(
+        self,
+        route_key: str,
+        reason: str,
+    ) -> bool:
+        """先同步失效内存任务，再异步持久化显式 Outbox 取消。"""
+        ctx = self.sessions.get(route_key)
+        delivery_id = ctx.delivery_id if ctx is not None else None
+        cancelled = self.sessions.request_cancel(route_key, reason=reason)
+        if cancelled and reason != "shutdown" and delivery_id:
+            await self._cancel_outbox_async(
+                delivery_id,
+                route_key=route_key,
+            )
         return cancelled
 
     @staticmethod
@@ -880,6 +1602,20 @@ class GatewayRunner:
             )
         return reason
 
+    async def _cancel_stale_outbox_async(
+        self,
+        ctx,
+        generation: int | None,
+        outbox_id: str,
+    ) -> str | None:
+        reason = self._task_cancel_reason(ctx, generation)
+        if reason is not None and reason != "shutdown":
+            await self._cancel_outbox_async(
+                outbox_id,
+                route_key=getattr(ctx, "route_key", None),
+            )
+        return reason
+
     async def _wait_for_delivery_attempt(
         self,
         delay: float,
@@ -889,7 +1625,11 @@ class GatewayRunner:
         outbox_id: str,
     ) -> str | None:
         """可被 generation 失效事件唤醒的重试等待。"""
-        reason = self._cancel_stale_outbox(ctx, generation, outbox_id)
+        reason = await self._cancel_stale_outbox_async(
+            ctx,
+            generation,
+            outbox_id,
+        )
         if reason is not None or delay <= 0:
             return reason
         if invalidation_event is None:
@@ -899,7 +1639,11 @@ class GatewayRunner:
                 await asyncio.wait_for(invalidation_event.wait(), timeout=delay)
             except TimeoutError:
                 pass
-        return self._cancel_stale_outbox(ctx, generation, outbox_id)
+        return await self._cancel_stale_outbox_async(
+            ctx,
+            generation,
+            outbox_id,
+        )
 
     def _mark_delivery_failed_without_outbox(
         self,
@@ -916,6 +1660,17 @@ class GatewayRunner:
             )
         finally:
             conn.close()
+
+    async def _mark_delivery_failed_without_outbox_async(
+        self,
+        route_key: str,
+        event: MessageEvent,
+    ) -> None:
+        await self.persistence.call(
+            mark_gateway_message_delivery_failed,
+            route_key,
+            event.message_id,
+        )
 
     def _delivery_attempt_limit(self, outbox: dict) -> int:
         """queue-full 回执只做短期 durable 投递，其余使用完整恢复预算。"""
@@ -966,12 +1721,16 @@ class GatewayRunner:
         while True:
             if self._runtime_lease_blocks_delivery():
                 return None
-            outbox = self._load_outbox(outbox_id)
+            outbox = await self._load_outbox_async(outbox_id)
             if outbox is None:
                 raise RuntimeError("gateway outbox is missing")
             if self._runtime_lease_blocks_delivery():
                 return None
-            if self._cancel_stale_outbox(ctx, generation, outbox_id) is not None:
+            if await self._cancel_stale_outbox_async(
+                ctx,
+                generation,
+                outbox_id,
+            ) is not None:
                 return None
             if outbox["status"] == "delivered":
                 return True
@@ -997,16 +1756,23 @@ class GatewayRunner:
 
             if self._runtime_lease_blocks_delivery():
                 return None
-            if self._cancel_stale_outbox(ctx, generation, outbox_id) is not None:
+            if await self._cancel_stale_outbox_async(
+                ctx,
+                generation,
+                outbox_id,
+            ) is not None:
                 return None
 
             adapter = self.adapters.get(outbox["platform"])
-            conn = init_db(self.db_path)
-            try:
-                can_send = mark_gateway_outbox_sending(conn, outbox_id)
-            finally:
-                conn.close()
+            can_send = await self.persistence.call(
+                mark_gateway_outbox_sending,
+                outbox_id,
+                **self._runtime_fence_kwargs(),
+            )
             if not can_send:
+                if self._runtime_lease_acquired:
+                    await self._outbox_send_fence_is_valid_async(outbox_id)
+                    return None
                 continue
 
             payloads = outbox["payloads"]
@@ -1017,7 +1783,11 @@ class GatewayRunner:
                 if self._runtime_lease_blocks_delivery():
                     return None
                 if (
-                    self._cancel_stale_outbox(ctx, generation, outbox_id)
+                    await self._cancel_stale_outbox_async(
+                        ctx,
+                        generation,
+                        outbox_id,
+                    )
                     is not None
                 ):
                     return None
@@ -1035,6 +1805,10 @@ class GatewayRunner:
                         retryable=False,
                     )
                 else:
+                    if not await self._outbox_send_fence_is_valid_async(
+                        outbox_id
+                    ):
+                        return None
                     try:
                         result = await adapter.send_prepared(
                             outbox["chat_id"],
@@ -1046,8 +1820,11 @@ class GatewayRunner:
                         raise
                     except Exception as exc:
                         print(
-                            f"  [gateway] {route_key}: adapter send error "
-                            f"({type(exc).__name__})"
+                            "  [gateway:audit] event=outbox_send_error "
+                            f"{safe_route_digest(route_key)} "
+                            f"delivery_id={outbox_id} "
+                            f"lease_epoch={self._runtime_lease_epoch} "
+                            f"exception={type(exc).__name__}"
                         )
                         result = SendResult(
                             success=False,
@@ -1062,25 +1839,24 @@ class GatewayRunner:
 
                 if result.message_id:
                     message_ids.append(result.message_id)
-                conn = init_db(self.db_path)
-                try:
-                    progress_saved = mark_gateway_outbox_chunk_sent(
-                        conn,
-                        outbox_id,
-                        index + 1,
-                        message_ids,
-                        len(payloads),
-                    )
-                finally:
-                    conn.close()
+                progress_saved = await self.persistence.call(
+                    mark_gateway_outbox_chunk_sent,
+                    outbox_id,
+                    index + 1,
+                    message_ids,
+                    len(payloads),
+                    **self._runtime_fence_kwargs(),
+                )
                 if not progress_saved:
+                    if self._runtime_lease_acquired:
+                        await self._outbox_send_fence_is_valid_async(outbox_id)
                     return None
 
                 all_chunks_sent = index + 1 >= len(payloads)
                 if all_chunks_sent:
                     # 平台已经确认完整回答。即使取消与本次成功并发，delivered
                     # 也必须优先，取消不能反向抹除已发生的外部事实。
-                    delivered = self._complete_outbox(
+                    delivered = await self._complete_outbox_async(
                         outbox_id,
                         route_key,
                         event,
@@ -1091,7 +1867,11 @@ class GatewayRunner:
                 if self._runtime_lease_blocks_delivery():
                     return None
                 if (
-                    self._cancel_stale_outbox(ctx, generation, outbox_id)
+                    await self._cancel_stale_outbox_async(
+                        ctx,
+                        generation,
+                        outbox_id,
+                    )
                     is not None
                 ):
                     return None
@@ -1099,7 +1879,7 @@ class GatewayRunner:
             if failed_result is None:
                 # 恢复时可能读取到 next_chunk_index 已经等于总片数、但进程
                 # 尚未来得及写 delivered 的记录；完整进度同样优先于取消。
-                delivered = self._complete_outbox(
+                delivered = await self._complete_outbox_async(
                     outbox_id,
                     route_key,
                     event,
@@ -1111,13 +1891,17 @@ class GatewayRunner:
             error = (failed_result.error or "internal_send_error")[:120]
             if self._runtime_lease_blocks_delivery():
                 return None
-            if self._cancel_stale_outbox(ctx, generation, outbox_id) is not None:
+            if await self._cancel_stale_outbox_async(
+                ctx,
+                generation,
+                outbox_id,
+            ) is not None:
                 return None
             if (
                 not failed_result.retryable
                 or attempt >= max_attempts
             ):
-                permanently_failed = self._fail_outbox(
+                permanently_failed = await self._fail_outbox_async(
                     outbox_id,
                     route_key,
                     event,
@@ -1125,12 +1909,21 @@ class GatewayRunner:
                     failed_result.error_code,
                 )
                 if not permanently_failed:
-                    current = self._load_outbox(outbox_id)
+                    current = await self._load_outbox_async(outbox_id)
                     if not current or current["status"] != "permanent_failed":
+                        if self._runtime_lease_acquired:
+                            await self._outbox_send_fence_is_valid_async(
+                                outbox_id
+                            )
                         return None
                 print(
-                    f"  [gateway] {route_key}: delivery failed permanently "
-                    f"(chunk={failed_index}, error={error})"
+                    "  [gateway:audit] event=outbox_permanent_failure "
+                    f"{safe_route_digest(route_key)} "
+                    f"delivery_id={outbox_id} "
+                    f"attempt_count={attempt} "
+                    "retry_status=permanent_failed "
+                    f"lease_epoch={self._runtime_lease_epoch} "
+                    f"failure_type={error} chunk={failed_index}"
                 )
                 return False
 
@@ -1138,26 +1931,39 @@ class GatewayRunner:
                 attempt,
                 failed_result.retry_after_seconds,
             )
-            if self._cancel_stale_outbox(ctx, generation, outbox_id) is not None:
+            if await self._cancel_stale_outbox_async(
+                ctx,
+                generation,
+                outbox_id,
+            ) is not None:
                 return None
-            conn = init_db(self.db_path)
-            try:
-                retry_scheduled = mark_gateway_outbox_retry(
-                    conn,
-                    outbox_id,
-                    error,
-                    failed_result.error_code,
-                    time.time() + delay,
-                )
-            finally:
-                conn.close()
+            retry_scheduled = await self.persistence.call(
+                mark_gateway_outbox_retry,
+                outbox_id,
+                error,
+                failed_result.error_code,
+                time.time() + delay,
+                **self._runtime_fence_kwargs(),
+            )
             if not retry_scheduled:
+                if self._runtime_lease_acquired:
+                    await self._outbox_send_fence_is_valid_async(outbox_id)
                 return None
             print(
-                f"  [gateway] {route_key}: delivery retry "
-                f"{attempt}/{max_attempts} in {delay:.1f}s"
+                "  [gateway:audit] event=outbox_retry "
+                f"{safe_route_digest(route_key)} "
+                f"delivery_id={outbox_id} "
+                f"attempt_count={attempt} "
+                "retry_status=retry_wait "
+                f"lease_epoch={self._runtime_lease_epoch} "
+                f"failure_type={error} max_attempts={max_attempts} "
+                f"delay_seconds={delay:.1f}"
             )
-            if self._cancel_stale_outbox(ctx, generation, outbox_id) is not None:
+            if await self._cancel_stale_outbox_async(
+                ctx,
+                generation,
+                outbox_id,
+            ) is not None:
                 return None
 
     def _start_durable_reply(
@@ -1178,6 +1984,33 @@ class GatewayRunner:
             delivery_kind,
         )
         delivery_id = self._enqueue_outbox(outbox)
+        self._accepted_messages.add((route_key, event.message_id))
+        self._launch_durable_reply_worker(
+            route_key,
+            event,
+            delivery_id,
+            ctx,
+        )
+        return delivery_id
+
+    async def _start_durable_reply_async(
+        self,
+        route_key: str,
+        event: MessageEvent,
+        content: str,
+        delivery_kind: str,
+        ctx,
+    ) -> str:
+        """异步持久化控制回执，route 空闲时再创建投递 worker。"""
+        delivery_id = str(uuid.uuid4())
+        outbox = self._build_outbox(
+            route_key,
+            event,
+            content,
+            delivery_id,
+            delivery_kind,
+        )
+        delivery_id = await self._enqueue_outbox_async(outbox)
         self._accepted_messages.add((route_key, event.message_id))
         self._launch_durable_reply_worker(
             route_key,
@@ -1258,6 +2091,8 @@ class GatewayRunner:
                 ctx.delivery_id = None
                 ctx.delivery_generation = None
             if owns_worker:
+                if cancel_reason != "shutdown":
+                    ctx.dispatching = True
                 ctx.worker_task = None
                 ctx.worker_generation = None
                 ctx.busy = False
@@ -1275,14 +2110,27 @@ class GatewayRunner:
         for message_id in message_ids:
             self._accepted_messages.discard((route_key, message_id))
 
+    async def _drop_events_async(
+        self,
+        route_key: str,
+        events: list[MessageEvent],
+    ) -> None:
+        message_ids = [event.message_id for event in events]
+        await self.persistence.call(
+            delete_gateway_messages,
+            route_key,
+            message_ids,
+        )
+        for message_id in message_ids:
+            self._accepted_messages.discard((route_key, message_id))
+
     async def _restore_outbound_messages(self) -> None:
         """按 route_key 恢复已生成但尚未完整送达的回复。"""
-        conn = init_db(self.db_path)
-        try:
-            reset_gateway_sending_outbox(conn)
-            rows = get_recoverable_gateway_outbox(conn)
-        finally:
-            conn.close()
+        await self.persistence.call(
+            reset_gateway_sending_outbox,
+            **self._runtime_fence_kwargs(),
+        )
+        rows = await self.persistence.call(get_recoverable_gateway_outbox)
 
         grouped: dict[str, list[dict]] = {}
         for row in rows:
@@ -1317,6 +2165,7 @@ class GatewayRunner:
 
                 # 创建 worker 前验证该 route 的全部事件。任一记录损坏时保留
                 # 整个 route 的原顺序，不跳过坏记录发送后面的回复。
+                route_source: SessionSource | None = None
                 for row in route_rows:
                     event = self._deserialize_event(row["event_json"])
                     expected = build_session_key(event.source, self.agent_name)
@@ -1324,15 +2173,19 @@ class GatewayRunner:
                         raise ValueError("route key mismatch")
                     if event.source.platform != platform:
                         raise ValueError("outbox platform mismatch")
+                    if route_source is None:
+                        route_source = event.source
                     self._remember_startup_message(
                         route_key,
                         event,
                         layer="outbox",
                         status=str(row["status"]),
                     )
-                ctx = self.sessions.get_or_create(
+                if route_source is None:
+                    raise ValueError("outbox route contains no events")
+                ctx = await self.sessions.get_or_create_async(
                     route_key,
-                    self._build_gateway_prompt(),
+                    self._build_gateway_prompt(route_source),
                 )
                 if self._route_has_active_worker(ctx):
                     print(
@@ -1373,9 +2226,12 @@ class GatewayRunner:
         invalidation_event: asyncio.Event,
     ) -> None:
         """同一路由按原创建顺序恢复回复,避免后回复先到。"""
-        ctx = self.sessions.get_or_create(
+        if not rows:
+            raise ValueError("outbox route contains no events")
+        first_event = self._deserialize_event(rows[0]["event_json"])
+        ctx = await self.sessions.get_or_create_async(
             route_key,
-            self._build_gateway_prompt(),
+            self._build_gateway_prompt(first_event.source),
         )
         cancel_reason = None
         try:
@@ -1397,7 +2253,7 @@ class GatewayRunner:
                         # 该恢复 worker 中其余回复同属已经被明确放弃的旧工作；
                         # 全部终止，避免下一次重启又把它们发送出来。
                         for stale_row in rows[position:]:
-                            self._cancel_outbox(
+                            await self._cancel_outbox_async(
                                 stale_row["id"],
                                 route_key=route_key,
                                 source_message_id=stale_row[
@@ -1430,6 +2286,8 @@ class GatewayRunner:
                 ctx.delivery_id = None
                 ctx.delivery_generation = None
             if owns_worker:
+                if cancel_reason != "shutdown":
+                    ctx.dispatching = True
                 ctx.worker_task = None
                 ctx.worker_generation = None
                 ctx.busy = False
@@ -1438,12 +2296,8 @@ class GatewayRunner:
 
     async def _restore_queued_messages(self) -> None:
         """恢复 queued / processing；已有 Outbox worker 的 route 进入 pending。"""
-        conn = init_db(self.db_path)
-        try:
-            reset_gateway_processing_messages(conn)
-            rows = get_gateway_queued_messages(conn)
-        finally:
-            conn.close()
+        await self.persistence.call(reset_gateway_processing_messages)
+        rows = await self.persistence.call(get_gateway_queued_messages)
 
         restored = 0
         for row in rows:
@@ -1486,7 +2340,41 @@ class GatewayRunner:
         *,
         from_queue: bool = False,
     ):
+        """按 route 串行完成数据库 admission 与内存任务注册。"""
+        route_key = build_session_key(event.source, self.agent_name)
+        lock = self._route_admission_locks.setdefault(
+            route_key,
+            asyncio.Lock(),
+        )
+        self._route_admission_users[route_key] = (
+            self._route_admission_users.get(route_key, 0) + 1
+        )
+        try:
+            async with lock:
+                return await self._handle_message_serialized(
+                    event,
+                    from_queue=from_queue,
+                )
+        finally:
+            users = self._route_admission_users.get(route_key, 1) - 1
+            if users <= 0:
+                self._route_admission_users.pop(route_key, None)
+                if self._route_admission_locks.get(route_key) is lock:
+                    self._route_admission_locks.pop(route_key, None)
+            else:
+                self._route_admission_users[route_key] = users
+
+    async def _handle_message_serialized(
+        self,
+        event: MessageEvent,
+        *,
+        from_queue: bool = False,
+    ):
         """所有 adapter 的入站消息在此汇聚。"""
+        if self._runtime_lease_blocks_delivery():
+            raise RuntimeError(
+                f"gateway runtime lease is invalid during {self._lifecycle_phase}"
+            )
         if (
             not from_queue
             and not self._accepting_external_messages
@@ -1497,7 +2385,7 @@ class GatewayRunner:
         route_key = build_session_key(event.source, self.agent_name)
         queue_key = (route_key, event.message_id)
         if not from_queue:
-            persisted = self._message_persistence_state(event)
+            persisted = await self._message_persistence_state_async(event)
             if persisted is not None:
                 self._accepted_messages.add(queue_key)
                 return
@@ -1507,40 +2395,52 @@ class GatewayRunner:
         # slash 命令(所有平台通用)
         cmd = (event.text or "").strip().lower()
         if cmd == "/new":
-            ctx = self.sessions.get_or_create(
-                route_key, self._build_gateway_prompt(),
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
             )
             if self._route_has_active_worker(ctx):
                 # /new 作为串行屏障:丢弃命令前尚未执行的旧消息,
                 # 等当前 worker 完全退出后再切换 conversation_id。
                 dropped_events = list(ctx.pending)
-                self._drop_events(route_key, dropped_events)
+                await self._drop_events_async(route_key, dropped_events)
                 ctx.pending.clear()
-                if not from_queue and not self._persist_event(route_key, event):
+                if (
+                    not from_queue
+                    and not await self._persist_event_async(route_key, event)
+                ):
                     return
                 self.sessions.enqueue(ctx, event)
-                self._request_session_cancel(route_key, reason="new")
+                await self._request_session_cancel_async(
+                    route_key,
+                    reason="new",
+                )
                 print(
                     f"  [gateway] {route_key}: /new queued "
                     f"({len(dropped_events)} old pending dropped)"
                 )
                 return
-            if not from_queue and not self._persist_event(route_key, event):
+            if (
+                not from_queue
+                and not await self._persist_event_async(route_key, event)
+            ):
                 return
-            ctx = self.sessions.new_conversation(
-                route_key, self._build_gateway_prompt(),
+            ctx = await self.sessions.new_conversation_async(
+                route_key, self._build_gateway_prompt(event.source),
             )
             if event.source.platform not in self.adapters:
                 # 保留无 Adapter 的测试 / 嵌入式调用兼容路径。真实平台事件
                 # 一定有对应 Adapter,仍走下面的持久 outbox。
                 result = await self._reply(event, "(new conversation started)")
                 if result is None or result.success:
-                    self._complete_event(route_key, event)
+                    await self._complete_event_async(route_key, event)
                 else:
-                    self._mark_delivery_failed_without_outbox(route_key, event)
-                await self._dispatch_next(ctx)
+                    await self._mark_delivery_failed_without_outbox_async(
+                        route_key,
+                        event,
+                    )
+                await self._dispatch_next(ctx, admission_locked=True)
                 return
-            self._start_durable_reply(
+            await self._start_durable_reply_async(
                 route_key,
                 event,
                 "(new conversation started)",
@@ -1549,16 +2449,19 @@ class GatewayRunner:
             )
             return
         if cmd == "/stop":
-            ctx = self.sessions.get_or_create(
-                route_key, self._build_gateway_prompt(),
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
             )
-            ok = self._request_session_cancel(route_key, reason="user")
+            ok = await self._request_session_cancel_async(
+                route_key,
+                reason="user",
+            )
             content = "(cancel requested)" if ok else "(no active task)"
             if event.source.platform not in self.adapters:
                 # 保留无 Adapter 的测试 / 嵌入式调用兼容路径。
                 await self._reply(event, content)
                 return
-            self._start_durable_reply(
+            await self._start_durable_reply_async(
                 route_key,
                 event,
                 content,
@@ -1567,15 +2470,26 @@ class GatewayRunner:
             )
             return
         if cmd == "/status":
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
+            )
             status = self.sessions.get_status(route_key)
-            if status:
-                await self._reply(event, f"({status})")
-            else:
-                await self._reply(event, "(no session)")
+            content = f"({status})" if status else "(no session)"
+            if event.source.platform not in self.adapters:
+                # 保留无 Adapter 的测试 / 嵌入式调用兼容路径。
+                await self._reply(event, content)
+                return
+            await self._start_durable_reply_async(
+                route_key,
+                event,
+                content,
+                "status_command",
+                ctx,
+            )
             return
 
-        ctx = self.sessions.get_or_create(
-            route_key, self._build_gateway_prompt(),
+        ctx = await self.sessions.get_or_create_async(
+            route_key, self._build_gateway_prompt(event.source),
         )
 
         if self._route_has_active_worker(ctx):
@@ -1589,7 +2503,7 @@ class GatewayRunner:
                 if event.source.platform not in self.adapters:
                     await self._reply(event, content)
                     return
-                self._start_durable_reply(
+                await self._start_durable_reply_async(
                     route_key,
                     event,
                     content,
@@ -1597,7 +2511,10 @@ class GatewayRunner:
                     ctx,
                 )
                 return
-            if not from_queue and not self._persist_event(route_key, event):
+            if (
+                not from_queue
+                and not await self._persist_event_async(route_key, event)
+            ):
                 return
             if from_queue:
                 # 已持久化消息必须全部恢复,不能因重启后的新上限丢失。
@@ -1607,7 +2524,7 @@ class GatewayRunner:
             # 重启恢复的历史队列按原顺序完整执行,不能让后一条恢复消息
             # 取消前一条;只有新到达的实时消息才覆盖当前请求。
             if not from_queue:
-                self._request_session_cancel(
+                await self._request_session_cancel_async(
                     route_key,
                     reason="superseded",
                 )
@@ -1617,9 +2534,12 @@ class GatewayRunner:
         # 原子设置 busy,避免竞态:create_task 不会立即执行,_rocess 也没
         # 机会在 _handle_message 返回前跑。所以在 _handle_message 里设 busy
         # 就能保证同一 route_key 只有一个 worker。
-        if not from_queue and not self._persist_event(route_key, event):
+        if (
+            not from_queue
+            and not await self._persist_event_async(route_key, event)
+        ):
             return
-        self._mark_event_processing(route_key, event)
+        await self._mark_event_processing_async(route_key, event)
         generation, invalidation_event = self.sessions.begin_task(ctx)
         delivery_id = str(uuid.uuid4())
         ctx.delivery_id = delivery_id
@@ -1654,8 +2574,8 @@ class GatewayRunner:
         invalidation_event: asyncio.Event | None = None,
     ):
         """串行处理一条消息,然后检查队列。"""
-        ctx = self.sessions.get_or_create(
-            route_key, self._build_gateway_prompt(),
+        ctx = await self.sessions.get_or_create_async(
+            route_key, self._build_gateway_prompt(event.source),
         )
         if generation is None:
             generation = (
@@ -1685,7 +2605,7 @@ class GatewayRunner:
                 delivery_id = ctx.delivery_id
             # worker 返回到事件循环后做最后一道取消检查。即使取消恰好
             # 发生在模型响应检查之后,也不能把旧回复发送给用户。
-            persisted_outbox = self._load_outbox(delivery_id)
+            persisted_outbox = await self._load_outbox_async(delivery_id)
             cancel_reason = self._task_cancel_reason(ctx, generation)
             if cancel_reason is not None:
                 abandoned = True
@@ -1693,29 +2613,35 @@ class GatewayRunner:
                     cancel_reason != "shutdown"
                     and persisted_outbox
                 ):
-                    event_completed = self._cancel_outbox(
+                    event_completed = await self._cancel_outbox_async(
                         delivery_id,
                         route_key=route_key,
                         source_message_id=event.message_id,
                     )
                 print(f"  [gateway] {route_key}: stale response discarded")
             elif not response and not persisted_outbox:
-                event_completed = self._complete_event(route_key, event)
+                event_completed = await self._complete_event_async(
+                    route_key,
+                    event,
+                )
             elif event.source.platform not in self.adapters:
                 # 无 Adapter 只用于测试或嵌入式调用;保留原 _reply 注入点。
                 result = await self._reply(event, str(response or ""))
                 if result is None or result.success:
                     if persisted_outbox:
-                        event_completed = self._cancel_outbox(
+                        event_completed = await self._cancel_outbox_async(
                             delivery_id,
                             route_key=route_key,
                             source_message_id=event.message_id,
                         )
                     else:
-                        event_completed = self._complete_event(route_key, event)
+                        event_completed = await self._complete_event_async(
+                            route_key,
+                            event,
+                        )
                 else:
                     if persisted_outbox:
-                        event_completed = self._fail_outbox(
+                        event_completed = await self._fail_outbox_async(
                             delivery_id,
                             route_key,
                             event,
@@ -1723,7 +2649,7 @@ class GatewayRunner:
                             result.error_code,
                         )
                     else:
-                        self._mark_delivery_failed_without_outbox(
+                        await self._mark_delivery_failed_without_outbox_async(
                             route_key,
                             event,
                         )
@@ -1750,7 +2676,7 @@ class GatewayRunner:
                     delivery_id,
                     "final",
                 )
-                delivery_id = self._enqueue_outbox(outbox)
+                delivery_id = await self._enqueue_outbox_async(outbox)
                 if (
                     ctx.delivery_generation == generation
                     and self._task_cancel_reason(ctx, generation) is None
@@ -1782,7 +2708,7 @@ class GatewayRunner:
             cancel_reason = self._task_cancel_reason(ctx, generation)
             if cancel_reason is not None:
                 abandoned = True
-            elif self._load_outbox(delivery_id) is None:
+            elif await self._load_outbox_async(delivery_id) is None:
                 try:
                     outbox = self._build_outbox(
                         route_key,
@@ -1791,7 +2717,7 @@ class GatewayRunner:
                         delivery_id,
                         "internal_error",
                     )
-                    delivery_id = self._enqueue_outbox(outbox)
+                    delivery_id = await self._enqueue_outbox_async(outbox)
                     if (
                         ctx.delivery_generation == generation
                         and self._task_cancel_reason(ctx, generation) is None
@@ -1846,10 +2772,6 @@ class GatewayRunner:
                     and ctx.worker_generation is None
                 )
             )
-            if owns_worker:
-                ctx.worker_task = None
-                ctx.worker_generation = None
-                ctx.busy = False
             if (
                 ctx.delivery_id == delivery_id
                 and ctx.delivery_generation in (None, generation)
@@ -1858,36 +2780,96 @@ class GatewayRunner:
                 ctx.delivery_generation = None
             # 用户取消 /new / 后续消息覆盖表示旧回答被明确放弃;shutdown
             # 则保留 processing / outbox,下次启动从持久状态恢复。
-            if (
-                abandoned
-                and cancel_reason != "shutdown"
-                and not event_completed
-            ):
-                if self._load_outbox(delivery_id):
-                    event_completed = self._cancel_outbox(
-                        delivery_id,
-                        route_key=route_key,
-                        source_message_id=event.message_id,
-                    )
-                else:
-                    event_completed = self._complete_event(route_key, event)
+            try:
+                if (
+                    abandoned
+                    and cancel_reason != "shutdown"
+                    and not event_completed
+                ):
+                    # 先让触发取消的入站批次完成 admission，再
+                    # 删除旧 processing 记录。这使内存队列与持久
+                    # 队列在同一边界上对外可见。
+                    await self._wait_for_route_admissions(route_key)
+                    if await self._load_outbox_async(delivery_id):
+                        event_completed = await self._cancel_outbox_async(
+                            delivery_id,
+                            route_key=route_key,
+                            source_message_id=event.message_id,
+                        )
+                    else:
+                        event_completed = await self._complete_event_async(
+                            route_key,
+                            event,
+                        )
+            finally:
+                # 关键状态已落库后才对外暴露 route 空闲。普通
+                # 收尾先进入 dispatching，由 admission 锁保证 pending
+                # 队头不会被同时到达的新消息越过。
+                if owns_worker:
+                    if cancel_reason != "shutdown":
+                        ctx.dispatching = True
+                    ctx.worker_task = None
+                    ctx.worker_generation = None
+                    ctx.busy = False
 
         if cancel_reason != "shutdown":
             await self._dispatch_next(ctx)
 
-    async def _dispatch_next(self, ctx) -> None:
+    async def _dispatch_next(
+        self,
+        ctx,
+        *,
+        admission_locked: bool = False,
+    ) -> None:
+        """在 route admission 临界区内接力持久工作。"""
+        if admission_locked:
+            await self._dispatch_next_locked(ctx)
+            return
+
+        route_key = ctx.route_key
+        # 当前 admission 调用可能在同一个事件循环回调中紧接着
+        # 提交多条消息。后台收尾者等到已注册的 admission
+        # 全部退出，并再让出一次调度；这样同一回调紧接着
+        # 发起的下一条消息可以先注册，不会被接力者插队。
+        await self._wait_for_route_admissions(route_key)
+        lock = self._route_admission_locks.setdefault(
+            route_key,
+            asyncio.Lock(),
+        )
+        self._route_admission_users[route_key] = (
+            self._route_admission_users.get(route_key, 0) + 1
+        )
+        try:
+            async with lock:
+                await self._dispatch_next_locked(ctx)
+        finally:
+            users = self._route_admission_users.get(route_key, 1) - 1
+            if users <= 0:
+                self._route_admission_users.pop(route_key, None)
+                if self._route_admission_locks.get(route_key) is lock:
+                    self._route_admission_locks.pop(route_key, None)
+            else:
+                self._route_admission_users[route_key] = users
+
+    async def _wait_for_route_admissions(self, route_key: str) -> None:
+        """等待当前入站批次稳定退出 route 临界区。"""
+        while True:
+            while self._route_admission_users.get(route_key, 0) > 0:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            if self._route_admission_users.get(route_key, 0) == 0:
+                return
+
+    async def _dispatch_next_locked(self, ctx) -> None:
         """优先接力已生成回复，再分发 pending 模型任务。"""
+        ctx.dispatching = False
         if self._route_has_active_worker(ctx):
             return
         try:
-            conn = init_db(self.db_path)
-            try:
-                outbox = get_next_recoverable_gateway_outbox_for_route(
-                    conn,
-                    ctx.route_key,
-                )
-            finally:
-                conn.close()
+            outbox = await self.persistence.call(
+                get_next_recoverable_gateway_outbox_for_route,
+                ctx.route_key,
+            )
             if outbox is not None:
                 event = self._deserialize_event(outbox["event_json"])
                 expected_route = build_session_key(event.source, self.agent_name)
@@ -1916,7 +2898,7 @@ class GatewayRunner:
         if not ctx.pending:
             return
         next_event = ctx.pending.popleft()
-        await self._handle_message(next_event, from_queue=True)
+        await self._handle_message_serialized(next_event, from_queue=True)
 
     async def _run_agent(
         self,
@@ -1933,7 +2915,7 @@ class GatewayRunner:
         event: MessageEvent,
         ctx,
     ) -> str | None:
-        """使用 AsyncOpenAI 跑主会话,SQLite 仍复用现有同步接口。"""
+        """使用 AsyncOpenAI 跑主会话，数据库 hook 统一在线程执行。"""
         from hermes.db import ensure_session
         from hermes.conversation import run_conversation_async
 
@@ -1958,7 +2940,7 @@ class GatewayRunner:
         conversation_id = ctx.conversation_id
         system_prompt = ctx.system_prompt
 
-        def persist_final_message(conn, session_id, msg) -> None:
+        def persist_final_message(conn, session_id, msg) -> str | None:
             """最终回答和 outbox 必须在同一个 SQLite 事务中落盘。"""
             if self._task_cancel_reason(ctx, generation) is not None:
                 raise asyncio.CancelledError
@@ -1978,34 +2960,28 @@ class GatewayRunner:
                 session_id,
                 msg,
                 outbox,
+                **self._runtime_fence_kwargs(),
             )
-            if (
-                self._task_cancel_reason(ctx, generation) is None
-                and getattr(ctx, "delivery_generation", generation) == generation
-            ):
-                ctx.delivery_id = actual_delivery_id
+            return actual_delivery_id
 
-        conn = init_db(self.db_path)
-        try:
-            ensure_session(
-                conn,
-                conversation_id,
-                source=event.source.platform,
-            )
-            result = await run_conversation_async(
-                event.text,
-                conn,
-                conversation_id,
-                system_prompt,
-                conversation_id,
-                cancel_checker,
-                async_client=self._get_async_client(),
-                final_message_callback=persist_final_message,
-                enabled_toolsets=[],
-            )
-            return result.get("final_response")
-        finally:
-            conn.close()
+        await self.persistence.call(
+            ensure_session,
+            conversation_id,
+            source=event.source.platform,
+        )
+        result = await run_conversation_async(
+            event.text,
+            None,
+            conversation_id,
+            system_prompt,
+            conversation_id,
+            cancel_checker,
+            async_client=self._get_async_client(),
+            final_message_callback=persist_final_message,
+            persistence_call=self.persistence.call,
+            enabled_toolsets=[],
+        )
+        return result.get("final_response")
 
     def _get_async_client(self):
         """按需创建 Runner 独占的异步模型客户端。"""
@@ -2015,7 +2991,11 @@ class GatewayRunner:
         return self._async_client
 
     async def _reply(self, event: MessageEvent, content: str) -> SendResult:
-        """发送时效性回复并把结果返回调用方,不再吞掉失败。"""
+        """只为未正式启动的嵌入式路径保留直接回复兼容。"""
+        if self._runtime_lease_acquired:
+            raise RuntimeError(
+                "gateway platform sends must use a fenced Outbox claim"
+            )
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return SendResult(

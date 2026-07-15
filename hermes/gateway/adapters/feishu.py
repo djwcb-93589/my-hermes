@@ -23,6 +23,7 @@ import asyncio
 import hmac
 import json
 import math
+import random
 import socket
 import sqlite3
 import threading
@@ -35,6 +36,21 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import urlsplit
 
+from hermes.db import (
+    InvalidFeishuInboxPayloadError,
+    build_feishu_inbox_route_key,
+    claim_feishu_inbox_route_message,
+    fail_feishu_inbox_message,
+    get_feishu_inbox_dispatch_routes,
+    get_feishu_inbox_payload,
+    get_feishu_inbox_route_next,
+    get_feishu_inbox_status,
+    insert_feishu_inbox_message,
+    prune_feishu_inbox_messages,
+    release_feishu_inbox_processing_message,
+    reset_feishu_inbox_processing,
+    update_feishu_inbox_status,
+)
 from hermes.gateway.adapters import BasePlatformAdapter
 from hermes.gateway.adapters.webhook_security import (
     BoundedThreadingHTTPServer,
@@ -42,6 +58,11 @@ from hermes.gateway.adapters.webhook_security import (
     TrustedProxyResolver,
     redact_ip,
 )
+from hermes.gateway.observability import (
+    safe_message_digest,
+    safe_route_digest,
+)
+from hermes.gateway.persistence import GatewayPersistence
 from hermes.gateway.types import MessageEvent, MessageType, SendResult, SessionSource
 
 
@@ -107,6 +128,8 @@ FEISHU_WEBHOOK_DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 FEISHU_WEBHOOK_READ_CHUNK_BYTES = 64 * 1024
 FEISHU_DEDUP_TTL_SECONDS = 72 * 60 * 60  # 已处理消息保留 72 小时
 FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
+FEISHU_DEDUP_CLEANUP_BATCH_SIZE = 200
+FEISHU_READINESS_TIMEOUT_SECONDS = 2.0
 _IMMEDIATE_COMMANDS = frozenset({"/new", "/stop", "/status"})
 
 
@@ -120,6 +143,30 @@ class TokenResult:
     error_code: str | None = None
     retryable: bool = False
     retry_after_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class InboxFailureDisposition:
+    """Inbox 异常分类结果，只持久化安全分类码而不保存原始敏感文本。"""
+
+    code: str
+    permanent: bool = False
+
+
+class FeishuInboxRetryableError(RuntimeError):
+    """Inbox 消费链路中的明确瞬时错误。"""
+
+
+class FeishuRunnerUnavailableError(FeishuInboxRetryableError):
+    """Runner 回调尚未注入或暂时不可使用。"""
+
+
+class FeishuGatewayLifecycleError(FeishuInboxRetryableError):
+    """Gateway 正在启动、停止或已经失去运行资格。"""
+
+
+class FeishuInboxBusinessDataError(ValueError):
+    """已落库但无法解析为业务事件的永久数据错误。"""
 
 
 class FeishuAdapter(BasePlatformAdapter):
@@ -152,6 +199,18 @@ class FeishuAdapter(BasePlatformAdapter):
         allow_all: bool = False,
         allowed_users: list[str] | None = None,
         allowed_chats: list[str] | None = None,
+        group_authorization_mode: str = "and",
+        inbox_retry_max_attempts: int = 5,
+        inbox_retry_base_delay_seconds: float = 1.0,
+        inbox_retry_max_delay_seconds: float = 60.0,
+        inbox_retry_jitter_ratio: float = 0.2,
+        inbox_retry_poll_interval_seconds: float = 1.0,
+        inbox_retry_batch_size: int = 64,
+        inbox_retention_seconds: float = FEISHU_DEDUP_TTL_SECONDS,
+        retention_cleanup_interval_seconds: float = (
+            FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS
+        ),
+        retention_cleanup_batch_size: int = FEISHU_DEDUP_CLEANUP_BATCH_SIZE,
         send_total_attempts: int | None = None,
         send_max_retries: int | None = None,
         send_retry_base_delay_seconds: float | None = None,
@@ -202,6 +261,55 @@ class FeishuAdapter(BasePlatformAdapter):
         self.allow_all = allow_all
         self.allowed_users = set(allowed_users or [])
         self.allowed_chats = set(allowed_chats or [])
+        self.group_authorization_mode = str(
+            group_authorization_mode or ""
+        ).strip().lower()
+        if self.group_authorization_mode not in {"and", "or"}:
+            raise ValueError(
+                "group_authorization_mode must be 'and' or 'or'"
+            )
+        self.inbox_retry_max_attempts = self._positive_int(
+            "inbox_retry_max_attempts",
+            inbox_retry_max_attempts,
+        )
+        self.inbox_retry_base_delay_seconds = self._nonnegative_float(
+            "inbox_retry_base_delay_seconds",
+            inbox_retry_base_delay_seconds,
+        )
+        self.inbox_retry_max_delay_seconds = max(
+            self.inbox_retry_base_delay_seconds,
+            self._nonnegative_float(
+                "inbox_retry_max_delay_seconds",
+                inbox_retry_max_delay_seconds,
+            ),
+        )
+        self.inbox_retry_jitter_ratio = min(
+            1.0,
+            self._nonnegative_float(
+                "inbox_retry_jitter_ratio",
+                inbox_retry_jitter_ratio,
+            ),
+        )
+        self.inbox_retry_poll_interval_seconds = self._positive_float(
+            "inbox_retry_poll_interval_seconds",
+            inbox_retry_poll_interval_seconds,
+        )
+        self.inbox_retry_batch_size = self._positive_int(
+            "inbox_retry_batch_size",
+            inbox_retry_batch_size,
+        )
+        self.inbox_retention_seconds = self._positive_float(
+            "inbox_retention_seconds",
+            inbox_retention_seconds,
+        )
+        self.retention_cleanup_interval_seconds = self._positive_float(
+            "retention_cleanup_interval_seconds",
+            retention_cleanup_interval_seconds,
+        )
+        self.retention_cleanup_batch_size = self._positive_int(
+            "retention_cleanup_batch_size",
+            retention_cleanup_batch_size,
+        )
         configured_attempts = (
             send_total_attempts
             if send_total_attempts is not None
@@ -263,16 +371,16 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         self._proxy_resolver = TrustedProxyResolver(webhook_trusted_proxies)
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._reliability_db: sqlite3.Connection | None = None
+        self._owns_persistence = False
         self._last_dedup_cleanup = 0.0
-        self._batch_buffers: dict[str, list[str]] = {}
-        self._batch_events: dict[str, MessageEvent] = {}
-        self._batch_message_ids: dict[str, list[str]] = {}
-        self._batch_sources: dict[str, list[dict]] = {}
-        self._batch_started_at: dict[str, float] = {}
-        self._batch_tasks: dict[str, asyncio.Task] = {}
-        self._batch_waiters: dict[str, list[asyncio.Future]] = {}
-        self._message_tasks: dict[str, asyncio.Task] = {}
+        self._route_tasks: dict[str, asyncio.Task] = {}
+        self._route_wakeups: dict[str, asyncio.Event] = {}
+        self._inbox_dispatcher_task: asyncio.Task | None = None
+        self._inbox_dispatch_wakeup: asyncio.Event | None = None
+        self._inbox_deferred_failures: dict[
+            str,
+            tuple[str, float | None, bool, str, int, str],
+        ] = {}
         self._send_rate_locks: dict[str, asyncio.Lock] = {}
         self._send_timestamps: dict[str, deque[float]] = {}
         self._send_rate_last_used: dict[str, float] = {}
@@ -284,6 +392,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._send_rate_overflow_timestamps: deque[float] = deque()
         self._initialized = False
         self._pending_restored = False
+        self._stopping = False
 
     @staticmethod
     def _positive_int(name: str, value: Any) -> int:
@@ -330,7 +439,7 @@ class FeishuAdapter(BasePlatformAdapter):
             or parsed.query
             or parsed.fragment
             or parsed.path != raw
-            or raw == "/healthz"
+            or raw in {"/healthz", "/livez", "/readyz"}
         ):
             raise ValueError("webhook_path must be a fixed non-root HTTP path")
         return raw
@@ -376,6 +485,25 @@ class FeishuAdapter(BasePlatformAdapter):
             reason="concurrency_limit",
         )
 
+    def readiness_snapshot(self) -> dict[str, bool]:
+        """返回 Feishu 本地恢复、监听和 durable dispatcher 状态。"""
+        dispatcher = self._inbox_dispatcher_task
+        server_thread = self._server_thread
+        return {
+            "adapter_initialized": bool(self._initialized),
+            "inbox_restored": bool(self._pending_restored),
+            "adapter_receiving": bool(
+                self._running
+                and not self._stopping
+                and self._server is not None
+                and server_thread is not None
+                and server_thread.is_alive()
+            ),
+            "durable_dispatcher": bool(
+                dispatcher is not None and not dispatcher.done()
+            ),
+        }
+
     # ===================== 生命周期 =====================
 
     async def initialize(self) -> bool:
@@ -415,18 +543,30 @@ class FeishuAdapter(BasePlatformAdapter):
             )
 
         try:
-            self._open_reliability_store()
+            await self._open_reliability_store()
             self._loop = asyncio.get_running_loop()
+            self._inbox_dispatch_wakeup = asyncio.Event()
+            self._inbox_deferred_failures.clear()
+            self._stopping = False
             self._http = httpx.AsyncClient(timeout=15.0)
             self._initialized = True
             self._pending_restored = False
+            self._ensure_webhook_server()
             return True
         except Exception as exc:
             print(f"  [feishu] initialization failed: {type(exc).__name__}")
             self._running = False
+            if self._server:
+                try:
+                    self._server.server_close()
+                except Exception:
+                    pass
+            self._server = None
+            self._server_thread = None
             await self._close_http_client()
-            self._close_reliability_store()
+            await self._close_reliability_store()
             self._loop = None
+            self._inbox_dispatch_wakeup = None
             self._initialized = False
             return False
 
@@ -434,37 +574,28 @@ class FeishuAdapter(BasePlatformAdapter):
         """在 Gateway queue / Outbox 恢复后提交仍由飞书 Inbox 独占的事件。"""
         if not self._initialized:
             raise RuntimeError("feishu adapter is not initialized")
-        await self._restore_pending_messages()
-        self._pending_restored = True
+        if self._pending_restored:
+            self._start_inbox_dispatcher()
+            self._wake_inbox_dispatcher()
+            return
+        try:
+            await self._restore_pending_messages()
+        except Exception:
+            self._pending_restored = False
+            task = self._inbox_dispatcher_task
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._inbox_dispatcher_task = None
+            raise
 
     async def start_receiving(self) -> bool:
-        """最后启动 Webhook Server，开放实时业务事件。"""
-        if not self._initialized:
+        """恢复完成后开放实时业务事件；健康 HTTP 监听已提前启动。"""
+        if not self._initialized or not self._pending_restored:
             return False
-        if self._server_thread is not None and self._server_thread.is_alive():
-            return True
         try:
-            handler = self._make_webhook_handler()
-            self._server = BoundedThreadingHTTPServer(
-                (self.webhook_host, self.webhook_port),
-                handler,
-                max_concurrent_requests=self.webhook_max_concurrent_requests,
-                reject_logger=self._log_webhook_overload,
-            )
-            self._server_thread = threading.Thread(
-                target=self._server.serve_forever,
-                name="feishu-webhook",
-                daemon=True,
-            )
+            self._ensure_webhook_server()
             self._running = True
-            self._server_thread.start()
-
-            # 端口为 0 时系统会自动分配端口,主要用于测试。
-            actual_port = self._server.server_address[1]
-            print(
-                f"  [feishu] webhook listening on "
-                f"http://{self.webhook_host}:{actual_port}{self.webhook_path}"
-            )
             return True
         except Exception as exc:
             print(f"  [feishu] webhook start failed: {type(exc).__name__}")
@@ -475,34 +606,66 @@ class FeishuAdapter(BasePlatformAdapter):
             self._server_thread = None
             return False
 
+    def _ensure_webhook_server(self) -> None:
+        """启动 HTTP 监听；业务 POST 是否开放仍由 ``_running`` 控制。"""
+        if self._server_thread is not None and self._server_thread.is_alive():
+            return
+        handler = self._make_webhook_handler()
+        server = BoundedThreadingHTTPServer(
+            (self.webhook_host, self.webhook_port),
+            handler,
+            max_concurrent_requests=self.webhook_max_concurrent_requests,
+            reject_logger=self._log_webhook_overload,
+        )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="feishu-webhook",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception:
+            server.server_close()
+            raise
+        self._server = server
+        self._server_thread = thread
+
+        # 端口为 0 时系统会自动分配端口，主要用于测试。
+        actual_port = server.server_address[1]
+        print(
+            f"  [feishu] HTTP listening on "
+            f"http://{self.webhook_host}:{actual_port} "
+            f"(webhook={self.webhook_path})"
+        )
+
     async def connect(self) -> bool:
         """兼容旧接口，但只负责开放接收；初始化和恢复必须显式先完成。"""
         return await self.start_receiving()
 
     async def disconnect(self):
+        self._stopping = True
         self._running = False
+        self._pending_restored = False
+        self._wake_inbox_dispatcher()
 
-        # 关闭时取消尚未提交的文本批次,避免 Adapter 停止后继续处理消息。
+        # 关闭时统一取消 dispatcher 和 route consumer，随后完整等待收尾。
         managed_tasks = list({
-            *self._message_tasks.values(),
-            *self._batch_tasks.values(),
+            *(
+                [self._inbox_dispatcher_task]
+                if self._inbox_dispatcher_task is not None
+                else []
+            ),
+            *self._route_tasks.values(),
         })
         for task in managed_tasks:
             task.cancel()
         if managed_tasks:
             await asyncio.gather(*managed_tasks, return_exceptions=True)
-        self._message_tasks.clear()
-        self._batch_tasks.clear()
-        self._batch_buffers.clear()
-        self._batch_events.clear()
-        self._batch_message_ids.clear()
-        self._batch_sources.clear()
-        self._batch_started_at.clear()
-        for waiters in self._batch_waiters.values():
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.cancel()
-        self._batch_waiters.clear()
+        self._inbox_dispatcher_task = None
+        self._route_tasks.clear()
+        self._route_wakeups.clear()
+        await self._flush_deferred_inbox_failures()
+        self._inbox_deferred_failures.clear()
         if self._server:
             server = self._server
             self._server = None
@@ -520,7 +683,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._server_thread = None
 
         await self._close_http_client()
-        self._close_reliability_store()
+        await self._close_reliability_store()
         self._tenant_token = ""
         self._token_expires_at = 0.0
         self._send_rate_locks.clear()
@@ -530,6 +693,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._send_rate_next_cleanup_at = 0.0
         self._send_rate_overflow_timestamps.clear()
         self._loop = None
+        self._inbox_dispatch_wakeup = None
         self._initialized = False
         self._pending_restored = False
 
@@ -541,114 +705,91 @@ class FeishuAdapter(BasePlatformAdapter):
                 pass
             self._http = None
 
-    def _open_reliability_store(self) -> None:
-        """在现有 Hermes 数据库中创建飞书入站可靠性表。"""
-        from hermes.db import init_db
+    async def _open_reliability_store(self) -> None:
+        """准备异步可靠性存储，不在事件循环中创建 SQLite 连接。"""
+        if self._persistence is None or self._persistence.closed:
+            self._persistence = GatewayPersistence(self.db_path)
+            self._owns_persistence = True
+        await self._prune_completed_messages(force=True)
 
-        self._reliability_db = init_db(self.db_path)
-        self._reliability_db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS feishu_message_inbox (
-                app_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                received_at REAL NOT NULL,
-                status TEXT NOT NULL,
-                completed_at REAL,
-                batch_message_id TEXT,
-                PRIMARY KEY (app_id, message_id)
-            );
+    async def _close_reliability_store(self) -> None:
+        if self._owns_persistence and self._persistence is not None:
+            await self._persistence.close()
+            self._persistence = None
+            self._owns_persistence = False
 
-            CREATE INDEX IF NOT EXISTS idx_feishu_inbox_completed
-                ON feishu_message_inbox(app_id, completed_at);
-            """
-        )
-        self._reliability_db.commit()
-        self._prune_completed_messages(force=True)
-
-    def _close_reliability_store(self) -> None:
-        if self._reliability_db:
-            self._reliability_db.close()
-            self._reliability_db = None
-
-    def _prune_completed_messages(self, *, force: bool = False) -> None:
-        """按 TTL 清理已完成记录,未处理 inbox 永不自动删除。"""
-        if not self._reliability_db:
+    def _require_persistence(self) -> GatewayPersistence:
+        persistence = self._persistence
+        if persistence is None or persistence.closed:
             raise RuntimeError("feishu reliability store is unavailable")
+        return persistence
+
+    async def _prune_completed_messages(self, *, force: bool = False) -> None:
+        """按保留期分批清理终态 Inbox；失败只记录并等待下轮。"""
+        persistence = self._require_persistence()
         now = time.time()
         if (
             not force
             and now - self._last_dedup_cleanup
-            < FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS
+            < self.retention_cleanup_interval_seconds
         ):
             return
-        cutoff = now - FEISHU_DEDUP_TTL_SECONDS
-        with self._reliability_db:
-            self._reliability_db.execute(
-                """
-                DELETE FROM feishu_message_inbox
-                WHERE app_id = ?
-                  AND status != 'pending'
-                  AND completed_at < ?
-                """,
-                (self.app_id, cutoff),
+        cutoff = now - self.inbox_retention_seconds
+        removed = 0
+        try:
+            for _ in range(4):
+                batch_removed = await persistence.call(
+                    prune_feishu_inbox_messages,
+                    self.app_id,
+                    completed_before=cutoff,
+                    limit=self.retention_cleanup_batch_size,
+                )
+                removed += int(batch_removed)
+                if int(batch_removed) < self.retention_cleanup_batch_size:
+                    break
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [feishu:audit] event=retention_cleanup_failed "
+                f"kind=inbox exception={type(exc).__name__}"
             )
+        else:
+            if removed:
+                print(
+                    "  [feishu:audit] event=retention_cleanup "
+                    f"kind=inbox removed={removed}"
+                )
+        # 失败也遵守清理间隔，避免锁故障期间每条 Webhook 都触发写重试。
         self._last_dedup_cleanup = now
 
-    def _message_inbox_status(self, message_id: str) -> str | None:
+    async def _message_inbox_status(self, message_id: str) -> str | None:
         """读取 Inbox 状态；调用方据此区分终态与可恢复 pending。"""
-        if not self._reliability_db:
-            raise RuntimeError("feishu reliability store is unavailable")
-        row = self._reliability_db.execute(
-            """
-            SELECT status
-            FROM feishu_message_inbox
-            WHERE app_id = ?
-              AND message_id = ?
-            """,
-            (self.app_id, message_id),
-        ).fetchone()
-        return str(row[0]) if row is not None else None
+        return await self._require_persistence().call(
+            get_feishu_inbox_status,
+            self.app_id,
+            message_id,
+        )
 
-    def _load_pending_message_payload(self, message_id: str) -> dict | None:
-        """按 message_id 读取仍为 pending 的原始事件。"""
-        if not self._reliability_db:
-            raise RuntimeError("feishu reliability store is unavailable")
-        row = self._reliability_db.execute(
-            """
-            SELECT payload
-            FROM feishu_message_inbox
-            WHERE app_id = ? AND message_id = ? AND status = 'pending'
-            """,
-            (self.app_id, message_id),
-        ).fetchone()
-        if row is None:
-            return None
-        try:
-            payload = json.loads(row[0])
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("invalid Feishu Inbox payload") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("Feishu Inbox payload must be an object")
-        return payload
-
-    def _store_pending_message(self, message_id: str, payload: dict) -> None:
+    async def _store_pending_message(
+        self,
+        message_id: str,
+        route_key: str,
+        payload: dict,
+    ) -> None:
         """先持久化原始事件,成功交给 Runner 后再标记完成。"""
-        if not self._reliability_db:
-            raise RuntimeError("feishu reliability store is unavailable")
-        self._prune_completed_messages()
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with self._reliability_db:
-            self._reliability_db.execute(
-                """
-                INSERT OR IGNORE INTO feishu_message_inbox
-                    (app_id, message_id, payload, received_at, status)
-                VALUES (?, ?, ?, ?, 'pending')
-                """,
-                (self.app_id, message_id, encoded, time.time()),
-            )
+        persistence = self._require_persistence()
+        await self._prune_completed_messages()
+        await persistence.call(
+            insert_feishu_inbox_message,
+            self.app_id,
+            message_id,
+            payload,
+            route_key=route_key,
+        )
 
-    def _complete_messages(
+    async def _complete_messages(
         self,
         message_ids: list[str],
         *,
@@ -658,50 +799,347 @@ class FeishuAdapter(BasePlatformAdapter):
         """原子标记整批消息完成,保留来源 ID 与拼接目标用于追踪。"""
         if not message_ids:
             return
-        if not self._reliability_db:
-            raise RuntimeError("feishu reliability store is unavailable")
         completed_at = time.time()
-        with self._reliability_db:
-            self._reliability_db.executemany(
-                """
-                UPDATE feishu_message_inbox
-                SET status = ?, completed_at = ?, batch_message_id = ?
-                WHERE app_id = ? AND message_id = ?
-                """,
-                [
-                    (
-                        status,
-                        completed_at,
-                        batch_message_id,
-                        self.app_id,
-                        message_id,
-                    )
-                    for message_id in message_ids
-                ],
-            )
+        await self._require_persistence().call(
+            update_feishu_inbox_status,
+            self.app_id,
+            message_ids,
+            status,
+            completed_at=completed_at,
+            batch_message_id=batch_message_id,
+            updated_at=completed_at,
+            expected_statuses=("pending", "processing"),
+        )
 
     async def _restore_pending_messages(self) -> None:
-        """启动时按接收顺序注册上次未完成消息的统一处理任务。"""
-        if not self._reliability_db:
+        """收敛异常退出状态并启动受管理的 Inbox dispatcher。"""
+        persistence = self._require_persistence()
+        recovered = await persistence.call(
+            reset_feishu_inbox_processing,
+            self.app_id,
+        )
+        candidates = await persistence.call(
+            get_feishu_inbox_dispatch_routes,
+            self.app_id,
+            limit=self.inbox_retry_batch_size,
+        )
+        self._pending_restored = True
+        self._start_inbox_dispatcher()
+        self._wake_inbox_dispatcher()
+        # 仅让 dispatcher 完成首轮 route 注册，不等待静默批次或 Runner handoff。
+        await asyncio.sleep(0)
+        if recovered:
+            print(f"  [feishu] recovered processing messages: {recovered}")
+        if candidates:
+            print(f"  [feishu] inbox dispatch routes: {len(candidates)}")
+
+    def _start_inbox_dispatcher(self) -> None:
+        """确保当前 Adapter 只有一个受管理 dispatcher Task。"""
+        task = self._inbox_dispatcher_task
+        if task is not None and not task.done():
             return
-        rows = self._reliability_db.execute(
-            """
-            SELECT message_id
-            FROM feishu_message_inbox
-            WHERE app_id = ? AND status = 'pending'
-            ORDER BY received_at, message_id
-            """,
-            (self.app_id,),
-        ).fetchall()
-        registered = 0
-        for row in rows:
-            if self._register_message_task(str(row[0])):
-                registered += 1
-        if registered:
-            # 让按接收顺序创建的任务至少进入各自的统一处理入口；不等待
-            # 静默窗口、Runner handoff 或模型执行完成。
-            await asyncio.sleep(0)
-            print(f"  [feishu] restored pending messages: {registered}")
+        if self._inbox_dispatch_wakeup is None:
+            raise RuntimeError("feishu inbox dispatcher is unavailable")
+        task = asyncio.create_task(
+            self._run_inbox_dispatcher(),
+            name="feishu-inbox-dispatcher",
+        )
+        self._inbox_dispatcher_task = task
+        task.add_done_callback(self._on_inbox_dispatcher_done)
+
+    def _wake_inbox_dispatcher(self, route_key: str | None = None) -> None:
+        """显式唤醒 dispatcher 和指定 route consumer。"""
+        if self._inbox_dispatch_wakeup is not None:
+            self._inbox_dispatch_wakeup.set()
+        if route_key:
+            route_wakeup = self._route_wakeups.get(route_key)
+            if route_wakeup is not None:
+                route_wakeup.set()
+
+    async def _run_inbox_dispatcher(self) -> None:
+        """持续注册当前可执行路由，并受显式唤醒和短轮询共同驱动。"""
+        while self._initialized and self._pending_restored and not self._stopping:
+            wakeup = self._inbox_dispatch_wakeup
+            if wakeup is None:
+                return
+            wakeup.clear()
+            dispatched = 0
+            try:
+                await self._prune_completed_messages()
+                await self._flush_deferred_inbox_failures()
+                dispatched = await self._dispatch_inbox_candidates()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    "  [feishu] inbox dispatcher deferred: "
+                    f"{type(exc).__name__}"
+                )
+
+            if dispatched >= self.inbox_retry_batch_size:
+                # 有界批量之间主动让出事件循环，避免大量恢复记录饿死 ACK。
+                await asyncio.sleep(0)
+                continue
+            try:
+                await asyncio.wait_for(
+                    wakeup.wait(),
+                    timeout=self.inbox_retry_poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _dispatch_inbox_candidates(self) -> int:
+        """读取一批可执行 route 队首，每个 route 只注册一个 consumer。"""
+        active_tasks = sum(
+            1 for task in self._route_tasks.values() if not task.done()
+        )
+        available_slots = max(0, self.inbox_retry_batch_size - active_tasks)
+        if available_slots <= 0:
+            return 0
+        route_keys = await self._require_persistence().call(
+            get_feishu_inbox_dispatch_routes,
+            self.app_id,
+            limit=available_slots,
+        )
+        dispatched = 0
+        for route_key in route_keys:
+            if self._register_route_consumer(route_key):
+                dispatched += 1
+        return dispatched
+
+    async def _flush_deferred_inbox_failures(self) -> int:
+        """重试此前因 SQLite 瞬时错误未能落库的失败状态。"""
+        if self._persistence is None or self._persistence.closed:
+            return 0
+        persisted = 0
+        for message_id, failure in list(
+            self._inbox_deferred_failures.items()
+        ):
+            (
+                last_error,
+                next_attempt_at,
+                permanent,
+                route_key,
+                attempt_number,
+                failure_type,
+            ) = failure
+            try:
+                result = await self._persistence.call(
+                    fail_feishu_inbox_message,
+                    self.app_id,
+                    message_id,
+                    last_error=last_error,
+                    next_attempt_at=next_attempt_at,
+                    max_attempts=self.inbox_retry_max_attempts,
+                    permanent=permanent,
+                )
+            except Exception:
+                continue
+            self._inbox_deferred_failures.pop(message_id, None)
+            if result is not None:
+                self._log_inbox_failure_state(
+                    route_key=route_key,
+                    message_id=message_id,
+                    attempt_count=int(result["attempt_count"]),
+                    status=str(result["status"]),
+                    failure_type=failure_type,
+                    next_attempt_at=next_attempt_at,
+                )
+            persisted += 1
+        return persisted
+
+    @staticmethod
+    def _is_retryable_sqlite_failure(exc: sqlite3.OperationalError) -> bool:
+        """识别锁竞争、I/O 中断等可能自行恢复的 SQLite 错误。"""
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(error_code, int):
+            primary_code = error_code & 0xFF
+            retryable_codes = {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+                sqlite3.SQLITE_IOERR,
+                sqlite3.SQLITE_INTERRUPT,
+                sqlite3.SQLITE_PROTOCOL,
+                sqlite3.SQLITE_CANTOPEN,
+            }
+            if primary_code in retryable_codes:
+                return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "database is locked",
+                "database table is locked",
+                "database is busy",
+                "disk i/o error",
+                "temporarily unavailable",
+            )
+        )
+
+    @classmethod
+    def _classify_inbox_failure(cls, exc: BaseException) -> InboxFailureDisposition:
+        """把消费异常分成可重试与永久失败，不持久化异常原文。"""
+        if isinstance(exc, InvalidFeishuInboxPayloadError):
+            return InboxFailureDisposition("invalid_payload", permanent=True)
+        if isinstance(exc, FeishuInboxBusinessDataError):
+            return InboxFailureDisposition("invalid_business_data", permanent=True)
+        if isinstance(exc, FeishuRunnerUnavailableError):
+            return InboxFailureDisposition("runner_unavailable")
+        if isinstance(exc, FeishuGatewayLifecycleError):
+            return InboxFailureDisposition("gateway_lifecycle")
+        if isinstance(exc, FeishuInboxRetryableError):
+            return InboxFailureDisposition("retryable_processing")
+        if isinstance(exc, sqlite3.OperationalError):
+            if cls._is_retryable_sqlite_failure(exc):
+                return InboxFailureDisposition("sqlite_transient")
+            return InboxFailureDisposition("sqlite_persistence", permanent=True)
+        if isinstance(exc, sqlite3.DatabaseError):
+            return InboxFailureDisposition("sqlite_persistence", permanent=True)
+        if isinstance(exc, RuntimeError) and str(exc).startswith(
+            "gateway is not accepting messages during "
+        ):
+            return InboxFailureDisposition("gateway_lifecycle")
+        if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+            return InboxFailureDisposition("transient_io")
+        if isinstance(exc, (ValueError, TypeError, KeyError)):
+            return InboxFailureDisposition("invalid_business_data", permanent=True)
+        return InboxFailureDisposition("unexpected_processing")
+
+    def _inbox_retry_delay(self, attempt_number: int) -> float:
+        """计算带对称小幅 jitter 的有上限指数退避。"""
+        exponent = max(0, min(30, int(attempt_number) - 1))
+        delay = min(
+            self.inbox_retry_max_delay_seconds,
+            self.inbox_retry_base_delay_seconds * (2 ** exponent),
+        )
+        jitter = delay * self.inbox_retry_jitter_ratio
+        if jitter <= 0:
+            return delay
+        return max(0.0, delay + random.uniform(-jitter, jitter))
+
+    async def _record_inbox_failure(
+        self,
+        route_key: str,
+        message_id: str,
+        attempt_count: int,
+        exc: BaseException,
+    ) -> None:
+        """持久化脱敏失败信息，并在需要时显式唤醒 dispatcher。"""
+        if self._persistence is None or self._persistence.closed:
+            return
+        disposition = self._classify_inbox_failure(exc)
+        attempt_number = int(attempt_count) + 1
+        last_error = f"{disposition.code}:{type(exc).__name__}"[:256]
+        now = time.time()
+        next_attempt_at = None
+        if (
+            not disposition.permanent
+            and attempt_number < self.inbox_retry_max_attempts
+        ):
+            next_attempt_at = now + self._inbox_retry_delay(attempt_number)
+        try:
+            result = await self._persistence.call(
+                fail_feishu_inbox_message,
+                self.app_id,
+                message_id,
+                last_error=last_error,
+                next_attempt_at=next_attempt_at,
+                max_attempts=self.inbox_retry_max_attempts,
+                permanent=disposition.permanent,
+                now=now,
+            )
+        except Exception:
+            # processing 记录不能因失败状态暂时写不回就丢失本地责任。
+            self._inbox_deferred_failures[message_id] = (
+                last_error,
+                next_attempt_at,
+                disposition.permanent,
+                route_key,
+                attempt_number,
+                disposition.code,
+            )
+            print(
+                "  [feishu:audit] event=inbox_failure_deferred "
+                f"{safe_route_digest(route_key)} "
+                f"{safe_message_digest(message_id)} "
+                f"attempt_count={attempt_number} "
+                "retry_status=processing "
+                f"lease_epoch={self.audit_context().get('lease_epoch')} "
+                f"failure_type={disposition.code}"
+            )
+            self._wake_inbox_dispatcher()
+            return
+        if result is None:
+            return
+        self._log_inbox_failure_state(
+            route_key=route_key,
+            message_id=message_id,
+            attempt_count=int(result["attempt_count"]),
+            status=str(result["status"]),
+            failure_type=disposition.code,
+            next_attempt_at=next_attempt_at,
+        )
+        if result["status"] == "retry_wait":
+            self._wake_inbox_dispatcher()
+
+    def _log_inbox_failure_state(
+        self,
+        *,
+        route_key: str,
+        message_id: str,
+        attempt_count: int,
+        status: str,
+        failure_type: str,
+        next_attempt_at: float | None,
+    ) -> None:
+        """记录不含正文和外部原始标识的 Inbox 重试/永久失败审计。"""
+        event = (
+            "inbox_permanent_failure"
+            if status == "permanent_failed"
+            else "inbox_retry"
+        )
+        fields = [
+            f"event={event}",
+            safe_route_digest(route_key),
+            safe_message_digest(message_id),
+            f"attempt_count={int(attempt_count)}",
+            f"retry_status={status}",
+            f"lease_epoch={self.audit_context().get('lease_epoch')}",
+            f"failure_type={failure_type}",
+        ]
+        if next_attempt_at is not None and status == "retry_wait":
+            fields.append(f"next_attempt_at={float(next_attempt_at):.3f}")
+        print(f"  [feishu:audit] {' '.join(fields)}")
+
+    async def _release_cancelled_inbox_message(self, message_id: str) -> None:
+        """shutdown 取消消费 Task 时把 processing 立即释放为可恢复状态。"""
+        if self._persistence is None or self._persistence.closed:
+            return
+        try:
+            await self._persistence.call(
+                release_feishu_inbox_processing_message,
+                self.app_id,
+                message_id,
+                last_error="gateway_stopping:CancelledError",
+            )
+        except Exception:
+            # 若 shutdown 时数据库不可写，下一次启动会统一 reset processing。
+            pass
+
+    @staticmethod
+    def _on_inbox_dispatcher_done(task: asyncio.Task) -> None:
+        """读取 dispatcher 异常，避免后台 Task 错误被静默回收。"""
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            print(
+                "  [feishu] inbox dispatcher stopped unexpectedly: "
+                f"{type(exc).__name__}"
+            )
 
     # ===================== Webhook HTTP 服务 =====================
 
@@ -906,23 +1344,85 @@ class FeishuAdapter(BasePlatformAdapter):
                 client_ip = self._resolve_client_ip()
                 return adapter._webhook_rate_limiter.allow(client_ip)
 
+            def _readiness_response(self) -> tuple[int, dict]:
+                future = adapter._submit_readiness_status()
+                if future is None:
+                    return 503, {
+                        "ok": False,
+                        "ready": False,
+                        "error": "gateway unavailable",
+                    }
+                try:
+                    result = future.result(
+                        timeout=FEISHU_READINESS_TIMEOUT_SECONDS
+                    )
+                except FutureTimeoutError:
+                    return 503, {
+                        "ok": False,
+                        "ready": False,
+                        "error": "readiness timeout",
+                    }
+                except Exception as exc:
+                    self._response_exception_type = type(exc).__name__
+                    return 503, {
+                        "ok": False,
+                        "ready": False,
+                        "error": "readiness failed",
+                    }
+                if not isinstance(result, dict):
+                    return 503, {
+                        "ok": False,
+                        "ready": False,
+                        "error": "invalid readiness state",
+                    }
+                ready = bool(result.get("ready", False))
+                payload = {
+                    "ok": ready,
+                    "ready": ready,
+                    "channel": "feishu",
+                    "checks": result.get("checks", {}),
+                    "lease_epoch": result.get("lease_epoch"),
+                }
+                return (200 if ready else 503), payload
+
             def do_GET(self) -> None:
                 self._headers_complete()
-                if self._path() != "/healthz":
+                path = self._path()
+                if path == "/livez":
+                    self._send_json(
+                        200,
+                        {"ok": True, "live": True, "channel": "feishu"},
+                    )
+                    return
+                if path == "/readyz":
+                    status, payload = self._readiness_response()
+                    self._send_json(
+                        status,
+                        payload,
+                        reason="" if status == 200 else "not_ready",
+                    )
+                    return
+                if path not in {"/livez", "/readyz"}:
                     self._send_json(
                         404,
                         {"ok": False, "error": "not found"},
                         reason="path_not_found",
                     )
-                    return
-                self._send_json(200, {"ok": True, "channel": "feishu"})
 
             def do_HEAD(self) -> None:
                 self._headers_complete()
-                if self._path() != "/healthz":
-                    self._send_head(404, reason="path_not_found")
+                path = self._path()
+                if path == "/livez":
+                    self._send_head(200)
                     return
-                self._send_head(200)
+                if path == "/readyz":
+                    status, _payload = self._readiness_response()
+                    self._send_head(
+                        status,
+                        reason="" if status == 200 else "not_ready",
+                    )
+                    return
+                self._send_head(404, reason="path_not_found")
 
             def do_POST(self) -> None:
                 self._headers_complete()
@@ -931,6 +1431,14 @@ class FeishuAdapter(BasePlatformAdapter):
                         404,
                         {"ok": False, "error": "not found"},
                         reason="path_not_found",
+                    )
+                    return
+
+                if not adapter._running:
+                    self._send_json(
+                        503,
+                        {"ok": False, "error": "gateway unavailable"},
+                        reason="webhook_not_ready",
                     )
                     return
 
@@ -1085,7 +1593,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._headers_complete()
                 if self._path() not in {
                     adapter.webhook_path,
-                    "/healthz",
+                    "/livez",
+                    "/readyz",
                 }:
                     self._send_json(
                         404,
@@ -1219,6 +1728,17 @@ class FeishuAdapter(BasePlatformAdapter):
             coroutine.close()
             return None
 
+    def _submit_readiness_status(self) -> Future | None:
+        """从 HTTP 线程向 Gateway 事件循环提交 readiness 聚合。"""
+        if not self._loop:
+            return None
+        coroutine = self.gateway_readiness_status()
+        try:
+            return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        except RuntimeError:
+            coroutine.close()
+            return None
+
     # ===================== 消息入站 =====================
 
     def _parse_message_event(self, payload: dict) -> MessageEvent | None:
@@ -1287,7 +1807,7 @@ class FeishuAdapter(BasePlatformAdapter):
         ):
             return
 
-        if not self._is_allowed(sender_id, chat_id):
+        if not self._is_allowed(sender_id, chat_id, chat_type):
             return
 
         thread_id = message.get("thread_id") or message.get("root_id")
@@ -1317,7 +1837,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return event_obj
 
     async def _accept_payload(self, payload: dict) -> None:
-        """校验事件、持久化 Inbox 并注册处理 Task，随后即可确认 HTTP。"""
+        """校验事件、持久化 Inbox 并唤醒消费者，随后即可确认 HTTP。"""
         if not self._initialized or not self._running:
             raise RuntimeError("feishu adapter is not receiving")
         event = self._parse_message_event(payload)
@@ -1325,48 +1845,56 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = event.message_id
-        status = self._message_inbox_status(message_id)
-        if status in {"processed", "cancelled"}:
+        route_key = self._build_inbox_route_key(event)
+        status = await self._message_inbox_status(message_id)
+        if status in {"processed", "cancelled", "permanent_failed"}:
             return
-        if status not in {None, "pending"}:
+        if status not in {None, "pending", "processing", "retry_wait"}:
             raise RuntimeError("invalid Feishu Inbox status")
         if status is None:
-            self._store_pending_message(message_id, payload)
+            await self._store_pending_message(message_id, route_key, payload)
 
-        # pending 重推只确认当前实例已经有受管 Task，不等待该 Task 完成。
-        self._register_message_task(message_id)
+        # ACK 只等待持久化和 Event.set()，不等待 claim、批处理或 Runner。
+        self._wake_inbox_dispatcher(route_key)
 
     async def _handle_payload(self, payload: dict) -> None:
         """兼容旧内部入口；其语义现为持久化并注册后台处理。"""
         await self._accept_payload(payload)
 
-    def _register_message_task(self, message_id: str) -> bool:
-        """确保同一 message_id 同时最多存在一个处理 Task。"""
-        existing = self._message_tasks.get(message_id)
+    def _register_route_consumer(self, route_key: str) -> bool:
+        """为持久路由注册唯一消费者，不在 dispatcher 中提前 claim。"""
+        existing = self._route_tasks.get(route_key)
         if existing is not None and not existing.done():
             return False
-
-        task = asyncio.create_task(
-            self._process_accepted_message(message_id),
-            name="feishu-inbox-message",
-        )
-        self._message_tasks[message_id] = task
+        wakeup = asyncio.Event()
+        self._route_wakeups[route_key] = wakeup
+        try:
+            task = asyncio.create_task(
+                self._consume_inbox_route(route_key, wakeup),
+                name="feishu-inbox-route",
+            )
+        except Exception:
+            self._route_wakeups.pop(route_key, None)
+            raise
+        self._route_tasks[route_key] = task
         task.add_done_callback(
-            lambda completed, mid=message_id: self._on_message_task_done(
-                mid,
+            lambda completed, key=route_key: self._on_route_consumer_done(
+                key,
                 completed,
             )
         )
         return True
 
-    def _on_message_task_done(
+    def _on_route_consumer_done(
         self,
-        message_id: str,
+        route_key: str,
         task: asyncio.Task,
     ) -> None:
-        """移除任务身份并读取异常，避免 fire-and-forget 警告。"""
-        if self._message_tasks.get(message_id) is task:
-            self._message_tasks.pop(message_id, None)
+        """移除 route consumer 身份并读取异常。"""
+        if self._route_tasks.get(route_key) is task:
+            self._route_tasks.pop(route_key, None)
+            self._route_wakeups.pop(route_key, None)
+        self._wake_inbox_dispatcher()
         if task.cancelled():
             return
         try:
@@ -1375,198 +1903,306 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         if exc is not None:
             print(
-                "  [feishu] inbox message processing failed: "
-                f"{type(exc).__name__}"
+                "  [feishu:audit] event=inbox_route_failed "
+                f"{safe_route_digest(route_key)} "
+                f"exception={type(exc).__name__}"
             )
 
-    async def _process_accepted_message(self, message_id: str) -> None:
-        """从 pending Inbox 读取事件并执行统一的命令或文本处理路径。"""
-        payload = self._load_pending_message_payload(message_id)
-        if payload is None:
-            return
-        event = self._parse_message_event(payload)
-        if event is None:
-            self._complete_messages(
-                [message_id],
-                status="processed",
-                batch_message_id=message_id,
-            )
-            return
-        if event.message_id != message_id:
-            raise ValueError("Feishu Inbox message_id mismatch")
-
-        # Runner Queue / Outbox 已接管时只收敛 Inbox，不重新提交模型任务。
-        persisted = self.persisted_message_state(event)
-        if persisted is not None:
-            self._complete_messages(
-                [message_id],
-                status="processed",
-                batch_message_id=message_id,
-            )
-            return
-        if not self._on_message:
-            raise RuntimeError("gateway runner is unavailable")
-
-        command = event.text.strip().lower()
-        if command in _IMMEDIATE_COMMANDS:
-            batch_key = self._build_batch_key(event)
-            if command in ("/new", "/stop"):
-                # 新建或停止会话时丢弃尚未提交的普通文本批次。
-                await self._discard_batch(batch_key)
-            else:
-                # /status 前先提交旧批次，使状态包含刚发送的任务。
-                await self._flush_batch(batch_key)
-            await self.handle_message(event)
-            self._complete_messages(
-                [message_id],
-                batch_message_id=message_id,
-            )
-            return
-
-        await self._enqueue_text(event)
-
-    async def _enqueue_text(self, event: MessageEvent) -> None:
-        """把同一来源短时间内的连续文本加入同一批次。"""
-        batch_key = self._build_batch_key(event)
-        now = time.monotonic()
-        waiter = asyncio.get_running_loop().create_future()
-
-        if batch_key not in self._batch_buffers:
-            self._batch_buffers[batch_key] = []
-            self._batch_message_ids[batch_key] = []
-            self._batch_sources[batch_key] = []
-            self._batch_waiters[batch_key] = []
-            self._batch_started_at[batch_key] = now
-        self._batch_buffers[batch_key].append(event.text)
-        self._batch_message_ids[batch_key].append(event.message_id)
-        self._batch_sources[batch_key].append({
-            "message_id": event.message_id,
-            "reply_to_message_id": event.reply_to_message_id,
-            "event_id": event.metadata.get("event_id", ""),
-        })
-        self._batch_waiters[batch_key].append(waiter)
-        # 使用最后一条消息的 message_id / reply 元数据回发。
-        self._batch_events[batch_key] = event
-
-        old_task = self._batch_tasks.get(batch_key)
-        if old_task and not old_task.done():
-            old_task.cancel()
-
-        elapsed = now - self._batch_started_at[batch_key]
-        remaining = max(0.0, FEISHU_BATCH_MAX_WAIT_SECONDS - elapsed)
-        delay = min(FEISHU_BATCH_QUIET_SECONDS, remaining)
-        task = asyncio.create_task(
-            self._flush_batch_after(batch_key, delay)
+    async def _claim_route_head(
+        self,
+        route_key: str,
+        *,
+        allow_existing_processing: bool,
+    ) -> dict | None:
+        """查看并条件 claim route 队首；永久失败和未到期重试均返回 None。"""
+        persistence = self._require_persistence()
+        head = await persistence.call(
+            get_feishu_inbox_route_next,
+            self.app_id,
+            route_key,
         )
-        task.add_done_callback(self._on_batch_task_done)
-        self._batch_tasks[batch_key] = task
-        await waiter
+        if head is None or head["status"] == "permanent_failed":
+            return None
+        return await persistence.call(
+            claim_feishu_inbox_route_message,
+            self.app_id,
+            route_key,
+            str(head["message_id"]),
+            allow_existing_processing=allow_existing_processing,
+        )
 
-    async def _flush_batch_after(self, batch_key: str, delay: float) -> None:
-        """等待静默窗口结束,合并并提交当前文本批次。"""
+    async def _consume_inbox_route(
+        self,
+        route_key: str,
+        wakeup: asyncio.Event,
+    ) -> None:
+        """按持久顺序串行消费一个 route，route 之间保持并行。"""
+        processing: dict[str, int] = {}
         try:
-            await asyncio.sleep(delay)
+            while self._initialized and not self._stopping:
+                try:
+                    claimed = await self._claim_route_head(
+                        route_key,
+                        allow_existing_processing=False,
+                    )
+                    if claimed is None:
+                        return
+                    message_id = str(claimed["message_id"])
+                    processing[message_id] = int(claimed["attempt_count"])
+                    event = await self._load_inbox_event(
+                        message_id,
+                        route_key,
+                        status="processing",
+                    )
+                    if (
+                        event is None
+                        or await self.persisted_message_state(event) is not None
+                    ):
+                        await self._complete_messages(
+                            [message_id],
+                            batch_message_id=message_id,
+                        )
+                        processing.pop(message_id, None)
+                        continue
+
+                    command = event.text.strip().lower()
+                    if command in _IMMEDIATE_COMMANDS:
+                        await self._handoff_to_runner(event)
+                        await self._complete_messages(
+                            [message_id],
+                            batch_message_id=message_id,
+                        )
+                        processing.pop(message_id, None)
+                        continue
+
+                    await self._consume_adjacent_text_batch(
+                        route_key,
+                        wakeup,
+                        event,
+                        processing,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not processing:
+                        raise
+                    for failed_id, attempt_count in list(processing.items()):
+                        await self._record_inbox_failure(
+                            route_key,
+                            failed_id,
+                            attempt_count,
+                            exc,
+                        )
+                        processing.pop(failed_id, None)
+                    return
         except asyncio.CancelledError:
-            return
+            for message_id in list(processing):
+                await self._release_cancelled_inbox_message(message_id)
+                processing.pop(message_id, None)
+            raise
 
-        # 只有当前最新计时任务可以提交,避免旧任务取消竞态重复发送。
-        if self._batch_tasks.get(batch_key) is not asyncio.current_task():
-            return
+    async def _load_inbox_event(
+        self,
+        message_id: str,
+        route_key: str,
+        *,
+        status: str | None,
+    ) -> MessageEvent | None:
+        """读取并验证持久事件与 message_id、route_key 的一致性。"""
+        payload = await self._require_persistence().call(
+            get_feishu_inbox_payload,
+            self.app_id,
+            message_id,
+            status=status,
+        )
+        if payload is None:
+            return None
+        try:
+            event = self._parse_message_event(payload)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise FeishuInboxBusinessDataError(
+                "Feishu Inbox business payload cannot be parsed"
+            ) from exc
+        if event is None:
+            return None
+        if event.message_id != message_id:
+            raise FeishuInboxBusinessDataError(
+                "Feishu Inbox message_id mismatch"
+            )
+        if self._build_inbox_route_key(event) != route_key:
+            raise FeishuInboxBusinessDataError(
+                "Feishu Inbox route_key mismatch"
+            )
+        return event
 
-        await self._flush_batch(batch_key)
-
-    def _pop_batch(self, batch_key: str) -> tuple:
-        """原子取出一个批次,并取消对应的静默计时任务。"""
-        task = self._batch_tasks.pop(batch_key, None)
-        current_task = asyncio.current_task()
-        if task and task is not current_task and not task.done():
-            task.cancel()
-
-        chunks = self._batch_buffers.pop(batch_key, [])
-        event = self._batch_events.pop(batch_key, None)
-        message_ids = self._batch_message_ids.pop(batch_key, [])
-        sources = self._batch_sources.pop(batch_key, [])
-        waiters = self._batch_waiters.pop(batch_key, [])
-        self._batch_started_at.pop(batch_key, None)
-        return chunks, event, message_ids, sources, waiters
-
-    async def _flush_batch(self, batch_key: str) -> None:
-        """立即合并并提交指定批次。"""
-        chunks, event, message_ids, sources, waiters = self._pop_batch(batch_key)
-        if not chunks or event is None:
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_result(None)
-            return
-
-        event.text = FEISHU_BATCH_SEPARATOR.join(chunks)
-        event.metadata["source_message_ids"] = message_ids
-        event.metadata["source_messages"] = sources
+    async def _handoff_to_runner(self, event: MessageEvent) -> None:
+        """把 Runner 不可用和生命周期拒绝转换成明确瞬时分类。"""
+        if not self._on_message:
+            raise FeishuRunnerUnavailableError("gateway runner is unavailable")
         try:
             await self.handle_message(event)
-            self._complete_messages(
+        except RuntimeError as exc:
+            if str(exc).startswith((
+                "gateway is not accepting messages during ",
+                "gateway runtime lease is invalid during ",
+            )):
+                raise FeishuGatewayLifecycleError(
+                    "gateway lifecycle temporarily rejects messages"
+                ) from exc
+            raise
+
+    async def _consume_adjacent_text_batch(
+        self,
+        route_key: str,
+        wakeup: asyncio.Event,
+        first_event: MessageEvent,
+        processing: dict[str, int],
+    ) -> None:
+        """在单 route consumer 内等待静默窗口并合并相邻普通文本。"""
+        events = [first_event]
+        started_at = time.monotonic()
+        last_message_at = started_at
+
+        while True:
+            now = time.monotonic()
+            max_remaining = FEISHU_BATCH_MAX_WAIT_SECONDS - (now - started_at)
+            quiet_remaining = FEISHU_BATCH_QUIET_SECONDS - (
+                now - last_message_at
+            )
+            if max_remaining <= 0 or quiet_remaining <= 0:
+                await self._finish_text_batch(events, processing)
+                return
+
+            # 先清 Event 再查库：查询前后的新写入要么可见，要么会保留唤醒。
+            wakeup.clear()
+            persistence = self._require_persistence()
+            head = await persistence.call(
+                get_feishu_inbox_route_next,
+                self.app_id,
+                route_key,
+            )
+            if head is None:
+                try:
+                    await asyncio.wait_for(
+                        wakeup.wait(),
+                        timeout=min(max_remaining, quiet_remaining),
+                    )
+                except asyncio.TimeoutError:
+                    await self._finish_text_batch(events, processing)
+                    return
+                continue
+
+            status = str(head["status"])
+            next_attempt_at = head["next_attempt_at"]
+            if (
+                status == "permanent_failed"
+                or status == "retry_wait"
+                and (
+                    next_attempt_at is None
+                    or float(next_attempt_at) > time.time()
+                )
+            ):
+                await self._finish_text_batch(events, processing)
+                return
+
+            message_id = str(head["message_id"])
+            try:
+                next_event = await self._load_inbox_event(
+                    message_id,
+                    route_key,
+                    status=None,
+                )
+            except (
+                InvalidFeishuInboxPayloadError,
+                FeishuInboxBusinessDataError,
+            ):
+                # 损坏队首是批次边界；先提交前批，再由下一轮 claim 后落终态。
+                await self._finish_text_batch(events, processing)
+                return
+
+            if (
+                next_event is None
+                or await self.persisted_message_state(next_event) is not None
+            ):
+                await self._finish_text_batch(events, processing)
+                return
+
+            command = next_event.text.strip().lower()
+            if command in _IMMEDIATE_COMMANDS:
+                if command in {"/new", "/stop"}:
+                    await self._finish_text_batch(
+                        events,
+                        processing,
+                        cancelled=True,
+                    )
+                else:
+                    await self._finish_text_batch(events, processing)
+                return
+
+            claimed = await persistence.call(
+                claim_feishu_inbox_route_message,
+                self.app_id,
+                route_key,
+                message_id,
+                allow_existing_processing=True,
+            )
+            if claimed is None:
+                await self._finish_text_batch(events, processing)
+                return
+            processing[message_id] = int(claimed["attempt_count"])
+            events.append(next_event)
+            last_message_at = time.monotonic()
+            if len(events) % self.inbox_retry_batch_size == 0:
+                await asyncio.sleep(0)
+
+    async def _finish_text_batch(
+        self,
+        events: list[MessageEvent],
+        processing: dict[str, int],
+        *,
+        cancelled: bool = False,
+    ) -> None:
+        """提交或取消已经由当前 route consumer claim 的完整文本批次。"""
+        message_ids = [event.message_id for event in events]
+        if cancelled:
+            await self._complete_messages(
+                message_ids,
+                status="cancelled",
+                batch_message_id=message_ids[-1],
+            )
+        else:
+            event = events[-1]
+            event.text = FEISHU_BATCH_SEPARATOR.join(
+                item.text for item in events
+            )
+            event.metadata["source_message_ids"] = message_ids
+            event.metadata["source_messages"] = [
+                {
+                    "message_id": item.message_id,
+                    "reply_to_message_id": item.reply_to_message_id,
+                    "event_id": item.metadata.get("event_id", ""),
+                }
+                for item in events
+            ]
+            await self._handoff_to_runner(event)
+            await self._complete_messages(
                 message_ids,
                 batch_message_id=event.message_id,
             )
-        except asyncio.CancelledError:
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.cancel()
-            raise
-        except Exception as exc:
-            # inbox 保持 pending,飞书重推或进程重启后会再次处理。
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_exception(exc)
-            raise
-        else:
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_result(None)
-
-    async def _discard_batch(self, batch_key: str) -> None:
-        """取消尚未提交的批次,用于 /new 和 /stop 保持命令语义。"""
-        _, _, message_ids, _, waiters = self._pop_batch(batch_key)
-        try:
-            self._complete_messages(
-                message_ids,
-                status="cancelled",
-                batch_message_id=message_ids[-1] if message_ids else None,
-            )
-        except Exception as exc:
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_exception(exc)
-            raise
-        else:
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_result(None)
+        for message_id in message_ids:
+            processing.pop(message_id, None)
 
     @staticmethod
-    def _on_batch_task_done(task: asyncio.Task) -> None:
-        """读取后台拼接任务异常,避免错误被 asyncio 静默回收。"""
-        if task.cancelled():
-            return
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exc:
-            print(f"  [feishu] batch processing failed: {type(exc).__name__}")
-
-    @staticmethod
-    def _build_batch_key(event: MessageEvent) -> str:
-        """构建拼接隔离键,不同会话 / 用户 / 话题绝不混合。"""
+    def _build_inbox_route_key(event: MessageEvent) -> str:
+        """构建持久路由键，不同应用、会话、用户和话题绝不混合。"""
         source = event.source
-        return ":".join((
-            source.platform,
+        return build_feishu_inbox_route_key(
             source.account_id,
             source.chat_type,
             source.chat_id,
             source.user_id,
-            source.thread_id or "",
-        ))
+            source.thread_id,
+        )
 
     @staticmethod
     def _parse_text(message: dict) -> str:
@@ -1604,15 +2240,23 @@ class FeishuAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _is_allowed(self, user_id: str, chat_id: str) -> bool:
-        """白名单检查。"""
+    def _is_allowed(
+        self,
+        user_id: str,
+        chat_id: str,
+        chat_type: str = "dm",
+    ) -> bool:
+        """私聊保留 OR；群聊和话题默认要求用户与会话同时授权。"""
         if self.allow_all:
             return True
-        if user_id and user_id in self.allowed_users:
-            return True
-        if chat_id and chat_id in self.allowed_chats:
-            return True
-        return False
+        user_allowed = bool(user_id and user_id in self.allowed_users)
+        chat_allowed = bool(chat_id and chat_id in self.allowed_chats)
+        normalized_chat_type = str(chat_type or "").strip().lower()
+        if normalized_chat_type in {"group", "topic"}:
+            if self.group_authorization_mode == "and":
+                return user_allowed and chat_allowed
+            return user_allowed or chat_allowed
+        return user_allowed or chat_allowed
 
     # ===================== 消息出站 =====================
 
