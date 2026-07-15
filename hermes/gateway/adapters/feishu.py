@@ -29,7 +29,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -130,6 +130,15 @@ FEISHU_DEDUP_TTL_SECONDS = 72 * 60 * 60  # 已处理消息保留 72 小时
 FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 FEISHU_DEDUP_CLEANUP_BATCH_SIZE = 200
 FEISHU_READINESS_TIMEOUT_SECONDS = 2.0
+FEISHU_PROCESSING_REACTION_CACHE_SIZE = 2048
+FEISHU_REACTION_ALREADY_GONE_CODES = frozenset({
+    230110,  # 原消息已经删除
+    231003,  # 原消息不存在或已经撤回
+    231004,  # 原会话不存在
+    231005,  # 原话题已经删除
+    231010,  # reaction 已不属于该消息
+    231011,  # reaction_id 已无法定位
+})
 _IMMEDIATE_COMMANDS = frozenset({"/new", "/stop", "/status"})
 
 
@@ -390,6 +399,11 @@ class FeishuAdapter(BasePlatformAdapter):
         # 从而不突破 key 上限，也不删除仍有 waiter 的 lock。
         self._send_rate_overflow_lock = asyncio.Lock()
         self._send_rate_overflow_timestamps: deque[float] = deque()
+        # reaction 仅作为进程内用户体验状态，不进入 Inbox 或 Outbox。
+        self._processing_reactions: OrderedDict[str, str] = OrderedDict()
+        self._processing_attempts: OrderedDict[str, None] = OrderedDict()
+        self._processing_outcomes: OrderedDict[str, str] = OrderedDict()
+        self._processing_reaction_lock = asyncio.Lock()
         self._initialized = False
         self._pending_restored = False
         self._stopping = False
@@ -682,6 +696,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._server_thread.join(timeout=2.0)
             self._server_thread = None
 
+        await self._clear_processing_reactions()
         await self._close_http_client()
         await self._close_reliability_store()
         self._tenant_token = ""
@@ -692,6 +707,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._send_rate_users.clear()
         self._send_rate_next_cleanup_at = 0.0
         self._send_rate_overflow_timestamps.clear()
+        self._processing_reactions.clear()
+        self._processing_attempts.clear()
+        self._processing_outcomes.clear()
         self._loop = None
         self._inbox_dispatch_wakeup = None
         self._initialized = False
@@ -2256,6 +2274,360 @@ class FeishuAdapter(BasePlatformAdapter):
                 return user_allowed and chat_allowed
             return user_allowed or chat_allowed
         return user_allowed or chat_allowed
+
+    # ===================== 处理状态 reaction =====================
+
+    def _log_reaction_failure(
+        self,
+        operation: str,
+        message_id: str,
+        error_type: str,
+        *,
+        http_status: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        """只记录 reaction 故障的安全分类，不记录响应正文或凭据。"""
+        fields = [
+            f"operation={self._safe_log_label(operation)}",
+            f"error={self._safe_log_label(error_type) or 'unknown'}",
+            safe_message_digest(message_id),
+        ]
+        if http_status is not None:
+            fields.append(f"http_status={int(http_status)}")
+        safe_code = self._safe_log_label(error_code)
+        if safe_code:
+            fields.append(f"feishu_code={safe_code}")
+        print(f"  [feishu:reaction] {' '.join(fields)}")
+
+    @staticmethod
+    def _reaction_operation(emoji_type: str) -> str:
+        if emoji_type == "Typing":
+            return "add_typing"
+        if emoji_type == "CrossMark":
+            return "add_crossmark"
+        return "add_reaction"
+
+    async def _add_message_reaction(
+        self,
+        message_id: str,
+        emoji_type: str,
+    ) -> str | None:
+        """单次添加 reaction；失败只写脱敏日志并返回 ``None``。"""
+        operation = self._reaction_operation(emoji_type)
+        if not self._http:
+            self._log_reaction_failure(
+                operation,
+                message_id,
+                "adapter_unavailable",
+            )
+            return None
+
+        token_refreshed = False
+        force_refresh = False
+        while True:
+            token_result = await self._refresh_token(force=force_refresh)
+            force_refresh = False
+            if not token_result.success:
+                self._log_reaction_failure(
+                    operation,
+                    message_id,
+                    token_result.error or "token_unavailable",
+                    error_code=token_result.error_code,
+                )
+                return None
+            token = token_result.token
+            try:
+                response = await self._http.post(
+                    f"{self.api_base}/im/v1/messages/{message_id}/reactions",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "reaction_type": {"emoji_type": emoji_type},
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                classified = self._classify_transport_exception(exc)
+                self._log_reaction_failure(
+                    operation,
+                    message_id,
+                    classified.error or "reaction_transport_error",
+                )
+                return None
+
+            try:
+                status_code = int(response.status_code)
+            except (AttributeError, TypeError, ValueError):
+                status_code = 0
+            try:
+                data = response.json()
+            except (TypeError, ValueError):
+                data = {}
+            raw_code = data.get("code") if isinstance(data, dict) else None
+            code = self._normalize_error_code(raw_code)
+            if code == 0:
+                reaction_data = data.get("data", {})
+                reaction_id = (
+                    reaction_data.get("reaction_id")
+                    if isinstance(reaction_data, dict)
+                    else None
+                )
+                if reaction_id:
+                    return str(reaction_id)
+                self._log_reaction_failure(
+                    operation,
+                    message_id,
+                    "invalid_response",
+                    http_status=status_code,
+                    error_code="0",
+                )
+                return None
+
+            if (
+                not token_refreshed
+                and (
+                    status_code == 401
+                    or code in FEISHU_TOKEN_ERROR_CODES
+                )
+            ):
+                await self._invalidate_token(token)
+                token_refreshed = True
+                force_refresh = True
+                continue
+
+            error, _, _ = self._classify_send_error(status_code, code)
+            self._log_reaction_failure(
+                operation,
+                message_id,
+                error,
+                http_status=status_code,
+                error_code=(str(raw_code) if raw_code is not None else None),
+            )
+            return None
+
+    async def _delete_message_reaction(
+        self,
+        message_id: str,
+        reaction_id: str,
+    ) -> bool:
+        """单次删除 reaction；已不存在时按幂等清理成功处理。"""
+        operation = "delete_typing"
+        if not self._http:
+            self._log_reaction_failure(
+                operation,
+                message_id,
+                "adapter_unavailable",
+            )
+            return False
+
+        token_refreshed = False
+        force_refresh = False
+        while True:
+            token_result = await self._refresh_token(force=force_refresh)
+            force_refresh = False
+            if not token_result.success:
+                self._log_reaction_failure(
+                    operation,
+                    message_id,
+                    token_result.error or "token_unavailable",
+                    error_code=token_result.error_code,
+                )
+                return False
+            token = token_result.token
+            try:
+                response = await self._http.delete(
+                    f"{self.api_base}/im/v1/messages/{message_id}/reactions/"
+                    f"{reaction_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                classified = self._classify_transport_exception(exc)
+                self._log_reaction_failure(
+                    operation,
+                    message_id,
+                    classified.error or "reaction_transport_error",
+                )
+                return False
+
+            try:
+                status_code = int(response.status_code)
+            except (AttributeError, TypeError, ValueError):
+                status_code = 0
+            try:
+                data = response.json()
+            except (TypeError, ValueError):
+                data = {}
+            raw_code = data.get("code") if isinstance(data, dict) else None
+            code = self._normalize_error_code(raw_code)
+            if (
+                code == 0
+                or status_code == 404
+                or code in FEISHU_REACTION_ALREADY_GONE_CODES
+            ):
+                return True
+
+            if (
+                not token_refreshed
+                and (
+                    status_code == 401
+                    or code in FEISHU_TOKEN_ERROR_CODES
+                )
+            ):
+                await self._invalidate_token(token)
+                token_refreshed = True
+                force_refresh = True
+                continue
+
+            error, _, _ = self._classify_send_error(status_code, code)
+            self._log_reaction_failure(
+                operation,
+                message_id,
+                error,
+                http_status=status_code,
+                error_code=(str(raw_code) if raw_code is not None else None),
+            )
+            return False
+
+    def _remember_processing_outcome(
+        self,
+        message_id: str,
+        outcome: str,
+    ) -> None:
+        self._processing_outcomes[message_id] = outcome
+        self._processing_outcomes.move_to_end(message_id)
+        while len(self._processing_outcomes) > (
+            FEISHU_PROCESSING_REACTION_CACHE_SIZE
+        ):
+            self._processing_outcomes.popitem(last=False)
+
+    async def mark_processing(self, event: MessageEvent) -> None:
+        """在原消息上幂等添加 Typing；任何平台错误都不影响主流程。"""
+        message_id = str(event.message_id or "")
+        if not message_id:
+            return
+        try:
+            async with self._processing_reaction_lock:
+                if message_id in self._processing_outcomes:
+                    return
+                if message_id in self._processing_reactions:
+                    self._processing_reactions.move_to_end(message_id)
+                    return
+                if message_id in self._processing_attempts:
+                    self._processing_attempts.move_to_end(message_id)
+                    return
+                # 请求结果可能因网络中断而未知；先记录尝试可避免重推或恢复
+                # 再次添加第二个无法关联 reaction_id 的 Typing。
+                self._processing_attempts[message_id] = None
+                while len(self._processing_attempts) > (
+                    FEISHU_PROCESSING_REACTION_CACHE_SIZE
+                ):
+                    self._processing_attempts.popitem(last=False)
+                reaction_id = await self._add_message_reaction(
+                    message_id,
+                    "Typing",
+                )
+                if not reaction_id:
+                    return
+                self._processing_reactions[message_id] = reaction_id
+                self._processing_reactions.move_to_end(message_id)
+                while len(self._processing_reactions) > (
+                    FEISHU_PROCESSING_REACTION_CACHE_SIZE
+                ):
+                    old_message_id, old_reaction_id = (
+                        self._processing_reactions.popitem(last=False)
+                    )
+                    await self._delete_message_reaction(
+                        old_message_id,
+                        old_reaction_id,
+                    )
+                    self._remember_processing_outcome(
+                        old_message_id,
+                        "evicted",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log_reaction_failure(
+                "add_typing",
+                message_id,
+                type(exc).__name__,
+            )
+
+    async def finish_processing(
+        self,
+        event: MessageEvent,
+        outcome: str,
+    ) -> None:
+        """幂等结束 Typing；失败才额外添加 CrossMark。"""
+        message_id = str(event.message_id or "")
+        normalized_outcome = str(outcome or "").strip().lower()
+        if not message_id or normalized_outcome not in {
+            "success",
+            "failed",
+            "cancelled",
+        }:
+            return
+        try:
+            async with self._processing_reaction_lock:
+                previous_outcome = self._processing_outcomes.get(message_id)
+                reaction_id = self._processing_reactions.get(message_id)
+                if reaction_id:
+                    deleted = await self._delete_message_reaction(
+                        message_id,
+                        reaction_id,
+                    )
+                    if deleted:
+                        self._processing_reactions.pop(message_id, None)
+
+                # 第一个真实终态获胜：success/cancelled 不能被旧 worker
+                # 改成失败；容量淘汰只表示 Typing 已清理，不吞掉后续失败。
+                if (
+                    previous_outcome is not None
+                    and previous_outcome != "evicted"
+                ):
+                    self._processing_outcomes.move_to_end(message_id)
+                    return
+                self._remember_processing_outcome(
+                    message_id,
+                    normalized_outcome,
+                )
+                if normalized_outcome == "failed":
+                    await self._add_message_reaction(
+                        message_id,
+                        "CrossMark",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log_reaction_failure(
+                f"finish_{normalized_outcome}",
+                message_id,
+                type(exc).__name__,
+            )
+
+    async def _clear_processing_reactions(self) -> None:
+        """正常断开时尽最大努力清理当前进程已知的 Typing。"""
+        try:
+            async with self._processing_reaction_lock:
+                pending = list(self._processing_reactions.items())
+                for message_id, reaction_id in pending:
+                    await self._delete_message_reaction(
+                        message_id,
+                        reaction_id,
+                    )
+                self._processing_reactions.clear()
+                self._processing_attempts.clear()
+                self._processing_outcomes.clear()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log_reaction_failure(
+                "shutdown_cleanup",
+                "",
+                type(exc).__name__,
+            )
 
     # ===================== 消息出站 =====================
 

@@ -101,6 +101,16 @@ class BasePlatformAdapter(ABC):
         """同步撤销外部接收资格，异步资源随后由 disconnect 完整回收。"""
         self._running = False
 
+    async def mark_processing(self, event: MessageEvent) -> None:
+        """通知平台该消息已经进入处理流程；默认不执行任何操作。"""
+
+    async def finish_processing(
+        self,
+        event: MessageEvent,
+        outcome: str,
+    ) -> None:
+        """结束平台处理状态；不支持该能力的平台保持原有行为。"""
+
     @abstractmethod
     async def send(
         self,

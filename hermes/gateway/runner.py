@@ -20,6 +20,7 @@ import os
 import random
 import time
 import uuid
+from dataclasses import dataclass
 
 from hermes.db import (
     acquire_gateway_runtime_lease,
@@ -56,7 +57,7 @@ from hermes.db import (
     reset_gateway_sending_outbox,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
-from hermes.gateway.observability import safe_route_digest
+from hermes.gateway.observability import safe_message_digest, safe_route_digest
 from hermes.gateway.persistence import GatewayPersistence
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import (
@@ -102,6 +103,28 @@ _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
     },
 }
 _GATEWAY_RUNTIME_LEASE_NAME = "gateway-main"
+_SAFE_MODEL_TIMEOUT_REPLY = "处理失败：模型响应超时，请稍后重试。"
+_SAFE_MODEL_UNAVAILABLE_REPLY = "处理失败：模型服务暂时不可用，请稍后重试。"
+_SAFE_PERSISTENCE_REPLY = "处理失败：系统暂时不可用，请稍后重试。"
+_SAFE_INTERNAL_REPLY = "处理失败：任务未能完成，请稍后重试。"
+
+
+@dataclass(frozen=True)
+class _GatewayAgentResult:
+    """Runner 内部的 Agent 结果，只保留可安全发送的用户文案。"""
+
+    response: str | None
+    failed: bool = False
+    failure_type: str | None = None
+
+
+def _safe_audit_label(value: object) -> str:
+    """限制审计分类字段，避免外部错误类型注入换行或正文。"""
+    raw = str(value or "")[:64]
+    return "".join(
+        char for char in raw
+        if char.isalnum() or char in {".", "_", "-"}
+    )
 
 
 def _load_gateway_context_values(
@@ -376,6 +399,159 @@ class GatewayRunner:
             os.getcwd(),
             enabled_toolsets=[],
             **context_policy,
+        )
+
+    @staticmethod
+    def _is_processing_event(event: MessageEvent) -> bool:
+        """只有进入普通 Agent 流程的消息才展示平台处理状态。"""
+        return (event.text or "").strip().lower() not in {
+            "/new",
+            "/stop",
+            "/status",
+        }
+
+    @staticmethod
+    def _outbox_tracks_processing(outbox: dict) -> bool:
+        """控制回执和 queue-full 回执不拥有 Typing 生命周期。"""
+        return str(outbox.get("delivery_kind", "")) in {
+            "final",
+            "internal_error",
+        }
+
+    async def _mark_processing_best_effort(
+        self,
+        event: MessageEvent,
+    ) -> None:
+        if not self._is_processing_event(event):
+            return
+        adapter = self.adapters.get(event.source.platform)
+        if adapter is None:
+            return
+        try:
+            await adapter.mark_processing(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=processing_status_failed "
+                "operation=mark_processing "
+                f"{safe_message_digest(event.message_id)} "
+                f"platform={event.source.platform} "
+                f"exception={type(exc).__name__}"
+            )
+
+    async def _finish_processing_best_effort(
+        self,
+        event: MessageEvent,
+        outcome: str,
+        *,
+        ctx=None,
+        generation: int | None = None,
+    ) -> bool:
+        """仅由仍持有 worker generation 的任务结束平台处理状态。"""
+        if not self._is_processing_event(event):
+            return False
+        if (
+            ctx is not None
+            and generation is not None
+            and getattr(ctx, "worker_generation", None) != generation
+        ):
+            return False
+        if (
+            outcome == "failed"
+            and ctx is not None
+            and generation is not None
+            and self._task_cancel_reason(ctx, generation) is not None
+        ):
+            return False
+        adapter = self.adapters.get(event.source.platform)
+        if adapter is None:
+            return False
+        try:
+            await adapter.finish_processing(event, outcome)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=processing_status_failed "
+                f"operation=finish_{outcome} "
+                f"{safe_message_digest(event.message_id)} "
+                f"platform={event.source.platform} "
+                f"exception={type(exc).__name__}"
+            )
+            return False
+
+    @staticmethod
+    def _safe_agent_result(result: dict) -> _GatewayAgentResult:
+        """把 Agent 结构化错误映射为固定文案，绝不发送原始异常。"""
+        final_response = result.get("final_response")
+        if result.get("ok", False):
+            response = str(final_response or "")
+            if response:
+                return _GatewayAgentResult(response)
+            return _GatewayAgentResult(
+                _SAFE_INTERNAL_REPLY,
+                failed=True,
+                failure_type="empty_response",
+            )
+
+        status = str(result.get("status", "") or "")
+        error_type = str(result.get("error_type", "") or "")
+        if status == "cancelled" or error_type == "cancelled":
+            return _GatewayAgentResult(None)
+        if error_type == "persistence_error":
+            return _GatewayAgentResult(
+                _SAFE_PERSISTENCE_REPLY,
+                failed=True,
+                failure_type="persistence_error",
+            )
+        if status == "model_error" or error_type == "model_error":
+            detail = str(final_response or "").lower()
+            if "timeout" in detail or "timed out" in detail:
+                return _GatewayAgentResult(
+                    _SAFE_MODEL_TIMEOUT_REPLY,
+                    failed=True,
+                    failure_type="model_timeout",
+                )
+            return _GatewayAgentResult(
+                _SAFE_MODEL_UNAVAILABLE_REPLY,
+                failed=True,
+                failure_type="model_unavailable",
+            )
+        return _GatewayAgentResult(
+            _SAFE_INTERNAL_REPLY,
+            failed=True,
+            failure_type=error_type or status or "internal_error",
+        )
+
+    @staticmethod
+    def _safe_exception_result(exc: Exception) -> _GatewayAgentResult:
+        """兜底异常只按类型分类，不把异常文本或本地路径发给用户。"""
+        error_name = type(exc).__name__.lower()
+        error_module = type(exc).__module__.lower()
+        if "timeout" in error_name:
+            return _GatewayAgentResult(
+                _SAFE_MODEL_TIMEOUT_REPLY,
+                failed=True,
+                failure_type="model_timeout",
+            )
+        if "connection" in error_name or error_module.startswith("openai"):
+            return _GatewayAgentResult(
+                _SAFE_MODEL_UNAVAILABLE_REPLY,
+                failed=True,
+                failure_type="model_unavailable",
+            )
+        if "sqlite" in error_module or "persistence" in error_name:
+            return _GatewayAgentResult(
+                _SAFE_PERSISTENCE_REPLY,
+                failed=True,
+                failure_type="persistence_error",
+            )
+        return _GatewayAgentResult(
+            _SAFE_INTERNAL_REPLY,
+            failed=True,
+            failure_type="internal_error",
         )
 
     def add_adapter(self, adapter: BasePlatformAdapter):
@@ -1763,12 +1939,35 @@ class GatewayRunner:
             ) is not None:
                 return None
             if outbox["status"] == "delivered":
+                if self._outbox_tracks_processing(outbox):
+                    await self._finish_processing_best_effort(
+                        event,
+                        (
+                            "failed"
+                            if outbox.get("delivery_kind") == "internal_error"
+                            else "success"
+                        ),
+                        ctx=ctx,
+                        generation=generation,
+                    )
                 return True
             if outbox["status"] in (
                 "permanent_failed",
                 "cancelled",
                 "partial_cancelled",
             ):
+                if self._outbox_tracks_processing(outbox):
+                    outcome = (
+                        "failed"
+                        if outbox["status"] == "permanent_failed"
+                        else "cancelled"
+                    )
+                    await self._finish_processing_best_effort(
+                        event,
+                        outcome,
+                        ctx=ctx,
+                        generation=generation,
+                    )
                 return False
 
             next_attempt_at = outbox.get("next_attempt_at")
@@ -1891,6 +2090,17 @@ class GatewayRunner:
                         route_key,
                         event,
                     )
+                    if delivered and self._outbox_tracks_processing(outbox):
+                        await self._finish_processing_best_effort(
+                            event,
+                            (
+                                "failed"
+                                if outbox.get("delivery_kind") == "internal_error"
+                                else "success"
+                            ),
+                            ctx=ctx,
+                            generation=generation,
+                        )
                     return True if delivered else None
 
                 # 成功进度已经持久化；从这里开始，取消只终止尚未发送的分片。
@@ -1914,6 +2124,17 @@ class GatewayRunner:
                     route_key,
                     event,
                 )
+                if delivered and self._outbox_tracks_processing(outbox):
+                    await self._finish_processing_best_effort(
+                        event,
+                        (
+                            "failed"
+                            if outbox.get("delivery_kind") == "internal_error"
+                            else "success"
+                        ),
+                        ctx=ctx,
+                        generation=generation,
+                    )
                 return True if delivered else None
 
             attempt = int(outbox["attempt_count"]) + 1
@@ -1955,6 +2176,13 @@ class GatewayRunner:
                     f"lease_epoch={self._runtime_lease_epoch} "
                     f"failure_type={error} chunk={failed_index}"
                 )
+                if self._outbox_tracks_processing(outbox):
+                    await self._finish_processing_best_effort(
+                        event,
+                        "failed",
+                        ctx=ctx,
+                        generation=generation,
+                    )
                 return False
 
             delay = self._delivery_retry_delay(
@@ -2115,6 +2343,17 @@ class GatewayRunner:
                 and ctx.worker_generation == generation
             )
             if (
+                owns_worker
+                and cancel_reason is not None
+                and cancel_reason != "shutdown"
+            ):
+                await self._finish_processing_best_effort(
+                    event,
+                    "cancelled",
+                    ctx=ctx,
+                    generation=generation,
+                )
+            if (
                 ctx.delivery_id == delivery_id
                 and ctx.delivery_generation == generation
             ):
@@ -2151,8 +2390,12 @@ class GatewayRunner:
             route_key,
             message_ids,
         )
-        for message_id in message_ids:
-            self._accepted_messages.discard((route_key, message_id))
+        for event in events:
+            self._accepted_messages.discard((route_key, event.message_id))
+            await self._finish_processing_best_effort(
+                event,
+                "cancelled",
+            )
 
     async def _restore_outbound_messages(self) -> None:
         """按 route_key 恢复已生成但尚未完整送达的回复。"""
@@ -2223,6 +2466,10 @@ class GatewayRunner:
                         f"(route={route_key})"
                     )
                     continue
+                for row in route_rows:
+                    if self._outbox_tracks_processing(row):
+                        event = self._deserialize_event(row["event_json"])
+                        await self._mark_processing_best_effort(event)
                 generation, invalidation_event = self.sessions.begin_task(ctx)
                 for row in route_rows:
                     self._accepted_messages.add((
@@ -2289,6 +2536,15 @@ class GatewayRunner:
                                 source_message_id=stale_row[
                                     "source_message_id"
                                 ],
+                            )
+                            stale_event = self._deserialize_event(
+                                stale_row["event_json"]
+                            )
+                            await self._finish_processing_best_effort(
+                                stale_event,
+                                "cancelled",
+                                ctx=ctx,
+                                generation=generation,
                             )
                     break
                 if (
@@ -2551,6 +2807,7 @@ class GatewayRunner:
                 ctx.pending.append(event)
             else:
                 self.sessions.enqueue(ctx, event)
+            await self._mark_processing_best_effort(event)
             # 重启恢复的历史队列按原顺序完整执行,不能让后一条恢复消息
             # 取消前一条;只有新到达的实时消息才覆盖当前请求。
             if not from_queue:
@@ -2569,6 +2826,7 @@ class GatewayRunner:
             and not await self._persist_event_async(route_key, event)
         ):
             return
+        await self._mark_processing_best_effort(event)
         await self._mark_event_processing_async(route_key, event)
         generation, invalidation_event = self.sessions.begin_task(ctx)
         delivery_id = str(uuid.uuid4())
@@ -2623,11 +2881,18 @@ class GatewayRunner:
         cancel_reason = None
         event_completed = False
         abandoned = False
+        agent_result = _GatewayAgentResult(None)
         try:
             if agent_task is None:
-                response = await self._run_agent(event, ctx)
+                raw_agent_result = await self._run_agent(event, ctx)
             else:
-                response = await agent_task
+                raw_agent_result = await agent_task
+            if isinstance(raw_agent_result, _GatewayAgentResult):
+                agent_result = raw_agent_result
+            else:
+                # 保留嵌入式调用和既有 monkeypatch 返回纯文本的兼容性。
+                agent_result = _GatewayAgentResult(raw_agent_result)
+            response = agent_result.response
             if (
                 ctx.delivery_generation == generation
                 and ctx.delivery_id is not None
@@ -2704,7 +2969,7 @@ class GatewayRunner:
                     event,
                     response,
                     delivery_id,
-                    "final",
+                    "internal_error" if agent_result.failed else "final",
                 )
                 delivery_id = await self._enqueue_outbox_async(outbox)
                 if (
@@ -2712,6 +2977,20 @@ class GatewayRunner:
                     and self._task_cancel_reason(ctx, generation) is None
                 ):
                     ctx.delivery_id = delivery_id
+                if agent_result.failed:
+                    await self._finish_processing_best_effort(
+                        event,
+                        "failed",
+                        ctx=ctx,
+                        generation=generation,
+                    )
+                    print(
+                        "  [gateway:audit] event=agent_final_failure "
+                        f"{safe_route_digest(route_key)} "
+                        f"{safe_message_digest(event.message_id)} "
+                        "failure_type="
+                        f"{_safe_audit_label(agent_result.failure_type) or 'internal_error'}"
+                    )
                 delivered = await self._deliver_outbox(
                     route_key,
                     event,
@@ -2738,47 +3017,82 @@ class GatewayRunner:
             cancel_reason = self._task_cancel_reason(ctx, generation)
             if cancel_reason is not None:
                 abandoned = True
-            elif await self._load_outbox_async(delivery_id) is None:
+            else:
                 try:
-                    outbox = self._build_outbox(
-                        route_key,
-                        event,
-                        f"(internal error: {type(exc).__name__})",
-                        delivery_id,
-                        "internal_error",
+                    existing_error_outbox = await self._load_outbox_async(
+                        delivery_id
                     )
-                    delivery_id = await self._enqueue_outbox_async(outbox)
-                    if (
-                        ctx.delivery_generation == generation
-                        and self._task_cancel_reason(ctx, generation) is None
-                    ):
-                        ctx.delivery_id = delivery_id
-                    delivered = await self._deliver_outbox(
-                        route_key,
-                        event,
-                        delivery_id,
-                        ctx,
-                        generation,
-                        invalidation_event,
-                    )
-                    if delivered:
-                        event_completed = True
-                    elif delivered is None:
-                        cancel_reason = self._task_cancel_reason(
-                            ctx,
-                            generation,
-                        )
-                        abandoned = True
-                except asyncio.CancelledError:
-                    cancel_reason = (
-                        self._task_cancel_reason(ctx, generation)
-                        or "cancelled"
-                    )
-                except Exception as send_exc:
+                except Exception as lookup_exc:
                     print(
-                        f"  [gateway] {route_key}: error reply failed "
-                        f"({type(send_exc).__name__})"
+                        f"  [gateway] {route_key}: error outbox lookup failed "
+                        f"({type(lookup_exc).__name__})"
                     )
+                    await self._finish_processing_best_effort(
+                        event,
+                        "failed",
+                        ctx=ctx,
+                        generation=generation,
+                    )
+                else:
+                    if existing_error_outbox is None:
+                        failure = self._safe_exception_result(exc)
+                        try:
+                            outbox = self._build_outbox(
+                                route_key,
+                                event,
+                                failure.response or _SAFE_INTERNAL_REPLY,
+                                delivery_id,
+                                "internal_error",
+                            )
+                            delivery_id = await self._enqueue_outbox_async(
+                                outbox
+                            )
+                            if (
+                                ctx.delivery_generation == generation
+                                and self._task_cancel_reason(
+                                    ctx,
+                                    generation,
+                                ) is None
+                            ):
+                                ctx.delivery_id = delivery_id
+                            await self._finish_processing_best_effort(
+                                event,
+                                "failed",
+                                ctx=ctx,
+                                generation=generation,
+                            )
+                            delivered = await self._deliver_outbox(
+                                route_key,
+                                event,
+                                delivery_id,
+                                ctx,
+                                generation,
+                                invalidation_event,
+                            )
+                            if delivered:
+                                event_completed = True
+                            elif delivered is None:
+                                cancel_reason = self._task_cancel_reason(
+                                    ctx,
+                                    generation,
+                                )
+                                abandoned = True
+                        except asyncio.CancelledError:
+                            cancel_reason = (
+                                self._task_cancel_reason(ctx, generation)
+                                or "cancelled"
+                            )
+                        except Exception as send_exc:
+                            print(
+                                f"  [gateway] {route_key}: error reply failed "
+                                f"({type(send_exc).__name__})"
+                            )
+                            await self._finish_processing_best_effort(
+                                event,
+                                "failed",
+                                ctx=ctx,
+                                generation=generation,
+                            )
         finally:
             cancel_reason = cancel_reason or self._task_cancel_reason(
                 ctx,
@@ -2835,6 +3149,17 @@ class GatewayRunner:
                 # 关键状态已落库后才对外暴露 route 空闲。普通
                 # 收尾先进入 dispatching，由 admission 锁保证 pending
                 # 队头不会被同时到达的新消息越过。
+                if (
+                    owns_worker
+                    and abandoned
+                    and cancel_reason != "shutdown"
+                ):
+                    await self._finish_processing_best_effort(
+                        event,
+                        "cancelled",
+                        ctx=ctx,
+                        generation=generation,
+                    )
                 if owns_worker:
                     if cancel_reason != "shutdown":
                         ctx.dispatching = True
@@ -2911,6 +3236,8 @@ class GatewayRunner:
                     ctx.route_key,
                     outbox["source_message_id"],
                 ))
+                if self._outbox_tracks_processing(outbox):
+                    await self._mark_processing_best_effort(event)
                 self._launch_durable_reply_worker(
                     ctx.route_key,
                     event,
@@ -2934,7 +3261,7 @@ class GatewayRunner:
         self,
         event: MessageEvent,
         ctx,
-    ) -> str | None:
+    ) -> _GatewayAgentResult | str | None:
         """在全局并发限制内运行异步主会话。"""
         # 所有 route_key 共用同一信号量,避免不同会话同时打满模型服务。
         async with self._llm_semaphore:
@@ -2944,7 +3271,7 @@ class GatewayRunner:
         self,
         event: MessageEvent,
         ctx,
-    ) -> str | None:
+    ) -> _GatewayAgentResult:
         """使用 AsyncOpenAI 跑主会话，数据库 hook 统一在线程执行。"""
         from hermes.db import ensure_session
         from hermes.conversation import run_conversation_async
@@ -3011,7 +3338,7 @@ class GatewayRunner:
             persistence_call=self.persistence.call,
             enabled_toolsets=[],
         )
-        return result.get("final_response")
+        return self._safe_agent_result(result)
 
     def _get_async_client(self):
         """按需创建 Runner 独占的异步模型客户端。"""
