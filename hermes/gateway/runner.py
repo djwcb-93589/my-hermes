@@ -21,6 +21,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from hermes.db import (
     acquire_gateway_runtime_lease,
@@ -36,6 +37,7 @@ from hermes.db import (
     fail_gateway_delivery,
     gateway_outbox_claim_is_valid,
     gateway_runtime_lease_is_valid,
+    get_gateway_conversation_for_route,
     get_gateway_message_persistence_state,
     get_gateway_routes_with_pending_outbox,
     get_next_recoverable_gateway_outbox_for_route,
@@ -43,6 +45,7 @@ from hermes.db import (
     get_gateway_queued_messages,
     get_recoverable_gateway_outbox,
     init_db,
+    list_gateway_conversations,
     mark_gateway_message_delivery_failed,
     mark_gateway_message_processing,
     mark_gateway_outbox_chunk_sent,
@@ -552,6 +555,82 @@ class GatewayRunner:
             _SAFE_INTERNAL_REPLY,
             failed=True,
             failure_type="internal_error",
+        )
+
+    @staticmethod
+    def _conversation_preview(value: object, limit: int = 50) -> str:
+        """把 user 消息压成单行安全预览，并限制展示长度。"""
+        preview = " ".join(str(value or "").split())
+        if not preview:
+            return "暂无消息"
+        if len(preview) <= limit:
+            return preview
+        return preview[:max(1, limit - 1)] + "…"
+
+    @staticmethod
+    def _short_conversation_id(conversation_id: object) -> str:
+        value = str(conversation_id or "")
+        return value[:8] if value else "<unknown>"
+
+    @classmethod
+    def _format_conversation_list(cls, conversations: list[dict]) -> str:
+        if not conversations:
+            return "当前路由暂无可用对话。"
+        lines = ["对话列表：", ""]
+        for index, conversation in enumerate(conversations, start=1):
+            marker = "[当前] " if conversation.get("is_current") else ""
+            active_at = (
+                conversation.get("last_message_at")
+                or conversation.get("last_selected_at")
+            )
+            try:
+                active_timestamp = float(active_at)
+                if not math.isfinite(active_timestamp):
+                    raise ValueError("invalid conversation timestamp")
+                active_text = datetime.fromtimestamp(
+                    active_timestamp
+                ).strftime("%Y-%m-%d %H:%M")
+            except (OSError, OverflowError, TypeError, ValueError):
+                active_text = "未知"
+            lines.extend([
+                f"{index}. {marker}{cls._short_conversation_id(conversation['conversation_id'])}",
+                f"   消息：{int(conversation.get('message_count', 0))} 条",
+                f"   最近：{cls._conversation_preview(conversation.get('preview'))}",
+                f"   活跃时间：{active_text}",
+                "",
+            ])
+        lines.extend([
+            "使用 /resume 2 切换对话。",
+            "序号以当前列表为准。",
+        ])
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_resume_success(cls, conversation: dict) -> str:
+        return "\n".join([
+            "━━━━━━━━━━━━━━━━━━",
+            "已切换对话",
+            "",
+            "当前对话："
+            f"{cls._short_conversation_id(conversation['conversation_id'])}",
+            f"历史消息：{int(conversation.get('message_count', 0))} 条",
+            "最近内容："
+            f"{cls._conversation_preview(conversation.get('preview'))}",
+            "",
+            "后续消息将进入该对话。",
+            "━━━━━━━━━━━━━━━━━━",
+        ])
+
+    @staticmethod
+    def _conversation_switch_is_busy(ctx) -> bool:
+        worker = getattr(ctx, "worker_task", None)
+        active_task = getattr(ctx, "active_task", None)
+        return bool(
+            getattr(ctx, "busy", False)
+            or getattr(ctx, "dispatching", False)
+            or getattr(ctx, "pending", ())
+            or (worker is not None and not worker.done())
+            or (active_task is not None and not active_task.done())
         )
 
     def add_adapter(self, adapter: BasePlatformAdapter):
@@ -2678,9 +2757,111 @@ class GatewayRunner:
             if queue_key in self._accepted_messages:
                 return
 
-        # slash 命令(所有平台通用)
-        cmd = (event.text or "").strip().lower()
-        if cmd == "/new":
+        # slash 命令只规范化命令名，conversation_id 参数保持原样精确匹配。
+        command_text = (event.text or "").strip()
+        command_parts = command_text.split(maxsplit=1)
+        cmd = command_parts[0].lower() if command_parts else ""
+        command_argument = (
+            command_parts[1].strip() if len(command_parts) > 1 else ""
+        )
+        if cmd == "/sessions" and not command_argument:
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
+            )
+            conversations = await self.persistence.call(
+                list_gateway_conversations,
+                route_key,
+                10,
+            )
+            content = self._format_conversation_list(conversations)
+            if event.source.platform not in self.adapters:
+                await self._reply(event, content)
+                return
+            await self._start_durable_reply_async(
+                route_key,
+                event,
+                content,
+                "sessions_command",
+                ctx,
+            )
+            return
+        if cmd == "/resume":
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
+            )
+            target = None
+            if not command_argument:
+                content = (
+                    "用法：/resume <序号或完整 conversation_id>\n"
+                    "请先使用 /sessions 查看当前对话列表。"
+                )
+            elif self._conversation_switch_is_busy(ctx):
+                content = (
+                    "当前任务仍在处理中，暂不能切换对话。\n"
+                    "请等待任务完成后重试，或先使用 /stop。"
+                )
+            else:
+                if command_argument.isdecimal():
+                    conversations = await self.persistence.call(
+                        list_gateway_conversations,
+                        route_key,
+                        10,
+                    )
+                    try:
+                        selected_index = int(command_argument) - 1
+                    except ValueError:
+                        selected_index = -1
+                    if 0 <= selected_index < len(conversations):
+                        target = conversations[selected_index]
+                else:
+                    target = await self.persistence.call(
+                        get_gateway_conversation_for_route,
+                        route_key,
+                        command_argument,
+                    )
+
+                if target is None:
+                    content = (
+                        "未找到可切换的对话。\n"
+                        "请使用 /sessions 查看当前会话的对话列表。"
+                    )
+                elif target["conversation_id"] == ctx.conversation_id:
+                    content = (
+                        "已经位于该对话："
+                        f"{self._short_conversation_id(ctx.conversation_id)}"
+                    )
+                else:
+                    try:
+                        await self.sessions.switch_conversation_async(
+                            route_key,
+                            target["conversation_id"],
+                            self._build_gateway_prompt(event.source),
+                        )
+                    except RuntimeError:
+                        content = (
+                            "当前任务仍在处理中，暂不能切换对话。\n"
+                            "请等待任务完成后重试，或先使用 /stop。"
+                        )
+                    except ValueError:
+                        content = (
+                            "未找到可切换的对话。\n"
+                            "请使用 /sessions 查看当前会话的对话列表。"
+                        )
+                    else:
+                        content = self._format_resume_success(target)
+
+            if event.source.platform not in self.adapters:
+                await self._reply(event, content)
+                return
+            await self._start_durable_reply_async(
+                route_key,
+                event,
+                content,
+                "resume_command",
+                ctx,
+            )
+            return
+        if cmd == "/new" and not command_argument:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
@@ -2734,7 +2915,7 @@ class GatewayRunner:
                 ctx,
             )
             return
-        if cmd == "/stop":
+        if cmd == "/stop" and not command_argument:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
@@ -2755,7 +2936,7 @@ class GatewayRunner:
                 ctx,
             )
             return
-        if cmd == "/status":
+        if cmd == "/status" and not command_argument:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )

@@ -24,7 +24,7 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
@@ -109,6 +109,19 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             conversation_id TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+
+        -- 保存 route 曾经选择过的全部对话；不增加 sessions 外键，因为
+        -- /new 允许先生成 conversation_id，首次模型调用时再创建 session。
+        CREATE TABLE IF NOT EXISTS gateway_route_conversations (
+            route_key TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            last_selected_at REAL NOT NULL,
+            PRIMARY KEY (route_key, conversation_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_gateway_route_conversations_recent
+            ON gateway_route_conversations(route_key, last_selected_at DESC);
 
         -- Runner 接受但尚未完成的消息。queued / processing 都会在
         -- Gateway 重启后恢复,完成后删除。
@@ -1168,6 +1181,71 @@ def _migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
     _create_gateway_fencing_triggers(conn)
 
 
+def _migrate_v12_to_v13(conn: sqlite3.Connection) -> None:
+    """保存每条 Gateway route 的历史对话归属并回填旧数据。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gateway_route_conversations (
+            route_key TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            last_selected_at REAL NOT NULL,
+            PRIMARY KEY (route_key, conversation_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gateway_route_conversations_recent
+        ON gateway_route_conversations(route_key, last_selected_at DESC)
+        """
+    )
+
+    # 当前映射是最可靠的选择时间来源，先完整登记。
+    conn.execute(
+        """
+        INSERT INTO gateway_route_conversations (
+            route_key, conversation_id, created_at, last_selected_at
+        )
+        SELECT route_key, conversation_id, updated_at, updated_at
+        FROM gateway_session_routes
+        WHERE 1=1
+        ON CONFLICT(route_key, conversation_id) DO UPDATE SET
+            last_selected_at=MAX(
+                gateway_route_conversations.last_selected_at,
+                excluded.last_selected_at
+            )
+        """
+    )
+
+    # 旧版只在 delivery 中保留历史 route + session 关系；最早创建时间和
+    # 最后更新时间分别作为 created_at / last_selected_at 的合理代理。
+    conn.execute(
+        """
+        INSERT INTO gateway_route_conversations (
+            route_key, conversation_id, created_at, last_selected_at
+        )
+        SELECT
+            route_key,
+            session_id,
+            MIN(created_at),
+            MAX(updated_at)
+        FROM gateway_message_deliveries
+        WHERE 1=1
+        GROUP BY route_key, session_id
+        ON CONFLICT(route_key, conversation_id) DO UPDATE SET
+            created_at=MIN(
+                gateway_route_conversations.created_at,
+                excluded.created_at
+            ),
+            last_selected_at=MAX(
+                gateway_route_conversations.last_selected_at,
+                excluded.last_selected_at
+            )
+        """
+    )
+
+
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
@@ -1177,7 +1255,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     v5 → v6 关联最终回答投递状态,v6 → v7 区分部分取消,
     v7 → v8 增加原始平台消息归属索引，v8 → v9 增加 Gateway 运行租约，
     v9 → v10 正式接管 Feishu Inbox schema，v10 → v11 持久化 Inbox
-    route_key，v11 → v12 增加运行租约 epoch 与 Outbox claim fencing。
+    route_key，v11 → v12 增加运行租约 epoch 与 Outbox claim fencing，
+    v12 → v13 保存每条 route 的历史 conversation 归属。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -1409,6 +1488,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 12
+
+    if current < 13:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v12_to_v13(conn)
+            _set_schema_version(conn, 13)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 13
 
     return current
 
@@ -2830,19 +2921,165 @@ def set_gateway_conversation_id(
     route_key: str,
     conversation_id: str,
 ) -> None:
-    """持久化 route_key 当前指向的 conversation_id。"""
-    conn.execute(
+    """原子更新当前映射，并登记该 route 的历史对话归属。"""
+    now = time.time()
+    with transaction(conn):
+        conn.execute(
+            """
+            INSERT INTO gateway_session_routes
+                (route_key, conversation_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(route_key) DO UPDATE SET
+                conversation_id=excluded.conversation_id,
+                updated_at=excluded.updated_at
+            """,
+            (route_key, conversation_id, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO gateway_route_conversations (
+                route_key, conversation_id, created_at, last_selected_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(route_key, conversation_id) DO UPDATE SET
+                last_selected_at=excluded.last_selected_at
+            """,
+            (route_key, conversation_id, now, now),
+        )
+
+
+def _gateway_conversation_summary(row: sqlite3.Row | tuple) -> dict:
+    """把固定列顺序的对话摘要查询结果转换成上层稳定结构。"""
+    return {
+        "conversation_id": str(row[0]),
+        "message_count": int(row[1] or 0),
+        "last_message_at": (
+            float(row[2]) if row[2] is not None else None
+        ),
+        "last_selected_at": float(row[3]),
+        "preview": str(row[4] or ""),
+        "is_current": bool(row[5]),
+    }
+
+
+def list_gateway_conversations(
+    conn: sqlite3.Connection,
+    route_key: str,
+    limit: int = 10,
+) -> list[dict]:
+    """列出单条 route 最近的对话；查询边界不能跨越 route_key。"""
+    normalized_limit = max(1, min(10, int(limit)))
+    rows = conn.execute(
         """
-        INSERT INTO gateway_session_routes
-            (route_key, conversation_id, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(route_key) DO UPDATE SET
-            conversation_id=excluded.conversation_id,
-            updated_at=excluded.updated_at
+        WITH route_conversations AS (
+            SELECT
+                route_key,
+                conversation_id,
+                last_selected_at
+            FROM gateway_route_conversations
+            WHERE route_key=?
+        ),
+        user_stats AS (
+            SELECT
+                message.session_id,
+                COUNT(*) AS message_count,
+                MAX(message.timestamp) AS last_message_at
+            FROM messages AS message
+            INNER JOIN route_conversations AS route_conversation
+                ON route_conversation.conversation_id=message.session_id
+            WHERE message.role='user'
+            GROUP BY message.session_id
+        )
+        SELECT
+            route_conversation.conversation_id,
+            COALESCE(user_stat.message_count, 0),
+            user_stat.last_message_at,
+            route_conversation.last_selected_at,
+            COALESCE((
+                SELECT message.content
+                FROM messages AS message
+                WHERE message.session_id=route_conversation.conversation_id
+                  AND message.role='user'
+                  AND TRIM(
+                      COALESCE(message.content, ''),
+                      char(9) || char(10) || char(13) || ' '
+                  )<>''
+                ORDER BY message.timestamp DESC, message.id DESC
+                LIMIT 1
+            ), ''),
+            CASE
+                WHEN current_route.conversation_id=
+                     route_conversation.conversation_id
+                THEN 1 ELSE 0
+            END
+        FROM route_conversations AS route_conversation
+        LEFT JOIN user_stats AS user_stat
+            ON user_stat.session_id=route_conversation.conversation_id
+        LEFT JOIN gateway_session_routes AS current_route
+            ON current_route.route_key=route_conversation.route_key
+        ORDER BY
+            COALESCE(
+                user_stat.last_message_at,
+                route_conversation.last_selected_at
+            ) DESC,
+            route_conversation.last_selected_at DESC,
+            route_conversation.conversation_id ASC
+        LIMIT ?
         """,
-        (route_key, conversation_id, time.time()),
-    )
-    conn.commit()
+        (route_key, normalized_limit),
+    ).fetchall()
+    return [_gateway_conversation_summary(row) for row in rows]
+
+
+def get_gateway_conversation_for_route(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+) -> dict | None:
+    """按 route 校验并读取对话摘要；找不到时不泄露跨 route 信息。"""
+    row = conn.execute(
+        """
+        SELECT
+            route_conversation.conversation_id,
+            (
+                SELECT COUNT(*)
+                FROM messages AS message
+                WHERE message.session_id=route_conversation.conversation_id
+                  AND message.role='user'
+            ),
+            (
+                SELECT MAX(message.timestamp)
+                FROM messages AS message
+                WHERE message.session_id=route_conversation.conversation_id
+                  AND message.role='user'
+            ),
+            route_conversation.last_selected_at,
+            COALESCE((
+                SELECT message.content
+                FROM messages AS message
+                WHERE message.session_id=route_conversation.conversation_id
+                  AND message.role='user'
+                  AND TRIM(
+                      COALESCE(message.content, ''),
+                      char(9) || char(10) || char(13) || ' '
+                  )<>''
+                ORDER BY message.timestamp DESC, message.id DESC
+                LIMIT 1
+            ), ''),
+            CASE
+                WHEN current_route.conversation_id=
+                     route_conversation.conversation_id
+                THEN 1 ELSE 0
+            END
+        FROM gateway_route_conversations AS route_conversation
+        LEFT JOIN gateway_session_routes AS current_route
+            ON current_route.route_key=route_conversation.route_key
+        WHERE route_conversation.route_key=?
+          AND route_conversation.conversation_id=?
+        """,
+        (route_key, conversation_id),
+    ).fetchone()
+    return _gateway_conversation_summary(row) if row is not None else None
 
 
 def enqueue_gateway_message(

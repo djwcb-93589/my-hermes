@@ -139,7 +139,24 @@ FEISHU_REACTION_ALREADY_GONE_CODES = frozenset({
     231010,  # reaction 已不属于该消息
     231011,  # reaction_id 已无法定位
 })
-_IMMEDIATE_COMMANDS = frozenset({"/new", "/stop", "/status"})
+_IMMEDIATE_COMMANDS = frozenset({
+    "/new",
+    "/stop",
+    "/status",
+    "/sessions",
+    "/resume",
+})
+
+
+def _immediate_command_name(text: str) -> str | None:
+    """保留旧命令精确匹配，仅 /resume 接受后续参数。"""
+    normalized = str(text or "").strip().lower()
+    if normalized in _IMMEDIATE_COMMANDS - {"/resume"}:
+        return normalized
+    parts = normalized.split(maxsplit=1)
+    if parts and parts[0] == "/resume":
+        return "/resume"
+    return None
 
 
 @dataclass(frozen=True)
@@ -1983,8 +2000,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         processing.pop(message_id, None)
                         continue
 
-                    command = event.text.strip().lower()
-                    if command in _IMMEDIATE_COMMANDS:
+                    command = _immediate_command_name(event.text)
+                    if command is not None:
                         await self._handoff_to_runner(event)
                         await self._complete_messages(
                             [message_id],
@@ -2144,8 +2161,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 await self._finish_text_batch(events, processing)
                 return
 
-            command = next_event.text.strip().lower()
-            if command in _IMMEDIATE_COMMANDS:
+            command = _immediate_command_name(next_event.text)
+            if command is not None:
                 if command in {"/new", "/stop"}:
                     await self._finish_text_batch(
                         events,

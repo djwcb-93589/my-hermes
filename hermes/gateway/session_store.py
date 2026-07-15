@@ -74,15 +74,27 @@ class SessionStore:
         self.max_pending_messages = max(1, int(max_pending_messages))
 
     def _load_conversation_id(self, route_key: str) -> str:
-        """从数据库恢复 route_key 当前会话;没有映射时保持旧行为。"""
+        """恢复当前会话；首次使用时把默认 route_key 会话正式登记。"""
         if not self.db_path:
             return route_key
 
-        from hermes.db import get_gateway_conversation_id, init_db
+        from hermes.db import (
+            get_gateway_conversation_id,
+            init_db,
+            set_gateway_conversation_id,
+        )
 
         conn = init_db(self.db_path)
         try:
-            return get_gateway_conversation_id(conn, route_key) or route_key
+            persisted = get_gateway_conversation_id(conn, route_key)
+            conversation_id = persisted or route_key
+            if persisted is None:
+                set_gateway_conversation_id(
+                    conn,
+                    route_key,
+                    conversation_id,
+                )
+            return conversation_id
         finally:
             conn.close()
 
@@ -91,7 +103,7 @@ class SessionStore:
         route_key: str,
         conversation_id: str,
     ) -> None:
-        """持久化 /new 产生的新会话映射。"""
+        """持久化 route 当前会话映射。"""
         if not self.db_path:
             return
 
@@ -136,19 +148,140 @@ class SessionStore:
             if ctx is None:
                 conversation_id = route_key
                 if self.db_path and self.persistence is not None:
-                    from hermes.db import get_gateway_conversation_id
+                    from hermes.db import (
+                        get_gateway_conversation_id,
+                        set_gateway_conversation_id,
+                    )
 
                     persisted = await self.persistence.call(
                         get_gateway_conversation_id,
                         route_key,
                     )
                     conversation_id = persisted or route_key
+                    if persisted is None:
+                        await self.persistence.call(
+                            set_gateway_conversation_id,
+                            route_key,
+                            conversation_id,
+                        )
+                elif self.db_path:
+                    conversation_id = await asyncio.to_thread(
+                        self._load_conversation_id,
+                        route_key,
+                    )
                 ctx = SessionContext(
                     route_key=route_key,
                     conversation_id=conversation_id,
                     system_prompt=system_prompt,
                 )
                 self._contexts[route_key] = ctx
+            ctx.last_activity = time.time()
+            return ctx
+
+    @staticmethod
+    def _conversation_switch_blocked(ctx: SessionContext) -> bool:
+        """切换不排队；任何活动 worker、dispatch 或 pending 都直接拒绝。"""
+        worker_running = (
+            ctx.worker_task is not None
+            and not ctx.worker_task.done()
+        )
+        active_running = (
+            ctx.active_task is not None
+            and not ctx.active_task.done()
+        )
+        return bool(
+            ctx.busy
+            or ctx.dispatching
+            or ctx.pending
+            or worker_running
+            or active_running
+        )
+
+    async def switch_conversation_async(
+        self,
+        route_key: str,
+        conversation_id: str,
+        system_prompt: str,
+    ) -> SessionContext:
+        """验证 route 归属后原子切换当前映射，再更新内存上下文。"""
+        lock = self._context_locks.setdefault(route_key, asyncio.Lock())
+        async with lock:
+            ctx = self._contexts.get(route_key)
+            if ctx is not None and self._conversation_switch_blocked(ctx):
+                raise RuntimeError("conversation switch is blocked by active work")
+
+            from hermes.db import (
+                get_gateway_conversation_for_route,
+                init_db,
+                set_gateway_conversation_id,
+            )
+
+            if self.db_path and self.persistence is not None:
+                summary = await self.persistence.call(
+                    get_gateway_conversation_for_route,
+                    route_key,
+                    conversation_id,
+                )
+            elif self.db_path:
+                def load_summary():
+                    conn = init_db(self.db_path)
+                    try:
+                        return get_gateway_conversation_for_route(
+                            conn,
+                            route_key,
+                            conversation_id,
+                        )
+                    finally:
+                        conn.close()
+
+                summary = await asyncio.to_thread(load_summary)
+            else:
+                summary = None
+            if summary is None:
+                raise ValueError("conversation does not belong to route")
+
+            if ctx is not None and ctx.conversation_id == conversation_id:
+                ctx.last_activity = time.time()
+                return ctx
+
+            # 数据库写入必须先成功；失败时下方所有内存状态都保持不变。
+            if self.db_path and self.persistence is not None:
+                await self.persistence.call(
+                    set_gateway_conversation_id,
+                    route_key,
+                    conversation_id,
+                )
+            elif self.db_path:
+                await asyncio.to_thread(
+                    self._save_conversation_id,
+                    route_key,
+                    conversation_id,
+                )
+
+            if ctx is None:
+                ctx = SessionContext(
+                    route_key=route_key,
+                    conversation_id=conversation_id,
+                    system_prompt=system_prompt,
+                )
+                self._contexts[route_key] = ctx
+            else:
+                ctx.invalidation_event.set()
+                ctx.generation += 1
+                ctx.conversation_id = conversation_id
+                ctx.system_prompt = system_prompt
+                ctx.cancel_requested = False
+                ctx.cancel_generation = None
+                ctx.cancel_reason = None
+                ctx.active_task = None
+                ctx.active_generation = None
+                ctx.delivery_id = None
+                ctx.delivery_generation = None
+                ctx.worker_task = None
+                ctx.worker_generation = None
+                ctx.busy = False
+                ctx.dispatching = False
+                ctx.invalidation_event = asyncio.Event()
             ctx.last_activity = time.time()
             return ctx
 
