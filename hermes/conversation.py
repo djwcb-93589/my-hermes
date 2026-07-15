@@ -280,7 +280,7 @@ class ConversationAgentLoop(AgentLoop):
         """主会话保留 print 日志,并把工具异常包装成 tool message。
 
         工具失败不是 DB 事务失败;真正持久化失败交给 add_messages 抛出。
-        output 回写给模型时走统一脱敏(密钥 / 外部路径 / traceback),
+        工具异常回写给模型时走统一摘要(凭证值 / 路径规范化 / traceback),
         复用 agent_loop._sanitize_error_message 避免重复实现。
         """
         return _dispatch_conversation_tool_call(self, tool_call)

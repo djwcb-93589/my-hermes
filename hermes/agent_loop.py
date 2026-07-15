@@ -21,7 +21,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Callable
 
 from hermes.config import client as _default_client
@@ -51,17 +51,19 @@ class AgentLoopResult:
 # 共享 helper(也可独立使用)
 # ---------------------------------------------------------------------------
 
-# 密钥 / token / password 脱敏模式。命中后替换成 <secret>,避免泄漏进模型上下文。
-_SECRET_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
-    re.compile(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*['\"]?[^'\"\s]+"),
-]
-
-# 敏感路径标记。命中任一即视为敏感路径,完全隐藏具体位置。
-_SENSITIVE_PATH_MARKERS = (
-    ".env", ".ssh", "id_rsa", "id_ed25519",
-    "token", "secret", "password", "apikey", "api_key",
+# 只替换高置信度凭证值,字段名和周边诊断信息保持不变。
+_AUTHORIZATION_BEARER_RE = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])['\"]?Authorization['\"]?"
+    r"\s*[:=]\s*['\"]?Bearer\s+)"
+    r"(?P<value>[^\s,;&)\]}>'\"]+)"
 )
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])['\"]?"
+    r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|password|secret)"
+    r"['\"]?\s*[:=]\s*)(?P<quote>['\"]?)"
+    r"(?P<value>[^\s,;&)\]}>'\"]+)"
+)
+_RAW_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{6,}")
 
 # fatal marker:普通字符串工具错误命中这些关键字时直接终止 loop,
 # 即使工具没返结构化 JSON error_type 也能识别。
@@ -75,7 +77,7 @@ _FATAL_MARKERS = (
 )
 
 # Windows 绝对路径:带引号时允许路径包含空格;未加引号时以空白为边界,
-# 同时覆盖 UNC 路径。避免把路径后面的错误描述和脱敏占位符一起吞掉。
+# 同时覆盖 UNC 路径。该正则只用于工作区路径规范化,不隐藏外部路径。
 _WINDOWS_ABS_PATH_RE = re.compile(
     r"(?:\"(?:[A-Za-z]:[\\/]|\\\\)[^\"\r\n]+\""
     r"|'(?:[A-Za-z]:[\\/]|\\\\)[^'\r\n]+'"
@@ -83,15 +85,26 @@ _WINDOWS_ABS_PATH_RE = re.compile(
 )
 _WINDOWS_DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _MSYS_DRIVE_PATH_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?$")
-# Unix 绝对路径:要求 / 前面不是字母数字 / 路径字符 / 占位符定界符,
-# 避免把相对路径(如 Windows 替换后的 data/a.txt)或已脱敏占位符
-# (如 <external_path>/x)里的 /x 当成绝对路径二次脱敏。
+# Unix 绝对路径:要求 / 前面不是字母数字或路径字符,避免把已经规范化的
+# 相对路径再次当成绝对路径处理。
 _UNIX_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9._\-/<>])(/[A-Za-z0-9._\-/]+)")
-
-
-def _is_sensitive_path(path_text: str) -> bool:
-    lower = path_text.lower().replace("\\", "/")
-    return any(marker in lower for marker in _SENSITIVE_PATH_MARKERS)
+_TRACEBACK_FRAME_RE = re.compile(
+    r"^\s*File\s+['\"].+['\"],\s+line\s+\d+(?:,\s+in\s+.*)?$"
+)
+_ERROR_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:command|working directory|cwd|path|file|target|operation|tool|"
+    r"request[_ -]?id|http status|status(?: code)?|errno|database|table|column|"
+    r"field|constraint|stderr)\s*[:=]"
+)
+_ERROR_REASON_RE = re.compile(
+    r"(?i)(?:\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)\b|\berrno\b|"
+    r"access denied|permission denied|not found|timed? out|unavailable|"
+    r"\bfailed\b|\bfailure\b)"
+)
+_PATH_HINT_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\|/(?:[^/\s]+/)*[^/\s]+|"
+    r"(?:^|\s)(?:\.{0,2}/)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)"
+)
 
 
 def _normalize_msys_path(path_text: str, workspace_root: str | None) -> str:
@@ -105,47 +118,145 @@ def _normalize_msys_path(path_text: str, workspace_root: str | None) -> str:
     return f"{match.group(1).upper()}:\\{rest}"
 
 
-def _sanitize_path_text(path_text: str, workspace_root: str | None = None) -> str:
-    """路径脱敏策略:
-    - 敏感路径(.env / .ssh / id_rsa 等)→ ``<sensitive_path>`` 完全隐藏
-    - 工作区内路径 → 相对路径(帮模型定位文件做修正)
-    - 工作区外路径 → ``<external_path>/<filename>`` 只留文件名
+def _normalize_path_text(path_text: str, workspace_root: str | None = None) -> str:
+    """把工作区内绝对路径规范化为相对路径,外部路径保持原样。"""
+    original = path_text.strip().strip("'\"")
+    normalized = _normalize_msys_path(original, workspace_root)
 
-    workspace_root 默认用 os.getcwd() 兜底;AgentLoop 调用方需要时
-    可传更精确的值(如 backend.cwd / file_root)。
-    """
-    if _is_sensitive_path(path_text):
-        return "<sensitive_path>"
-    normalized = path_text.strip().strip("'\"")
-    normalized = _normalize_msys_path(normalized, workspace_root)
+    if not workspace_root:
+        return original
 
-    # UNC 路径用 PureWindowsPath 做词法判断,避免在非 Windows 平台失去
-    # 路径结构,也避免解析外部网络共享时触发不必要的文件系统访问。
-    if normalized.startswith("\\\\"):
+    root_text = str(workspace_root).strip().strip("'\"")
+
+    # 使用纯词法路径判断,不访问文件系统,也不受当前运行平台影响。
+    if normalized.startswith("\\\\") or _WINDOWS_DRIVE_ROOT_RE.match(normalized):
         path = PureWindowsPath(normalized)
-        if workspace_root and str(workspace_root).startswith("\\\\"):
+        if root_text.startswith("\\\\") or _WINDOWS_DRIVE_ROOT_RE.match(root_text):
             try:
-                rel = path.relative_to(PureWindowsPath(workspace_root))
+                rel = path.relative_to(PureWindowsPath(root_text))
                 if ".." not in rel.parts:
                     return rel.as_posix()
             except ValueError:
                 pass
-        return f"<external_path>/{path.name}" if path.name else "<external_path>"
+        return original
 
-    if workspace_root:
+    if normalized.startswith("/") and root_text.startswith("/"):
         try:
-            p = Path(normalized)
-            root = Path(workspace_root)
-            if p.is_absolute():
-                rel = p.resolve().relative_to(root.resolve())
-                return str(rel).replace("\\", "/")
-        except Exception:
+            rel = PurePosixPath(normalized).relative_to(PurePosixPath(root_text))
+            if ".." not in rel.parts:
+                return rel.as_posix()
+        except ValueError:
             pass
-    try:
-        name = Path(normalized).name
-    except Exception:
-        name = ""
-    return f"<external_path>/{name}" if name else "<external_path>"
+    return original
+
+
+def _redact_explicit_secret_values(text: str) -> str:
+    """只替换明确的凭证值,不因普通文本或路径关键词隐藏内容。"""
+    text = _AUTHORIZATION_BEARER_RE.sub(
+        lambda match: f"{match.group('prefix')}<secret>",
+        text,
+    )
+    text = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}<secret>"
+        ),
+        text,
+    )
+    return _RAW_API_KEY_RE.sub("<secret>", text)
+
+
+def _extract_error_summary(text: str, max_lines: int = 3) -> str:
+    """折叠 traceback 栈帧,保留错误原因和最多三行关键上下文。"""
+    lines: list[str] = []
+    skip_frame_source = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Traceback (most recent call last):"):
+            skip_frame_source = False
+            continue
+        if _TRACEBACK_FRAME_RE.match(raw_line):
+            skip_frame_source = True
+            continue
+        if skip_frame_source:
+            skip_frame_source = False
+            if raw_line[:1].isspace() or stripped.startswith("^"):
+                continue
+        if stripped in {
+            "During handling of the above exception, another exception occurred:",
+            "The above exception was the direct cause of the following exception:",
+        }:
+            continue
+        if not lines or lines[-1] != stripped:
+            lines.append(stripped)
+
+    if not lines:
+        return ""
+    if len(lines) <= max_lines:
+        return "; ".join(lines)
+
+    final_index = len(lines) - 1
+    scored: list[tuple[int, int]] = []
+    for index, line in enumerate(lines[:-1]):
+        score = 0
+        if _ERROR_CONTEXT_RE.search(line):
+            score += 4
+        if _PATH_HINT_RE.search(line):
+            score += 3
+        if _ERROR_REASON_RE.search(line):
+            score += 2
+        if score:
+            scored.append((score, index))
+
+    selected = {final_index}
+    for _score, index in sorted(scored, key=lambda item: (-item[0], item[1])):
+        selected.add(index)
+        if len(selected) >= max_lines:
+            break
+
+    # 没有足够的显式标签时,补充最靠近错误开头的上下文。
+    if len(selected) < max_lines:
+        for index in range(final_index):
+            selected.add(index)
+            if len(selected) >= max_lines:
+                break
+
+    return "; ".join(lines[index] for index in sorted(selected))
+
+
+def _truncate_error_part(text: str, max_len: int) -> str:
+    """截断单段错误文本时同时保留开头类型和末尾原因。"""
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    available = max_len - 3
+    head_len = (available + 1) // 2
+    tail_len = available - head_len
+    if tail_len <= 0:
+        return f"{text[:head_len]}..."
+    return f"{text[:head_len].rstrip()}...{text[-tail_len:].lstrip()}"
+
+
+def _limit_error_summary(text: str, max_len: int) -> str:
+    """限长时分别保留上下文目标和末尾异常类型、原因。"""
+    if len(text) <= max_len:
+        return text
+    if max_len <= 0:
+        return ""
+
+    # 摘要末段通常是异常类型和原因,单独分配空间可避免被长上下文挤掉。
+    if "; " in text and max_len >= 24:
+        context, reason = text.rsplit("; ", 1)
+        available = max_len - 2
+        context_len = available // 2
+        reason_len = available - context_len
+        return (
+            f"{_truncate_error_part(context, context_len)}; "
+            f"{_truncate_error_part(reason, reason_len)}"
+        )
+    return _truncate_error_part(text, max_len)
 
 
 def _sanitize_error_message(
@@ -155,12 +266,11 @@ def _sanitize_error_message(
 ) -> str:
     """把底层异常转成可给模型看的短错误信息。
 
-    做四件事,避免把敏感信息放进模型上下文:
-      1. 多行 traceback 简短化 —— 只保留最后一个非空摘要行
-      2. 密钥脱敏 —— sk-xxx / api_key=xxx / token=xxx → ``<secret>``
-      3. 路径脱敏 —— 工作区内保相对路径,工作区外只留文件名,
-         .env / .ssh / id_rsa 等敏感路径完全隐藏
-      4. 限长 —— 超过 max_len 截断
+    做四件事:
+      1. 折叠 traceback 栈帧,保留一至三行错误原因和关键上下文
+      2. 只替换明确凭证值,保留字段名
+      3. 工作区内绝对路径规范化为相对路径,外部路径保持原样
+      4. 从首尾共同限长,保留操作目标和末尾错误原因
 
     workspace_root 默认用 os.getcwd() 兜底,不阻塞修复。
     """
@@ -170,28 +280,28 @@ def _sanitize_error_message(
         except Exception:
             workspace_root = None
 
-    text = exc if isinstance(exc, str) else str(exc)
+    if isinstance(exc, str):
+        text = exc
+    else:
+        detail = str(exc)
+        error_name = type(exc).__name__
+        text = f"{error_name}: {detail}" if detail else error_name
 
-    # 多行 traceback 只保留最后一个非空行(通常是异常类型 + 消息)
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if lines:
-        text = lines[-1]
+    text = _extract_error_summary(text)
+    text = _redact_explicit_secret_values(text)
 
-    # 脱敏密钥 / token / password
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub("<secret>", text)
-
-    # Windows / Unix 绝对路径:工作区内保相对,工作区外脱敏
+    # 路径只做工作区相对化,不再按关键词或工作区边界隐藏。
     text = _WINDOWS_ABS_PATH_RE.sub(
-        lambda m: _sanitize_path_text(m.group(0), workspace_root), text,
+        lambda match: _normalize_path_text(match.group(0), workspace_root),
+        text,
     )
     text = _UNIX_ABS_PATH_RE.sub(
-        lambda m: _sanitize_path_text(m.group(0), workspace_root), text,
+        lambda match: _normalize_path_text(match.group(0), workspace_root),
+        text,
     )
 
-    if len(text) > max_len:
-        text = text[:max_len] + "..."
-    return text or "Tool execution failed."
+    text = text or "Tool execution failed."
+    return _limit_error_summary(text, max_len)
 
 
 def _short_error(exc) -> str:
