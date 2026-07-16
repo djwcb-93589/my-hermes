@@ -80,6 +80,113 @@ def _disabled_tool_result(tool_name: str) -> tuple[str, str, str]:
     )
 
 
+def _normalize_async_resume_state(value: dict | None) -> dict:
+    """校验 Gateway 审批保存的最小异步循环状态。"""
+    state = {
+        "iterations_used": 0,
+        "retry_count": 0,
+        "continuation_count": 0,
+        "using_fallback": False,
+        "active_model": "",
+    }
+    if value is not None:
+        if not isinstance(value, dict):
+            raise ValueError("approval resume state must contain an object")
+        state.update(value)
+    for field in ("iterations_used", "retry_count", "continuation_count"):
+        raw = state.get(field)
+        if isinstance(raw, bool):
+            raise ValueError(f"approval resume state {field} is invalid")
+        normalized = int(raw)
+        if normalized < 0:
+            raise ValueError(f"approval resume state {field} is invalid")
+        state[field] = normalized
+    if not isinstance(state.get("using_fallback"), bool):
+        raise ValueError("approval resume fallback state is invalid")
+    if not isinstance(state.get("active_model"), str):
+        raise ValueError("approval resume active model is invalid")
+    return state
+
+
+def _is_approval_placeholder(content: object, approval_id: str) -> bool:
+    if not isinstance(content, str):
+        return False
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("approval_required") is not True:
+        return False
+    request = payload.get("approval_request")
+    return isinstance(request, dict) and str(request.get("id", "")) == approval_id
+
+
+def validate_approval_resume_history(
+    messages: list[dict],
+    approval_id: str,
+    tool_call_id: str,
+) -> bool:
+    """验证审批恢复所依赖的 assistant/tool 历史是一组完整事实。"""
+    if not approval_id or not tool_call_id:
+        return False
+
+    target_assistants: list[tuple[int, list[str]]] = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        call_ids: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                return False
+            call_id = str(call.get("id", ""))
+            function = call.get("function")
+            if not call_id or not isinstance(function, dict):
+                return False
+            call_ids.append(call_id)
+        if len(call_ids) != len(set(call_ids)):
+            return False
+        if tool_call_id in call_ids:
+            target_assistants.append((index, call_ids))
+    if len(target_assistants) != 1:
+        return False
+
+    assistant_index, call_ids = target_assistants[0]
+    results_by_call: dict[str, list[tuple[int, dict]]] = {
+        call_id: [] for call_id in call_ids
+    }
+    for index, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        if _is_approval_placeholder(message.get("content"), approval_id):
+            return False
+        result_id = str(message.get("tool_call_id", ""))
+        if result_id in results_by_call:
+            results_by_call[result_id].append((index, message))
+
+    for call_id in call_ids:
+        results = results_by_call[call_id]
+        if len(results) != 1 or results[0][0] <= assistant_index:
+            return False
+    return True
+
+
+def _approval_resume_error_response(error_type: str) -> dict:
+    """构造不携带工具参数或结果正文的审批恢复内部错误。"""
+    return {
+        "final_response": f"(agent error: {error_type})",
+        "messages": [],
+        "ok": False,
+        "status": "error",
+        "error_type": error_type,
+        "fatal": True,
+        "retryable": False,
+        "approval_request": None,
+    }
+
+
 def _dispatch_conversation_tool_call(loop, tool_call):
     """主会话工具分发共享实现,供同步 / 异步循环复用。"""
     tool_name = tool_call.function.name
@@ -337,6 +444,8 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         cancel_checker=None,
         final_message_callback=None,
         persistence_call=None,
+        resume_from_history: bool = False,
+        resume_state: dict | None = None,
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
     ):
@@ -358,9 +467,12 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self.max_continuations = max_continuations
         self.compression_threshold = compression_threshold
         self._existing_messages = existing_messages
-        self._retry_count = 0
-        self._continuation_count = 0
-        self._using_fallback = False
+        self.resume_from_history = resume_from_history
+        restored_state = _normalize_async_resume_state(resume_state)
+        self._iterations_used_before = restored_state["iterations_used"]
+        self._retry_count = restored_state["retry_count"]
+        self._continuation_count = restored_state["continuation_count"]
+        self._using_fallback = restored_state["using_fallback"]
         # 空集合是 Gateway 的硬边界：伪造 tool call 也不能触达 registry。
         self.allowed_tool_names = (
             None
@@ -373,11 +485,34 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self.persistence_call = persistence_call
         # fallback 客户端由本循环创建,结束时单独关闭;主客户端归 Runner 管理。
         self._fallback_client = None
+        active_model = restored_state["active_model"]
+        if self._using_fallback:
+            fallback_client, fallback_model = switch_to_async_fallback()
+            if fallback_client is None:
+                raise RuntimeError("approval resume fallback is unavailable")
+            self.client = fallback_client
+            self.model = active_model or fallback_model
+            self._fallback_client = fallback_client
+        elif active_model:
+            self.model = active_model
 
     def init_messages(self, user_message: str) -> list[dict]:
+        if self.resume_from_history:
+            return list(self._existing_messages)
+
         return list(self._existing_messages) + [
             {"role": "user", "content": user_message},
         ]
+
+    def export_resume_state(self) -> dict:
+        """导出下一次审批恢复需要的最小可序列化状态。"""
+        return {
+            "iterations_used": self._iterations_used_before + self.iterations,
+            "retry_count": self._retry_count,
+            "continuation_count": self._continuation_count,
+            "using_fallback": self._using_fallback,
+            "active_model": self.model,
+        }
 
     async def pre_model_call(self, messages: list[dict]) -> list[dict]:
         if estimate_tokens(messages) >= self.compression_threshold:
@@ -665,10 +800,17 @@ async def run_conversation_async(
     async_client=None,
     final_message_callback=None,
     persistence_call=None,
+    resume_from_history: bool = False,
+    approval_resume_id: str | None = None,
+    approval_tool_call_id: str | None = None,
+    resume_state: dict | None = None,
     enabled_toolsets: list[str] | None = None,
     tool_context: dict | None = None,
 ) -> dict:
-    """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。"""
+    """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。
+
+    历史恢复模式不会把 ``user_message`` 创建或持久化为模型消息。
+    """
     owns_client = async_client is None
     if async_client is None:
         async_client = create_async_client()
@@ -676,52 +818,86 @@ async def run_conversation_async(
     loop = None
     try:
         try:
-            user_msg = {"role": "user", "content": user_message}
+            normalized_resume_state = _normalize_async_resume_state(
+                resume_state if resume_from_history else None
+            )
+        except (TypeError, ValueError):
+            return _approval_resume_error_response(
+                "invalid_approval_resume_state"
+            )
+        try:
             if persistence_call is None:
                 existing = get_gateway_visible_session_messages(
                     conn,
                     session_id,
                 )
-                add_messages(conn, session_id, [user_msg])
+                if not resume_from_history:
+                    user_msg = {"role": "user", "content": user_message}
+                    add_messages(conn, session_id, [user_msg])
             else:
                 existing = await persistence_call(
                     get_gateway_visible_session_messages,
                     session_id,
                 )
-                await persistence_call(
-                    add_messages,
-                    session_id,
-                    [user_msg],
-                )
+                if not resume_from_history:
+                    user_msg = {"role": "user", "content": user_message}
+                    await persistence_call(
+                        add_messages,
+                        session_id,
+                        [user_msg],
+                    )
         except Exception as exc:
             return _persistence_error_response(exc)
+
+        if resume_from_history and not validate_approval_resume_history(
+            existing,
+            str(approval_resume_id or ""),
+            str(approval_tool_call_id or ""),
+        ):
+            return _approval_resume_error_response(
+                "invalid_approval_resume_history"
+            )
 
         tools, allowed_tool_names = _select_conversation_tools(
             enabled_toolsets
         )
-        loop = AsyncConversationAgentLoop(
-            model=MODEL,
-            max_iterations=MAX_ITERATIONS,
-            tools=tools,
-            system_prompt=cached_prompt,
-            registry=registry,
-            client=async_client,
-            session_key=session_key or session_id,
-            conn=conn,
-            db_session_id=session_id,
-            existing_messages=existing,
-            max_retries=MAX_RETRIES,
-            max_continuations=MAX_CONTINUATIONS,
-            compression_threshold=COMPRESSION_THRESHOLD,
-            model_kwargs=None,
-            cancel_checker=cancel_checker,
-            final_message_callback=final_message_callback,
-            persistence_call=persistence_call,
-            allowed_tool_names=allowed_tool_names,
-            tool_context=tool_context,
+        remaining_iterations = max(
+            0,
+            MAX_ITERATIONS - normalized_resume_state["iterations_used"],
         )
+        try:
+            loop = AsyncConversationAgentLoop(
+                model=MODEL,
+                max_iterations=remaining_iterations,
+                tools=tools,
+                system_prompt=cached_prompt,
+                registry=registry,
+                client=async_client,
+                session_key=session_key or session_id,
+                conn=conn,
+                db_session_id=session_id,
+                existing_messages=existing,
+                max_retries=MAX_RETRIES,
+                max_continuations=MAX_CONTINUATIONS,
+                compression_threshold=COMPRESSION_THRESHOLD,
+                model_kwargs=None,
+                cancel_checker=cancel_checker,
+                final_message_callback=final_message_callback,
+                persistence_call=persistence_call,
+                resume_from_history=resume_from_history,
+                resume_state=normalized_resume_state,
+                allowed_tool_names=allowed_tool_names,
+                tool_context=tool_context,
+            )
+        except RuntimeError:
+            return _approval_resume_error_response(
+                "approval_resume_fallback_unavailable"
+            )
         result: AgentLoopResult = await loop.run(user_message)
-        return _conversation_result_response(result)
+        response = _conversation_result_response(result)
+        if result.status == "awaiting_approval":
+            response["agent_state"] = loop.export_resume_state()
+        return response
     finally:
         if loop is not None:
             await loop.close()

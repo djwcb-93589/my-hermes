@@ -24,7 +24,15 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 14
+LATEST_SCHEMA_VERSION = 15
+
+_DEFAULT_GATEWAY_APPROVAL_AGENT_STATE = {
+    "iterations_used": 0,
+    "retry_count": 0,
+    "continuation_count": 0,
+    "using_fallback": False,
+    "active_model": "",
+}
 
 GATEWAY_APPROVAL_STATUSES = frozenset({
     "pending",
@@ -142,6 +150,10 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
             message_id TEXT NOT NULL,
             event_json TEXT NOT NULL,
             status TEXT NOT NULL,
+            task_kind TEXT NOT NULL DEFAULT 'external' CHECK (
+                task_kind IN ('external', 'approval_resume')
+            ),
+            approval_id TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             UNIQUE(route_key, message_id)
@@ -150,12 +162,17 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_gateway_message_queue_status
             ON gateway_message_queue(status, id);
 
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_approval_resume_task
+            ON gateway_message_queue(approval_id)
+            WHERE task_kind='approval_resume';
+
         -- Gateway 已生成但尚未完整送达平台的回复。payloads_json 保存已经
         -- 确定格式和 UUID 的分片,重启后不能重新切分或重新生成 UUID。
         CREATE TABLE IF NOT EXISTS gateway_outbox (
             id TEXT PRIMARY KEY,
             route_key TEXT NOT NULL,
             source_message_id TEXT NOT NULL,
+            queue_message_id TEXT NOT NULL,
             event_json TEXT NOT NULL,
             platform TEXT NOT NULL,
             chat_id TEXT NOT NULL,
@@ -452,6 +469,8 @@ def _create_gateway_approval_schema(conn: sqlite3.Connection) -> None:
             ),
             decision_message_id TEXT,
             result_content TEXT,
+            source_event_json TEXT NOT NULL,
+            agent_state_json TEXT NOT NULL,
             created_at REAL NOT NULL,
             expires_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -1309,6 +1328,74 @@ def _migrate_v12_to_v13(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v14_to_v15(conn: sqlite3.Connection) -> None:
+    """为审批恢复补充可信队列身份、原始事件和最小循环状态。"""
+    queue_columns = _table_columns(conn, "gateway_message_queue")
+    if "task_kind" not in queue_columns:
+        conn.execute(
+            "ALTER TABLE gateway_message_queue "
+            "ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'external' "
+            "CHECK (task_kind IN ('external', 'approval_resume'))"
+        )
+    if "approval_id" not in queue_columns:
+        conn.execute(
+            "ALTER TABLE gateway_message_queue ADD COLUMN approval_id TEXT"
+        )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_approval_resume_task
+        ON gateway_message_queue(approval_id)
+        WHERE task_kind='approval_resume'
+        """
+    )
+
+    outbox_columns = _table_columns(conn, "gateway_outbox")
+    if "queue_message_id" not in outbox_columns:
+        conn.execute(
+            "ALTER TABLE gateway_outbox "
+            "ADD COLUMN queue_message_id TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        """
+        UPDATE gateway_outbox
+        SET queue_message_id=source_message_id
+        WHERE queue_message_id IS NULL OR queue_message_id=''
+        """
+    )
+
+    approval_columns = _table_columns(conn, "gateway_approval_requests")
+    if "source_event_json" not in approval_columns:
+        conn.execute(
+            "ALTER TABLE gateway_approval_requests "
+            "ADD COLUMN source_event_json TEXT"
+        )
+    if "agent_state_json" not in approval_columns:
+        conn.execute(
+            """
+            ALTER TABLE gateway_approval_requests
+            ADD COLUMN agent_state_json TEXT NOT NULL DEFAULT
+            '{"iterations_used":0,"retry_count":0,"continuation_count":0,"using_fallback":false,"active_model":""}'
+            """
+        )
+
+    # v14 审批问题的 Outbox 保存了原始事件；尽力回填仍在审计表中的旧请求。
+    conn.execute(
+        """
+        UPDATE gateway_approval_requests AS approval
+        SET source_event_json=(
+            SELECT outbox.event_json
+            FROM gateway_outbox AS outbox
+            WHERE outbox.route_key=approval.route_key
+              AND outbox.source_message_id=approval.source_message_id
+              AND outbox.delivery_kind='approval_request'
+            ORDER BY outbox.created_at DESC, outbox.id DESC
+            LIMIT 1
+        )
+        WHERE source_event_json IS NULL OR source_event_json=''
+        """
+    )
+
+
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
@@ -1320,7 +1407,7 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     v9 → v10 正式接管 Feishu Inbox schema，v10 → v11 持久化 Inbox
     route_key，v11 → v12 增加运行租约 epoch 与 Outbox claim fencing，
     v12 → v13 保存每条 route 的历史 conversation 归属，v13 → v14
-    增加与 Tool Result 绑定的远程审批请求。
+    增加与 Tool Result 绑定的远程审批请求，v14 → v15 增加持久化审批恢复。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -1577,6 +1664,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
             conn.commit()
             current = 14
 
+    if current < 15:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v14_to_v15(conn)
+            _set_schema_version(conn, 15)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 15
+
     return current
 
 
@@ -1639,13 +1738,14 @@ def reconcile_gateway_terminal_deliveries(
             return 0
         rows = conn.execute(
             """
-            SELECT o.id, o.route_key, o.source_message_id, o.status,
+            SELECT o.id, o.route_key, o.source_message_id,
+                   o.queue_message_id, o.status,
                    o.next_chunk_index, o.payloads_json,
                    q.status, o.event_json
             FROM gateway_outbox AS o
             LEFT JOIN gateway_message_queue AS q
               ON q.route_key=o.route_key
-             AND q.message_id=o.source_message_id
+             AND q.message_id=o.queue_message_id
             WHERE (
                 o.status IN (
                     'delivered', 'permanent_failed',
@@ -1666,6 +1766,7 @@ def reconcile_gateway_terminal_deliveries(
             outbox_id,
             route_key,
             source_message_id,
+            queue_message_id,
             stored_status,
             next_chunk_index,
             payloads_json,
@@ -1733,23 +1834,24 @@ def reconcile_gateway_terminal_deliveries(
             )
             if queue_status == "reply_pending":
                 if status == "permanent_failed":
-                    conn.execute(
-                        """
-                        UPDATE gateway_message_queue
-                        SET status='delivery_failed', updated_at=?
-                        WHERE route_key=? AND message_id=?
-                          AND status='reply_pending'
-                        """,
-                        (now, route_key, source_message_id),
+                    _finish_gateway_queue_for_delivery(
+                        conn,
+                        str(route_key),
+                        str(queue_message_id),
+                        status="delivery_failed",
+                        now=now,
                     )
                 else:
-                    conn.execute(
-                        """
-                        DELETE FROM gateway_message_queue
-                        WHERE route_key=? AND message_id=?
-                          AND status='reply_pending'
-                        """,
-                        (route_key, source_message_id),
+                    _finish_gateway_queue_for_delivery(
+                        conn,
+                        str(route_key),
+                        str(queue_message_id),
+                        status=(
+                            "cancelled"
+                            if status in {"cancelled", "partial_cancelled"}
+                            else "completed"
+                        ),
+                        now=now,
                     )
             reconciled += 1
     return reconciled
@@ -2577,7 +2679,8 @@ def prune_gateway_terminal_outbox(
     with _immediate_transaction(conn):
         rows = conn.execute(
             """
-            SELECT outbox.id, outbox.route_key, outbox.source_message_id
+            SELECT outbox.id, outbox.route_key, outbox.source_message_id,
+                   outbox.queue_message_id
             FROM gateway_outbox AS outbox
             WHERE outbox.updated_at < ?
               AND outbox.status IN (
@@ -2588,7 +2691,7 @@ def prune_gateway_terminal_outbox(
                   SELECT 1
                   FROM gateway_message_queue AS queue
                   WHERE queue.route_key=outbox.route_key
-                    AND queue.message_id=outbox.source_message_id
+                    AND queue.message_id=outbox.queue_message_id
                     AND queue.status IN (
                         'queued', 'processing', 'reply_pending'
                     )
@@ -2605,7 +2708,7 @@ def prune_gateway_terminal_outbox(
             (cutoff, batch_limit),
         ).fetchall()
         removed = 0
-        for outbox_id, route_key, source_message_id in rows:
+        for outbox_id, route_key, source_message_id, queue_message_id in rows:
             delivery = conn.execute(
                 """
                 SELECT assistant_message_id, status
@@ -2631,7 +2734,7 @@ def prune_gateway_terminal_outbox(
                 WHERE route_key=? AND message_id=?
                   AND status='delivery_failed'
                 """,
-                (str(route_key), str(source_message_id)),
+                (str(route_key), str(queue_message_id)),
             )
             cursor = conn.execute(
                 """
@@ -3158,66 +3261,102 @@ def get_gateway_conversation_for_route(
     return _gateway_conversation_summary(row) if row is not None else None
 
 
+def _enqueue_gateway_message_in_transaction(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_id: str,
+    event_json: str,
+    *,
+    task_kind: str,
+    approval_id: str | None,
+) -> bool:
+    """在调用方事务内写入 Runner queue 与原始消息归属。"""
+    if task_kind not in {"external", "approval_resume"}:
+        raise DBError("invalid gateway queue task kind")
+    if task_kind == "approval_resume" and not approval_id:
+        raise DBError("approval resume queue task is missing approval id")
+    if task_kind == "external" and approval_id is not None:
+        raise DBError("external gateway queue task cannot bind an approval")
+
+    incoming_source_ids = gateway_event_source_message_ids(
+        event_json,
+        message_id,
+    )
+    now = time.time()
+    placeholders = ",".join("?" for _ in incoming_source_ids)
+    existing_owners = conn.execute(
+        f"""
+        SELECT source_message_id, owner_kind, owner_id
+        FROM gateway_source_message_ownership
+        WHERE route_key=?
+          AND source_message_id IN ({placeholders})
+        """,
+        (route_key, *incoming_source_ids),
+    ).fetchall()
+    for _source_message_id, owner_kind, owner_id in existing_owners:
+        if str(owner_kind) == "outbox" or str(owner_id) != message_id:
+            return False
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO gateway_message_queue (
+            route_key, message_id, event_json, status, task_kind,
+            approval_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
+        """,
+        (
+            route_key,
+            message_id,
+            event_json,
+            task_kind,
+            approval_id,
+            now,
+            now,
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT event_json, status, created_at, updated_at
+        FROM gateway_message_queue
+        WHERE route_key=? AND message_id=?
+        """,
+        (route_key, message_id),
+    ).fetchone()
+    if row is None:
+        raise DBError("gateway queue insert did not create a row")
+    source_message_ids = gateway_event_source_message_ids(
+        str(row[0]),
+        message_id,
+    )
+    _upsert_gateway_source_message_ownership(
+        conn,
+        route_key,
+        source_message_ids,
+        owner_kind="queue",
+        owner_id=message_id,
+        status=str(row[1]),
+        created_at=float(row[2]),
+        updated_at=float(row[3]),
+    )
+    return True
+
+
 def enqueue_gateway_message(
     conn: sqlite3.Connection,
     route_key: str,
     message_id: str,
     event_json: str,
 ) -> bool:
-    """原子写入 Runner queue 与全部原始消息的 Queue 归属。"""
-    incoming_source_ids = gateway_event_source_message_ids(
-        event_json,
-        message_id,
-    )
-    now = time.time()
+    """原子写入外部 Runner queue 与全部原始消息的 Queue 归属。"""
     with transaction(conn):
-        placeholders = ",".join("?" for _ in incoming_source_ids)
-        existing_owners = conn.execute(
-            f"""
-            SELECT source_message_id, owner_kind, owner_id
-            FROM gateway_source_message_ownership
-            WHERE route_key=?
-              AND source_message_id IN ({placeholders})
-            """,
-            (route_key, *incoming_source_ids),
-        ).fetchall()
-        for _source_message_id, owner_kind, owner_id in existing_owners:
-            if str(owner_kind) == "outbox" or str(owner_id) != message_id:
-                return False
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO gateway_message_queue
-                (route_key, message_id, event_json, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'queued', ?, ?)
-            """,
-            (route_key, message_id, event_json, now, now),
-        )
-        row = conn.execute(
-            """
-            SELECT event_json, status, created_at, updated_at
-            FROM gateway_message_queue
-            WHERE route_key=? AND message_id=?
-            """,
-            (route_key, message_id),
-        ).fetchone()
-        if row is None:
-            raise DBError("gateway queue insert did not create a row")
-        source_message_ids = gateway_event_source_message_ids(
-            str(row[0]),
-            message_id,
-        )
-        _upsert_gateway_source_message_ownership(
+        return _enqueue_gateway_message_in_transaction(
             conn,
             route_key,
-            source_message_ids,
-            owner_kind="queue",
-            owner_id=message_id,
-            status=str(row[1]),
-            created_at=float(row[2]),
-            updated_at=float(row[3]),
+            message_id,
+            event_json,
+            task_kind="external",
+            approval_id=None,
         )
-    return True
 
 
 def _update_gateway_source_message_ownership_status(
@@ -3456,7 +3595,7 @@ def get_gateway_queued_messages(conn: sqlite3.Connection) -> list[dict]:
     """返回仍需调用模型的消息;等待投递的消息由 outbox 单独恢复。"""
     rows = conn.execute(
         """
-        SELECT route_key, message_id, event_json, status
+        SELECT route_key, message_id, event_json, status, task_kind, approval_id
         FROM gateway_message_queue
         WHERE status IN ('queued', 'processing')
         ORDER BY id
@@ -3468,8 +3607,17 @@ def get_gateway_queued_messages(conn: sqlite3.Connection) -> list[dict]:
             "message_id": message_id,
             "event_json": event_json,
             "status": status,
+            "task_kind": task_kind,
+            "approval_id": approval_id,
         }
-        for route_key, message_id, event_json, status in rows
+        for (
+            route_key,
+            message_id,
+            event_json,
+            status,
+            task_kind,
+            approval_id,
+        ) in rows
     ]
 
 
@@ -3534,10 +3682,14 @@ def _insert_gateway_outbox(
         lease_epoch,
     )
     now = time.time()
+    queue_message_id = str(
+        outbox.get("queue_message_id") or outbox["source_message_id"]
+    )
     values = (
         str(outbox["id"]),
         str(outbox["route_key"]),
         str(outbox["source_message_id"]),
+        queue_message_id,
         str(outbox["event_json"]),
         str(outbox["platform"]),
         str(outbox["chat_id"]),
@@ -3552,12 +3704,13 @@ def _insert_gateway_outbox(
         conn.execute(
             """
             INSERT OR IGNORE INTO gateway_outbox (
-                id, route_key, source_message_id, event_json, platform,
+                id, route_key, source_message_id, queue_message_id,
+                event_json, platform,
                 chat_id, reply_to_message_id, thread_id, delivery_kind,
                 payloads_json, next_chunk_index, message_ids_json, status,
                 attempt_count, next_attempt_at, last_error, last_error_code,
                 claimed_by, claim_epoch, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
                       NULL, NULL, NULL, NULL, NULL, ?, ?)
             """,
             values,
@@ -3568,13 +3721,14 @@ def _insert_gateway_outbox(
         conn.execute(
             """
             INSERT OR IGNORE INTO gateway_outbox (
-                id, route_key, source_message_id, event_json, platform,
+                id, route_key, source_message_id, queue_message_id,
+                event_json, platform,
                 chat_id, reply_to_message_id, thread_id, delivery_kind,
                 payloads_json, next_chunk_index, message_ids_json, status,
                 attempt_count, next_attempt_at, last_error, last_error_code,
                 claimed_by, claim_epoch, created_at, updated_at
             )
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', 'pending', 0,
                    NULL, NULL, NULL, NULL, NULL, ?, ?
             WHERE EXISTS (
                 SELECT 1
@@ -3596,7 +3750,7 @@ def _insert_gateway_outbox(
         fence_params = (fence[0], fence[1], fence[2], now)
     row = conn.execute(
         f"""
-        SELECT id, event_json, status, created_at, updated_at
+        SELECT id, event_json, status, created_at, updated_at, queue_message_id
         FROM gateway_outbox
         WHERE route_key=? AND source_message_id=? AND delivery_kind=?
         {fence_clause}
@@ -3611,6 +3765,8 @@ def _insert_gateway_outbox(
     if row is None:
         raise DBError("gateway outbox insert did not create a row")
     outbox_id = str(row[0])
+    if str(row[5]) != queue_message_id:
+        raise DBError("gateway outbox queue identity mismatch")
     source_message_ids = gateway_event_source_message_ids(
         str(row[1]),
         str(outbox["source_message_id"]),
@@ -3645,17 +3801,12 @@ def enqueue_gateway_outbox(
             instance_id=instance_id,
             lease_epoch=lease_epoch,
         )
-        conn.execute(
-            """
-            UPDATE gateway_message_queue
-            SET status='reply_pending', updated_at=?
-            WHERE route_key=? AND message_id=?
-            """,
-            (
-                time.time(),
-                str(outbox["route_key"]),
-                str(outbox["source_message_id"]),
-            ),
+        _set_gateway_queue_status(
+            conn,
+            str(outbox["route_key"]),
+            str(outbox.get("queue_message_id") or outbox["source_message_id"]),
+            "reply_pending",
+            time.time(),
         )
     return outbox_id
 
@@ -3667,6 +3818,7 @@ def _gateway_outbox_row(row) -> dict | None:
         outbox_id,
         route_key,
         source_message_id,
+        queue_message_id,
         event_json,
         platform,
         chat_id,
@@ -3695,6 +3847,7 @@ def _gateway_outbox_row(row) -> dict | None:
         "id": str(outbox_id),
         "route_key": str(route_key),
         "source_message_id": str(source_message_id),
+        "queue_message_id": str(queue_message_id),
         "event_json": str(event_json),
         "platform": str(platform),
         "chat_id": str(chat_id),
@@ -3715,7 +3868,7 @@ def _gateway_outbox_row(row) -> dict | None:
 
 
 _GATEWAY_OUTBOX_COLUMNS = """
-    id, route_key, source_message_id, event_json, platform, chat_id,
+    id, route_key, source_message_id, queue_message_id, event_json, platform, chat_id,
     reply_to_message_id, thread_id, delivery_kind, payloads_json,
     next_chunk_index, message_ids_json, status, attempt_count,
     next_attempt_at, last_error, last_error_code, claimed_by, claim_epoch
@@ -3757,9 +3910,10 @@ def get_recoverable_gateway_outbox(
                 "id": str(row[0]),
                 "route_key": str(row[1]),
                 "source_message_id": str(row[2]),
-                "event_json": str(row[3]),
-                "platform": str(row[4]),
-                "status": str(row[12]),
+                "queue_message_id": str(row[3]),
+                "event_json": str(row[4]),
+                "platform": str(row[5]),
+                "status": str(row[13]),
                 "recovery_error": type(exc).__name__,
             })
     return recovered
@@ -4098,7 +4252,7 @@ def _gateway_terminal_outbox_row(
 ):
     return conn.execute(
         """
-        SELECT route_key, source_message_id, status,
+        SELECT route_key, source_message_id, queue_message_id, status,
                next_chunk_index, payloads_json, event_json,
                claimed_by, claim_epoch
         FROM gateway_outbox
@@ -4106,6 +4260,55 @@ def _gateway_terminal_outbox_row(
         """,
         (outbox_id,),
     ).fetchone()
+
+
+def _finish_gateway_queue_for_delivery(
+    conn: sqlite3.Connection,
+    route_key: str,
+    queue_message_id: str,
+    *,
+    status: str,
+    now: float,
+) -> None:
+    """在 Outbox 终态事务内同步其实际关联的 Queue 任务。"""
+    row = conn.execute(
+        """
+        SELECT event_json
+        FROM gateway_message_queue
+        WHERE route_key=? AND message_id=?
+        """,
+        (route_key, queue_message_id),
+    ).fetchone()
+    if row is None:
+        return
+    if status == "delivery_failed":
+        _set_gateway_queue_status(
+            conn,
+            route_key,
+            queue_message_id,
+            "delivery_failed",
+            now,
+        )
+        return
+
+    ownership_status = "cancelled" if status == "cancelled" else "completed"
+    _update_gateway_source_message_ownership_status(
+        conn,
+        route_key=route_key,
+        event_json=str(row[0]),
+        fallback_message_id=queue_message_id,
+        owner_kind="queue",
+        owner_id=queue_message_id,
+        status=ownership_status,
+        updated_at=now,
+    )
+    conn.execute(
+        """
+        DELETE FROM gateway_message_queue
+        WHERE route_key=? AND message_id=?
+        """,
+        (route_key, queue_message_id),
+    )
 
 
 def _validate_gateway_delivery_identity(
@@ -4148,7 +4351,7 @@ def complete_gateway_delivery(
             route_key,
             source_message_id,
         )
-        old_status = str(row[2])
+        old_status = str(row[3])
         if old_status not in {
             "pending",
             "sending",
@@ -4158,14 +4361,14 @@ def complete_gateway_delivery(
         }:
             return False
         try:
-            payloads = json.loads(row[4])
+            payloads = json.loads(row[5])
         except (TypeError, ValueError) as exc:
             raise DBError(
                 f"gateway outbox JSON deserialization failed: {exc}"
             ) from exc
         if not isinstance(payloads, list):
             raise DBError("gateway outbox payloads JSON has invalid structure")
-        if int(row[3]) < len(payloads):
+        if int(row[4]) < len(payloads):
             return False
 
         claim_clause, claim_params = _gateway_outbox_claim_clause(fence, now)
@@ -4201,16 +4404,16 @@ def complete_gateway_delivery(
             outbox_id=outbox_id,
             route_key=route_key,
             source_message_id=source_message_id,
-            event_json=str(row[5]),
+            event_json=str(row[6]),
             status="delivered",
             updated_at=now,
         )
-        conn.execute(
-            """
-            DELETE FROM gateway_message_queue
-            WHERE route_key=? AND message_id=?
-            """,
-            (route_key, source_message_id),
+        _finish_gateway_queue_for_delivery(
+            conn,
+            route_key,
+            str(row[2]),
+            status="completed",
+            now=now,
         )
     return True
 
@@ -4246,7 +4449,7 @@ def fail_gateway_delivery(
             route_key,
             source_message_id,
         )
-        old_status = str(row[2])
+        old_status = str(row[3])
         if old_status not in {"pending", "sending", "retry_wait"}:
             return False
         claim_clause, claim_params = _gateway_outbox_claim_clause(fence, now)
@@ -4284,17 +4487,16 @@ def fail_gateway_delivery(
             outbox_id=outbox_id,
             route_key=route_key,
             source_message_id=source_message_id,
-            event_json=str(row[5]),
+            event_json=str(row[6]),
             status="permanent_failed",
             updated_at=now,
         )
-        conn.execute(
-            """
-            UPDATE gateway_message_queue
-            SET status='delivery_failed', updated_at=?
-            WHERE route_key=? AND message_id=?
-            """,
-            (now, route_key, source_message_id),
+        _finish_gateway_queue_for_delivery(
+            conn,
+            route_key,
+            str(row[2]),
+            status="delivery_failed",
+            now=now,
         )
     return True
 
@@ -4326,7 +4528,7 @@ def cancel_gateway_delivery(
             route_key,
             source_message_id,
         )
-        old_status = str(row[2])
+        old_status = str(row[3])
         if old_status not in {
             "pending",
             "sending",
@@ -4336,8 +4538,8 @@ def cancel_gateway_delivery(
         }:
             return False
         status = _infer_cancelled_gateway_outbox_status(
-            int(row[3]),
-            str(row[4]),
+            int(row[4]),
+            str(row[5]),
         )
         if status == old_status:
             return False
@@ -4388,16 +4590,16 @@ def cancel_gateway_delivery(
             outbox_id=outbox_id,
             route_key=route_key,
             source_message_id=source_message_id,
-            event_json=str(row[5]),
+            event_json=str(row[6]),
             status=status,
             updated_at=now,
         )
-        conn.execute(
-            """
-            DELETE FROM gateway_message_queue
-            WHERE route_key=? AND message_id=?
-            """,
-            (route_key, source_message_id),
+        _finish_gateway_queue_for_delivery(
+            conn,
+            route_key,
+            str(row[2]),
+            status="cancelled",
+            now=now,
         )
     return True
 
@@ -4620,6 +4822,33 @@ def add_final_message_with_gateway_outbox(
             "gateway final delivery must reference an assistant message"
         )
     with transaction(conn):
+        queue_message_id = str(
+            outbox.get("queue_message_id") or outbox["source_message_id"]
+        )
+        existing = conn.execute(
+            """
+            SELECT id, queue_message_id
+            FROM gateway_outbox
+            WHERE route_key=? AND source_message_id=? AND delivery_kind=?
+            """,
+            (
+                str(outbox["route_key"]),
+                str(outbox["source_message_id"]),
+                str(outbox["delivery_kind"]),
+            ),
+        ).fetchone()
+        if existing is not None:
+            if str(existing[1]) != queue_message_id:
+                raise DBError("gateway final outbox queue identity mismatch")
+            _set_gateway_queue_status(
+                conn,
+                str(outbox["route_key"]),
+                queue_message_id,
+                "reply_pending",
+                time.time(),
+            )
+            return str(existing[0])
+
         assistant_message_id = _insert_message(conn, session_id, msg)
         outbox_id = _insert_gateway_outbox(
             conn,
@@ -4636,17 +4865,12 @@ def add_final_message_with_gateway_outbox(
             route_key=str(outbox["route_key"]),
             source_message_id=str(outbox["source_message_id"]),
         )
-        conn.execute(
-            """
-            UPDATE gateway_message_queue
-            SET status='reply_pending', updated_at=?
-            WHERE route_key=? AND message_id=?
-            """,
-            (
-                time.time(),
-                str(outbox["route_key"]),
-                str(outbox["source_message_id"]),
-            ),
+        _set_gateway_queue_status(
+            conn,
+            str(outbox["route_key"]),
+            str(outbox.get("queue_message_id") or outbox["source_message_id"]),
+            "reply_pending",
+            time.time(),
         )
     return outbox_id
 
@@ -4659,8 +4883,43 @@ _GATEWAY_APPROVAL_COLUMNS = """
     id, route_key, conversation_id, requester_user_id, source_message_id,
     tool_call_id, tool_message_id, tool_name, tool_args_json, summary,
     details_json, status, decision_message_id, result_content,
-    created_at, expires_at, updated_at
+    source_event_json, agent_state_json, created_at, expires_at, updated_at
 """
+
+
+def _normalize_gateway_approval_agent_state(value: dict | None) -> dict:
+    """校验并收敛可持久化的最小 AgentLoop 状态。"""
+    state = dict(_DEFAULT_GATEWAY_APPROVAL_AGENT_STATE)
+    if value is not None:
+        if not isinstance(value, dict):
+            raise DBError("gateway approval agent state must contain an object")
+        state.update(value)
+
+    for field in ("iterations_used", "retry_count", "continuation_count"):
+        raw = state.get(field)
+        if isinstance(raw, bool):
+            raise DBError(f"gateway approval agent state {field} is invalid")
+        try:
+            normalized = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise DBError(
+                f"gateway approval agent state {field} is invalid"
+            ) from exc
+        if normalized < 0:
+            raise DBError(f"gateway approval agent state {field} is invalid")
+        state[field] = normalized
+
+    if not isinstance(state.get("using_fallback"), bool):
+        raise DBError("gateway approval fallback state is invalid")
+    if not isinstance(state.get("active_model"), str):
+        raise DBError("gateway approval active model is invalid")
+    return {
+        "iterations_used": state["iterations_used"],
+        "retry_count": state["retry_count"],
+        "continuation_count": state["continuation_count"],
+        "using_fallback": state["using_fallback"],
+        "active_model": state["active_model"],
+    }
 
 
 def _gateway_approval_row(row) -> dict | None:
@@ -4670,10 +4929,12 @@ def _gateway_approval_row(row) -> dict | None:
     try:
         tool_args = json.loads(row[8])
         details = json.loads(row[10])
+        agent_state = json.loads(row[15])
     except (TypeError, ValueError) as exc:
         raise DBError(f"gateway approval JSON deserialization failed: {exc}") from exc
     if not isinstance(tool_args, dict) or not isinstance(details, dict):
         raise DBError("gateway approval JSON has invalid structure")
+    agent_state = _normalize_gateway_approval_agent_state(agent_state)
     return {
         "id": str(row[0]),
         "route_key": str(row[1]),
@@ -4693,9 +4954,13 @@ def _gateway_approval_row(row) -> dict | None:
         "result_content": (
             str(row[13]) if row[13] is not None else None
         ),
-        "created_at": float(row[14]),
-        "expires_at": float(row[15]),
-        "updated_at": float(row[16]),
+        "source_event_json": (
+            str(row[14]) if row[14] is not None else None
+        ),
+        "agent_state": agent_state,
+        "created_at": float(row[16]),
+        "expires_at": float(row[17]),
+        "updated_at": float(row[18]),
     }
 
 
@@ -4799,11 +5064,13 @@ def create_gateway_approval_with_outbox(
     outbox: dict,
     ttl_seconds: float,
     *,
+    agent_state: dict | None = None,
     lease_name: str | None = None,
     instance_id: str | None = None,
     lease_epoch: int | None = None,
 ) -> str:
     """原子写入审批请求、审批问题及其 Outbox。"""
+    outbox = dict(outbox)
     request_id = str(request.get("id", ""))
     tool_name = str(request.get("tool_name", ""))
     tool_call_id = str(request.get("tool_call_id", ""))
@@ -4819,12 +5086,43 @@ def create_gateway_approval_with_outbox(
         raise DBError("invalid gateway approval details")
     if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
         raise InvalidMessageError("approval delivery must reference an assistant message")
+    source_event_json = str(outbox.get("event_json", "") or "")
+    if not source_event_json:
+        raise DBError("gateway approval source event is missing")
+    source_message_id = str(outbox.get("source_message_id", "") or "")
+    source_ids = gateway_event_source_message_ids(
+        source_event_json,
+        source_message_id,
+    )
+    if source_message_id not in source_ids:
+        raise DBError("gateway approval source event identity mismatch")
+    normalized_agent_state = _normalize_gateway_approval_agent_state(agent_state)
+    encoded_tool_args = _serialize_gateway_json(tool_args, "approval tool args")
+    encoded_details = _serialize_gateway_json(details, "approval details")
+    encoded_agent_state = _serialize_gateway_json(
+        normalized_agent_state,
+        "approval agent state",
+    )
     ttl = float(ttl_seconds)
     if ttl <= 0:
         raise DBError("gateway approval ttl must be positive")
 
     now = time.time()
     with transaction(conn):
+        if str(outbox.get("delivery_kind", "")) == "approval_request":
+            first_request = conn.execute(
+                """
+                SELECT id
+                FROM gateway_approval_requests
+                WHERE route_key=? AND source_message_id=?
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (str(outbox["route_key"]), source_message_id),
+            ).fetchone()
+            if first_request is not None and str(first_request[0]) != request_id:
+                outbox["delivery_kind"] = f"approval_request:{request_id}"
+
         tool_row = conn.execute(
             """
             SELECT id, content
@@ -4838,27 +5136,71 @@ def create_gateway_approval_with_outbox(
         if tool_row is None or request_id not in str(tool_row[1] or ""):
             raise DBError("approval request is not bound to its tool result")
 
+        existing_row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_APPROVAL_COLUMNS}
+            FROM gateway_approval_requests
+            WHERE id=?
+            """,
+            (request_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _gateway_approval_row(existing_row)
+            if (
+                existing["route_key"] != str(outbox["route_key"])
+                or existing["conversation_id"] != session_id
+                or existing["source_message_id"] != source_message_id
+                or existing["tool_call_id"] != tool_call_id
+                or existing["tool_message_id"] != int(tool_row[0])
+                or existing["tool_name"] != tool_name
+                or existing["tool_args"] != tool_args
+                or existing["source_event_json"] != source_event_json
+                or existing["agent_state"] != normalized_agent_state
+            ):
+                raise DBError("gateway approval idempotency identity mismatch")
+            outbox_row = conn.execute(
+                """
+                SELECT id
+                FROM gateway_outbox
+                WHERE route_key=? AND source_message_id=?
+                  AND delivery_kind=?
+                """,
+                (
+                    str(outbox["route_key"]),
+                    source_message_id,
+                    str(outbox["delivery_kind"]),
+                ),
+            ).fetchone()
+            if outbox_row is None:
+                raise DBError("gateway approval is missing its outbox")
+            return str(outbox_row[0])
+
         conn.execute(
             """
             INSERT INTO gateway_approval_requests (
                 id, route_key, conversation_id, requester_user_id,
                 source_message_id, tool_call_id, tool_message_id, tool_name,
                 tool_args_json, summary, details_json, status,
+                source_event_json, agent_state_json,
                 created_at, expires_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?
+            )
             """,
             (
                 request_id,
                 str(outbox["route_key"]),
                 session_id,
                 str(requester_user_id or ""),
-                str(outbox["source_message_id"]),
+                source_message_id,
                 tool_call_id,
                 int(tool_row[0]),
                 tool_name,
-                _serialize_gateway_json(tool_args, "approval tool args"),
+                encoded_tool_args,
                 str(request.get("summary", "需要批准的工具操作")),
-                _serialize_gateway_json(details, "approval details"),
+                encoded_details,
+                source_event_json,
+                encoded_agent_state,
                 now,
                 now + ttl,
                 now,
@@ -4880,17 +5222,12 @@ def create_gateway_approval_with_outbox(
             route_key=str(outbox["route_key"]),
             source_message_id=str(outbox["source_message_id"]),
         )
-        conn.execute(
-            """
-            UPDATE gateway_message_queue
-            SET status='reply_pending', updated_at=?
-            WHERE route_key=? AND message_id=?
-            """,
-            (
-                now,
-                str(outbox["route_key"]),
-                str(outbox["source_message_id"]),
-            ),
+        _set_gateway_queue_status(
+            conn,
+            str(outbox["route_key"]),
+            str(outbox.get("queue_message_id") or source_message_id),
+            "reply_pending",
+            now,
         )
     return outbox_id
 
@@ -5068,6 +5405,214 @@ def finish_gateway_approval(
         request["status"] = final_status
         request["result_content"] = str(result_content)
         return request
+
+
+def _approval_resume_message_id(request_id: str) -> str:
+    normalized = str(request_id or "")
+    if not normalized.startswith("approval_"):
+        raise DBError("invalid gateway approval request id")
+    return f"approval-resume:{normalized}"
+
+
+def _build_gateway_approval_resume_event(
+    request: dict,
+) -> tuple[str, str]:
+    """从审批保存的原始事件构造最小内部恢复事件。"""
+    source_event_json = request.get("source_event_json")
+    if not isinstance(source_event_json, str) or not source_event_json:
+        raise DBError("gateway approval source event is unavailable")
+    try:
+        source_payload = json.loads(source_event_json)
+    except (TypeError, ValueError) as exc:
+        raise DBError("gateway approval source event is invalid") from exc
+    if not isinstance(source_payload, dict):
+        raise DBError("gateway approval source event must contain an object")
+    source = source_payload.get("source")
+    if not isinstance(source, dict):
+        raise DBError("gateway approval source identity is invalid")
+    if str(source_payload.get("message_id", "")) != request["source_message_id"]:
+        raise DBError("gateway approval source message identity mismatch")
+
+    message_id = _approval_resume_message_id(request["id"])
+    event = {
+        "message_id": message_id,
+        "text": "",
+        "message_type": "text",
+        "media_urls": [],
+        "reply_to_message_id": None,
+        "attachments": [],
+        "metadata": {
+            "gateway_internal_task": "approval_resume",
+            "approval_id": request["id"],
+        },
+        "source": dict(source),
+    }
+    return message_id, _serialize_gateway_json(event, "approval resume event")
+
+
+def _gateway_approval_resume_task_row(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_id: str,
+) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT event_json, status, task_kind, approval_id
+        FROM gateway_message_queue
+        WHERE route_key=? AND message_id=?
+        """,
+        (route_key, message_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "route_key": route_key,
+        "message_id": message_id,
+        "event_json": str(row[0]),
+        "status": str(row[1]),
+        "task_kind": str(row[2]),
+        "approval_id": str(row[3]) if row[3] is not None else None,
+    }
+
+
+def finish_gateway_approval_and_enqueue_resume(
+    conn: sqlite3.Connection,
+    request_id: str,
+    result_content: str,
+    *,
+    succeeded: bool,
+) -> dict:
+    """原子固化工具结果、审批终态和唯一的 history-only 恢复任务。"""
+    final_status = "executed" if succeeded else "failed"
+    with transaction(conn):
+        row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_APPROVAL_COLUMNS}
+            FROM gateway_approval_requests
+            WHERE id=?
+            """,
+            (request_id,),
+        ).fetchone()
+        request = _gateway_approval_row(row)
+        if request is None:
+            raise DBError("gateway approval request not found")
+
+        # 终态重复调用只返回已有事实，绝不重新创建已经完成的恢复任务。
+        if request["status"] in {"executed", "failed"}:
+            message_id = _approval_resume_message_id(request["id"])
+            return {
+                "approval": request,
+                "resume_task": _gateway_approval_resume_task_row(
+                    conn,
+                    request["route_key"],
+                    message_id,
+                ),
+                "already_finished": True,
+            }
+        if request["status"] != "executing":
+            raise DBError("gateway approval is not executing")
+
+        message_id, event_json = _build_gateway_approval_resume_event(request)
+        now = time.time()
+        conn.execute(
+            "UPDATE messages SET content=? WHERE id=?",
+            (str(result_content), request["tool_message_id"]),
+        )
+        changed = conn.execute(
+            """
+            UPDATE gateway_approval_requests
+            SET status=?, result_content=?, updated_at=?
+            WHERE id=? AND status='executing'
+            """,
+            (final_status, str(result_content), now, request_id),
+        ).rowcount
+        if changed != 1:
+            raise DBError("gateway approval terminal transition failed")
+
+        accepted = _enqueue_gateway_message_in_transaction(
+            conn,
+            request["route_key"],
+            message_id,
+            event_json,
+            task_kind="approval_resume",
+            approval_id=request["id"],
+        )
+        if not accepted:
+            raise DBError("gateway approval resume queue identity is occupied")
+        task = _gateway_approval_resume_task_row(
+            conn,
+            request["route_key"],
+            message_id,
+        )
+        if (
+            task is None
+            or task["task_kind"] != "approval_resume"
+            or task["approval_id"] != request["id"]
+            or task["event_json"] != event_json
+        ):
+            raise DBError("gateway approval resume task identity mismatch")
+
+        request["status"] = final_status
+        request["result_content"] = str(result_content)
+        request["updated_at"] = now
+        return {
+            "approval": request,
+            "resume_task": task,
+            "already_finished": False,
+        }
+
+
+def get_gateway_approval_resume(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+    message_id: str,
+    approval_id: str,
+) -> dict | None:
+    """验证数据库内部恢复任务与审批终态的完整绑定。"""
+    expected_message_id = _approval_resume_message_id(approval_id)
+    if str(message_id) != expected_message_id:
+        return None
+    task = _gateway_approval_resume_task_row(
+        conn,
+        str(route_key),
+        expected_message_id,
+    )
+    if (
+        task is None
+        or task["status"] not in {"queued", "processing"}
+        or task["task_kind"] != "approval_resume"
+        or task["approval_id"] != approval_id
+    ):
+        return None
+
+    row = conn.execute(
+        f"""
+        SELECT {_GATEWAY_APPROVAL_COLUMNS}
+        FROM gateway_approval_requests
+        WHERE id=? AND route_key=? AND conversation_id=?
+          AND status IN ('executed', 'failed')
+        """,
+        (approval_id, route_key, conversation_id),
+    ).fetchone()
+    approval = _gateway_approval_row(row)
+    if approval is None:
+        return None
+    expected_id, expected_event_json = _build_gateway_approval_resume_event(approval)
+    if expected_id != message_id or task["event_json"] != expected_event_json:
+        return None
+
+    source_event_json = approval.get("source_event_json")
+    source_ids = gateway_event_source_message_ids(
+        str(source_event_json),
+        approval["source_message_id"],
+    )
+    if approval["source_message_id"] not in source_ids:
+        return None
+    return {
+        "approval": approval,
+        "resume_task": task,
+    }
 
 
 def cancel_pending_gateway_approvals(

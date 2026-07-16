@@ -40,7 +40,7 @@ from hermes.db import (
     enqueue_gateway_outbox,
     enqueue_gateway_message,
     fail_gateway_delivery,
-    finish_gateway_approval,
+    finish_gateway_approval_and_enqueue_resume,
     gateway_outbox_claim_is_valid,
     gateway_runtime_lease_is_valid,
     get_gateway_conversation_for_route,
@@ -48,6 +48,7 @@ from hermes.db import (
     get_gateway_routes_with_pending_outbox,
     get_next_recoverable_gateway_outbox_for_route,
     get_gateway_outbox,
+    get_gateway_approval_resume,
     get_pending_gateway_approval,
     get_gateway_queued_messages,
     get_recoverable_gateway_outbox,
@@ -127,6 +128,13 @@ _SAFE_MODEL_UNAVAILABLE_REPLY = "处理失败：模型服务暂时不可用，�
 _SAFE_PERSISTENCE_REPLY = "处理失败：系统暂时不可用，请稍后重试。"
 _SAFE_INTERNAL_REPLY = "处理失败：任务未能完成，请稍后重试。"
 _GATEWAY_APPROVAL_TTL_SECONDS = 600.0
+_APPROVAL_RESUME_MESSAGE_PREFIX = "approval-resume:"
+_APPROVAL_RESUME_TERMINAL_FAILURES = frozenset({
+    "invalid_approval_resume_task",
+    "invalid_approval_resume_history",
+    "invalid_approval_resume_state",
+    "approval_resume_fallback_unavailable",
+})
 
 
 def _short_approval_id(request_id: object) -> str:
@@ -1765,6 +1773,8 @@ class GatewayRunner:
         content: str,
         delivery_id: str,
         delivery_kind: str,
+        *,
+        queue_message_id: str | None = None,
     ) -> dict:
         """构造包含确定分片的 outbox,这里不执行网络请求。"""
         adapter = self.adapters.get(event.source.platform)
@@ -1781,6 +1791,7 @@ class GatewayRunner:
             "id": delivery_id,
             "route_key": route_key,
             "source_message_id": event.message_id,
+            "queue_message_id": queue_message_id or event.message_id,
             "event_json": self._serialize_event(event),
             "platform": event.source.platform,
             "chat_id": event.source.chat_id,
@@ -2888,7 +2899,10 @@ class GatewayRunner:
             else:
                 self._route_admission_users[route_key] = users
 
-    async def _execute_claimed_approval(self, request: dict) -> tuple[str, bool]:
+    async def _execute_claimed_approval(
+        self,
+        request: dict,
+    ) -> tuple[str, bool, dict]:
         """执行数据库中已 claim 的原始工具参数，并立即固化结果。"""
         from hermes.tools import registry
 
@@ -2932,13 +2946,13 @@ class GatewayRunner:
             )
             succeeded = False
 
-        await self.persistence.call(
-            finish_gateway_approval,
+        terminal = await self.persistence.call(
+            finish_gateway_approval_and_enqueue_resume,
             request["id"],
             output,
             succeeded=succeeded,
         )
-        return output, succeeded
+        return output, succeeded, terminal
 
     async def _pending_approval_for_context(self, route_key: str, ctx):
         """读取当前 route/conversation 的未决请求。"""
@@ -2946,6 +2960,25 @@ class GatewayRunner:
             get_pending_gateway_approval,
             route_key,
             ctx.conversation_id,
+        )
+
+    async def _reject_approval_resume_task(
+        self,
+        route_key: str,
+        event: MessageEvent,
+    ) -> None:
+        """把不满足可信恢复条件的内部 Queue 任务收敛为失败终态。"""
+        await self.persistence.call(
+            mark_gateway_message_delivery_failed,
+            route_key,
+            event.message_id,
+        )
+        self._accepted_messages.discard((route_key, event.message_id))
+        print(
+            "  [gateway:audit] event=approval_resume_rejected "
+            f"{safe_route_digest(route_key)} "
+            f"{safe_message_digest(event.message_id)} "
+            "failure_type=invalid_approval_resume_task"
         )
 
     async def _handle_message_serialized(
@@ -2974,6 +3007,44 @@ class GatewayRunner:
                 self._accepted_messages.add(queue_key)
                 return
             if queue_key in self._accepted_messages:
+                return
+
+        approval_resume_id = None
+        delivery_event = event
+        if from_queue and event.message_id.startswith(
+            _APPROVAL_RESUME_MESSAGE_PREFIX
+        ):
+            approval_resume_id = event.message_id[
+                len(_APPROVAL_RESUME_MESSAGE_PREFIX):
+            ]
+            ctx = await self.sessions.get_or_create_async(
+                route_key,
+                self._build_gateway_prompt(event.source),
+            )
+            resume_record = await self.persistence.call(
+                get_gateway_approval_resume,
+                route_key,
+                ctx.conversation_id,
+                event.message_id,
+                approval_resume_id,
+            )
+            if resume_record is None:
+                await self._reject_approval_resume_task(route_key, event)
+                return
+            try:
+                approval = resume_record["approval"]
+                delivery_event = self._deserialize_event(
+                    approval["source_event_json"]
+                )
+                if (
+                    build_session_key(delivery_event.source, self.agent_name)
+                    != route_key
+                    or delivery_event.message_id
+                    != approval["source_message_id"]
+                ):
+                    raise ValueError("approval source event identity mismatch")
+            except Exception:
+                await self._reject_approval_resume_task(route_key, event)
                 return
 
         # slash 命令只规范化命令名，conversation_id 参数保持原样精确匹配。
@@ -3018,24 +3089,25 @@ class GatewayRunner:
                 outcome = str(decision.get("outcome", ""))
                 if outcome == "claimed":
                     request = decision["request"]
-                    _output, succeeded = await self._execute_claimed_approval(
-                        request
+                    _output, _succeeded, terminal = (
+                        await self._execute_claimed_approval(request)
                     )
-                    state = "成功" if succeeded else "返回失败"
-                    event.text = (
-                        f"用户已批准审批请求 {_short_approval_id(request['id'])}。"
-                        f"Gateway 已按原始参数执行该操作，工具{state}；"
-                        "真实 Tool Result 已写入对话历史。请继续原任务，"
-                        "不要重复执行同一操作。"
+                    resume_task = terminal.get("resume_task")
+                    if not isinstance(resume_task, dict):
+                        raise RuntimeError(
+                            "approval terminal transaction did not create resume task"
+                        )
+                    resume_event = self._deserialize_event(
+                        str(resume_task["event_json"])
                     )
-                    event.metadata = {
-                        **dict(event.metadata or {}),
-                        "gateway_approval_resume": request["id"],
-                    }
-                    command_text = event.text
-                    command_parts = command_text.split(maxsplit=1)
-                    cmd = ""
-                    command_argument = ""
+                    self._accepted_messages.add(
+                        (route_key, resume_event.message_id)
+                    )
+                    await self._handle_message_serialized(
+                        resume_event,
+                        from_queue=True,
+                    )
+                    return
                 else:
                     content = _approval_command_reply(outcome, command_argument)
 
@@ -3345,7 +3417,12 @@ class GatewayRunner:
         # 模型 Task 与串行收尾 worker 分开管理。即使模型 Task 在首次运行前
         # 就被取消,worker 仍会启动并清理 busy / 持久队列。
         agent_task = asyncio.create_task(
-            self._run_agent(event, ctx),
+            self._run_agent(
+                event,
+                ctx,
+                resume_from_history=approval_resume_id is not None,
+                approval_resume_id=approval_resume_id,
+            ),
         )
         ctx.active_task = agent_task
         ctx.active_generation = generation
@@ -3357,6 +3434,7 @@ class GatewayRunner:
                 agent_task,
                 generation,
                 invalidation_event,
+                delivery_event=delivery_event,
             ),
         )
         ctx.worker_task = worker_task
@@ -3370,8 +3448,11 @@ class GatewayRunner:
         agent_task: asyncio.Task | None = None,
         generation: int | None = None,
         invalidation_event: asyncio.Event | None = None,
+        *,
+        delivery_event: MessageEvent | None = None,
     ):
         """串行处理一条消息,然后检查队列。"""
+        delivery_event = delivery_event or event
         ctx = await self.sessions.get_or_create_async(
             route_key, self._build_gateway_prompt(event.source),
         )
@@ -3412,7 +3493,36 @@ class GatewayRunner:
             # 发生在模型响应检查之后,也不能把旧回复发送给用户。
             persisted_outbox = await self._load_outbox_async(delivery_id)
             cancel_reason = self._task_cancel_reason(ctx, generation)
-            if cancel_reason is not None:
+            approval_resume_failed = (
+                event.message_id.startswith(_APPROVAL_RESUME_MESSAGE_PREFIX)
+                and agent_result.failed
+                and agent_result.failure_type
+                in _APPROVAL_RESUME_TERMINAL_FAILURES
+            )
+            if approval_resume_failed:
+                await self.persistence.call(
+                    mark_gateway_message_delivery_failed,
+                    route_key,
+                    event.message_id,
+                )
+                self._accepted_messages.discard(
+                    (route_key, event.message_id)
+                )
+                event_completed = True
+                await self._finish_processing_best_effort(
+                    delivery_event,
+                    "failed",
+                    ctx=ctx,
+                    generation=generation,
+                )
+                print(
+                    "  [gateway:audit] event=approval_resume_failed "
+                    f"{safe_route_digest(route_key)} "
+                    f"{safe_message_digest(event.message_id)} "
+                    "failure_type="
+                    f"{_safe_audit_label(agent_result.failure_type)}"
+                )
+            elif cancel_reason is not None:
                 abandoned = True
                 if (
                     cancel_reason != "shutdown"
@@ -3421,7 +3531,7 @@ class GatewayRunner:
                     event_completed = await self._cancel_outbox_async(
                         delivery_id,
                         route_key=route_key,
-                        source_message_id=event.message_id,
+                        source_message_id=delivery_event.message_id,
                     )
                 print(f"  [gateway] {route_key}: stale response discarded")
             elif not response and not persisted_outbox:
@@ -3431,13 +3541,13 @@ class GatewayRunner:
                 )
             elif event.source.platform not in self.adapters:
                 # 无 Adapter 只用于测试或嵌入式调用;保留原 _reply 注入点。
-                result = await self._reply(event, str(response or ""))
+                result = await self._reply(delivery_event, str(response or ""))
                 if result is None or result.success:
                     if persisted_outbox:
                         event_completed = await self._cancel_outbox_async(
                             delivery_id,
                             route_key=route_key,
-                            source_message_id=event.message_id,
+                            source_message_id=delivery_event.message_id,
                         )
                     else:
                         event_completed = await self._complete_event_async(
@@ -3449,7 +3559,7 @@ class GatewayRunner:
                         event_completed = await self._fail_outbox_async(
                             delivery_id,
                             route_key,
-                            event,
+                            delivery_event,
                             result.error or "internal_send_error",
                             result.error_code,
                         )
@@ -3461,7 +3571,7 @@ class GatewayRunner:
             elif persisted_outbox:
                 delivered = await self._deliver_outbox(
                     route_key,
-                    event,
+                    delivery_event,
                     delivery_id,
                     ctx,
                     generation,
@@ -3476,10 +3586,11 @@ class GatewayRunner:
                 # 模型错误等没有 assistant 最终消息的返回在这里补建 outbox。
                 outbox = self._build_outbox(
                     route_key,
-                    event,
+                    delivery_event,
                     response,
                     delivery_id,
                     "internal_error" if agent_result.failed else "final",
+                    queue_message_id=event.message_id,
                 )
                 delivery_id = await self._enqueue_outbox_async(outbox)
                 if (
@@ -3489,7 +3600,7 @@ class GatewayRunner:
                     ctx.delivery_id = delivery_id
                 if agent_result.failed:
                     await self._finish_processing_best_effort(
-                        event,
+                        delivery_event,
                         "failed",
                         ctx=ctx,
                         generation=generation,
@@ -3503,7 +3614,7 @@ class GatewayRunner:
                     )
                 delivered = await self._deliver_outbox(
                     route_key,
-                    event,
+                    delivery_event,
                     delivery_id,
                     ctx,
                     generation,
@@ -3549,10 +3660,11 @@ class GatewayRunner:
                         try:
                             outbox = self._build_outbox(
                                 route_key,
-                                event,
+                                delivery_event,
                                 failure.response or _SAFE_INTERNAL_REPLY,
                                 delivery_id,
                                 "internal_error",
+                                queue_message_id=event.message_id,
                             )
                             delivery_id = await self._enqueue_outbox_async(
                                 outbox
@@ -3566,14 +3678,14 @@ class GatewayRunner:
                             ):
                                 ctx.delivery_id = delivery_id
                             await self._finish_processing_best_effort(
-                                event,
+                                delivery_event,
                                 "failed",
                                 ctx=ctx,
                                 generation=generation,
                             )
                             delivered = await self._deliver_outbox(
                                 route_key,
-                                event,
+                                delivery_event,
                                 delivery_id,
                                 ctx,
                                 generation,
@@ -3648,7 +3760,7 @@ class GatewayRunner:
                         event_completed = await self._cancel_outbox_async(
                             delivery_id,
                             route_key=route_key,
-                            source_message_id=event.message_id,
+                            source_message_id=delivery_event.message_id,
                         )
                     else:
                         event_completed = await self._complete_event_async(
@@ -3665,7 +3777,7 @@ class GatewayRunner:
                     and cancel_reason != "shutdown"
                 ):
                     await self._finish_processing_best_effort(
-                        event,
+                        delivery_event,
                         "cancelled",
                         ctx=ctx,
                         generation=generation,
@@ -3771,16 +3883,27 @@ class GatewayRunner:
         self,
         event: MessageEvent,
         ctx,
+        *,
+        resume_from_history: bool = False,
+        approval_resume_id: str | None = None,
     ) -> _GatewayAgentResult | str | None:
         """在全局并发限制内运行异步主会话。"""
         # 所有 route_key 共用同一信号量,避免不同会话同时打满模型服务。
         async with self._llm_semaphore:
-            return await self._run_agent_async(event, ctx)
+            return await self._run_agent_async(
+                event,
+                ctx,
+                resume_from_history=resume_from_history,
+                approval_resume_id=approval_resume_id,
+            )
 
     async def _run_agent_async(
         self,
         event: MessageEvent,
         ctx,
+        *,
+        resume_from_history: bool = False,
+        approval_resume_id: str | None = None,
     ) -> _GatewayAgentResult:
         """使用 AsyncOpenAI 跑主会话，数据库 hook 统一在线程执行。"""
         from hermes.db import ensure_session
@@ -3806,9 +3929,55 @@ class GatewayRunner:
         route_key = ctx.route_key
         conversation_id = ctx.conversation_id
         system_prompt = ctx.system_prompt
+        task_event = event
+        approval_resume = None
+        if resume_from_history:
+            if not approval_resume_id:
+                return _GatewayAgentResult(
+                    _SAFE_INTERNAL_REPLY,
+                    failed=True,
+                    failure_type="invalid_approval_resume_task",
+                )
+            approval_resume = await self.persistence.call(
+                get_gateway_approval_resume,
+                route_key,
+                conversation_id,
+                event.message_id,
+                approval_resume_id,
+            )
+            if approval_resume is None:
+                return _GatewayAgentResult(
+                    _SAFE_INTERNAL_REPLY,
+                    failed=True,
+                    failure_type="invalid_approval_resume_task",
+                )
+            try:
+                task_event = self._deserialize_event(
+                    approval_resume["approval"]["source_event_json"]
+                )
+                if (
+                    build_session_key(task_event.source, self.agent_name)
+                    != route_key
+                    or task_event.message_id
+                    != approval_resume["approval"]["source_message_id"]
+                ):
+                    raise ValueError("approval source event identity mismatch")
+            except Exception:
+                return _GatewayAgentResult(
+                    _SAFE_INTERNAL_REPLY,
+                    failed=True,
+                    failure_type="invalid_approval_resume_task",
+                )
+        elif approval_resume_id is not None:
+            return _GatewayAgentResult(
+                _SAFE_INTERNAL_REPLY,
+                failed=True,
+                failure_type="invalid_approval_resume_task",
+            )
 
         def persist_final_message(conn, session_id, msg) -> str | None:
             """最终回答和 outbox 必须在同一个 SQLite 事务中落盘。"""
+            nonlocal delivery_id
             if self._task_cancel_reason(ctx, generation) is not None:
                 raise asyncio.CancelledError
             content = str(msg.get("content", "") or "")
@@ -3817,10 +3986,11 @@ class GatewayRunner:
                 return
             outbox = self._build_outbox(
                 route_key,
-                event,
+                task_event,
                 content,
                 delivery_id,
                 "final",
+                queue_message_id=event.message_id,
             )
             actual_delivery_id = add_final_message_with_gateway_outbox(
                 conn,
@@ -3829,12 +3999,18 @@ class GatewayRunner:
                 outbox,
                 **self._runtime_fence_kwargs(),
             )
+            delivery_id = actual_delivery_id
             return actual_delivery_id
 
         await self.persistence.call(
             ensure_session,
             conversation_id,
-            source=event.source.platform,
+            source=task_event.source.platform,
+        )
+        approval = (
+            approval_resume["approval"]
+            if approval_resume is not None
+            else None
         )
         result = await run_conversation_async(
             event.text,
@@ -3846,7 +4022,13 @@ class GatewayRunner:
             async_client=self._get_async_client(),
             final_message_callback=persist_final_message,
             persistence_call=self.persistence.call,
-            enabled_toolsets=self._enabled_toolsets_for_source(event.source),
+            resume_from_history=resume_from_history,
+            approval_resume_id=(approval["id"] if approval is not None else None),
+            approval_tool_call_id=(
+                approval["tool_call_id"] if approval is not None else None
+            ),
+            resume_state=(approval["agent_state"] if approval is not None else None),
+            enabled_toolsets=self._enabled_toolsets_for_source(task_event.source),
             tool_context={
                 "interactive_approval": False,
                 "approval_mode": "remote",
@@ -3866,22 +4048,34 @@ class GatewayRunner:
             msg = {"role": "assistant", "content": question}
             outbox = self._build_outbox(
                 route_key,
-                event,
+                task_event,
                 question,
                 delivery_id,
                 "approval_request",
+                queue_message_id=event.message_id,
             )
-            await self.persistence.call(
+            delivery_id = await self.persistence.call(
                 create_gateway_approval_with_outbox,
                 conversation_id,
                 request,
-                event.source.user_id or event.source.user_id_alt,
+                task_event.source.user_id or task_event.source.user_id_alt,
                 msg,
                 outbox,
                 _GATEWAY_APPROVAL_TTL_SECONDS,
+                agent_state=result.get("agent_state"),
                 **self._runtime_fence_kwargs(),
             )
+            if (
+                getattr(ctx, "delivery_generation", generation) == generation
+                and self._task_cancel_reason(ctx, generation) is None
+            ):
+                ctx.delivery_id = delivery_id
             return _GatewayAgentResult(question)
+        if (
+            getattr(ctx, "delivery_generation", generation) == generation
+            and self._task_cancel_reason(ctx, generation) is None
+        ):
+            ctx.delivery_id = delivery_id
         return self._safe_agent_result(result)
 
     def _get_async_client(self):
