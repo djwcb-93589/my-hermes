@@ -2,8 +2,8 @@
 执行环境抽象。
 
 BaseExecutionEnvironment 把每条命令包装成：CWD 追踪、环境变量快照（用于
-session 间持久化）、密钥脱敏、超时处理。具体后端只需实现 _run_bash()
-和 cleanup()。
+同一 session 的命令间持久化）、超时处理。LocalBackend 另在创建子进程前
+过滤基础设施凭证。具体后端只需实现 _run_bash() 和 cleanup()。
 
 路径双重表示
 ------------
@@ -22,20 +22,144 @@ POSIX 上两者完全相同。Windows + Git Bash 上不同 —— LocalBackend �
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from hermes.config import _config
+from hermes.redaction import is_explicit_credential_env_name
 
 
-# Hermes 自己的 API key 绝对不能泄漏给被拉起的子进程。
-_SECRET_BLOCKLIST = frozenset([
-    "OPENAI_API_KEY", "ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY",
-    "OPENROUTER_API_KEY", "GITHUB_TOKEN",
-])
+# Local Terminal 的硬性基础设施凭证名单。这里维护项目实际使用或保留的
+# 环境变量名，不按 KEY/TOKEN/SECRET 等普通子串做全量猜测。
+INFRASTRUCTURE_CREDENTIAL_ENV_VARS = frozenset({
+    "OPENAI_API_KEY",
+    "FALLBACK_API_KEY",
+    "ANTHROPIC_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GITHUB_TOKEN",
+    "FEISHU_APP_SECRET",
+    "FEISHU_VERIFICATION_TOKEN",
+    "FEISHU_ENCRYPT_KEY",
+    "WEIXIN_TOKEN",
+    # 为项目自身未来的内部服务保留一个明确名称，不扩展厂商名单。
+    "HERMES_INTERNAL_SERVICE_TOKEN",
+})
+
+# 兼容旧的内部导入；新实现统一使用语义更明确的公开常量。
+_SECRET_BLOCKLIST = INFRASTRUCTURE_CREDENTIAL_ENV_VARS
+
+_GATEWAY_CREDENTIAL_FIELDS = frozenset({
+    "app_secret",
+    "verification_token",
+    "encrypt_key",
+    "token",
+    "secret",
+})
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _configured_infrastructure_credential_values(
+    config: Mapping,
+) -> frozenset[str]:
+    """收集配置中真实生效的模型与 Gateway 凭证值。"""
+    values: set[str] = set()
+
+    def add(value) -> None:
+        if isinstance(value, str) and value:
+            values.add(value)
+
+    add(config.get("api_key"))
+    fallback_cfg = config.get("fallback", {})
+    if isinstance(fallback_cfg, Mapping):
+        add(fallback_cfg.get("api_key"))
+
+    gateway_cfg = config.get("gateway", {})
+    if isinstance(gateway_cfg, Mapping):
+        platforms_cfg = gateway_cfg.get("platforms", {})
+        if isinstance(platforms_cfg, Mapping):
+            for platform_cfg in platforms_cfg.values():
+                if not isinstance(platform_cfg, Mapping):
+                    continue
+                for field in _GATEWAY_CREDENTIAL_FIELDS:
+                    add(platform_cfg.get(field))
+    return frozenset(values)
+
+
+def _load_terminal_env_passthrough(
+    terminal_cfg: Mapping,
+) -> frozenset[str]:
+    """读取任务凭证显式透传名单；硬性基础设施名单不可覆盖。"""
+    configured = terminal_cfg.get("env_passthrough", [])
+    if configured is None:
+        configured = []
+    if not isinstance(configured, list) or not all(
+        isinstance(name, str) for name in configured
+    ):
+        raise ValueError(
+            "terminal.env_passthrough must be a list of environment "
+            "variable names"
+        )
+
+    passthrough: set[str] = set()
+    for raw_name in configured:
+        name = raw_name.strip()
+        if not _ENV_VAR_NAME_RE.fullmatch(name):
+            raise ValueError(
+                "terminal.env_passthrough contains an invalid environment "
+                f"variable name: {raw_name!r}"
+            )
+        normalized = name.upper()
+        if normalized in INFRASTRUCTURE_CREDENTIAL_ENV_VARS:
+            raise ValueError(
+                "terminal.env_passthrough cannot include protected "
+                f"infrastructure credential: {name}"
+            )
+        passthrough.add(normalized)
+    return frozenset(passthrough)
+
+
+def filter_local_subprocess_environment(
+    source_env: Mapping[str, str],
+    *,
+    env_passthrough: Iterable[str] = (),
+    infrastructure_secret_values: Iterable[str] = (),
+) -> dict[str, str]:
+    """构造 Local 子进程环境，保留普通变量并隔离凭证。
+
+    硬性基础设施变量及其已配置值永不继承。其它以明确凭证字段结尾的
+    任务变量只有出现在 env_passthrough 中才继承；普通环境变量保持原样。
+    """
+    passthrough = frozenset(
+        str(name).strip().upper()
+        for name in env_passthrough
+        if str(name).strip()
+    )
+    protected_values = frozenset(
+        str(value)
+        for value in infrastructure_secret_values
+        if str(value)
+    )
+
+    filtered: dict[str, str] = {}
+    for name, value in source_env.items():
+        normalized = name.upper()
+        if normalized in INFRASTRUCTURE_CREDENTIAL_ENV_VARS:
+            continue
+        if value and value in protected_values:
+            continue
+        if (
+            is_explicit_credential_env_name(name)
+            and normalized not in passthrough
+        ):
+            continue
+        filtered[name] = value
+    return filtered
 
 
 class UnsupportedBackendError(Exception):
@@ -191,8 +315,10 @@ def create_backend(config: dict) -> BaseExecutionEnvironment:
     from hermes.backends.docker import DockerBackend
     from hermes.backends.ssh import SSHBackend
 
-    backend_type = config.get("terminal", {}).get("backend", "local")
     terminal_cfg = config.get("terminal", {})
+    if not isinstance(terminal_cfg, Mapping):
+        raise ValueError("terminal config must be a mapping")
+    backend_type = terminal_cfg.get("backend", "local")
 
     if backend_type == "docker":
         image = terminal_cfg.get("docker_image", "python:3.11-slim")
@@ -205,7 +331,13 @@ def create_backend(config: dict) -> BaseExecutionEnvironment:
             cwd="~",
         )
     else:
-        return LocalBackend(cwd=os.getcwd())
+        return LocalBackend(
+            cwd=os.getcwd(),
+            env_passthrough=_load_terminal_env_passthrough(terminal_cfg),
+            infrastructure_secret_values=(
+                _configured_infrastructure_credential_values(config)
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

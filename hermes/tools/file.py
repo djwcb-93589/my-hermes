@@ -17,7 +17,13 @@ import os
 import re
 from datetime import datetime, timezone
 
+from hermes.approval import (
+    build_approval_required,
+    has_approval_grant,
+    is_remote_approval,
+)
 from hermes.backends import get_backend, UnsupportedBackendError
+from hermes.redaction import redact_file_content
 
 
 # 单次读取的字节上限。超过则 truncated=true，调用方再用 offset 续读。
@@ -133,6 +139,25 @@ def handle_file(args, **kwargs):
         return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
                            "error_type": "forbidden", "error": reason})
 
+    if is_remote_approval(kwargs) and not has_approval_grant(kwargs, "file", args):
+        details = {
+            "action": action,
+            "path": rel_path,
+            "abs_path": abs_path,
+        }
+        if action in {"write", "append"}:
+            details["content_size"] = len(str(args.get("content", "")).encode("utf-8"))
+        elif action == "replace":
+            details["find_size"] = len(str(args.get("find", "")).encode("utf-8"))
+            details["replace_size"] = len(
+                str(args.get("replace", "")).encode("utf-8")
+            )
+        return build_approval_required(
+            "file",
+            f"执行 File {action} 操作",
+            details=details,
+        )
+
     try:
         if action == "read":
             return _do_read(backend, abs_path, rel_path, args, require_range=False)
@@ -189,11 +214,13 @@ def _do_read(backend, abs_path, rel_path, args, require_range: bool):
         truncated = offset + size < total
     except Exception:
         pass  # ponytail: stat 失败就保守当未截断
+    decoded = data.decode("utf-8", errors="replace")
     return _json({
         "ok": True,
         "path": rel_path,
         "abs_path": abs_path,
-        "content": data.decode("utf-8", errors="replace"),
+        # 只处理返回给模型的副本，磁盘内容和写入类 action 均保持原样。
+        "content": redact_file_content(decoded),
         "size": size,
         "offset": offset,
         "total_size": total,
@@ -323,6 +350,9 @@ def register(registry):
                 "and metadata. Actions: "
                 "read, read_range, write, append, replace, list, stat, "
                 "pwd, context. "
+                "Gateway remote sessions pause for user approval before every "
+                "path action; pwd/context remain available without approval. "
+                "Do not retry an operation while approval is pending. "
                 "Paths are relative to backend.cwd unless absolute. "
                 "Path traversal outside the fixed file root is rejected. Sensitive files "
                 "(.env, *.key, *.pem, id_rsa, *.db, *.db-wal, .git/*) require "

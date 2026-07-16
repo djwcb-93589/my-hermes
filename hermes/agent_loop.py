@@ -24,14 +24,16 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Callable
 
+from hermes.approval import build_approval_deferred
 from hermes.config import client as _default_client
+from hermes.redaction import redact_explicit_secrets
 
 
 @dataclass
 class AgentLoopResult:
     """AgentLoop.run 的返回。"""
     ok: bool
-    status: str  # completed | max_iterations | tool_error | model_error | error | cancelled
+    status: str  # completed | awaiting_approval | max_iterations | tool_error | model_error | error | cancelled
     summary: str
     messages: list[dict]
     iterations: int
@@ -45,25 +47,12 @@ class AgentLoopResult:
     error_type: str | None = None
     fatal: bool = False
     retryable: bool = True
+    approval_request: dict | None = None
 
 
 # ---------------------------------------------------------------------------
 # 共享 helper(也可独立使用)
 # ---------------------------------------------------------------------------
-
-# 只替换高置信度凭证值,字段名和周边诊断信息保持不变。
-_AUTHORIZATION_BEARER_RE = re.compile(
-    r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])['\"]?Authorization['\"]?"
-    r"\s*[:=]\s*['\"]?Bearer\s+)"
-    r"(?P<value>[^\s,;&)\]}>'\"]+)"
-)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])['\"]?"
-    r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|password|secret)"
-    r"['\"]?\s*[:=]\s*)(?P<quote>['\"]?)"
-    r"(?P<value>[^\s,;&)\]}>'\"]+)"
-)
-_RAW_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{6,}")
 
 # fatal marker:普通字符串工具错误命中这些关键字时直接终止 loop,
 # 即使工具没返结构化 JSON error_type 也能识别。
@@ -148,21 +137,6 @@ def _normalize_path_text(path_text: str, workspace_root: str | None = None) -> s
         except ValueError:
             pass
     return original
-
-
-def _redact_explicit_secret_values(text: str) -> str:
-    """只替换明确的凭证值,不因普通文本或路径关键词隐藏内容。"""
-    text = _AUTHORIZATION_BEARER_RE.sub(
-        lambda match: f"{match.group('prefix')}<secret>",
-        text,
-    )
-    text = _SECRET_ASSIGNMENT_RE.sub(
-        lambda match: (
-            f"{match.group('prefix')}{match.group('quote')}<secret>"
-        ),
-        text,
-    )
-    return _RAW_API_KEY_RE.sub("<secret>", text)
 
 
 def _extract_error_summary(text: str, max_lines: int = 3) -> str:
@@ -288,7 +262,7 @@ def _sanitize_error_message(
         text = f"{error_name}: {detail}" if detail else error_name
 
     text = _extract_error_summary(text)
-    text = _redact_explicit_secret_values(text)
+    text = redact_explicit_secrets(text)
 
     # 路径只做工作区相对化,不再按关键词或工作区边界隐藏。
     text = _WINDOWS_ABS_PATH_RE.sub(
@@ -328,6 +302,52 @@ def _detect_fatal_marker(text: str) -> str | None:
     return None
 
 
+def _extract_approval_request(
+    output: str,
+    tool_call,
+) -> dict | None:
+    """从受信任 Tool Result 提取待审批请求，并绑定原始 tool_call 参数。"""
+    if not isinstance(output, str):
+        return None
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("approval_required") is not True:
+        return None
+    request = payload.get("approval_request")
+    if not isinstance(request, dict):
+        return None
+
+    request_id = request.get("id")
+    tool_name = request.get("tool_name")
+    if (
+        not isinstance(request_id, str)
+        or not request_id.startswith("approval_")
+        or tool_name not in {"file", "terminal"}
+    ):
+        return None
+    call_name = AgentLoop._tool_call_name(tool_call)
+    if call_name != tool_name:
+        return None
+    try:
+        arguments = json.loads(tool_call.function.arguments)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+
+    details = request.get("details")
+    return {
+        "id": request_id,
+        "tool_name": tool_name,
+        "tool_call_id": str(getattr(tool_call, "id", "")),
+        "arguments": arguments,
+        "summary": str(request.get("summary", "需要批准的工具操作")),
+        "details": details if isinstance(details, dict) else {},
+    }
+
+
 def build_assistant_msg_dict(assistant_msg) -> dict:
     """把 SDK 的 assistant message 对象转成可序列化 dict。"""
     msg_dict: dict = {
@@ -355,6 +375,7 @@ def dispatch_tool_call(
     *,
     session_key: str | None = None,
     blocked_tools: set[str] | None = None,
+    tool_context: dict | None = None,
 ) -> tuple[str, str | None, str | None]:
     """处理单个 tool_call。
 
@@ -364,7 +385,9 @@ def dispatch_tool_call(
       - JSON 参数解析失败: ``("(error: ...)", "json", "invalid JSON in <name>: <exc>")``
       - dispatch 抛异常: ``("(error: ...)", "dispatch", "tool <name> raised: <exc>")``
 
-    output 会做脱敏 + 截断,不返完整 traceback 给模型。
+    AgentLoop 只统一摘要参数解析与 dispatch 异常。正常 output 由具体
+    工具边界负责；Terminal/File 处理各自成功出口中的明确凭证值，
+    这里不对所有正常 Tool Result 做全局扫描。
     """
     tool_name = tool_call.function.name
 
@@ -386,7 +409,9 @@ def dispatch_tool_call(
         )
 
     try:
-        output = registry.dispatch(tool_name, tool_args, session_key=session_key)
+        dispatch_context = dict(tool_context or {})
+        dispatch_context["session_key"] = session_key
+        output = registry.dispatch(tool_name, tool_args, **dispatch_context)
     except Exception as exc:
         short = _short_error(exc)
         return (
@@ -437,6 +462,7 @@ class AgentLoop:
         blocked_tools: set[str] | None = None,
         model_kwargs: dict | None = None,
         cancel_checker: "Callable[[], bool] | None" = None,
+        tool_context: dict | None = None,
     ):
         self.model = model
         self.max_iterations = max_iterations
@@ -446,6 +472,8 @@ class AgentLoop:
         self.client = client
         self.session_key = session_key
         self.blocked_tools = set(blocked_tools) if blocked_tools else set()
+        # 调用方可显式传递平台能力上下文，工具处理器只读取所需字段。
+        self.tool_context = dict(tool_context) if tool_context else {}
         # provider-specific 额外参数(如 extra_body / temperature 等)。
         # AgentLoop 只透传,不理解内容;由 ConversationAgentLoop /
         # DelegateAgentLoop 的调用方决定。
@@ -726,16 +754,22 @@ class AgentLoop:
         tool_messages: list[dict] = []
         fatal_detail: str | None = None
         fatal_error_type: str | None = None
+        approval_request: dict | None = None
         for tc in tool_calls:
-            try:
-                output, err_status, err_detail = self.dispatch_one(tc)
-            except Exception as exc:
-                # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
-                tool_name = self._tool_call_name(tc)
-                short = _short_error(exc)
-                output = f"(error: tool {tool_name} failed: {short})"
-                err_status = "dispatch"
-                err_detail = f"tool {tool_name!r} dispatch raised: {short}"
+            if approval_request is not None:
+                output = build_approval_deferred()
+                err_status = None
+                err_detail = None
+            else:
+                try:
+                    output, err_status, err_detail = self.dispatch_one(tc)
+                except Exception as exc:
+                    # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
+                    tool_name = self._tool_call_name(tc)
+                    short = _short_error(exc)
+                    output = f"(error: tool {tool_name} failed: {short})"
+                    err_status = "dispatch"
+                    err_detail = f"tool {tool_name!r} dispatch raised: {short}"
 
             tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
@@ -751,6 +785,11 @@ class AgentLoop:
 
             # 已经决定终止,后续 tool_call 仍生成 tool_msg 让 batch 持久化完整
             if fatal_detail is not None:
+                continue
+
+            pending = _extract_approval_request(output, tc)
+            if pending is not None:
+                approval_request = pending
                 continue
 
             fatal, err_type = self._classify_tool_error(output, err_status)
@@ -785,6 +824,18 @@ class AgentLoop:
                     )
                     fatal_error_type = display_type
 
+        if approval_request is not None:
+            return tool_messages, self._result(
+                ok=False,
+                status="awaiting_approval",
+                summary="",
+                messages=messages,
+                error="tool operation is awaiting remote approval",
+                error_type="approval_required",
+                fatal=False,
+                retryable=False,
+                approval_request=approval_request,
+            )
         if fatal_detail is not None:
             return tool_messages, self._result(
                 ok=False, status="tool_error",
@@ -869,6 +920,7 @@ class AgentLoop:
             tool_call, self.registry,
             session_key=self.session_key,
             blocked_tools=self.blocked_tools,
+            tool_context=self.tool_context,
         )
 
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
@@ -910,6 +962,7 @@ class AgentLoop:
         error_type: str | None = None,
         fatal: bool = False,
         retryable: bool = True,
+        approval_request: dict | None = None,
     ) -> AgentLoopResult:
         """统一构造结果对象。"""
         return AgentLoopResult(
@@ -918,6 +971,7 @@ class AgentLoop:
             tools_used=list(self.tools_used),
             error=error, error_type=error_type,
             fatal=fatal, retryable=retryable,
+            approval_request=approval_request,
         )
 
 
@@ -945,6 +999,7 @@ class AsyncAgentLoop(AgentLoop):
         blocked_tools: set[str] | None = None,
         model_kwargs: dict | None = None,
         cancel_checker: "Callable[[], bool] | None" = None,
+        tool_context: dict | None = None,
     ):
         super().__init__(
             model=model,
@@ -957,6 +1012,7 @@ class AsyncAgentLoop(AgentLoop):
             blocked_tools=blocked_tools,
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
+            tool_context=tool_context,
         )
 
     async def run(self, user_message: str) -> AgentLoopResult:
@@ -1076,17 +1132,23 @@ class AsyncAgentLoop(AgentLoop):
         tool_messages: list[dict] = []
         fatal_detail: str | None = None
         fatal_error_type: str | None = None
+        approval_request: dict | None = None
         for tc in tool_calls:
-            try:
-                output, err_status, err_detail = await self.dispatch_one(tc)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                tool_name = self._tool_call_name(tc)
-                short = _short_error(exc)
-                output = f"(error: tool {tool_name} failed: {short})"
-                err_status = "dispatch"
-                err_detail = f"tool {tool_name!r} dispatch raised: {short}"
+            if approval_request is not None:
+                output = build_approval_deferred()
+                err_status = None
+                err_detail = None
+            else:
+                try:
+                    output, err_status, err_detail = await self.dispatch_one(tc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    tool_name = self._tool_call_name(tc)
+                    short = _short_error(exc)
+                    output = f"(error: tool {tool_name} failed: {short})"
+                    err_status = "dispatch"
+                    err_detail = f"tool {tool_name!r} dispatch raised: {short}"
 
             tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
@@ -1101,6 +1163,11 @@ class AsyncAgentLoop(AgentLoop):
             await self.on_tool_message(tc, tool_msg, output)
 
             if fatal_detail is not None:
+                continue
+
+            pending = _extract_approval_request(output, tc)
+            if pending is not None:
+                approval_request = pending
                 continue
 
             fatal, err_type = self._classify_tool_error(output, err_status)
@@ -1128,6 +1195,18 @@ class AsyncAgentLoop(AgentLoop):
                     )
                     fatal_error_type = display_type
 
+        if approval_request is not None:
+            return tool_messages, self._result(
+                ok=False,
+                status="awaiting_approval",
+                summary="",
+                messages=messages,
+                error="tool operation is awaiting remote approval",
+                error_type="approval_required",
+                fatal=False,
+                retryable=False,
+                approval_request=approval_request,
+            )
         if fatal_detail is not None:
             return tool_messages, self._result(
                 ok=False, status="tool_error",
@@ -1187,6 +1266,7 @@ class AsyncAgentLoop(AgentLoop):
             self.registry,
             session_key=self.session_key,
             blocked_tools=self.blocked_tools,
+            tool_context=self.tool_context,
         )
 
     async def on_tool_message(

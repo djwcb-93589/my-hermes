@@ -13,9 +13,13 @@ import os
 import stat as stat_mod
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
-from hermes.backends import BaseExecutionEnvironment, _SECRET_BLOCKLIST
+from hermes.backends import (
+    BaseExecutionEnvironment,
+    filter_local_subprocess_environment,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +110,20 @@ class LocalBackend(BaseExecutionEnvironment):
     bash 命令时转成 MSYS 形式。
     """
 
+    def __init__(
+        self,
+        cwd: str,
+        timeout: int = 180,
+        *,
+        env_passthrough: Iterable[str] = (),
+        infrastructure_secret_values: Iterable[str] = (),
+    ):
+        self._env_passthrough = frozenset(env_passthrough)
+        self._infrastructure_secret_values = frozenset(
+            infrastructure_secret_values
+        )
+        super().__init__(cwd=cwd, timeout=timeout)
+
     def _setup_paths(self):
         """Windows 下把 snapshot/cwd 文件迁到 HERMES_HOME/cache/terminal/。
 
@@ -141,7 +159,11 @@ class LocalBackend(BaseExecutionEnvironment):
         # `["bash", ...]` 会沿 PATH 查找，可能命中 WSL 的 bash。
         bash = _find_git_bash() if sys.platform == "win32" else "bash"
 
-        env = {k: v for k, v in os.environ.items() if k not in _SECRET_BLOCKLIST}
+        env = filter_local_subprocess_environment(
+            os.environ,
+            env_passthrough=self._env_passthrough,
+            infrastructure_secret_values=self._infrastructure_secret_values,
+        )
         return subprocess.Popen(
             [bash, "-c", cmd_string],
             stdout=subprocess.PIPE,

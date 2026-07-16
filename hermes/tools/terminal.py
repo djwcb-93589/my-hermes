@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import json
 
-from hermes.backends import get_backend
+from hermes.approval import (
+    build_approval_required,
+    has_approval_grant,
+    is_cwd_only_terminal_command,
+    is_remote_approval,
+)
+from hermes.backends import (
+    INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
+    get_backend,
+)
+from hermes.redaction import redact_terminal_output
 from hermes.security import detect_dangerous_command, approve_command
 
 
@@ -18,19 +28,56 @@ def run_terminal(args, **kwargs):
     """
     command = args.get("command", "")
 
+    remote_approval = is_remote_approval(kwargs)
+    approval_granted = has_approval_grant(kwargs, "terminal", args)
+    session_key = kwargs.get("session_key") or "default"
+    backend = None
+    if (
+        remote_approval
+        and not approval_granted
+        and not is_cwd_only_terminal_command(command)
+    ):
+        backend = get_backend(session_key=session_key)
+        return build_approval_required(
+            "terminal",
+            "执行 Terminal 命令",
+            details={"command": command, "cwd": backend.cwd},
+        )
+
     matches = detect_dangerous_command(command)
-    if matches and not approve_command(command, matches):
+    if (
+        matches
+        and not approval_granted
+        and kwargs.get("interactive_approval", True) is False
+    ):
+        return json.dumps({
+            "ok": False,
+            "error_type": "safety_blocked",
+            "fatal": True,
+            "error": (
+                "Dangerous commands require interactive server approval, "
+                "which is unavailable for this session."
+            ),
+            "matches": [description for _, _, description in matches],
+        }, ensure_ascii=False)
+    if matches and not approval_granted and not approve_command(command, matches):
         return json.dumps({
             "ok": False,
             "error_type": "user_denied",
             "error": "Command denied by user.",
         })
 
-    session_key = kwargs.get("session_key") or "default"
-    backend = get_backend(session_key=session_key)
+    if backend is None:
+        backend = get_backend(session_key=session_key)
     result = backend.execute(command)
 
-    output = result["output"].rstrip()
+    # Local Terminal 不是沙箱。输出脱敏只能减少凭证进入模型上下文，
+    # 不能阻止子进程自己读取数据或通过网络外传。
+    output = redact_terminal_output(
+        result["output"].rstrip(),
+        command,
+        infrastructure_env_names=INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
+    )
     return json.dumps({
         "ok": True,
         "command_succeeded": result["returncode"] == 0,
@@ -55,6 +102,9 @@ def register(registry):
                 "paths used by the file tool resolve from this same cwd. "
                 "Use the file tool for file reads, writes, directory listings, "
                 "and metadata; use terminal for shell commands and processes. "
+                "Gateway remote sessions pause for user approval before every "
+                "command except a strict standalone cd or pwd. Do not retry an "
+                "operation while approval is pending. "
                 "On Windows the local backend uses Git Bash (MINGW/MSYS) — "
                 "NOT PowerShell, CMD, or WSL. Always emit Bash/POSIX-compatible "
                 "commands. Use forward-slash MSYS paths for absolute Windows "

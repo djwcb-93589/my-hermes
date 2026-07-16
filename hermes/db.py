@@ -24,7 +24,18 @@ from typing import Iterator
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 14
+
+GATEWAY_APPROVAL_STATUSES = frozenset({
+    "pending",
+    "executing",
+    "executed",
+    "denied",
+    "expired",
+    "cancelled",
+    "failed",
+    "execution_unknown",
+})
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
@@ -205,6 +216,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     )
     _create_gateway_source_message_ownership_schema(conn)
     _create_gateway_runtime_lease_schema(conn)
+    _create_gateway_approval_schema(conn)
     _create_gateway_fencing_triggers(conn)
     _create_feishu_inbox_schema(conn)
 
@@ -412,6 +424,57 @@ def _create_gateway_runtime_lease_schema(conn: sqlite3.Connection) -> None:
             heartbeat_at REAL NOT NULL,
             expires_at REAL NOT NULL
         )
+        """
+    )
+
+
+def _create_gateway_approval_schema(conn: sqlite3.Connection) -> None:
+    """创建远程工具审批表；请求与原始 Tool Result 一一绑定。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gateway_approval_requests (
+            id TEXT PRIMARY KEY,
+            route_key TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            requester_user_id TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            tool_message_id INTEGER NOT NULL UNIQUE,
+            tool_name TEXT NOT NULL CHECK (tool_name IN ('file', 'terminal')),
+            tool_args_json TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'executing', 'executed', 'denied', 'expired',
+                    'cancelled', 'failed', 'execution_unknown'
+                )
+            ),
+            decision_message_id TEXT,
+            result_content TEXT,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (conversation_id)
+                REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (tool_message_id)
+                REFERENCES messages(id) ON DELETE CASCADE,
+            UNIQUE(route_key, tool_call_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gateway_approval_route_status
+            ON gateway_approval_requests(
+                route_key, conversation_id, status, created_at
+            )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gateway_approval_expiry
+            ON gateway_approval_requests(status, expires_at)
         """
     )
 
@@ -1256,7 +1319,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     v7 → v8 增加原始平台消息归属索引，v8 → v9 增加 Gateway 运行租约，
     v9 → v10 正式接管 Feishu Inbox schema，v10 → v11 持久化 Inbox
     route_key，v11 → v12 增加运行租约 epoch 与 Outbox claim fencing，
-    v12 → v13 保存每条 route 的历史 conversation 归属。
+    v12 → v13 保存每条 route 的历史 conversation 归属，v13 → v14
+    增加与 Tool Result 绑定的远程审批请求。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -1500,6 +1564,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 13
+
+    if current < 14:
+        conn.execute("BEGIN")
+        try:
+            _create_gateway_approval_schema(conn)
+            _set_schema_version(conn, 14)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 14
 
     return current
 
@@ -4573,6 +4649,461 @@ def add_final_message_with_gateway_outbox(
             ),
         )
     return outbox_id
+
+
+# ===========================================================================
+# Gateway 远程工具审批
+# ===========================================================================
+
+_GATEWAY_APPROVAL_COLUMNS = """
+    id, route_key, conversation_id, requester_user_id, source_message_id,
+    tool_call_id, tool_message_id, tool_name, tool_args_json, summary,
+    details_json, status, decision_message_id, result_content,
+    created_at, expires_at, updated_at
+"""
+
+
+def _gateway_approval_row(row) -> dict | None:
+    """把审批查询行还原为上层可使用的结构。"""
+    if row is None:
+        return None
+    try:
+        tool_args = json.loads(row[8])
+        details = json.loads(row[10])
+    except (TypeError, ValueError) as exc:
+        raise DBError(f"gateway approval JSON deserialization failed: {exc}") from exc
+    if not isinstance(tool_args, dict) or not isinstance(details, dict):
+        raise DBError("gateway approval JSON has invalid structure")
+    return {
+        "id": str(row[0]),
+        "route_key": str(row[1]),
+        "conversation_id": str(row[2]),
+        "requester_user_id": str(row[3]),
+        "source_message_id": str(row[4]),
+        "tool_call_id": str(row[5]),
+        "tool_message_id": int(row[6]),
+        "tool_name": str(row[7]),
+        "tool_args": tool_args,
+        "summary": str(row[9]),
+        "details": details,
+        "status": str(row[11]),
+        "decision_message_id": (
+            str(row[12]) if row[12] is not None else None
+        ),
+        "result_content": (
+            str(row[13]) if row[13] is not None else None
+        ),
+        "created_at": float(row[14]),
+        "expires_at": float(row[15]),
+        "updated_at": float(row[16]),
+    }
+
+
+def _approval_terminal_content(request_id: str, status: str) -> str:
+    """生成拒绝、过期等未执行审批的最终 Tool Result。"""
+    return json.dumps(
+        {
+            "ok": False,
+            "error_type": f"approval_{status}",
+            "approval_request_id": request_id,
+            "error": f"Tool operation was not executed: approval {status}.",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _expire_gateway_approvals_in_transaction(
+    conn: sqlite3.Connection,
+    now: float,
+) -> int:
+    """在调用方事务内把超时请求转成终态，并同步 Tool Result。"""
+    rows = conn.execute(
+        """
+        SELECT id, tool_message_id
+        FROM gateway_approval_requests
+        WHERE status='pending' AND expires_at<=?
+        """,
+        (now,),
+    ).fetchall()
+    for request_id, tool_message_id in rows:
+        conn.execute(
+            "UPDATE messages SET content=? WHERE id=?",
+            (
+                _approval_terminal_content(str(request_id), "expired"),
+                int(tool_message_id),
+            ),
+        )
+    if rows:
+        conn.execute(
+            """
+            UPDATE gateway_approval_requests
+            SET status='expired', updated_at=?
+            WHERE status='pending' AND expires_at<=?
+            """,
+            (now, now),
+        )
+    return len(rows)
+
+
+def expire_gateway_approvals(
+    conn: sqlite3.Connection,
+    now: float | None = None,
+) -> int:
+    """公开的审批过期收敛入口。"""
+    effective_now = time.time() if now is None else float(now)
+    with transaction(conn):
+        return _expire_gateway_approvals_in_transaction(conn, effective_now)
+
+
+def recover_gateway_approvals(conn: sqlite3.Connection) -> dict:
+    """启动恢复：过期 pending，executing 转为不可重试的未知结果。"""
+    now = time.time()
+    with transaction(conn):
+        expired = _expire_gateway_approvals_in_transaction(conn, now)
+        rows = conn.execute(
+            """
+            SELECT id, tool_message_id
+            FROM gateway_approval_requests
+            WHERE status='executing'
+            """
+        ).fetchall()
+        for request_id, tool_message_id in rows:
+            conn.execute(
+                "UPDATE messages SET content=? WHERE id=?",
+                (
+                    _approval_terminal_content(
+                        str(request_id),
+                        "execution_unknown",
+                    ),
+                    int(tool_message_id),
+                ),
+            )
+        if rows:
+            conn.execute(
+                """
+                UPDATE gateway_approval_requests
+                SET status='execution_unknown', updated_at=?
+                WHERE status='executing'
+                """,
+                (now,),
+            )
+    return {"expired": expired, "execution_unknown": len(rows)}
+
+
+def create_gateway_approval_with_outbox(
+    conn: sqlite3.Connection,
+    session_id: str,
+    request: dict,
+    requester_user_id: str,
+    assistant_msg: dict,
+    outbox: dict,
+    ttl_seconds: float,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+) -> str:
+    """原子写入审批请求、审批问题及其 Outbox。"""
+    request_id = str(request.get("id", ""))
+    tool_name = str(request.get("tool_name", ""))
+    tool_call_id = str(request.get("tool_call_id", ""))
+    tool_args = request.get("arguments")
+    details = request.get("details", {})
+    if not request_id.startswith("approval_"):
+        raise DBError("invalid gateway approval request id")
+    if tool_name not in {"file", "terminal"}:
+        raise DBError("invalid gateway approval tool")
+    if not tool_call_id or not isinstance(tool_args, dict):
+        raise DBError("invalid gateway approval tool call")
+    if not isinstance(details, dict):
+        raise DBError("invalid gateway approval details")
+    if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
+        raise InvalidMessageError("approval delivery must reference an assistant message")
+    ttl = float(ttl_seconds)
+    if ttl <= 0:
+        raise DBError("gateway approval ttl must be positive")
+
+    now = time.time()
+    with transaction(conn):
+        tool_row = conn.execute(
+            """
+            SELECT id, content
+            FROM messages
+            WHERE session_id=? AND role='tool' AND tool_call_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session_id, tool_call_id),
+        ).fetchone()
+        if tool_row is None or request_id not in str(tool_row[1] or ""):
+            raise DBError("approval request is not bound to its tool result")
+
+        conn.execute(
+            """
+            INSERT INTO gateway_approval_requests (
+                id, route_key, conversation_id, requester_user_id,
+                source_message_id, tool_call_id, tool_message_id, tool_name,
+                tool_args_json, summary, details_json, status,
+                created_at, expires_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                request_id,
+                str(outbox["route_key"]),
+                session_id,
+                str(requester_user_id or ""),
+                str(outbox["source_message_id"]),
+                tool_call_id,
+                int(tool_row[0]),
+                tool_name,
+                _serialize_gateway_json(tool_args, "approval tool args"),
+                str(request.get("summary", "需要批准的工具操作")),
+                _serialize_gateway_json(details, "approval details"),
+                now,
+                now + ttl,
+                now,
+            ),
+        )
+        assistant_message_id = _insert_message(conn, session_id, assistant_msg)
+        outbox_id = _insert_gateway_outbox(
+            conn,
+            outbox,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
+        _insert_gateway_message_delivery(
+            conn,
+            delivery_id=outbox_id,
+            session_id=session_id,
+            assistant_message_id=assistant_message_id,
+            route_key=str(outbox["route_key"]),
+            source_message_id=str(outbox["source_message_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE gateway_message_queue
+            SET status='reply_pending', updated_at=?
+            WHERE route_key=? AND message_id=?
+            """,
+            (
+                now,
+                str(outbox["route_key"]),
+                str(outbox["source_message_id"]),
+            ),
+        )
+    return outbox_id
+
+
+def get_pending_gateway_approval(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+) -> dict | None:
+    """返回当前对话最早的未决审批；读取前先收敛过期状态。"""
+    expire_gateway_approvals(conn)
+    row = conn.execute(
+        f"""
+        SELECT {_GATEWAY_APPROVAL_COLUMNS}
+        FROM gateway_approval_requests
+        WHERE route_key=? AND conversation_id=? AND status='pending'
+        ORDER BY created_at
+        LIMIT 1
+        """,
+        (route_key, conversation_id),
+    ).fetchone()
+    return _gateway_approval_row(row)
+
+
+def _select_gateway_approval(
+    conn: sqlite3.Connection,
+    route_key: str,
+    selector: str,
+) -> tuple[str, dict | None]:
+    """按 route 内的完整 ID 或唯一前缀选择审批请求。"""
+    normalized = str(selector or "").strip()
+    if not normalized or any(
+        not (char.isalnum() or char in {"_", "-"})
+        for char in normalized
+    ):
+        return "invalid_id", None
+    prefix = normalized if normalized.startswith("approval_") else f"approval_{normalized}"
+    rows = conn.execute(
+        f"""
+        SELECT {_GATEWAY_APPROVAL_COLUMNS}
+        FROM gateway_approval_requests
+        WHERE route_key=? AND substr(id, 1, ?)=?
+        ORDER BY created_at DESC
+        LIMIT 2
+        """,
+        (route_key, len(prefix), prefix),
+    ).fetchall()
+    if not rows:
+        return "not_found", None
+    if len(rows) > 1:
+        return "ambiguous", None
+    return "found", _gateway_approval_row(rows[0])
+
+
+def claim_gateway_approval(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+    requester_user_id: str,
+    selector: str,
+    decision_message_id: str,
+) -> dict:
+    """校验审批归属并以 CAS 把 pending 转为 executing。"""
+    now = time.time()
+    with transaction(conn):
+        _expire_gateway_approvals_in_transaction(conn, now)
+        outcome, request = _select_gateway_approval(conn, route_key, selector)
+        if request is None:
+            return {"outcome": outcome}
+        if request["conversation_id"] != conversation_id:
+            return {"outcome": "stale_conversation", "request": request}
+        if (
+            request["requester_user_id"]
+            and request["requester_user_id"] != str(requester_user_id or "")
+        ):
+            return {"outcome": "forbidden", "request": request}
+        if request["status"] != "pending":
+            return {"outcome": request["status"], "request": request}
+        changed = conn.execute(
+            """
+            UPDATE gateway_approval_requests
+            SET status='executing', decision_message_id=?, updated_at=?
+            WHERE id=? AND status='pending'
+            """,
+            (decision_message_id, now, request["id"]),
+        ).rowcount
+        if changed != 1:
+            return {"outcome": "conflict"}
+        request["status"] = "executing"
+        request["decision_message_id"] = decision_message_id
+        return {"outcome": "claimed", "request": request}
+
+
+def deny_gateway_approval(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+    requester_user_id: str,
+    selector: str,
+    decision_message_id: str,
+) -> dict:
+    """校验审批归属并把 pending 原子转为 denied。"""
+    now = time.time()
+    with transaction(conn):
+        _expire_gateway_approvals_in_transaction(conn, now)
+        outcome, request = _select_gateway_approval(conn, route_key, selector)
+        if request is None:
+            return {"outcome": outcome}
+        if request["conversation_id"] != conversation_id:
+            return {"outcome": "stale_conversation", "request": request}
+        if (
+            request["requester_user_id"]
+            and request["requester_user_id"] != str(requester_user_id or "")
+        ):
+            return {"outcome": "forbidden", "request": request}
+        if request["status"] != "pending":
+            return {"outcome": request["status"], "request": request}
+        changed = conn.execute(
+            """
+            UPDATE gateway_approval_requests
+            SET status='denied', decision_message_id=?, updated_at=?
+            WHERE id=? AND status='pending'
+            """,
+            (decision_message_id, now, request["id"]),
+        ).rowcount
+        if changed != 1:
+            return {"outcome": "conflict"}
+        conn.execute(
+            "UPDATE messages SET content=? WHERE id=?",
+            (
+                _approval_terminal_content(request["id"], "denied"),
+                request["tool_message_id"],
+            ),
+        )
+        request["status"] = "denied"
+        return {"outcome": "denied", "request": request}
+
+
+def finish_gateway_approval(
+    conn: sqlite3.Connection,
+    request_id: str,
+    result_content: str,
+    *,
+    succeeded: bool,
+) -> dict:
+    """保存一次性执行结果，并用真实结果替换 awaiting Tool Result。"""
+    final_status = "executed" if succeeded else "failed"
+    now = time.time()
+    with transaction(conn):
+        row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_APPROVAL_COLUMNS}
+            FROM gateway_approval_requests
+            WHERE id=?
+            """,
+            (request_id,),
+        ).fetchone()
+        request = _gateway_approval_row(row)
+        if request is None:
+            raise DBError("gateway approval request not found")
+        changed = conn.execute(
+            """
+            UPDATE gateway_approval_requests
+            SET status=?, result_content=?, updated_at=?
+            WHERE id=? AND status='executing'
+            """,
+            (final_status, str(result_content), now, request_id),
+        ).rowcount
+        if changed != 1:
+            raise DBError("gateway approval is not executing")
+        conn.execute(
+            "UPDATE messages SET content=? WHERE id=?",
+            (str(result_content), request["tool_message_id"]),
+        )
+        request["status"] = final_status
+        request["result_content"] = str(result_content)
+        return request
+
+
+def cancel_pending_gateway_approvals(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+) -> int:
+    """取消当前对话的全部 pending 请求，不触碰已经开始执行的请求。"""
+    now = time.time()
+    with transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT id, tool_message_id
+            FROM gateway_approval_requests
+            WHERE route_key=? AND conversation_id=? AND status='pending'
+            """,
+            (route_key, conversation_id),
+        ).fetchall()
+        for request_id, tool_message_id in rows:
+            conn.execute(
+                "UPDATE messages SET content=? WHERE id=?",
+                (
+                    _approval_terminal_content(str(request_id), "cancelled"),
+                    int(tool_message_id),
+                ),
+            )
+        if rows:
+            conn.execute(
+                """
+                UPDATE gateway_approval_requests
+                SET status='cancelled', updated_at=?
+                WHERE route_key=? AND conversation_id=? AND status='pending'
+                """,
+                (now, route_key, conversation_id),
+            )
+    return len(rows)
 
 
 def add_message(

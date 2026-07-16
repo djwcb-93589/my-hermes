@@ -14,6 +14,7 @@ GatewayRunner:启动 adapter,路由入站消息,跑 agent,回发结果。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -28,13 +29,18 @@ from hermes.db import (
     add_final_message_with_gateway_outbox,
     add_messages,
     cancel_gateway_delivery,
+    cancel_pending_gateway_approvals,
     check_gateway_runtime_readiness,
+    claim_gateway_approval,
     complete_gateway_delivery,
     complete_gateway_message,
+    create_gateway_approval_with_outbox,
     delete_gateway_messages,
+    deny_gateway_approval,
     enqueue_gateway_outbox,
     enqueue_gateway_message,
     fail_gateway_delivery,
+    finish_gateway_approval,
     gateway_outbox_claim_is_valid,
     gateway_runtime_lease_is_valid,
     get_gateway_conversation_for_route,
@@ -42,6 +48,7 @@ from hermes.db import (
     get_gateway_routes_with_pending_outbox,
     get_next_recoverable_gateway_outbox_for_route,
     get_gateway_outbox,
+    get_pending_gateway_approval,
     get_gateway_queued_messages,
     get_recoverable_gateway_outbox,
     init_db,
@@ -54,6 +61,7 @@ from hermes.db import (
     prune_gateway_terminal_outbox,
     prune_gateway_terminal_ownership,
     reconcile_gateway_terminal_deliveries,
+    recover_gateway_approvals,
     release_gateway_runtime_lease,
     renew_gateway_runtime_lease,
     reset_gateway_processing_messages,
@@ -71,6 +79,7 @@ from hermes.gateway.types import (
     build_session_key,
 )
 from hermes.prompt import build_system_prompt
+from hermes.redaction import redact_explicit_secrets
 
 
 _GATEWAY_CONTEXT_FIELDS = (
@@ -79,6 +88,13 @@ _GATEWAY_CONTEXT_FIELDS = (
     "include_user_profile",
     "include_project_context",
 )
+_GATEWAY_SUPPORTED_TOOLSETS = frozenset({
+    "terminal",
+    "file",
+    "memory",
+    "skill",
+    "delegate",
+})
 _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
     "default": {
         "include_soul": True,
@@ -110,6 +126,93 @@ _SAFE_MODEL_TIMEOUT_REPLY = "处理失败：模型响应超时，请稍后重试
 _SAFE_MODEL_UNAVAILABLE_REPLY = "处理失败：模型服务暂时不可用，请稍后重试。"
 _SAFE_PERSISTENCE_REPLY = "处理失败：系统暂时不可用，请稍后重试。"
 _SAFE_INTERNAL_REPLY = "处理失败：任务未能完成，请稍后重试。"
+_GATEWAY_APPROVAL_TTL_SECONDS = 600.0
+
+
+def _short_approval_id(request_id: object) -> str:
+    """生成便于在聊天中输入、仍可由 route 内唯一前缀解析的审批号。"""
+    raw = str(request_id or "")
+    if raw.startswith("approval_"):
+        raw = raw[len("approval_"):]
+    return raw[:12]
+
+
+def _approval_value_preview(value: object, limit: int = 500) -> str:
+    """审批问题只展示脱敏且限长的操作内容。"""
+    text = redact_explicit_secrets(str(value or ""))
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…"
+
+
+def _format_approval_question(request: dict) -> str:
+    """把持久化请求格式化为明确的文本审批问题。"""
+    request_id = _short_approval_id(request.get("id"))
+    tool_name = str(request.get("tool_name", ""))
+    arguments = request.get("arguments", {})
+    details = request.get("details", {})
+    lines = [
+        "检测到受控操作，当前尚未执行。",
+        "",
+        f"审批编号：{request_id}",
+        f"工具：{tool_name}",
+        f"操作：{request.get('summary', '需要批准的工具操作')}",
+    ]
+    if tool_name == "terminal":
+        cwd = _approval_value_preview(details.get("cwd", ""), 1000)
+        if cwd:
+            lines.append(f"工作目录：{cwd}")
+        lines.append(
+            f"命令：{_approval_value_preview(arguments.get('command', ''), 2000)}"
+        )
+    elif tool_name == "file":
+        action = str(arguments.get("action", ""))
+        path = _approval_value_preview(
+            details.get("abs_path") or arguments.get("path", ""),
+            1000,
+        )
+        lines.extend([f"File action：{action}", f"路径：{path}"])
+        if action in {"write", "append"}:
+            content = str(arguments.get("content", ""))
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            lines.append(
+                f"内容：{len(content.encode('utf-8'))} bytes，SHA-256 {digest}"
+            )
+            lines.append(f"预览：{_approval_value_preview(content, 300)}")
+        elif action == "replace":
+            lines.append(
+                f"查找：{_approval_value_preview(arguments.get('find', ''), 300)}"
+            )
+            lines.append(
+                f"替换：{_approval_value_preview(arguments.get('replace', ''), 300)}"
+            )
+    lines.extend([
+        "",
+        f"批准：/approve {request_id}",
+        f"拒绝：/deny {request_id}",
+        "该请求 10 分钟后失效，只能由原请求者批准一次。",
+    ])
+    return "\n".join(lines)
+
+
+def _approval_command_reply(outcome: str, selector: str) -> str:
+    """把审批状态映射为不泄漏其它 route 信息的用户文案。"""
+    labels = {
+        "invalid_id": "审批编号格式无效。",
+        "not_found": "未找到该审批请求。",
+        "ambiguous": "审批编号不唯一，请输入更长的编号。",
+        "stale_conversation": "该审批请求不属于当前对话，不能执行。",
+        "forbidden": "该审批请求只能由原请求者处理。",
+        "expired": "该审批请求已经过期，操作未执行。",
+        "denied": "该审批请求已经被拒绝，操作未执行。",
+        "cancelled": "该审批请求已经取消，操作未执行。",
+        "executed": "该审批请求已经执行，不能重复执行。",
+        "failed": "该审批请求已经执行过，但工具返回失败。",
+        "executing": "该审批请求正在执行，请勿重复提交。",
+        "execution_unknown": "上次执行被中断，结果不确定；为避免重复副作用不会重试。",
+        "conflict": "审批状态刚刚发生变化，请重新查看。",
+    }
+    return labels.get(outcome, f"审批请求 {selector} 当前不可处理。")
 
 
 @dataclass(frozen=True)
@@ -188,6 +291,49 @@ def _load_gateway_context_config(
             )
         policies[policy_name] = policy
     return policies
+
+
+def _load_gateway_platform_toolsets(
+    gateway_cfg: dict,
+) -> dict[str, tuple[str, ...]]:
+    """读取各平台显式开放的工具集，未配置的平台保持无工具。"""
+    platforms_cfg = gateway_cfg.get("platforms", {})
+    if not isinstance(platforms_cfg, dict):
+        raise ValueError("gateway.platforms must be a mapping")
+
+    platform_toolsets: dict[str, tuple[str, ...]] = {}
+    for raw_platform, platform_cfg in platforms_cfg.items():
+        platform = str(raw_platform).strip().lower()
+        if not platform:
+            raise ValueError("gateway platform name must not be empty")
+        if not isinstance(platform_cfg, dict):
+            raise ValueError(
+                f"gateway.platforms.{platform} must be a mapping"
+            )
+
+        configured = platform_cfg.get("toolsets", [])
+        if not isinstance(configured, list) or not all(
+            isinstance(toolset, str) for toolset in configured
+        ):
+            raise ValueError(
+                f"gateway.platforms.{platform}.toolsets must be a list "
+                "of strings"
+            )
+
+        normalized: list[str] = []
+        for raw_toolset in configured:
+            toolset = raw_toolset.strip().lower()
+            if toolset not in _GATEWAY_SUPPORTED_TOOLSETS:
+                raise ValueError(
+                    f"gateway.platforms.{platform}.toolsets contains "
+                    f"unsupported toolset: {raw_toolset!r}; allowed: "
+                    f"{sorted(_GATEWAY_SUPPORTED_TOOLSETS)}"
+                )
+            if toolset not in normalized:
+                normalized.append(toolset)
+        platform_toolsets[platform] = tuple(normalized)
+
+    return platform_toolsets
 
 
 def _load_positive_seconds(
@@ -274,6 +420,9 @@ class GatewayRunner:
         if not isinstance(gateway_cfg, dict):
             raise ValueError("gateway must be a mapping")
         self._gateway_context_policies = _load_gateway_context_config(
+            gateway_cfg
+        )
+        self._gateway_platform_toolsets = _load_gateway_platform_toolsets(
             gateway_cfg
         )
         self.runtime_lease_ttl_seconds = _load_positive_seconds(
@@ -395,14 +544,22 @@ class GatewayRunner:
         return "default"
 
     def _build_gateway_prompt(self, source: SessionSource) -> str:
-        """按事件来源选择只读上下文，本地工具始终关闭。"""
+        """按事件来源选择只读上下文与平台工具能力。"""
         policy_name = self._gateway_context_policy_name(source)
         context_policy = self._gateway_context_policies[policy_name]
         return build_system_prompt(
             os.getcwd(),
-            enabled_toolsets=[],
+            enabled_toolsets=self._enabled_toolsets_for_source(source),
             **context_policy,
         )
+
+    def _enabled_toolsets_for_source(
+        self,
+        source: SessionSource,
+    ) -> list[str]:
+        """返回来源平台的工具集副本，避免会话修改共享配置。"""
+        platform = str(source.platform or "").strip().lower()
+        return list(self._gateway_platform_toolsets.get(platform, ()))
 
     @staticmethod
     def _is_processing_event(event: MessageEvent) -> bool:
@@ -1240,6 +1397,8 @@ class GatewayRunner:
         self._lifecycle_phase = "gateway_terminal_reconcile"
         try:
             await self._reconcile_terminal_deliveries_async()
+            self._lifecycle_phase = "gateway_approval_reconcile"
+            await self.persistence.call(recover_gateway_approvals)
             await self._require_startup_runtime_lease()
         except Exception as exc:
             # 终态无法收敛时不能继续恢复，也不能开放外部入口。
@@ -2729,6 +2888,59 @@ class GatewayRunner:
             else:
                 self._route_admission_users[route_key] = users
 
+    async def _execute_claimed_approval(self, request: dict) -> tuple[str, bool]:
+        """执行数据库中已 claim 的原始工具参数，并立即固化结果。"""
+        from hermes.tools import registry
+
+        try:
+            output = await asyncio.to_thread(
+                registry.dispatch,
+                request["tool_name"],
+                dict(request["tool_args"]),
+                session_key=request["conversation_id"],
+                interactive_approval=False,
+                approval_mode="remote",
+                approval_grant={
+                    "id": request["id"],
+                    "tool_name": request["tool_name"],
+                    "arguments": dict(request["tool_args"]),
+                },
+            )
+            try:
+                payload = json.loads(output)
+            except (TypeError, ValueError):
+                succeeded = False
+            else:
+                succeeded = not (
+                    isinstance(payload, dict) and payload.get("ok") is False
+                )
+        except Exception as exc:
+            output = json.dumps(
+                {
+                    "ok": False,
+                    "error_type": "approval_execution_failed",
+                    "error": f"Approved tool execution failed: {type(exc).__name__}",
+                },
+                ensure_ascii=False,
+            )
+            succeeded = False
+
+        await self.persistence.call(
+            finish_gateway_approval,
+            request["id"],
+            output,
+            succeeded=succeeded,
+        )
+        return output, succeeded
+
+    async def _pending_approval_for_context(self, route_key: str, ctx):
+        """读取当前 route/conversation 的未决请求。"""
+        return await self.persistence.call(
+            get_pending_gateway_approval,
+            route_key,
+            ctx.conversation_id,
+        )
+
     async def _handle_message_serialized(
         self,
         event: MessageEvent,
@@ -2764,6 +2976,101 @@ class GatewayRunner:
         command_argument = (
             command_parts[1].strip() if len(command_parts) > 1 else ""
         )
+        if cmd in {"/approve", "/deny"}:
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
+            )
+            content = None
+            if self._route_has_active_worker(ctx):
+                content = "当前任务仍在处理中，请稍后再处理审批请求。"
+            elif not command_argument:
+                content = f"用法：{cmd} <审批编号>"
+            elif cmd == "/deny":
+                decision = await self.persistence.call(
+                    deny_gateway_approval,
+                    route_key,
+                    ctx.conversation_id,
+                    event.source.user_id or event.source.user_id_alt,
+                    command_argument,
+                    event.message_id,
+                )
+                outcome = str(decision.get("outcome", ""))
+                if outcome == "denied":
+                    content = "已拒绝该审批请求，操作未执行。"
+                else:
+                    content = _approval_command_reply(outcome, command_argument)
+            else:
+                decision = await self.persistence.call(
+                    claim_gateway_approval,
+                    route_key,
+                    ctx.conversation_id,
+                    event.source.user_id or event.source.user_id_alt,
+                    command_argument,
+                    event.message_id,
+                )
+                outcome = str(decision.get("outcome", ""))
+                if outcome == "claimed":
+                    request = decision["request"]
+                    _output, succeeded = await self._execute_claimed_approval(
+                        request
+                    )
+                    state = "成功" if succeeded else "返回失败"
+                    event.text = (
+                        f"用户已批准审批请求 {_short_approval_id(request['id'])}。"
+                        f"Gateway 已按原始参数执行该操作，工具{state}；"
+                        "真实 Tool Result 已写入对话历史。请继续原任务，"
+                        "不要重复执行同一操作。"
+                    )
+                    event.metadata = {
+                        **dict(event.metadata or {}),
+                        "gateway_approval_resume": request["id"],
+                    }
+                    command_text = event.text
+                    command_parts = command_text.split(maxsplit=1)
+                    cmd = ""
+                    command_argument = ""
+                else:
+                    content = _approval_command_reply(outcome, command_argument)
+
+            if content is not None:
+                if event.source.platform not in self.adapters:
+                    await self._reply(event, content)
+                    return
+                await self._start_durable_reply_async(
+                    route_key,
+                    event,
+                    content,
+                    "approval_command",
+                    ctx,
+                )
+                return
+
+        if cmd not in {"/sessions", "/status", "/new", "/stop"}:
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
+            )
+            pending_approval = await self._pending_approval_for_context(
+                route_key,
+                ctx,
+            )
+            if pending_approval is not None:
+                request_id = _short_approval_id(pending_approval["id"])
+                content = (
+                    f"当前有待审批操作 {request_id}，原任务已暂停。\n"
+                    f"批准：/approve {request_id}\n"
+                    f"拒绝：/deny {request_id}"
+                )
+                if event.source.platform not in self.adapters:
+                    await self._reply(event, content)
+                    return
+                await self._start_durable_reply_async(
+                    route_key,
+                    event,
+                    content,
+                    "approval_pending",
+                    ctx,
+                )
+                return
         if cmd == "/sessions" and not command_argument:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
@@ -2865,6 +3172,11 @@ class GatewayRunner:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
+            await self.persistence.call(
+                cancel_pending_gateway_approvals,
+                route_key,
+                ctx.conversation_id,
+            )
             if self._route_has_active_worker(ctx):
                 # /new 作为串行屏障:丢弃命令前尚未执行的旧消息,
                 # 等当前 worker 完全退出后再切换 conversation_id。
@@ -2919,11 +3231,21 @@ class GatewayRunner:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
+            cancelled_approvals = await self.persistence.call(
+                cancel_pending_gateway_approvals,
+                route_key,
+                ctx.conversation_id,
+            )
             ok = await self._request_session_cancel_async(
                 route_key,
                 reason="user",
             )
-            content = "(cancel requested)" if ok else "(no active task)"
+            if ok:
+                content = "(cancel requested)"
+            elif cancelled_approvals:
+                content = "(pending approval cancelled)"
+            else:
+                content = "(no active task)"
             if event.source.platform not in self.adapters:
                 # 保留无 Adapter 的测试 / 嵌入式调用兼容路径。
                 await self._reply(event, content)
@@ -3517,8 +3839,42 @@ class GatewayRunner:
             async_client=self._get_async_client(),
             final_message_callback=persist_final_message,
             persistence_call=self.persistence.call,
-            enabled_toolsets=[],
+            enabled_toolsets=self._enabled_toolsets_for_source(event.source),
+            tool_context={
+                "interactive_approval": False,
+                "approval_mode": "remote",
+            },
         )
+        if result.get("status") == "awaiting_approval":
+            request = result.get("approval_request")
+            if not isinstance(request, dict):
+                return _GatewayAgentResult(
+                    _SAFE_INTERNAL_REPLY,
+                    failed=True,
+                    failure_type="invalid_approval_request",
+                )
+            if self._task_cancel_reason(ctx, generation) is not None:
+                return _GatewayAgentResult(None)
+            question = _format_approval_question(request)
+            msg = {"role": "assistant", "content": question}
+            outbox = self._build_outbox(
+                route_key,
+                event,
+                question,
+                delivery_id,
+                "approval_request",
+            )
+            await self.persistence.call(
+                create_gateway_approval_with_outbox,
+                conversation_id,
+                request,
+                event.source.user_id or event.source.user_id_alt,
+                msg,
+                outbox,
+                _GATEWAY_APPROVAL_TTL_SECONDS,
+                **self._runtime_fence_kwargs(),
+            )
+            return _GatewayAgentResult(question)
         return self._safe_agent_result(result)
 
     def _get_async_client(self):

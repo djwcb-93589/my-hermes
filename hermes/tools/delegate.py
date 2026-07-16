@@ -237,6 +237,7 @@ def run_delegate_child(
     toolsets: list[str],
     child_session_key: str,
     cancel_checker: Callable[[], bool] | None = None,
+    tool_context: dict | None = None,
 ) -> dict:
     """跑一个子 agent 任务,返回 dict(不是 JSON)。
 
@@ -266,6 +267,7 @@ def run_delegate_child(
             # provider-specific 参数留空,需要时由调用方注入
             model_kwargs=None,
             cancel_checker=cancel_checker,
+            tool_context=tool_context,
         )
         # goal 作为 user message 传入;system prompt 只描述角色 / 约束
         result = loop.run(goal)
@@ -309,6 +311,24 @@ def handle_delegate(args, **kwargs) -> str:
     if err is not None:
         return err
 
+    # 子 agent 的 backend 生命周期在 delegate 返回时结束，无法把待审批操作
+    # 安全恢复到原 cwd。远程会话必须让主 agent 直接调用 File/Terminal，确保
+    # 审批绑定的原始参数和执行 backend 完全一致。
+    if (
+        kwargs.get("approval_mode") == "remote"
+        and set(toolsets or ()) & {"file", "terminal"}
+    ):
+        return _result(
+            False,
+            "remote_approval_required",
+            "",
+            error=(
+                "Remote delegated file/terminal operations are disabled. "
+                "The main agent must call the tool directly so the user can "
+                "approve the exact operation."
+            ),
+        )
+
     # 提前过滤:无可用工具直接返,不创建 backend / job
     if not _filter_definitions(toolsets):
         return _result(
@@ -320,11 +340,25 @@ def handle_delegate(args, **kwargs) -> str:
     background = bool(args.get("background", False))
     parent_session_key = kwargs.get("session_key")
     child_session_key = f"child-{uuid.uuid4().hex[:12]}"
+    child_tool_context = {
+        "interactive_approval": kwargs.get(
+            "interactive_approval",
+            True,
+        ) is not False,
+    }
+    if kwargs.get("approval_mode") is not None:
+        child_tool_context["approval_mode"] = kwargs.get("approval_mode")
 
     if not background:
         # ---------- 同步模式 ----------
         print(f"  [delegate] sync child={child_session_key} goal={goal[:80]!r}")
-        r = run_delegate_child(goal, context, toolsets, child_session_key)
+        r = run_delegate_child(
+            goal,
+            context,
+            toolsets,
+            child_session_key,
+            tool_context=child_tool_context,
+        )
         return _result(
             r["ok"], r["status"], r["summary"],
             iterations=r["iterations"],
@@ -344,6 +378,7 @@ def handle_delegate(args, **kwargs) -> str:
             return run_delegate_child(
                 goal, context, toolsets, child_session_key,
                 cancel_checker=lambda: manager.is_cancel_requested(job_id),
+                tool_context=child_tool_context,
             )
         return runner
 

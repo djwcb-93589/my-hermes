@@ -103,9 +103,11 @@ def _dispatch_conversation_tool_call(loop, tool_call):
         f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
     )
     try:
+        dispatch_context = dict(getattr(loop, "tool_context", {}))
+        dispatch_context["session_key"] = loop.session_key
         output = loop.registry.dispatch(
             tool_name, tool_args,
-            session_key=loop.session_key,
+            **dispatch_context,
         )
     except Exception as exc:
         short = _sanitize_error_message(exc, max_len=200)
@@ -143,6 +145,7 @@ class ConversationAgentLoop(AgentLoop):
         model_kwargs: dict | None = None,
         cancel_checker=None,
         allowed_tool_names: set[str] | None = None,
+        tool_context: dict | None = None,
     ):
         super().__init__(
             model=model,
@@ -154,6 +157,7 @@ class ConversationAgentLoop(AgentLoop):
             session_key=session_key,
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
+            tool_context=tool_context,
         )
         # 主会话专有状态
         self.conn = conn
@@ -330,6 +334,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         final_message_callback=None,
         persistence_call=None,
         allowed_tool_names: set[str] | None = None,
+        tool_context: dict | None = None,
     ):
         super().__init__(
             model=model,
@@ -341,6 +346,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
             session_key=session_key,
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
+            tool_context=tool_context,
         )
         self.conn = conn
         self.db_session_id = db_session_id
@@ -541,6 +547,8 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
         final = "(max iterations reached)"
     elif result.status == "cancelled":
         final = "(cancelled)"
+    elif result.status == "awaiting_approval":
+        final = ""
     elif result.status == "model_error":
         final = (
             f"(agent error: model_error; fatal={result.fatal}; "
@@ -567,6 +575,7 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
         "error_type": result.error_type,
         "fatal": result.fatal,
         "retryable": result.retryable,
+        "approval_request": result.approval_request,
     }
 
 
@@ -591,6 +600,7 @@ def run_conversation(
     session_key: str | None = None,
     cancel_checker=None,
     enabled_toolsets: list[str] | None = None,
+    tool_context: dict | None = None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -632,6 +642,7 @@ def run_conversation(
         model_kwargs=None,
         cancel_checker=cancel_checker,
         allowed_tool_names=allowed_tool_names,
+        tool_context=tool_context,
     )
     result: AgentLoopResult = loop.run(user_message)
 
@@ -651,6 +662,7 @@ async def run_conversation_async(
     final_message_callback=None,
     persistence_call=None,
     enabled_toolsets: list[str] | None = None,
+    tool_context: dict | None = None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。"""
     owns_client = async_client is None
@@ -702,6 +714,7 @@ async def run_conversation_async(
             final_message_callback=final_message_callback,
             persistence_call=persistence_call,
             allowed_tool_names=allowed_tool_names,
+            tool_context=tool_context,
         )
         result: AgentLoopResult = await loop.run(user_message)
         return _conversation_result_response(result)

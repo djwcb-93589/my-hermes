@@ -70,6 +70,13 @@ gateway:
 
     feishu:
       enabled: false
+      # 未配置或设为 [] 时不开放工具；Gateway 不支持 cron toolset。
+      toolsets:
+        - terminal
+        - file
+        - memory
+        - skill
+        - delegate
       app_id: ${FEISHU_APP_ID}
       app_secret: ${FEISHU_APP_SECRET}
       verification_token: ${FEISHU_VERIFICATION_TOKEN}

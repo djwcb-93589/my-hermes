@@ -13,6 +13,7 @@ import signal
 
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
+from hermes.tools import register_all
 
 
 async def run_gateway():
@@ -20,11 +21,11 @@ async def run_gateway():
     print(f"=== Hermes Gateway ===")
     print(f"Model: {MODEL}")
 
-    # Runner 会对 prompt、API tools 和 dispatch 同时显式传入空工具集；
-    # 这里不再把“未调用 register_all()”当作安全边界。
-
-    # Runner 构造阶段统一校验 Gateway 上下文策略；非法配置会在任何
-    # Adapter 初始化或 Webhook 监听开始前直接终止启动。
+    # Runner 会按平台配置把同一工具集同时用于 prompt、API schema 和
+    # dispatch 白名单；全局 registry 本身不作为安全边界。
+    # Runner 构造阶段统一校验 Gateway 配置；非法配置会在任何 Adapter
+    # 初始化或 Webhook 监听开始前直接终止启动。
+    register_all()
     runner = GatewayRunner(config=_config, db_path=DB_PATH)
 
     platforms = _config.get("gateway", {}).get("platforms", {})

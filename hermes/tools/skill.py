@@ -9,6 +9,7 @@ Markdown body。所有写操作走"文件锁 + 原子替换"完整事务;所有�
 from __future__ import annotations
 
 import contextlib
+from dataclasses import asdict
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from pathlib import Path
 import yaml
 
 from hermes.config import HERMES_HOME
+from hermes.skill_security import get_skill_trust_state, scan_skill_content
 
 
 SKILLS_DIR = HERMES_HOME / "skills"
@@ -274,7 +276,7 @@ def discover_skills() -> list[dict]:
 
 
 def handle_skill_view(args, **kwargs):
-    """按 name 加载 skill 完整内容。"""
+    """按 name 加载完整正文，并返回风险报告与当前内容版本的信任状态。"""
     name = args.get("name", "")
     skill_dir, reason = _resolve_skill_dir(name)
     if skill_dir is None:
@@ -289,14 +291,46 @@ def handle_skill_view(args, **kwargs):
     if error:
         return _err("parse_error", error, name=name, relative_path=f"skills/{name}")
 
+    risk_report = scan_skill_content(body)
+    risk = {
+        "level": risk_report.risk_level,
+        "findings": [asdict(finding) for finding in risk_report.findings],
+    }
+    trust_state = get_skill_trust_state(name, text)
+    common = {
+        "name": metadata.get("name", name),
+        "relative_path": f"skills/{name}",
+        "risk": risk,
+        "trusted": trust_state.trusted,
+        "trust_stale": trust_state.trust_stale,
+    }
+
+    # Gateway 等无人值守调用没有可靠的交互确认能力；CLI 仍完整展示正文。
+    if kwargs.get("interactive_approval") is False:
+        if risk_report.risk_level == "high":
+            return _err(
+                "safety_blocked",
+                "high-risk skill is blocked in unattended mode",
+                status="blocked",
+                requires_confirmation=True,
+                **common,
+            )
+        if risk_report.risk_level == "medium" and not trust_state.trusted:
+            return _err(
+                "permission_denied",
+                "untrusted medium-risk skill requires interactive confirmation",
+                status="confirmation_required",
+                requires_confirmation=True,
+                **common,
+            )
+
     return _ok(
-        name=metadata.get("name", name),
         description=metadata.get("description", ""),
         version=metadata.get("version"),
         platforms=metadata.get("platforms"),
         metadata=metadata.get("metadata"),
         body=body,
-        relative_path=f"skills/{name}",
+        **common,
     )
 
 
@@ -486,7 +520,8 @@ def register(registry):
             "description": (
                 "Load full content of a skill by name (frontmatter + body). "
                 "Returns structured JSON with name/description/version/platforms/"
-                "metadata/body fields. Skills live under skills/<name>/SKILL.md."
+                "metadata/body fields plus risk and content-bound trust state. "
+                "Skills live under skills/<name>/SKILL.md."
             ),
             "parameters": {
                 "type": "object",
