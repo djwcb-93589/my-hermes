@@ -21,6 +21,11 @@ from hermes.backends import (
     BaseExecutionEnvironment,
     filter_local_subprocess_environment,
 )
+from hermes.path_policy import PathAccessPolicy
+from hermes.path_utils import (
+    git_bash_to_windows_path as _bash_to_win_path,
+    windows_to_git_bash_path as _win_to_bash_path,
+)
 
 
 if sys.platform == "win32":
@@ -104,37 +109,6 @@ def _find_git_bash() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Windows ↔ Git Bash 路径互转。
-# ---------------------------------------------------------------------------
-
-def _win_to_bash_path(win_path: str) -> str:
-    """``D:\\my-hermes\\foo`` → ``/d/my-hermes/foo``。
-
-    盘符变成 ``/<letter>/``；反斜杠换成正斜杠。相对路径或 UNC 路径
-    仅翻转反斜杠。
-    """
-    p = Path(win_path)
-    if p.drive:
-        drive_letter = p.drive[0].lower()
-        rest = str(p)[len(p.drive):].lstrip("\\/").replace("\\", "/")
-        return f"/{drive_letter}/{rest}" if rest else f"/{drive_letter}"
-    return str(p).replace("\\", "/")
-
-
-def _bash_to_win_path(bash_path: str) -> str:
-    """``/d/my-hermes/foo`` → ``D:\\my-hermes\\foo``。
-
-    只转换 ``/<drive-letter>/...`` 这种 MSYS 形式；其它路径（相对路径、
-    ``//unc/...`` 等）原样返回。
-    """
-    if len(bash_path) >= 3 and bash_path[0] == "/" and bash_path[2] == "/":
-        drive = bash_path[1].upper()
-        rest = bash_path[3:].replace("/", "\\")
-        return f"{drive}:\\{rest}"
-    return bash_path
-
-
-# ---------------------------------------------------------------------------
 # LocalBackend。
 # ---------------------------------------------------------------------------
 
@@ -146,11 +120,14 @@ class LocalBackend(BaseExecutionEnvironment):
     bash 命令时转成 MSYS 形式。
     """
 
+    terminal_path_preflight_enabled = True
+
     def __init__(
         self,
         cwd: str,
         timeout: int = 180,
         *,
+        path_policy: PathAccessPolicy | None = None,
         env_passthrough: Iterable[str] = (),
         infrastructure_secret_values: Iterable[str] = (),
     ):
@@ -158,7 +135,11 @@ class LocalBackend(BaseExecutionEnvironment):
         self._infrastructure_secret_values = frozenset(
             infrastructure_secret_values
         )
-        super().__init__(cwd=cwd, timeout=timeout)
+        super().__init__(
+            cwd=cwd,
+            timeout=timeout,
+            path_policy=path_policy,
+        )
 
     def _setup_paths(self):
         """Windows 下把 snapshot/cwd 文件迁到 HERMES_HOME/cache/terminal/。
@@ -271,17 +252,16 @@ class LocalBackend(BaseExecutionEnvironment):
 
     def resolve_path(self, rel_path: str) -> str:
         """相对路径以 cwd 为基准；同时接受 MSYS 形式（``/d/...``）方便 LLM。"""
+        rel_path = os.path.expandvars(os.path.expanduser(rel_path))
         if (
             sys.platform == "win32"
             and rel_path.startswith("/")
-            and len(rel_path) >= 3
-            and rel_path[2] == "/"
+            and len(rel_path) >= 2
+            and rel_path[1].isalpha()
+            and (len(rel_path) == 2 or rel_path[2] == "/")
         ):
             rel_path = _bash_to_win_path(rel_path)
-        p = Path(rel_path)
-        if not p.is_absolute():
-            p = Path(self.cwd) / p
-        return str(p)
+        return super().resolve_path(rel_path)
 
     def read_file(self, path: str, offset: int = 0, limit: int | None = None) -> bytes:
         """按字节读取文件，offset/limit 都是字节单位。"""

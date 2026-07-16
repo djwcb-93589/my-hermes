@@ -14,6 +14,17 @@ import re
 import yaml
 from openai import AsyncOpenAI, OpenAI
 
+from hermes.path_policy import PathAccessPolicy
+
+
+DEFAULT_CONFIG = {
+    "security": {
+        "filesystem": {
+            "denied_paths": [],
+        },
+    },
+}
+
 
 def _expand_env_vars(value):
     """Recursively resolve ${VAR} references in config values."""
@@ -33,6 +44,39 @@ def _expand_env_vars(value):
         return [_expand_env_vars(item) for item in value]
 
     return value
+
+
+def _validate_filesystem_security_config(config: dict) -> None:
+    """补齐并校验统一文件系统策略配置。"""
+    security = config.get("security")
+    if security is None:
+        security = {}
+        config["security"] = security
+    if not isinstance(security, dict):
+        raise ValueError("security must be a mapping")
+
+    filesystem = security.get("filesystem")
+    if filesystem is None:
+        filesystem = {}
+        security["filesystem"] = filesystem
+    if not isinstance(filesystem, dict):
+        raise ValueError("security.filesystem must be a mapping")
+
+    denied_paths = filesystem.get(
+        "denied_paths",
+        DEFAULT_CONFIG["security"]["filesystem"]["denied_paths"],
+    )
+    if not isinstance(denied_paths, list):
+        raise ValueError(
+            "security.filesystem.denied_paths must be a list"
+        )
+    for index, path in enumerate(denied_paths):
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(
+                "security.filesystem.denied_paths entries must be "
+                f"non-empty strings (invalid item at index {index})"
+            )
+    filesystem["denied_paths"] = list(denied_paths)
 
 
 def load_env(env_path=None):
@@ -72,7 +116,9 @@ def load_config(config_path=None) -> dict:
 
     if not isinstance(config, dict):
         raise ValueError(f"config file must contain a mapping: {config_path}")
-    return _expand_env_vars(config)
+    config = _expand_env_vars(config)
+    _validate_filesystem_security_config(config)
+    return config
 
 
 def save_config(config: dict, config_path=None):
@@ -109,6 +155,11 @@ HERMES_HOME = _Path(os.getenv("HERMES_HOME") or _PROJECT_ROOT)
 load_env()
 
 _config = load_config()
+
+PATH_ACCESS_POLICY = PathAccessPolicy(
+    _config["security"]["filesystem"]["denied_paths"],
+    cwd=os.getcwd(),
+)
 
 BASE_URL = os.getenv("OPENAI_BASE_URL") or _config["base_url"]
 API_KEY = os.getenv("OPENAI_API_KEY") or _config["api_key"]

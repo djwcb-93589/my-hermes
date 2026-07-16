@@ -2915,6 +2915,9 @@ class GatewayRunner:
                     "id": request["id"],
                     "tool_name": request["tool_name"],
                     "arguments": dict(request["tool_args"]),
+                    "approved_abs_path": request.get("details", {}).get(
+                        "abs_path"
+                    ),
                 },
             }
             # 只有已从 pending 原子 claim 为 executing 的 File 请求能获得本次内部许可。

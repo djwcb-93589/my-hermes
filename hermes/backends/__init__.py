@@ -31,7 +31,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
-from hermes.config import _config
+from hermes.config import PATH_ACCESS_POLICY, _config
+from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessPolicy
 from hermes.redaction import is_explicit_credential_env_name
 
 
@@ -175,9 +176,17 @@ class BaseExecutionEnvironment(ABC):
     CWD 追踪、超时处理——都在基类里共享。
     """
 
-    def __init__(self, cwd: str, timeout: int = 180):
+    terminal_path_preflight_enabled = False
+
+    def __init__(
+        self,
+        cwd: str,
+        timeout: int = 180,
+        *,
+        path_policy: PathAccessPolicy | None = None,
+    ):
         self.cwd = cwd
-        self.file_root = cwd
+        self.path_policy = path_policy or ALLOW_ALL_PATH_POLICY
         self.timeout = timeout
         self._session_id = uuid.uuid4().hex[:12]
         # 默认：/tmp/hermes-* （POSIX 下 shell == host）。Windows 上的
@@ -415,7 +424,8 @@ class BaseExecutionEnvironment(ABC):
         相对路径以 ``self.cwd`` 为基准。子类可覆盖以处理路径形式转换
         （如 Windows + Git Bash 把 MSYS 形式 ``/d/...`` 转成 Windows 形式）。
         """
-        p = Path(rel_path)
+        expanded = os.path.expandvars(os.path.expanduser(rel_path))
+        p = Path(expanded)
         if not p.is_absolute():
             p = Path(self.cwd) / p
         return str(p)
@@ -445,7 +455,11 @@ class BaseExecutionEnvironment(ABC):
         )
 
 
-def create_backend(config: dict) -> BaseExecutionEnvironment:
+def create_backend(
+    config: dict,
+    *,
+    path_policy: PathAccessPolicy | None = None,
+) -> BaseExecutionEnvironment:
     """根据 config 选择合适的后端。"""
     # 局部 import，避免模块加载阶段产生循环引用。
     from hermes.backends.local import LocalBackend
@@ -456,20 +470,27 @@ def create_backend(config: dict) -> BaseExecutionEnvironment:
     if not isinstance(terminal_cfg, Mapping):
         raise ValueError("terminal config must be a mapping")
     backend_type = terminal_cfg.get("backend", "local")
+    active_path_policy = path_policy or PATH_ACCESS_POLICY
 
     if backend_type == "docker":
         image = terminal_cfg.get("docker_image", "python:3.11-slim")
-        return DockerBackend(image=image, cwd="/workspace")
+        return DockerBackend(
+            image=image,
+            cwd="/workspace",
+            path_policy=active_path_policy,
+        )
     elif backend_type == "ssh":
         return SSHBackend(
             host=terminal_cfg["ssh_host"],
             user=terminal_cfg["ssh_user"],
             key_path=terminal_cfg.get("ssh_key"),
             cwd="~",
+            path_policy=active_path_policy,
         )
     else:
         return LocalBackend(
             cwd=os.getcwd(),
+            path_policy=active_path_policy,
             env_passthrough=_load_terminal_env_passthrough(terminal_cfg),
             infrastructure_secret_values=(
                 _configured_infrastructure_credential_values(config)
@@ -499,7 +520,7 @@ def get_backend(session_key: str = "default") -> BaseExecutionEnvironment:
     with _backends_lock:
         b = _backends.get(session_key)
         if b is None:
-            b = create_backend(_config)
+            b = create_backend(_config, path_policy=PATH_ACCESS_POLICY)
             _backends[session_key] = b
         return b
 

@@ -6,14 +6,14 @@
 路径守卫
 --------
 - 相对路径以 ``backend.cwd`` 为基准（terminal cd 会改 cwd）。
-- 拒绝穿越到固定 ``file_root`` 之外（``../`` 攻击）。
+- LocalBackend 可访问操作系统用户有权限访问的全部本机路径。
+- 用户配置的统一禁止路径在敏感文件判断和审批之前硬拒绝。
 - 默认拒绝敏感文件（.env、私钥、数据库等），Gateway 可按次审批后执行。
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import datetime, timezone
 
@@ -23,6 +23,11 @@ from hermes.approval import (
     is_remote_approval,
 )
 from hermes.backends import get_backend, UnsupportedBackendError
+from hermes.path_policy import (
+    ALLOW_ALL_PATH_POLICY,
+    PATH_POLICY_DENIED_ERROR_TYPE,
+    PathAccessDeniedError,
+)
 from hermes.redaction import redact_file_content
 
 
@@ -54,17 +59,12 @@ def _is_sensitive(abs_path: str) -> bool:
     return any(pat.search(norm) for pat in _SENSITIVE_PATTERNS)
 
 
-def _guard_path(abs_path: str, root: str, allow_sensitive: bool) -> tuple[bool, str]:
-    """检查 abs_path 是否安全可访问。返回 (ok, reason)。
-
-    1. realpath 解析后必须在 root 子树内（拒绝符号链接 + ``../`` 穿越）。
-    2. 始终判断是否为敏感路径，命中时仅由本次内部许可决定是否放行。
-    """
-    real_abs = os.path.realpath(abs_path)
-    real_root = os.path.realpath(root)
-    if real_abs != real_root and not real_abs.startswith(real_root + os.sep):
-        return False, "path escapes project root"
-    if _is_sensitive(real_abs) and not allow_sensitive:
+def _guard_sensitive_path(
+    abs_path: str,
+    allow_sensitive: bool,
+) -> tuple[bool, str]:
+    """检查内置敏感文件规则；统一禁止路径已在此前硬拒绝。"""
+    if _is_sensitive(abs_path) and not allow_sensitive:
         return False, _SENSITIVE_PATH_ERROR
     return True, ""
 
@@ -76,9 +76,12 @@ def _json(obj: dict) -> str:
 
 def _file_context(backend) -> dict:
     cwd = getattr(backend, "cwd", "")
+    path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
     return {
         "cwd": cwd,
-        "file_root": getattr(backend, "file_root", cwd),
+        "filesystem_scope": "host",
+        "denied_paths_configured": path_policy.denied_paths_configured,
+        "denied_paths_count": path_policy.denied_paths_count,
     }
 
 
@@ -103,6 +106,8 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
     rel_path = args.get("path", "")
     session_key = kwargs.get("session_key") or "default"
     backend = get_backend(session_key=session_key)
+    remote_approval = is_remote_approval(kwargs)
+    approval_granted = has_approval_grant(kwargs, "file", args)
 
     # 该字段只允许可信内部调用通过 keyword-only 参数传入，模型 JSON 不得控制。
     if "allow_sensitive" in args:
@@ -127,7 +132,7 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
             },
         )
 
-    if not rel_path:
+    if not isinstance(rel_path, str) or not rel_path.strip():
         return _file_error(
             backend,
             {
@@ -137,19 +142,46 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
             },
         )
 
-    # 解析路径（相对 backend.cwd）
+    # Backend 先处理 cwd 和平台路径形式，策略再生成审批与执行共用的真实路径。
     try:
-        abs_path = backend.resolve_path(rel_path)
+        resolved_path = backend.resolve_path(rel_path)
+        path_policy = getattr(
+            backend,
+            "path_policy",
+            ALLOW_ALL_PATH_POLICY,
+        )
+        abs_path = path_policy.require_allowed(
+            resolved_path,
+            cwd=backend.cwd,
+        )
+        grant = kwargs.get("approval_grant")
+        approved_abs_path = (
+            grant.get("approved_abs_path")
+            if approval_granted and isinstance(grant, dict)
+            else None
+        )
+        if isinstance(approved_abs_path, str) and approved_abs_path:
+            # 审批恢复固定使用审批时展示的规范化绝对路径，避免 cwd 或路径文本漂移。
+            abs_path = path_policy.require_allowed(
+                approved_abs_path,
+                cwd=backend.cwd,
+            )
+    except PathAccessDeniedError:
+        return _json({
+            "ok": False,
+            "error_type": PATH_POLICY_DENIED_ERROR_TYPE,
+            "error": "path is blocked by the configured filesystem policy",
+        })
     except Exception as exc:
         return _file_error(backend, {"path": rel_path,
                            "error_type": "invalid_path", "error": str(exc)})
 
-    # 路径守卫始终重新检查 root 和敏感路径；只有内部布尔值 True 才能放行。
+    # 用户禁止路径已经硬拒绝；内部许可只能影响第二层敏感文件规则。
     allow_sensitive = allow_sensitive is True
-    file_root = getattr(backend, "file_root", backend.cwd)
-    ok, reason = _guard_path(abs_path, file_root, allow_sensitive=allow_sensitive)
-    remote_approval = is_remote_approval(kwargs)
-    approval_granted = has_approval_grant(kwargs, "file", args)
+    ok, reason = _guard_sensitive_path(
+        abs_path,
+        allow_sensitive=allow_sensitive,
+    )
     pending_sensitive_approval = (
         not ok
         and reason == _SENSITIVE_PATH_ERROR
@@ -200,6 +232,10 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
     except FileNotFoundError:
         return _file_error(backend, {"path": rel_path,
                            "error_type": "not_found", "error": "file does not exist"})
+    except PermissionError:
+        return _file_error(backend, {"path": rel_path,
+                           "error_type": "os_permission_denied",
+                           "error": "operating system denied access to the path"})
     except IsADirectoryError:
         return _file_error(backend, {"path": rel_path,
                            "error_type": "is_directory", "error": "path is a directory"})
@@ -365,8 +401,9 @@ def register(registry):
                 "current session cwd, which is shared with and persisted by "
                 "the terminal tool. After terminal changes directory, use a "
                 "path relative to that new cwd; never prefix the cwd directory "
-                "name again. File operations are constrained to the session's "
-                "fixed file root. Prefer "
+                "name again. Local file operations use host scope and may "
+                "access paths outside the project when the operating system "
+                "allows it. Prefer "
                 "this tool over terminal for file content, directory listings, "
                 "and metadata. Actions: "
                 "read, read_range, write, append, replace, list, stat, "
@@ -375,7 +412,9 @@ def register(registry):
                 "path action; pwd/context remain available without approval. "
                 "Do not retry an operation while approval is pending. "
                 "Paths are relative to backend.cwd unless absolute. "
-                "Path traversal outside the fixed file root is rejected. Sensitive file "
+                "Paths blocked by the shared filesystem policy are always "
+                "rejected with error_type=path_policy_denied before approval; "
+                "do not try another tool to bypass that result. Sensitive file "
                 "operations (.env, *.key, *.pem, id_rsa, *.db, *.db-wal, .git/*) "
                 "require a separate Gateway approval for every operation. "
                 "write defaults to no-overwrite; "
@@ -384,7 +423,8 @@ def register(registry):
                 "available. replace only supports UTF-8 files up to 100KB. "
                 "Call again with offset for ranged reads. Docker/SSH backends "
                 "stat returns mtime_utc and mtime_local with timezone data. "
-                "All successful results include cwd and file_root. Docker/SSH "
+                "All successful results include cwd, filesystem_scope, and "
+                "the configured denied-path count without exposing paths. Docker/SSH "
                 "backends return error_type=unsupported_backend for IO actions."
             ),
             "parameters": {

@@ -25,6 +25,11 @@ memory:
   memory_char_limit: 12000
   user_char_limit: 12000
 
+security:
+  filesystem:
+    # 每一项同时禁止该路径本身和全部子路径；空列表表示不额外禁止。
+    denied_paths: []
+
 db_path: database/hermes.db
 
 terminal:

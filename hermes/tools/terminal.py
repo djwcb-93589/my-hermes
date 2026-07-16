@@ -14,8 +14,14 @@ from hermes.backends import (
     INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
     get_backend,
 )
+from hermes.path_policy import (
+    ALLOW_ALL_PATH_POLICY,
+    PATH_POLICY_DENIED_ERROR_TYPE,
+    PathAccessDeniedError,
+)
 from hermes.redaction import redact_terminal_output
 from hermes.security import detect_dangerous_command, approve_command
+from hermes.terminal_path_preflight import preflight_terminal_command
 
 
 def run_terminal(args, **kwargs):
@@ -31,13 +37,35 @@ def run_terminal(args, **kwargs):
     remote_approval = is_remote_approval(kwargs)
     approval_granted = has_approval_grant(kwargs, "terminal", args)
     session_key = kwargs.get("session_key") or "default"
-    backend = None
+    backend = get_backend(session_key=session_key)
+
+    # Local Terminal 的路径检查是审批前尽力预检，不是不可绕过的沙箱。
+    if getattr(backend, "terminal_path_preflight_enabled", False):
+        try:
+            preflight_terminal_command(
+                command,
+                cwd=backend.cwd,
+                path_policy=getattr(
+                    backend,
+                    "path_policy",
+                    ALLOW_ALL_PATH_POLICY,
+                ),
+            )
+        except PathAccessDeniedError:
+            return json.dumps({
+                "ok": False,
+                "error_type": PATH_POLICY_DENIED_ERROR_TYPE,
+                "error": (
+                    "terminal command references a path blocked by the "
+                    "configured filesystem policy"
+                ),
+            }, ensure_ascii=False)
+
     if (
         remote_approval
         and not approval_granted
         and not is_cwd_only_terminal_command(command)
     ):
-        backend = get_backend(session_key=session_key)
         return build_approval_required(
             "terminal",
             "执行 Terminal 命令",
@@ -67,8 +95,6 @@ def run_terminal(args, **kwargs):
             "error": "Command denied by user.",
         })
 
-    if backend is None:
-        backend = get_backend(session_key=session_key)
     cancel_checker = kwargs.get("cancel_checker")
     if callable(cancel_checker):
         result = backend.execute(command, cancel_checker=cancel_checker)
@@ -129,6 +155,11 @@ def register(registry):
                 "locations (e.g. /d/my-project, not D:\\\\my-project). "
                 "On Linux/macOS the local backend uses /bin/bash. The result "
                 "is JSON with output, exit_code, cwd, and session-state flags. "
+                "Local terminal path enforcement is best-effort and is not a "
+                "sandbox. Commands that clearly reference a path blocked by "
+                "the shared filesystem policy are rejected before approval, "
+                "but complex dynamic scripts may not be detected. Do not try "
+                "to bypass error_type=path_policy_denied through another tool. "
                 "A Gateway /stop request interrupts the active local process "
                 "group like Ctrl+C, then force-stops it if it does not exit."
             ),
