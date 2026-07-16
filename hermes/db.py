@@ -5076,6 +5076,7 @@ def create_gateway_approval_with_outbox(
     tool_call_id = str(request.get("tool_call_id", ""))
     tool_args = request.get("arguments")
     details = request.get("details", {})
+    normalized_requester_user_id = str(requester_user_id or "").strip()
     if not request_id.startswith("approval_"):
         raise DBError("invalid gateway approval request id")
     if tool_name not in {"file", "terminal"}:
@@ -5084,6 +5085,8 @@ def create_gateway_approval_with_outbox(
         raise DBError("invalid gateway approval tool call")
     if not isinstance(details, dict):
         raise DBError("invalid gateway approval details")
+    if not normalized_requester_user_id:
+        raise DBError("gateway approval requester identity is required")
     if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
         raise InvalidMessageError("approval delivery must reference an assistant message")
     source_event_json = str(outbox.get("event_json", "") or "")
@@ -5154,6 +5157,7 @@ def create_gateway_approval_with_outbox(
                 or existing["tool_message_id"] != int(tool_row[0])
                 or existing["tool_name"] != tool_name
                 or existing["tool_args"] != tool_args
+                or existing["requester_user_id"] != normalized_requester_user_id
                 or existing["source_event_json"] != source_event_json
                 or existing["agent_state"] != normalized_agent_state
             ):
@@ -5191,7 +5195,7 @@ def create_gateway_approval_with_outbox(
                 request_id,
                 str(outbox["route_key"]),
                 session_id,
-                str(requester_user_id or ""),
+                normalized_requester_user_id,
                 source_message_id,
                 tool_call_id,
                 int(tool_row[0]),
@@ -5230,6 +5234,47 @@ def create_gateway_approval_with_outbox(
             now,
         )
     return outbox_id
+
+
+def fail_gateway_approval_identity_unavailable(
+    conn: sqlite3.Connection,
+    session_id: str,
+    request_id: str,
+    tool_call_id: str,
+) -> str:
+    """在不创建审批记录时，把占位 Tool Result 原子收敛为身份失败。"""
+    result_content = _serialize_gateway_json(
+        {
+            "ok": False,
+            "error_type": "approval_identity_unavailable",
+            "error": "approval requires a verifiable platform actor identity",
+        },
+        "approval identity failure",
+    )
+    with transaction(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM gateway_approval_requests WHERE id=?",
+            (str(request_id),),
+        ).fetchone()
+        if existing is not None:
+            raise DBError("gateway approval identity failure already has a request")
+        tool_row = conn.execute(
+            """
+            SELECT id, content
+            FROM messages
+            WHERE session_id=? AND role='tool' AND tool_call_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(session_id), str(tool_call_id)),
+        ).fetchone()
+        if tool_row is None or str(request_id) not in str(tool_row[1] or ""):
+            raise DBError("approval identity failure is not bound to its tool result")
+        conn.execute(
+            "UPDATE messages SET content=? WHERE id=?",
+            (result_content, int(tool_row[0])),
+        )
+    return result_content
 
 
 def get_pending_gateway_approval(
@@ -5297,13 +5342,16 @@ def claim_gateway_approval(
         outcome, request = _select_gateway_approval(conn, route_key, selector)
         if request is None:
             return {"outcome": outcome}
-        if request["conversation_id"] != conversation_id:
-            return {"outcome": "stale_conversation", "request": request}
+        current_actor_id = str(requester_user_id or "").strip()
+        stored_actor_id = str(request["requester_user_id"] or "").strip()
         if (
-            request["requester_user_id"]
-            and request["requester_user_id"] != str(requester_user_id or "")
+            not current_actor_id
+            or not stored_actor_id
+            or stored_actor_id != current_actor_id
         ):
             return {"outcome": "forbidden", "request": request}
+        if request["conversation_id"] != conversation_id:
+            return {"outcome": "stale_conversation", "request": request}
         if request["status"] != "pending":
             return {"outcome": request["status"], "request": request}
         changed = conn.execute(
@@ -5336,13 +5384,16 @@ def deny_gateway_approval(
         outcome, request = _select_gateway_approval(conn, route_key, selector)
         if request is None:
             return {"outcome": outcome}
-        if request["conversation_id"] != conversation_id:
-            return {"outcome": "stale_conversation", "request": request}
+        current_actor_id = str(requester_user_id or "").strip()
+        stored_actor_id = str(request["requester_user_id"] or "").strip()
         if (
-            request["requester_user_id"]
-            and request["requester_user_id"] != str(requester_user_id or "")
+            not current_actor_id
+            or not stored_actor_id
+            or stored_actor_id != current_actor_id
         ):
             return {"outcome": "forbidden", "request": request}
+        if request["conversation_id"] != conversation_id:
+            return {"outcome": "stale_conversation", "request": request}
         if request["status"] != "pending":
             return {"outcome": request["status"], "request": request}
         changed = conn.execute(

@@ -19,9 +19,11 @@ import json
 import math
 import os
 import random
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from hermes.db import (
@@ -40,6 +42,8 @@ from hermes.db import (
     enqueue_gateway_outbox,
     enqueue_gateway_message,
     fail_gateway_delivery,
+    fail_gateway_approval_identity_unavailable,
+    finish_gateway_approval,
     finish_gateway_approval_and_enqueue_resume,
     gateway_outbox_claim_is_valid,
     gateway_runtime_lease_is_valid,
@@ -69,7 +73,11 @@ from hermes.db import (
     reset_gateway_sending_outbox,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
-from hermes.gateway.observability import safe_message_digest, safe_route_digest
+from hermes.gateway.observability import (
+    safe_identifier_digest,
+    safe_message_digest,
+    safe_route_digest,
+)
 from hermes.gateway.persistence import GatewayPersistence
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import (
@@ -230,6 +238,17 @@ class _GatewayAgentResult:
     response: str | None
     failed: bool = False
     failure_type: str | None = None
+
+
+@dataclass
+class _RunningApproval:
+    """Gateway 内存中的一次已认领审批执行。"""
+
+    approval_id: str
+    route_key: str
+    conversation_id: str
+    task: asyncio.Task = field(repr=False)
+    cancel_event: threading.Event = field(repr=False)
 
 
 def _safe_audit_label(value: object) -> str:
@@ -535,6 +554,11 @@ class GatewayRunner:
         self._readiness_probe_cached_result = False
         self._route_admission_locks: dict[str, asyncio.Lock] = {}
         self._route_admission_users: dict[str, int] = {}
+        self._running_approvals: dict[str, _RunningApproval] = {}
+        self._running_approvals_by_context: dict[
+            tuple[str, str],
+            set[str],
+        ] = {}
         self._stop_lock = asyncio.Lock()
         # 异步模型客户端按需创建,Gateway 停止时统一关闭。
         self._async_client = None
@@ -550,6 +574,13 @@ class GatewayRunner:
         if chat_type == "group":
             return "group"
         return "default"
+
+    @staticmethod
+    def _stable_actor_id(event: MessageEvent) -> str | None:
+        """只接受平台提供的稳定用户标识，不以 route 或展示信息代替。"""
+        actor_id = event.source.user_id or event.source.user_id_alt
+        actor_id = str(actor_id or "").strip()
+        return actor_id or None
 
     def _build_gateway_prompt(self, source: SessionSource) -> str:
         """按事件来源选择只读上下文与平台工具能力。"""
@@ -1103,6 +1134,7 @@ class GatewayRunner:
         # 失租等同 shutdown：保留可恢复 Outbox，不把它误标为用户取消。
         for adapter in self.adapters.values():
             adapter.revoke_receiving()
+        self._signal_all_running_approvals()
         self.sessions.cancel_all(reason="shutdown")
         if (
             self._lease_shutdown_task is None
@@ -1150,6 +1182,10 @@ class GatewayRunner:
                 try:
                     protected = await self.persistence.call(
                         get_gateway_routes_with_pending_outbox,
+                    )
+                    protected.update(
+                        state.route_key
+                        for state in self._running_approvals.values()
                     )
                     removed = self.sessions.cleanup_idle(protected)
                 except Exception as exc:
@@ -1502,10 +1538,13 @@ class GatewayRunner:
             self._receiving_adapters.clear()
 
             # 入站关闭后再停止 heartbeat / housekeeping 和 route worker。
+            self._signal_all_running_approvals()
             await self._cancel_background_tasks()
             active_tasks = self.sessions.cancel_all(reason="shutdown")
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
+            self._signal_all_running_approvals()
+            await self._wait_for_running_approvals()
 
             for adapter in self.adapters.values():
                 try:
@@ -1516,6 +1555,11 @@ class GatewayRunner:
                         f"platform={adapter.platform_name} "
                         f"exception={type(exc).__name__}"
                     )
+
+            # disconnect 会等待或取消 Adapter 自己的 consumer；再次收口可捕获
+            # revoke 之前已经进入 claim、随后才登记的审批任务。
+            self._signal_all_running_approvals()
+            await self._wait_for_running_approvals()
 
             if self._runtime_lease_acquired:
                 try:
@@ -2877,6 +2921,15 @@ class GatewayRunner:
     ):
         """按 route 串行完成数据库 admission 与内存任务注册。"""
         route_key = build_session_key(event.source, self.agent_name)
+        async with self._route_admission(route_key):
+            return await self._handle_message_serialized(
+                event,
+                from_queue=from_queue,
+            )
+
+    @asynccontextmanager
+    async def _route_admission(self, route_key: str):
+        """登记并持有 route 的短临界区，退出后回收空闲锁。"""
         lock = self._route_admission_locks.setdefault(
             route_key,
             asyncio.Lock(),
@@ -2886,10 +2939,7 @@ class GatewayRunner:
         )
         try:
             async with lock:
-                return await self._handle_message_serialized(
-                    event,
-                    from_queue=from_queue,
-                )
+                yield
         finally:
             users = self._route_admission_users.get(route_key, 1) - 1
             if users <= 0:
@@ -2899,11 +2949,147 @@ class GatewayRunner:
             else:
                 self._route_admission_users[route_key] = users
 
+    def _unregister_running_approval(
+        self,
+        approval_id: str,
+        *,
+        task: asyncio.Task | None = None,
+    ) -> _RunningApproval | None:
+        """幂等清理完整审批 ID 及 route/conversation 反向索引。"""
+        state = self._running_approvals.get(approval_id)
+        if state is None or (task is not None and state.task is not task):
+            return None
+        self._running_approvals.pop(approval_id, None)
+        context_key = (state.route_key, state.conversation_id)
+        approval_ids = self._running_approvals_by_context.get(context_key)
+        if approval_ids is not None:
+            approval_ids.discard(approval_id)
+            if not approval_ids:
+                self._running_approvals_by_context.pop(context_key, None)
+        return state
+
+    def _on_running_approval_done(
+        self,
+        approval_id: str,
+        task: asyncio.Task,
+    ) -> None:
+        """读取后台异常并兜底清理，避免未处理的 Task exception。"""
+        state = self._unregister_running_approval(approval_id, task=task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            print(
+                "  [gateway:audit] event=approval_task_cancelled "
+                f"{safe_identifier_digest(approval_id, label='approval')}"
+            )
+        except Exception as exc:
+            route_label = (
+                safe_route_digest(state.route_key)
+                if state is not None
+                else "route=unavailable"
+            )
+            print(
+                "  [gateway:audit] event=approval_task_failed "
+                f"{route_label} "
+                f"{safe_identifier_digest(approval_id, label='approval')} "
+                f"exception={type(exc).__name__}"
+            )
+
+    def _register_running_approval(
+        self,
+        route_key: str,
+        conversation_id: str,
+        request: dict,
+        cancel_event: threading.Event,
+    ) -> asyncio.Task:
+        """用完整审批 ID 注册唯一后台任务。"""
+        approval_id = str(request["id"])
+        if approval_id in self._running_approvals:
+            raise RuntimeError("gateway approval task is already registered")
+        if self._lifecycle_phase in {"stopping", "stopped", "lease_lost"}:
+            cancel_event.set()
+        task = asyncio.create_task(
+            self._run_claimed_approval(
+                route_key,
+                conversation_id,
+                request,
+                cancel_event,
+            ),
+            name=(
+                "gateway-approval-"
+                f"{hashlib.sha256(approval_id.encode('utf-8')).hexdigest()[:12]}"
+            ),
+        )
+        state = _RunningApproval(
+            approval_id=approval_id,
+            route_key=route_key,
+            conversation_id=conversation_id,
+            task=task,
+            cancel_event=cancel_event,
+        )
+        self._running_approvals[approval_id] = state
+        self._running_approvals_by_context.setdefault(
+            (route_key, conversation_id),
+            set(),
+        ).add(approval_id)
+        task.add_done_callback(
+            lambda completed, request_id=approval_id: (
+                self._on_running_approval_done(request_id, completed)
+            )
+        )
+        return task
+
+    def _signal_running_approvals(
+        self,
+        route_key: str,
+        conversation_id: str,
+    ) -> int:
+        """向指定 route/conversation 的审批执行发送协作式取消信号。"""
+        approval_ids = tuple(
+            self._running_approvals_by_context.get(
+                (route_key, conversation_id),
+                (),
+            )
+        )
+        signalled = 0
+        for approval_id in approval_ids:
+            state = self._running_approvals.get(approval_id)
+            if state is None or state.task.done():
+                continue
+            state.cancel_event.set()
+            signalled += 1
+        return signalled
+
+    def _signal_all_running_approvals(self) -> int:
+        """Gateway 停止时通知全部审批执行，不直接取消其等待 Task。"""
+        signalled = 0
+        for state in tuple(self._running_approvals.values()):
+            if state.task.done():
+                continue
+            state.cancel_event.set()
+            signalled += 1
+        return signalled
+
+    async def _wait_for_running_approvals(self) -> None:
+        """等待审批工具沿既有取消链路完成结果收尾。"""
+        await asyncio.sleep(0)
+        while self._running_approvals:
+            tasks = [
+                state.task
+                for state in tuple(self._running_approvals.values())
+            ]
+            if not tasks:
+                return
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+
     async def _execute_claimed_approval(
         self,
         request: dict,
-    ) -> tuple[str, bool, dict]:
-        """执行数据库中已 claim 的原始工具参数，并立即固化结果。"""
+        *,
+        cancel_checker=None,
+    ) -> tuple[str, bool]:
+        """复用工具注册表执行已 claim 参数，不负责 route 编排。"""
         from hermes.tools import registry
 
         try:
@@ -2923,6 +3109,11 @@ class GatewayRunner:
             # 只有已从 pending 原子 claim 为 executing 的 File 请求能获得本次内部许可。
             if request["tool_name"] == "file":
                 dispatch_context["allow_sensitive"] = True
+            elif (
+                request["tool_name"] == "terminal"
+                and callable(cancel_checker)
+            ):
+                dispatch_context["cancel_checker"] = cancel_checker
 
             output = await asyncio.to_thread(
                 registry.dispatch,
@@ -2948,14 +3139,112 @@ class GatewayRunner:
                 ensure_ascii=False,
             )
             succeeded = False
+        return output, succeeded
 
-        terminal = await self.persistence.call(
-            finish_gateway_approval_and_enqueue_resume,
-            request["id"],
-            output,
-            succeeded=succeeded,
-        )
-        return output, succeeded, terminal
+    async def _run_claimed_approval(
+        self,
+        route_key: str,
+        conversation_id: str,
+        request: dict,
+        cancel_event: threading.Event,
+    ) -> None:
+        """执行审批工具、固化结果，并在短 route 临界区内决定是否恢复。"""
+        approval_id = str(request["id"])
+        try:
+            # 先让 /approve 的 admission 临界区退出，再启动真实工具执行。
+            await self._wait_for_route_admissions(route_key)
+            output, succeeded = await self._execute_claimed_approval(
+                request,
+                cancel_checker=cancel_event.is_set,
+            )
+
+            while True:
+                # Terminal/File 的实际执行已经结束，route 锁只保护结果接力判断。
+                await self._wait_for_route_admissions(route_key)
+                blocking_task = None
+                async with self._route_admission(route_key):
+                    ctx = self.sessions.get(route_key)
+                    invalidated = (
+                        cancel_event.is_set()
+                        or ctx is None
+                        or ctx.conversation_id != conversation_id
+                        or self._lifecycle_phase
+                        in {"stopping", "stopped", "lease_lost"}
+                        or self._runtime_lease_blocks_delivery()
+                    )
+                    if invalidated:
+                        await self.persistence.call(
+                            finish_gateway_approval,
+                            approval_id,
+                            output,
+                            succeeded=succeeded,
+                        )
+                        return
+
+                    # 审批回执等同 route worker 先完成；等待期间不持有 route 锁，
+                    # 让 /stop、/new 及其他控制消息可以先进入临界区。
+                    if self._route_has_active_worker(ctx):
+                        blocking_task = ctx.worker_task or ctx.active_task
+                    else:
+                        terminal = await self.persistence.call(
+                            finish_gateway_approval_and_enqueue_resume,
+                            approval_id,
+                            output,
+                            succeeded=succeeded,
+                        )
+                        resume_task = terminal.get("resume_task")
+                        if not isinstance(resume_task, dict):
+                            raise RuntimeError(
+                                "approval terminal transaction did not create "
+                                "resume task"
+                            )
+                        resume_event = self._deserialize_event(
+                            str(resume_task["event_json"])
+                        )
+
+                        # shutdown 可在数据库调用让出事件循环时设置取消信号。
+                        current_ctx = self.sessions.get(route_key)
+                        if (
+                            cancel_event.is_set()
+                            or current_ctx is None
+                            or current_ctx.conversation_id != conversation_id
+                            or self._lifecycle_phase
+                            in {"stopping", "stopped", "lease_lost"}
+                            or self._runtime_lease_blocks_delivery()
+                        ):
+                            await self.persistence.call(
+                                mark_gateway_message_delivery_failed,
+                                route_key,
+                                resume_event.message_id,
+                            )
+                            self._accepted_messages.discard(
+                                (route_key, resume_event.message_id)
+                            )
+                            return
+
+                        self._accepted_messages.add(
+                            (route_key, resume_event.message_id)
+                        )
+                        await self._handle_message_serialized(
+                            resume_event,
+                            from_queue=True,
+                        )
+                        return
+
+                if blocking_task is None:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.gather(
+                        asyncio.shield(blocking_task),
+                        return_exceptions=True,
+                    )
+        finally:
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._unregister_running_approval(
+                    approval_id,
+                    task=current_task,
+                )
 
     async def _pending_approval_for_context(self, route_key: str, ctx):
         """读取当前 route/conversation 的未决请求。"""
@@ -3062,8 +3351,11 @@ class GatewayRunner:
                 route_key, self._build_gateway_prompt(event.source),
             )
             content = None
-            if self._route_has_active_worker(ctx):
-                content = "当前任务仍在处理中，请稍后再处理审批请求。"
+            actor_id = self._stable_actor_id(event)
+            if actor_id is None:
+                content = (
+                    "当前平台事件缺少可验证的用户身份，无法处理审批请求。"
+                )
             elif not command_argument:
                 content = f"用法：{cmd} <审批编号>"
             elif cmd == "/deny":
@@ -3071,7 +3363,7 @@ class GatewayRunner:
                     deny_gateway_approval,
                     route_key,
                     ctx.conversation_id,
-                    event.source.user_id or event.source.user_id_alt,
+                    actor_id,
                     command_argument,
                     event.message_id,
                 )
@@ -3085,32 +3377,21 @@ class GatewayRunner:
                     claim_gateway_approval,
                     route_key,
                     ctx.conversation_id,
-                    event.source.user_id or event.source.user_id_alt,
+                    actor_id,
                     command_argument,
                     event.message_id,
                 )
                 outcome = str(decision.get("outcome", ""))
                 if outcome == "claimed":
                     request = decision["request"]
-                    _output, _succeeded, terminal = (
-                        await self._execute_claimed_approval(request)
+                    cancel_event = threading.Event()
+                    self._register_running_approval(
+                        route_key,
+                        ctx.conversation_id,
+                        request,
+                        cancel_event,
                     )
-                    resume_task = terminal.get("resume_task")
-                    if not isinstance(resume_task, dict):
-                        raise RuntimeError(
-                            "approval terminal transaction did not create resume task"
-                        )
-                    resume_event = self._deserialize_event(
-                        str(resume_task["event_json"])
-                    )
-                    self._accepted_messages.add(
-                        (route_key, resume_event.message_id)
-                    )
-                    await self._handle_message_serialized(
-                        resume_event,
-                        from_queue=True,
-                    )
-                    return
+                    content = "审批已通过，操作开始执行。"
                 else:
                     content = _approval_command_reply(outcome, command_argument)
 
@@ -3127,10 +3408,31 @@ class GatewayRunner:
                 )
                 return
 
-        if cmd not in {"/sessions", "/status", "/new", "/stop"}:
+        if (
+            approval_resume_id is None
+            and cmd not in {"/sessions", "/status", "/new", "/stop"}
+        ):
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
+            if self._running_approvals_by_context.get(
+                (route_key, ctx.conversation_id)
+            ):
+                content = (
+                    "已批准的操作正在执行。可使用 /stop 请求停止，"
+                    "或使用 /new 开始新对话。"
+                )
+                if event.source.platform not in self.adapters:
+                    await self._reply(event, content)
+                    return
+                await self._start_durable_reply_async(
+                    route_key,
+                    event,
+                    content,
+                    "approval_executing",
+                    ctx,
+                )
+                return
             pending_approval = await self._pending_approval_for_context(
                 route_key,
                 ctx,
@@ -3254,6 +3556,10 @@ class GatewayRunner:
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
+            self._signal_running_approvals(
+                route_key,
+                ctx.conversation_id,
+            )
             await self.persistence.call(
                 cancel_pending_gateway_approvals,
                 route_key,
@@ -3318,14 +3624,16 @@ class GatewayRunner:
                 route_key,
                 ctx.conversation_id,
             )
+            cancelled_running_approvals = self._signal_running_approvals(
+                route_key,
+                ctx.conversation_id,
+            )
             ok = await self._request_session_cancel_async(
                 route_key,
                 reason="user",
             )
-            if ok:
+            if ok or cancelled_running_approvals or cancelled_approvals:
                 content = "(cancel requested)"
-            elif cancelled_approvals:
-                content = "(pending approval cancelled)"
             else:
                 content = "(no active task)"
             if event.source.platform not in self.adapters:
@@ -3413,6 +3721,21 @@ class GatewayRunner:
             return
         await self._mark_processing_best_effort(event)
         await self._mark_event_processing_async(route_key, event)
+        if approval_resume_id is not None:
+            running_approval = self._running_approvals.get(
+                approval_resume_id
+            )
+            if (
+                (
+                    running_approval is not None
+                    and running_approval.cancel_event.is_set()
+                )
+                or self._lifecycle_phase
+                in {"stopping", "stopped", "lease_lost"}
+                or self._runtime_lease_blocks_delivery()
+            ):
+                await self._reject_approval_resume_task(route_key, event)
+                return
         generation, invalidation_event = self.sessions.begin_task(ctx)
         delivery_id = str(uuid.uuid4())
         ctx.delivery_id = delivery_id
@@ -4047,6 +4370,19 @@ class GatewayRunner:
                 )
             if self._task_cancel_reason(ctx, generation) is not None:
                 return _GatewayAgentResult(None)
+            actor_id = self._stable_actor_id(task_event)
+            if actor_id is None:
+                await self.persistence.call(
+                    fail_gateway_approval_identity_unavailable,
+                    conversation_id,
+                    str(request.get("id", "")),
+                    str(request.get("tool_call_id", "")),
+                )
+                return _GatewayAgentResult(
+                    "当前平台事件缺少可验证的用户身份，受控操作未执行。",
+                    failed=True,
+                    failure_type="approval_identity_unavailable",
+                )
             question = _format_approval_question(request)
             msg = {"role": "assistant", "content": question}
             outbox = self._build_outbox(
@@ -4061,7 +4397,7 @@ class GatewayRunner:
                 create_gateway_approval_with_outbox,
                 conversation_id,
                 request,
-                task_event.source.user_id or task_event.source.user_id_alt,
+                actor_id,
                 msg,
                 outbox,
                 _GATEWAY_APPROVAL_TTL_SECONDS,
