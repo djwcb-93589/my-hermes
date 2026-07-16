@@ -69,7 +69,25 @@ def run_terminal(args, **kwargs):
 
     if backend is None:
         backend = get_backend(session_key=session_key)
-    result = backend.execute(command)
+    cancel_checker = kwargs.get("cancel_checker")
+    if callable(cancel_checker):
+        result = backend.execute(command, cancel_checker=cancel_checker)
+    else:
+        result = backend.execute(command)
+
+    if result.get("cancelled"):
+        return json.dumps({
+            "ok": False,
+            "command_succeeded": False,
+            "error_type": "cancelled",
+            "fatal": True,
+            "error": "Command cancelled by user.",
+            "output": "(cancelled)",
+            "exit_code": 130,
+            "cwd": backend.cwd,
+            "cwd_persisted": True,
+            "environment_persisted": True,
+        }, ensure_ascii=False)
 
     # Local Terminal 不是沙箱。输出脱敏只能减少凭证进入模型上下文，
     # 不能阻止子进程自己读取数据或通过网络外传。
@@ -110,7 +128,9 @@ def register(registry):
                 "commands. Use forward-slash MSYS paths for absolute Windows "
                 "locations (e.g. /d/my-project, not D:\\\\my-project). "
                 "On Linux/macOS the local backend uses /bin/bash. The result "
-                "is JSON with output, exit_code, cwd, and session-state flags."
+                "is JSON with output, exit_code, cwd, and session-state flags. "
+                "A Gateway /stop request interrupts the active local process "
+                "group like Ctrl+C, then force-stops it if it does not exit."
             ),
             "parameters": {
                 "type": "object",

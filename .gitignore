@@ -21,3 +21,4 @@ config origin.yaml
 SOUL.md
 memories/
 数据脱敏和安全边界笔记.md
+*.md

@@ -25,9 +25,10 @@ import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 from hermes.config import _config
@@ -187,8 +188,12 @@ class BaseExecutionEnvironment(ABC):
         self._cwd_shell = f"{stem}-cwd.txt"
         self._cwd_host = self._cwd_shell
         self._snapshot_ready = False
+        self._execute_lock = threading.Lock()
         # 子类 hook：重新定位临时文件。
         self._setup_paths()
+
+    _CANCEL_POLL_INTERVAL = 0.1
+    _INTERRUPT_GRACE_SECONDS = 2.0
 
     @abstractmethod
     def _run_bash(self, cmd_string: str, *, timeout: int) -> subprocess.Popen:
@@ -215,6 +220,75 @@ class BaseExecutionEnvironment(ABC):
         """把 `pwd -P` 的原始输出转回 host 形式。"""
         return raw
 
+    def _interrupt_process(self, proc: subprocess.Popen) -> None:
+        """请求当前命令尽快退出；LocalBackend 会覆盖为进程组中断。"""
+        proc.terminate()
+
+    def _kill_process_tree(self, proc: subprocess.Popen) -> None:
+        """强制终止当前命令；默认只能保证终止直接子进程。"""
+        proc.kill()
+
+    def _release_process_resources(self, proc: subprocess.Popen) -> None:
+        """释放子类附加到进程的资源。"""
+        pass
+
+    @staticmethod
+    def _cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
+        """读取外部取消信号；检查器异常不能遗留失控子进程。"""
+        if cancel_checker is None:
+            return False
+        try:
+            return bool(cancel_checker())
+        except Exception:
+            return False
+
+    def _stop_process(
+        self,
+        proc: subprocess.Popen,
+        *,
+        interrupt_first: bool,
+    ) -> str:
+        """先软中断、必要时强杀，并回收管道输出。"""
+        if interrupt_first:
+            try:
+                self._interrupt_process(proc)
+            except (OSError, ValueError):
+                try:
+                    self._kill_process_tree(proc)
+                except (OSError, ValueError):
+                    pass
+        else:
+            try:
+                self._kill_process_tree(proc)
+            except (OSError, ValueError):
+                pass
+
+        try:
+            stdout, _ = proc.communicate(
+                timeout=(self._INTERRUPT_GRACE_SECONDS if interrupt_first else 5),
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                self._kill_process_tree(proc)
+            except (OSError, ValueError):
+                pass
+            try:
+                stdout, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # 极端情况下后代进程可能仍持有 stdout 管道；停止等待输出，
+                # 防止 /stop 因等待 EOF 再次无界阻塞。
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                stdout = ""
+        return stdout or ""
+
     # --- 共享逻辑 ---
 
     def init_session(self):
@@ -224,24 +298,87 @@ class BaseExecutionEnvironment(ABC):
             f"pwd -P > {self._cwd_shell}"
         )
         proc = self._run_bash(init_cmd, timeout=10)
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=10)
+        finally:
+            self._release_process_resources(proc)
         self._snapshot_ready = True
 
-    def execute(self, command: str, timeout: int | None = None) -> dict:
+    def execute(
+        self,
+        command: str,
+        timeout: int | None = None,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> dict:
+        """串行执行单个 session 的命令，避免取消收尾与下一条命令竞态。"""
+        with self._execute_lock:
+            return self._execute(
+                command,
+                timeout=timeout,
+                cancel_checker=cancel_checker,
+            )
+
+    def _execute(
+        self,
+        command: str,
+        timeout: int | None = None,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> dict:
         """包装 → 执行 → 等待 → 更新 CWD。返回 {"output": str, "returncode": int}。"""
+        if self._cancel_requested(cancel_checker):
+            return {
+                "output": "(cancelled)",
+                "returncode": 130,
+                "cancelled": True,
+            }
         if not self._snapshot_ready:
             self.init_session()
+
+        if self._cancel_requested(cancel_checker):
+            return {
+                "output": "(cancelled)",
+                "returncode": 130,
+                "cancelled": True,
+            }
 
         timeout = timeout or self.timeout
         wrapped = self._wrap_command(command)
         proc = self._run_bash(wrapped, timeout=timeout)
+        deadline = time.monotonic() + timeout
 
         try:
-            stdout, _ = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            return {"output": "(timed out)", "returncode": 124}
+            while True:
+                if self._cancel_requested(cancel_checker):
+                    self._stop_process(proc, interrupt_first=True)
+                    return {
+                        "output": "(cancelled)",
+                        "returncode": 130,
+                        "cancelled": True,
+                    }
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._stop_process(proc, interrupt_first=False)
+                    return {"output": "(timed out)", "returncode": 124}
+
+                try:
+                    stdout, _ = proc.communicate(
+                        timeout=min(self._CANCEL_POLL_INTERVAL, remaining),
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except KeyboardInterrupt:
+            # CLI 的 Ctrl+C 与 Agent /stop 走同一软中断语义。
+            self._stop_process(proc, interrupt_first=True)
+            raise
+        except BaseException:
+            self._stop_process(proc, interrupt_first=False)
+            raise
+        finally:
+            self._release_process_resources(proc)
 
         self._update_cwd()
 

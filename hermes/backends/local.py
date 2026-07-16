@@ -10,6 +10,7 @@ Windows 上明确优先使用 Git Bash，绝不回退到 WSL 的
 from __future__ import annotations
 
 import os
+import signal
 import stat as stat_mod
 import subprocess
 import sys
@@ -20,6 +21,41 @@ from hermes.backends import (
     BaseExecutionEnvironment,
     filter_local_subprocess_environment,
 )
+
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.AssignProcessToJobObject.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+    )
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def _attach_windows_job(proc: subprocess.Popen) -> None:
+    """把进程放入独立 Job，供后续可靠终止仍存活的后代进程。"""
+    if sys.platform != "win32":
+        return
+    job_handle = _kernel32.CreateJobObjectW(None, None)
+    if not job_handle:
+        return
+    assigned = _kernel32.AssignProcessToJobObject(
+        job_handle,
+        wintypes.HANDLE(int(proc._handle)),
+    )
+    if not assigned:
+        _kernel32.CloseHandle(job_handle)
+        return
+    proc._hermes_job_handle = job_handle
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +200,12 @@ class LocalBackend(BaseExecutionEnvironment):
             env_passthrough=self._env_passthrough,
             infrastructure_secret_values=self._infrastructure_secret_values,
         )
-        return subprocess.Popen(
+        process_group_options = (
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if sys.platform == "win32"
+            else {"start_new_session": True}
+        )
+        proc = subprocess.Popen(
             [bash, "-c", cmd_string],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -172,7 +213,51 @@ class LocalBackend(BaseExecutionEnvironment):
             encoding="utf-8",   # bash 输出 UTF-8；不让 Windows 用 GBK 解码
             errors="replace",
             env=env,
+            **process_group_options,
         )
+        _attach_windows_job(proc)
+        return proc
+
+    def _interrupt_process(self, proc: subprocess.Popen) -> None:
+        """向整组进程发送与终端 Ctrl+C 等价的软中断。"""
+        if sys.platform == "win32":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            return
+        os.killpg(proc.pid, signal.SIGINT)
+
+    def _kill_process_tree(self, proc: subprocess.Popen) -> None:
+        """软中断无效时强制结束本地命令的进程树。"""
+        if sys.platform == "win32":
+            job_handle = getattr(proc, "_hermes_job_handle", None)
+            if job_handle and _kernel32.TerminateJobObject(job_handle, 130):
+                return
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if proc.poll() is None:
+                proc.kill()
+            return
+
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def _release_process_resources(self, proc: subprocess.Popen) -> None:
+        """关闭 Windows Job 句柄；正常结束时不终止后台子进程。"""
+        if sys.platform != "win32":
+            return
+        job_handle = getattr(proc, "_hermes_job_handle", None)
+        if not job_handle:
+            return
+        _kernel32.CloseHandle(job_handle)
+        proc._hermes_job_handle = None
 
     def cleanup(self):
         """通过 HOST 路径删除 snapshot/cwd 文件。"""

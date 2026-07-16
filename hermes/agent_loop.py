@@ -410,6 +410,8 @@ def dispatch_tool_call(
 
     try:
         dispatch_context = dict(tool_context or {})
+        # 普通 AgentLoop 不得把内部敏感文件许可透传给工具。
+        dispatch_context.pop("allow_sensitive", None)
         dispatch_context["session_key"] = session_key
         output = registry.dispatch(tool_name, tool_args, **dispatch_context)
     except Exception as exc:
@@ -916,11 +918,17 @@ class AgentLoop:
         返回值里的 error_status 表示工具执行失败,但调用方仍会生成
         合法 tool message,再由 batch hook 原子持久化。
         """
+        tool_context = dict(self.tool_context)
+        if (
+            self.cancel_checker is not None
+            and self._tool_call_name(tool_call) == "terminal"
+        ):
+            tool_context["cancel_checker"] = self.cancel_checker
         return dispatch_tool_call(
             tool_call, self.registry,
             session_key=self.session_key,
             blocked_tools=self.blocked_tools,
-            tool_context=self.tool_context,
+            tool_context=tool_context,
         )
 
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
@@ -1260,13 +1268,19 @@ class AsyncAgentLoop(AgentLoop):
         tool_call,
     ) -> tuple[str, str | None, str | None]:
         """在线程池运行现有同步工具,避免阻塞 Gateway 事件循环。"""
+        tool_context = dict(self.tool_context)
+        if (
+            self.cancel_checker is not None
+            and self._tool_call_name(tool_call) == "terminal"
+        ):
+            tool_context["cancel_checker"] = self.cancel_checker
         return await asyncio.to_thread(
             dispatch_tool_call,
             tool_call,
             self.registry,
             session_key=self.session_key,
             blocked_tools=self.blocked_tools,
-            tool_context=self.tool_context,
+            tool_context=tool_context,
         )
 
     async def on_tool_message(

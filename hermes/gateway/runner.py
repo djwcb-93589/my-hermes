@@ -2893,18 +2893,25 @@ class GatewayRunner:
         from hermes.tools import registry
 
         try:
-            output = await asyncio.to_thread(
-                registry.dispatch,
-                request["tool_name"],
-                dict(request["tool_args"]),
-                session_key=request["conversation_id"],
-                interactive_approval=False,
-                approval_mode="remote",
-                approval_grant={
+            dispatch_context = {
+                "session_key": request["conversation_id"],
+                "interactive_approval": False,
+                "approval_mode": "remote",
+                "approval_grant": {
                     "id": request["id"],
                     "tool_name": request["tool_name"],
                     "arguments": dict(request["tool_args"]),
                 },
+            }
+            # 只有已从 pending 原子 claim 为 executing 的 File 请求能获得本次内部许可。
+            if request["tool_name"] == "file":
+                dispatch_context["allow_sensitive"] = True
+
+            output = await asyncio.to_thread(
+                registry.dispatch,
+                request["tool_name"],
+                dict(request["tool_args"]),
+                **dispatch_context,
             )
             try:
                 payload = json.loads(output)

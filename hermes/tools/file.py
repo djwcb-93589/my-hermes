@@ -7,7 +7,7 @@
 --------
 - 相对路径以 ``backend.cwd`` 为基准（terminal cd 会改 cwd）。
 - 拒绝穿越到固定 ``file_root`` 之外（``../`` 攻击）。
-- 默认拒绝敏感文件（.env、私钥、数据库等），需显式 ``allow_sensitive=true`` 覆盖。
+- 默认拒绝敏感文件（.env、私钥、数据库等），Gateway 可按次审批后执行。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ REPLACE_LIMIT = READ_LIMIT
 _CONTEXT_ACTIONS = {"pwd", "context"}
 _PATH_ACTIONS = {"read", "read_range", "write", "append", "replace", "list", "stat"}
 
-# 敏感文件模式（路径用 / 归一化后匹配）。命中且未显式 allow_sensitive 时拒绝。
+# 敏感文件模式（路径用 / 归一化后匹配）。命中且本次未获内部许可时拒绝。
 _SENSITIVE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -45,6 +45,8 @@ _SENSITIVE_PATTERNS = [
     ]
 ]
 
+_SENSITIVE_PATH_ERROR = "sensitive file requires Gateway approval"
+
 
 def _is_sensitive(abs_path: str) -> bool:
     """路径是否属于敏感文件。"""
@@ -56,14 +58,14 @@ def _guard_path(abs_path: str, root: str, allow_sensitive: bool) -> tuple[bool, 
     """检查 abs_path 是否安全可访问。返回 (ok, reason)。
 
     1. realpath 解析后必须在 root 子树内（拒绝符号链接 + ``../`` 穿越）。
-    2. 默认拒绝敏感文件，``allow_sensitive=True`` 时跳过此检查。
+    2. 始终判断是否为敏感路径，命中时仅由本次内部许可决定是否放行。
     """
     real_abs = os.path.realpath(abs_path)
     real_root = os.path.realpath(root)
     if real_abs != real_root and not real_abs.startswith(real_root + os.sep):
         return False, "path escapes project root"
-    if not allow_sensitive and _is_sensitive(real_abs):
-        return False, "sensitive file (pass allow_sensitive=true to override)"
+    if _is_sensitive(real_abs) and not allow_sensitive:
+        return False, _SENSITIVE_PATH_ERROR
     return True, ""
 
 
@@ -95,12 +97,23 @@ def _file_exists(backend, abs_path: str) -> bool:
         return False
 
 
-def handle_file(args, **kwargs):
+def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
     """file 工具入口。按 action 分发到具体操作。"""
     action = args.get("action")
     rel_path = args.get("path", "")
     session_key = kwargs.get("session_key") or "default"
     backend = get_backend(session_key=session_key)
+
+    # 该字段只允许可信内部调用通过 keyword-only 参数传入，模型 JSON 不得控制。
+    if "allow_sensitive" in args:
+        return _file_error(
+            backend,
+            {
+                "path": rel_path,
+                "error_type": "invalid_args",
+                "error": "unexpected internal-only argument",
+            },
+        )
 
     if action in _CONTEXT_ACTIONS:
         return _json({"ok": True, **_file_context(backend)})
@@ -131,15 +144,23 @@ def handle_file(args, **kwargs):
         return _file_error(backend, {"path": rel_path,
                            "error_type": "invalid_path", "error": str(exc)})
 
-    # 路径守卫
-    allow_sensitive = bool(args.get("allow_sensitive", False))
+    # 路径守卫始终重新检查 root 和敏感路径；只有内部布尔值 True 才能放行。
+    allow_sensitive = allow_sensitive is True
     file_root = getattr(backend, "file_root", backend.cwd)
     ok, reason = _guard_path(abs_path, file_root, allow_sensitive=allow_sensitive)
-    if not ok:
+    remote_approval = is_remote_approval(kwargs)
+    approval_granted = has_approval_grant(kwargs, "file", args)
+    pending_sensitive_approval = (
+        not ok
+        and reason == _SENSITIVE_PATH_ERROR
+        and remote_approval
+        and not approval_granted
+    )
+    if not ok and not pending_sensitive_approval:
         return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
                            "error_type": "forbidden", "error": reason})
 
-    if is_remote_approval(kwargs) and not has_approval_grant(kwargs, "file", args):
+    if remote_approval and not approval_granted:
         details = {
             "action": action,
             "path": rel_path,
@@ -354,9 +375,10 @@ def register(registry):
                 "path action; pwd/context remain available without approval. "
                 "Do not retry an operation while approval is pending. "
                 "Paths are relative to backend.cwd unless absolute. "
-                "Path traversal outside the fixed file root is rejected. Sensitive files "
-                "(.env, *.key, *.pem, id_rsa, *.db, *.db-wal, .git/*) require "
-                "allow_sensitive=true. write defaults to no-overwrite; "
+                "Path traversal outside the fixed file root is rejected. Sensitive file "
+                "operations (.env, *.key, *.pem, id_rsa, *.db, *.db-wal, .git/*) "
+                "require a separate Gateway approval for every operation. "
+                "write defaults to no-overwrite; "
                 "pass overwrite=true to replace (atomic via tmp + os.replace). "
                 "Reads capped at 100KB; truncated=true means more data "
                 "available. replace only supports UTF-8 files up to 100KB. "
@@ -393,8 +415,6 @@ def register(registry):
                     "replace": {"type": "string", "description": "replace: replacement text"},
                     "all": {"type": "boolean", "default": True,
                             "description": "replace: replace all occurrences (default true)"},
-                    "allow_sensitive": {"type": "boolean", "default": False,
-                                        "description": "bypass sensitive-file guard"},
                 },
                 "required": ["action"],
             },
