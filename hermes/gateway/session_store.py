@@ -461,6 +461,13 @@ class SessionStore:
         protected_route_keys: set[str] | None = None,
     ) -> int:
         """清理真正空闲且没有持久投递负担的会话。"""
+        return len(self.cleanup_idle_conversations(protected_route_keys))
+
+    def cleanup_idle_conversations(
+        self,
+        protected_route_keys: set[str] | None = None,
+    ) -> list[str]:
+        """清理空闲 route，并返回需要释放授权的 conversation IDs。"""
         now = time.time()
         protected = protected_route_keys or set()
         expired = [
@@ -480,7 +487,10 @@ class SessionStore:
                 and (now - ctx.last_activity) > self.idle_timeout
             )
         ]
+        conversation_ids = [
+            self._contexts[k].conversation_id for k in expired
+        ]
         for k in expired:
             del self._contexts[k]
             self._context_locks.pop(k, None)
-        return len(expired)
+        return conversation_ids

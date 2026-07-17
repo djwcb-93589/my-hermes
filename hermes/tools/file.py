@@ -8,24 +8,34 @@
 - 相对路径以 ``backend.cwd`` 为基准（terminal cd 会改 cwd）。
 - LocalBackend 可访问操作系统用户有权限访问的全部本机路径。
 - 用户配置的统一禁止路径在敏感文件判断和审批之前硬拒绝。
-- 默认拒绝敏感文件（.env、私钥、数据库等），Gateway 可按次审批后执行。
+- 敏感文件（.env、私钥、数据库等）属于 critical，不能创建 grant。
 """
 
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 
 from hermes.approval import (
-    build_approval_required,
-    has_approval_grant,
+    build_assessment_response,
     is_remote_approval,
 )
+from hermes.approval_policy import (
+    DENY,
+    approved_file_path_candidate,
+    approved_file_snapshot_candidate,
+    assess_file_operation,
+    assess_path_policy_denial,
+)
 from hermes.backends import get_backend, UnsupportedBackendError
+from hermes.config import SENSITIVE_FILE_PATTERNS
+from hermes.file_state import (
+    FileStateSnapshotError,
+    capture_file_state_snapshot,
+    file_state_snapshot_matches,
+)
 from hermes.path_policy import (
     ALLOW_ALL_PATH_POLICY,
-    PATH_POLICY_DENIED_ERROR_TYPE,
     PathAccessDeniedError,
 )
 from hermes.redaction import redact_file_content
@@ -37,36 +47,10 @@ REPLACE_LIMIT = READ_LIMIT
 _CONTEXT_ACTIONS = {"pwd", "context"}
 _PATH_ACTIONS = {"read", "read_range", "write", "append", "replace", "list", "stat"}
 
-# 敏感文件模式（路径用 / 归一化后匹配）。命中且本次未获内部许可时拒绝。
-_SENSITIVE_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"(^|/)\.env(\..*)?$",        # .env / .env.local
-        r"\.(key|pem|pfx|p12)$",      # 私钥 / 证书
-        r"/id_(rsa|dsa|ed25519|ecdsa)(\.pub)?$",  # SSH 私钥
-        # SQLite 主文件和 WAL/SHM/journal sidecar 都可能包含会话内容。
-        r"\.(db|sqlite|sqlite3)(-(wal|shm|journal))?$",
-        r"(^|/)\.git($|/)",               # git 内部目录
-    ]
-]
-
-_SENSITIVE_PATH_ERROR = "sensitive file requires Gateway approval"
-
-
 def _is_sensitive(abs_path: str) -> bool:
-    """路径是否属于敏感文件。"""
+    """路径是否命中配置的敏感文件模式。"""
     norm = abs_path.replace("\\", "/").lower()
-    return any(pat.search(norm) for pat in _SENSITIVE_PATTERNS)
-
-
-def _guard_sensitive_path(
-    abs_path: str,
-    allow_sensitive: bool,
-) -> tuple[bool, str]:
-    """检查内置敏感文件规则；统一禁止路径已在此前硬拒绝。"""
-    if _is_sensitive(abs_path) and not allow_sensitive:
-        return False, _SENSITIVE_PATH_ERROR
-    return True, ""
+    return any(pat.search(norm) for pat in SENSITIVE_FILE_PATTERNS)
 
 
 def _json(obj: dict) -> str:
@@ -100,6 +84,15 @@ def _file_exists(backend, abs_path: str) -> bool:
         return False
 
 
+def _requires_file_state_snapshot(args: dict) -> bool:
+    """标记必须把审批时状态绑定进 grant 的修改操作。"""
+    action = args.get("action")
+    return (
+        action in {"replace", "append"}
+        or (action == "write" and bool(args.get("overwrite", False)))
+    )
+
+
 def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
     """file 工具入口。按 action 分发到具体操作。"""
     action = args.get("action")
@@ -107,10 +100,13 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
     session_key = kwargs.get("session_key") or "default"
     backend = get_backend(session_key=session_key)
     remote_approval = is_remote_approval(kwargs)
-    approval_granted = has_approval_grant(kwargs, "file", args)
+    approval_grant = kwargs.get("approval_grant")
 
     # 该字段只允许可信内部调用通过 keyword-only 参数传入，模型 JSON 不得控制。
-    if "allow_sensitive" in args:
+    if any(
+        field in args
+        for field in ("allow_sensitive", "approval_grant", "session_grant")
+    ):
         return _file_error(
             backend,
             {
@@ -121,6 +117,25 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
         )
 
     if action in _CONTEXT_ACTIONS:
+        assessment = assess_file_operation(
+            args,
+            normalized_path=None,
+            session_key=session_key,
+            remote_approval=remote_approval,
+            sensitive=False,
+            allow_sensitive=False,
+            approval_grant=approval_grant,
+            security_policy=backend.tool_approval_policy,
+            backend_context=backend.approval_risk_context(),
+            intelligent_advisor=backend.intelligent_approval_advisor,
+        )
+        policy_response = build_assessment_response(
+            assessment,
+            f"执行 File {action} 操作",
+            denial_payload=_file_context(backend),
+        )
+        if policy_response is not None:
+            return policy_response
         return _json({"ok": True, **_file_context(backend)})
 
     if action not in _PATH_ACTIONS:
@@ -154,62 +169,156 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
             resolved_path,
             cwd=backend.cwd,
         )
-        grant = kwargs.get("approval_grant")
-        approved_abs_path = (
-            grant.get("approved_abs_path")
-            if approval_granted and isinstance(grant, dict)
-            else None
+        approved_abs_path = approved_file_path_candidate(
+            approval_grant,
+            args,
+            session_key=session_key,
         )
-        if isinstance(approved_abs_path, str) and approved_abs_path:
+        if approved_abs_path is not None:
             # 审批恢复固定使用审批时展示的规范化绝对路径，避免 cwd 或路径文本漂移。
             abs_path = path_policy.require_allowed(
                 approved_abs_path,
                 cwd=backend.cwd,
             )
     except PathAccessDeniedError:
-        return _json({
-            "ok": False,
-            "error_type": PATH_POLICY_DENIED_ERROR_TYPE,
-            "error": "path is blocked by the configured filesystem policy",
-        })
+        return build_assessment_response(
+            assess_path_policy_denial(
+                "file",
+                session_key=session_key,
+            ),
+            f"执行 File {action} 操作",
+            denial_payload=_file_context(backend),
+        )
     except Exception as exc:
         return _file_error(backend, {"path": rel_path,
                            "error_type": "invalid_path", "error": str(exc)})
 
-    # 用户禁止路径已经硬拒绝；内部许可只能影响第二层敏感文件规则。
-    allow_sensitive = allow_sensitive is True
-    ok, reason = _guard_sensitive_path(
-        abs_path,
-        allow_sensitive=allow_sensitive,
+    # denied_paths 已在 grant 解析前后各检查一次，审批只能影响后续敏感层。
+    sensitive = _is_sensitive(abs_path)
+    # hardline、用户路径规则和 sensitive 必须在快照读取与 grant 复检之前收敛。
+    guardrail_assessment = assess_file_operation(
+        args,
+        normalized_path=abs_path,
+        session_key=session_key,
+        remote_approval=remote_approval,
+        sensitive=sensitive,
+        allow_sensitive=False,
+        approval_grant=None,
+        file_snapshot=None,
+        security_policy=backend.tool_approval_policy,
+        backend_context=backend.approval_risk_context(),
+        intelligent_advisor=None,
     )
-    pending_sensitive_approval = (
-        not ok
-        and reason == _SENSITIVE_PATH_ERROR
-        and remote_approval
-        and not approval_granted
-    )
-    if not ok and not pending_sensitive_approval:
-        return _file_error(backend, {"path": rel_path, "abs_path": abs_path,
-                           "error_type": "forbidden", "error": reason})
-
-    if remote_approval and not approval_granted:
-        details = {
-            "action": action,
-            "path": rel_path,
-            "abs_path": abs_path,
-        }
-        if action in {"write", "append"}:
-            details["content_size"] = len(str(args.get("content", "")).encode("utf-8"))
-        elif action == "replace":
-            details["find_size"] = len(str(args.get("find", "")).encode("utf-8"))
-            details["replace_size"] = len(
-                str(args.get("replace", "")).encode("utf-8")
-            )
-        return build_approval_required(
-            "file",
+    if guardrail_assessment.decision == DENY:
+        return build_assessment_response(
+            guardrail_assessment,
             f"执行 File {action} 操作",
-            details=details,
+            denial_payload={
+                "path": rel_path,
+                "abs_path": abs_path,
+                **_file_context(backend),
+            },
         )
+    file_snapshot = approved_file_snapshot_candidate(
+        approval_grant,
+        args,
+        session_key=session_key,
+    )
+    if file_snapshot is not None:
+        try:
+            snapshot_matches = file_state_snapshot_matches(
+                backend,
+                abs_path,
+                file_snapshot,
+                path_policy=path_policy,
+            )
+        except PathAccessDeniedError:
+            return build_assessment_response(
+                assess_path_policy_denial(
+                    "file",
+                    session_key=session_key,
+                ),
+                f"执行 File {action} 操作",
+                denial_payload=_file_context(backend),
+            )
+        except PermissionError:
+            return _file_error(backend, {
+                "path": rel_path,
+                "abs_path": abs_path,
+                "error_type": "os_permission_denied",
+                "error": "permission denied while validating approved file state",
+            })
+        except (FileStateSnapshotError, OSError, ValueError):
+            snapshot_matches = False
+        if not snapshot_matches:
+            return _file_error(backend, {
+                "path": rel_path,
+                "abs_path": abs_path,
+                "error_type": "approval_stale",
+                "error": (
+                    "approved file state changed; request approval again"
+                ),
+                "fatal": False,
+            })
+    elif (
+        remote_approval
+        and approval_grant is None
+        and not sensitive
+        and _requires_file_state_snapshot(args)
+    ):
+        try:
+            file_snapshot = capture_file_state_snapshot(
+                backend,
+                abs_path,
+                path_policy=path_policy,
+            )
+        except UnsupportedBackendError as exc:
+            return _file_error(backend, {
+                "path": rel_path,
+                "abs_path": abs_path,
+                "error_type": "unsupported_backend",
+                "error": str(exc),
+            })
+        except PermissionError:
+            return _file_error(backend, {
+                "path": rel_path,
+                "abs_path": abs_path,
+                "error_type": "os_permission_denied",
+                "error": "permission denied while capturing file state",
+            })
+        except (FileStateSnapshotError, OSError, ValueError):
+            return _file_error(backend, {
+                "path": rel_path,
+                "abs_path": abs_path,
+                "error_type": "approval_snapshot_unavailable",
+                "error": "could not capture a stable file state for approval",
+            })
+
+    assessment = assess_file_operation(
+        args,
+        normalized_path=abs_path,
+        session_key=session_key,
+        remote_approval=remote_approval,
+        sensitive=sensitive,
+        allow_sensitive=allow_sensitive is True,
+        approval_grant=approval_grant,
+        file_snapshot=file_snapshot,
+        security_policy=backend.tool_approval_policy,
+        backend_context=backend.approval_risk_context(),
+        intelligent_advisor=backend.intelligent_approval_advisor,
+    )
+    denial_payload = {
+        "path": rel_path,
+        "abs_path": abs_path,
+        **_file_context(backend),
+    }
+    policy_response = build_assessment_response(
+        assessment,
+        f"执行 File {action} 操作",
+        denial_payload=denial_payload,
+    )
+    if policy_response is not None:
+        return policy_response
 
     try:
         if action == "read":
@@ -408,15 +517,28 @@ def register(registry):
                 "and metadata. Actions: "
                 "read, read_range, write, append, replace, list, stat, "
                 "pwd, context. "
-                "Gateway remote sessions pause for user approval before every "
-                "path action; pwd/context remain available without approval. "
-                "Do not retry an operation while approval is pending. "
+                "Gateway remote sessions run pwd/context and ordinary "
+                "stat/list/read/read_range operations without approval when "
+                "the normalized path is neither blocked nor sensitive. "
+                "write/append/replace and sensitive path operations require "
+                "different handling: ordinary modifications require a "
+                "once approval, while critical sensitive paths are denied. "
+                "Approval binds the complete arguments, normalized absolute "
+                "path, and operation fingerprint. Do not retry an operation "
+                "while approval is pending. "
+                "replace, overwrite writes, and append operations also bind "
+                "a file-state snapshot; execution returns "
+                "error_type=approval_stale if the target changes first. "
                 "Paths are relative to backend.cwd unless absolute. "
                 "Paths blocked by the shared filesystem policy are always "
                 "rejected with error_type=path_policy_denied before approval; "
-                "do not try another tool to bypass that result. Sensitive file "
-                "operations (.env, *.key, *.pem, id_rsa, *.db, *.db-wal, .git/*) "
-                "require a separate Gateway approval for every operation. "
+                "do not try another tool to bypass that result. Critical "
+                "hardline protected paths and configured File action/path "
+                "deny rules are also evaluated before once/session grants. "
+                "Structured File path checks are strong policy enforcement; "
+                "they do not rely on Terminal command parsing. "
+                "Paths matching configured sensitive file patterns are "
+                "critical and denied rather than approvable. "
                 "write defaults to no-overwrite; "
                 "pass overwrite=true to replace (atomic via tmp + os.replace). "
                 "Reads capped at 100KB; truncated=true means more data "

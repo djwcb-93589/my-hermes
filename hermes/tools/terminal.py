@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 
 from hermes.approval import (
-    build_approval_required,
-    has_approval_grant,
-    is_cwd_only_terminal_command,
+    build_assessment_response,
     is_remote_approval,
+)
+from hermes.approval_policy import (
+    assess_path_policy_denial,
+    assess_terminal_operation,
+    normalize_terminal_command,
 )
 from hermes.backends import (
     INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
@@ -16,11 +19,9 @@ from hermes.backends import (
 )
 from hermes.path_policy import (
     ALLOW_ALL_PATH_POLICY,
-    PATH_POLICY_DENIED_ERROR_TYPE,
     PathAccessDeniedError,
 )
 from hermes.redaction import redact_terminal_output
-from hermes.security import detect_dangerous_command, approve_command
 from hermes.terminal_path_preflight import preflight_terminal_command
 
 
@@ -29,15 +30,31 @@ def run_terminal(args, **kwargs):
 
     每个 session_key 对应独立的 backend，cwd / 环境状态不会跨对话泄漏。
     session_key 由 run_conversation 从调用方的 session_id（CLI）或平台
-    维度的 session_key（gateway）转发过来。未传时默认 "default"
-    （例如 delegate.py 里的子代理不转发 session_key）。
+    会话 conversation_id（gateway）转发过来；Delegate 使用独立的
+    child_session_key。仅直接嵌入式调用未传时兼容回退到 "default"。
     """
-    command = args.get("command", "")
-
-    remote_approval = is_remote_approval(kwargs)
-    approval_granted = has_approval_grant(kwargs, "terminal", args)
+    if any(field in args for field in ("approval_grant", "session_grant")):
+        return json.dumps({
+            "ok": False,
+            "error_type": "invalid_args",
+            "error": "unexpected internal-only argument",
+        }, ensure_ascii=False)
     session_key = kwargs.get("session_key") or "default"
     backend = get_backend(session_key=session_key)
+    try:
+        command = normalize_terminal_command(args.get("command", ""))
+    except ValueError as exc:
+        return json.dumps({
+            "ok": False,
+            "error_type": "invalid_args",
+            "error": str(exc),
+        }, ensure_ascii=False)
+
+    path_policy = getattr(
+        backend,
+        "path_policy",
+        ALLOW_ALL_PATH_POLICY,
+    )
 
     # Local Terminal 的路径检查是审批前尽力预检，不是不可绕过的沙箱。
     if getattr(backend, "terminal_path_preflight_enabled", False):
@@ -45,55 +62,54 @@ def run_terminal(args, **kwargs):
             preflight_terminal_command(
                 command,
                 cwd=backend.cwd,
-                path_policy=getattr(
-                    backend,
-                    "path_policy",
-                    ALLOW_ALL_PATH_POLICY,
-                ),
+                path_policy=path_policy,
             )
         except PathAccessDeniedError:
-            return json.dumps({
-                "ok": False,
-                "error_type": PATH_POLICY_DENIED_ERROR_TYPE,
-                "error": (
-                    "terminal command references a path blocked by the "
-                    "configured filesystem policy"
+            return build_assessment_response(
+                assess_path_policy_denial(
+                    "terminal",
+                    session_key=session_key,
                 ),
-            }, ensure_ascii=False)
+                "执行 Terminal 命令",
+            )
 
-    if (
-        remote_approval
-        and not approval_granted
-        and not is_cwd_only_terminal_command(command)
-    ):
-        return build_approval_required(
-            "terminal",
-            "执行 Terminal 命令",
-            details={"command": command, "cwd": backend.cwd},
-        )
-
-    matches = detect_dangerous_command(command)
-    if (
-        matches
-        and not approval_granted
-        and kwargs.get("interactive_approval", True) is False
-    ):
-        return json.dumps({
-            "ok": False,
-            "error_type": "safety_blocked",
-            "fatal": True,
-            "error": (
-                "Dangerous commands require interactive server approval, "
-                "which is unavailable for this session."
+    try:
+        if getattr(backend, "terminal_path_preflight_enabled", False):
+            normalized_cwd = path_policy.normalize_path(
+                backend.cwd,
+                cwd=backend.cwd,
+            )
+        else:
+            # 远端 backend 的 cwd 属于远端命令语义，不按 host 路径解释。
+            normalized_cwd = str(backend.cwd or "").strip()
+        assessment = assess_terminal_operation(
+            args,
+            normalized_cwd=normalized_cwd,
+            session_key=session_key,
+            remote_approval=is_remote_approval(kwargs),
+            interactive_approval=(
+                kwargs.get("interactive_approval", True) is not False
             ),
-            "matches": [description for _, _, description in matches],
-        }, ensure_ascii=False)
-    if matches and not approval_granted and not approve_command(command, matches):
+            approval_grant=kwargs.get("approval_grant"),
+            security_policy=backend.tool_approval_policy,
+            backend_context=backend.approval_risk_context(),
+            intelligent_advisor=backend.intelligent_approval_advisor,
+        )
+    except ValueError as exc:
         return json.dumps({
             "ok": False,
-            "error_type": "user_denied",
-            "error": "Command denied by user.",
-        })
+            "error_type": "invalid_args",
+            "error": str(exc),
+        }, ensure_ascii=False)
+
+    policy_response = build_assessment_response(
+        assessment,
+        "执行 Terminal 命令",
+    )
+    if policy_response is not None:
+        return policy_response
+
+    command = assessment.normalized_command or command
 
     cancel_checker = kwargs.get("cancel_checker")
     if callable(cancel_checker):
@@ -146,9 +162,31 @@ def register(registry):
                 "paths used by the file tool resolve from this same cwd. "
                 "Use the file tool for file reads, writes, directory listings, "
                 "and metadata; use terminal for shell commands and processes. "
-                "Gateway remote sessions pause for user approval before every "
-                "command except a strict standalone cd or pwd. Do not retry an "
-                "operation while approval is pending. "
+                "Gateway remote sessions automatically run only conservative "
+                "standalone forms of pwd, simple cd, safe ls, git status, "
+                "read-only git diff/log/rev-parse, git branch --show-current, "
+                "and safe read-only rg. Pipes, redirects, compound commands, "
+                "Shell expansion, parsing uncertainty, and commands outside "
+                "that allowlist require explicit approval. Do not retry an "
+                "operation while approval is pending. Approval binds the "
+                "normalized command, current cwd, session key, and operation "
+                "fingerprint; cwd defines command semantics but is not an "
+                "access boundary. "
+                "Low/medium approvals may offer a constrained session grant "
+                "that re-parses executable/argv and requires the same cwd; "
+                "high risk is once-only and critical commands are denied. "
+                "Hardline safety rules and configured command, executable, "
+                "or protected-path deny rules run before every once/session "
+                "grant and cannot be approved. Hardline coverage includes "
+                "root or disk-root recursive deletion, filesystem formatting, "
+                "raw device writes, fork bombs, critical security-service "
+                "damage, and explicit attempts to modify Hermes approval "
+                "configuration. "
+                "Backend risk is explicit: local and ordinary unmounted Docker "
+                "still use command risk, SSH and Docker host mounts require "
+                "high-risk once approval, and Docker socket access is critical "
+                "and denied. Docker is never auto-approved merely because it "
+                "is named a sandbox. "
                 "On Windows the local backend uses Git Bash (MINGW/MSYS) — "
                 "NOT PowerShell, CMD, or WSL. Always emit Bash/POSIX-compatible "
                 "commands. Use forward-slash MSYS paths for absolute Windows "

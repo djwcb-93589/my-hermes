@@ -1,125 +1,307 @@
-# Hermes 配置示例。建议将敏感值放入 .env，再通过 ${VAR} 引用。
+# Hermes 完整配置示例。敏感值建议放入 .env，再通过 ${VAR} 引用。
+
+# 主模型名称，填写 OpenAI 兼容服务支持的模型标识。
 model: gpt-5
+# 主模型 API 的 OpenAI 兼容基础地址。
 base_url: https://api.openai.com/v1
+# 主模型 API 密钥；建议使用环境变量引用，避免明文提交。
 api_key: ${OPENAI_API_KEY}
 
+# 主模型不可用时使用的回退模型配置；空值表示继承主模型对应配置。
 fallback:
+  # 回退模型名称；空字符串表示不单独指定。
   model: ""
+  # 回退模型 API 地址；空字符串表示沿用主模型地址。
   base_url: ""
+  # 回退模型 API 密钥；空字符串表示沿用主模型密钥。
   api_key: ""
 
+# Agent 循环、重试和模型调用超时限制。
 limits:
+  # 主 Agent 单次任务允许的最大循环次数。
   max_iterations: 50
+  # Delegate 子 Agent 单次任务允许的最大循环次数。
   max_child_iterations: 30
+  # 可重试错误的最大重试次数。
   max_retries: 3
+  # 模型输出被截断时允许继续生成的最大次数。
   max_continuations: 3
+  # 单次模型请求超时时间，单位为秒。
   model_timeout_seconds: 120
 
+# 长对话上下文压缩参数。
 compression:
+  # 估算 token 数达到该阈值后触发压缩。
   threshold: 120000
+  # 压缩时始终保留最前面的消息数量。
   protect_first: 4
+  # 压缩时保留最近完整工具结果的数量。
   keep_recent_tool_results: 5
+  # 压缩后为最近消息预留的 token 预算。
   tail_token_budget: 50000
 
+# 注入系统提示的 Memory 文本长度上限。
 memory:
+  # MEMORY.md 最多读取的字符数。
   memory_char_limit: 12000
+  # USER.md 最多读取的字符数。
   user_char_limit: 12000
 
+# 模型可控 File/Terminal 操作使用的统一安全策略。
 security:
+  # 文件系统硬拒绝策略；不限制框架自身的内部持久化文件。
   filesystem:
-    # 每一项同时禁止该路径本身和全部子路径；空列表表示不额外禁止。
+    # 禁止访问的本机路径列表；每项同时禁止路径本身及其全部子路径。
+    # 支持 ~、环境变量、相对路径和 Windows/Git Bash 路径；空列表表示不额外禁止。
     denied_paths: []
 
+  # File/Terminal 的审批与用户拒绝策略。
+  approval:
+    # 禁止 Terminal 命令的正则表达式列表；命中后直接拒绝且不能审批。
+    # 示例：['\\bterraform\\s+destroy\\b']
+    denied_command_patterns: []
+    # 禁止执行的 executable 基名列表，按解析后的命令匹配而非字符串前缀。
+    # 示例：[terraform, custom-deploy-tool]
+    denied_executables: []
+    # 允许读取但禁止 File/Terminal 修改的受保护路径列表。
+    # 示例：['D:\\production', '/etc/my-service']
+    protected_paths: []
+    # File action 与路径范围组合拒绝规则；action 可为 read、read_range、write、
+    # append、replace、list 或 stat，path_under 同时覆盖目录本身和全部子路径。
+    # 示例：[{actions: [write, append, replace], path_under: 'D:\\published'}]
+    denied_file_rules: []
+    # File 敏感文件拒绝正则；命中后读写均按 critical 直接拒绝。
+    # 默认值与原内置列表一致，可按需增加、删除或替换。
+    sensitive_file_patterns:
+      # .env、.env.local 等环境文件。
+      - '(^|/)\.env(\..*)?$'
+      # key、pem、pfx、p12 私钥或证书文件。
+      - '\.(key|pem|pfx|p12)$'
+      # id_rsa、id_ed25519 等 SSH 密钥及其公钥文件。
+      - '/id_(rsa|dsa|ed25519|ecdsa)(\.pub)?$'
+      # SQLite 主文件及 WAL、SHM、journal sidecar。
+      - '\.(db|sqlite|sqlite3)(-(wal|shm|journal))?$'
+      # Git 内部目录及其全部文件。
+      - '(^|/)\.git($|/)'
+    # Gateway 审批请求有效期，单位为秒，必须是有限正数。
+    request_ttl_seconds: 600.0
+    # 预留的智能审批接口；当前只有可信 backend 注入 advisor 后才可能生效。
+    intelligent_approval:
+      # 是否允许 advisor 处理 low/medium 的 ASK；high/critical 和硬拒绝永不交给它。
+      enabled: false
+
+# SQLite 状态数据库路径；相对路径以 Hermes 配置目录为基准解析。
 db_path: database/hermes.db
 
+# Terminal 执行 backend 与相关能力配置。
 terminal:
+  # 执行 backend，可选 local、docker 或 ssh。
   backend: local
-  docker_image: ""
+  # Docker backend 使用的镜像；仅在 backend=docker 时生效。
+  docker_image: python:3.11-slim
+  # Docker 宿主机 bind mount 列表；任何宿主挂载都会提高审批风险。
+  # source 与 denied_paths 子树相交时启动会失败；target 必须是非根 POSIX 绝对路径。
+  docker_mounts: []
+  # SSH 主机地址；仅在 backend=ssh 时使用。
   ssh_host: ""
+  # SSH 登录用户名；仅在 backend=ssh 时使用。
   ssh_user: ""
+  # SSH 私钥路径；仅在 backend=ssh 时使用。
   ssh_key: ""
+  # Local Terminal 可以显式透传的普通凭证型环境变量名；基础设施凭证永远不能透传。
+  env_passthrough: []
 
+# Gateway 会话、持久队列、上下文暴露和平台 Adapter 配置。
 gateway:
+  # Gateway Agent 的显示名称和 session key 命名空间。
   agent_name: main
+  # 空闲会话保留时间，单位为秒；超时后清理 backend、pending 审批和 session grant。
   session_idle_timeout: 86400
+  # 单 route 可排队的最大待处理用户消息数。
   max_pending_messages: 20
+  # Gateway 全局允许并发进行的模型请求数。
   max_concurrent_llm_requests: 4
+  # Gateway 单实例运行 lease 的有效期，单位为秒。
   runtime_lease_ttl_seconds: 30
+  # Gateway 续租运行 lease 的间隔，单位为秒；TTL 必须大于该值的两倍。
   runtime_lease_heartbeat_seconds: 10
+  # 扫描并清理空闲会话的间隔，单位为秒。
   session_cleanup_interval_seconds: 600
+  # Outbox 一条消息的总投递尝试次数，不是额外重试次数。
   delivery_max_attempts: 20
+  # Outbox 第一次重试的基础延迟，单位为秒。
   delivery_retry_base_delay: 2.0
+  # Outbox 指数退避允许的最大延迟，单位为秒。
   delivery_retry_max_delay: 60.0
+  # Outbox 重试延迟的随机抖动比例，范围为 0 到 1。
   delivery_retry_jitter_ratio: 0.2
+  # 队列已满回执的总持久投递尝试次数。
   queue_full_reply_max_attempts: 3
+  # readiness 数据库与 lease 探针结果的短缓存时间，单位为秒。
   readiness_probe_cache_seconds: 1.0
-  # 终态记录按小批次清理；非终态和仍被 Queue/Outbox 引用的数据始终保留。
+
+  # Gateway 终态记录保留与分批清理策略；非终态和仍被引用的记录不会删除。
   retention:
+    # 飞书 Inbox 终态记录保留时间，单位为秒。
     feishu_inbox_seconds: 259200
+    # Gateway source ownership 终态记录保留时间，单位为秒。
     ownership_seconds: 2592000
+    # Gateway Outbox 终态记录保留时间，单位为秒。
     outbox_seconds: 2592000
+    # 运行终态清理任务的间隔，单位为秒。
     cleanup_interval_seconds: 3600
+    # 每次终态清理最多处理的记录数。
     cleanup_batch_size: 200
 
-  # Gateway 远程会话的只读上下文暴露策略。值必须是 YAML 布尔值，
-  # 不能写成带引号的 "true" 或 "false"。
+  # 不同会话类型允许注入系统提示的只读上下文；所有开关必须是 YAML 布尔值。
   context:
-    include_soul: true
-    include_memory: true
-    include_user_profile: true
-    include_project_context: false
+    # 无法识别会话类型时使用的默认策略。
+    default:
+      # 是否注入 SOUL.md。
+      include_soul: true
+      # 是否注入 MEMORY.md。
+      include_memory: false
+      # 是否注入 USER.md 用户资料。
+      include_user_profile: false
+      # 是否扫描并注入项目上下文文件。
+      include_project_context: false
+    # 私聊会话在 default 基础上的覆盖策略。
+    dm:
+      # 私聊是否注入 SOUL.md。
+      include_soul: true
+      # 私聊是否注入 MEMORY.md。
+      include_memory: true
+      # 私聊是否注入 USER.md 用户资料。
+      include_user_profile: true
+      # 私聊是否扫描并注入项目上下文文件。
+      include_project_context: false
+    # 普通群聊在 default 基础上的覆盖策略。
+    group:
+      # 群聊是否注入 SOUL.md。
+      include_soul: true
+      # 群聊是否注入 MEMORY.md。
+      include_memory: false
+      # 群聊是否注入 USER.md 用户资料。
+      include_user_profile: false
+      # 群聊是否扫描并注入项目上下文文件。
+      include_project_context: false
+    # 话题或 thread 会话在 default 基础上的覆盖策略。
+    topic:
+      # 话题是否注入 SOUL.md。
+      include_soul: true
+      # 话题是否注入 MEMORY.md。
+      include_memory: false
+      # 话题是否注入 USER.md 用户资料。
+      include_user_profile: false
+      # 话题是否扫描并注入项目上下文文件。
+      include_project_context: false
 
+  # 各消息平台 Adapter 的启用和访问控制配置。
   platforms:
+    # Gateway 控制台 Adapter。
     cli:
+      # 是否启用控制台 Adapter。
       enabled: false
 
+    # 飞书/Lark Webhook Adapter。
     feishu:
+      # 是否启用飞书 Adapter。
       enabled: false
-      # 未配置或设为 [] 时不开放工具；Gateway 不支持 cron toolset。
+      # 飞书会话向模型开放的工具集；Gateway 不支持 cron toolset。
       toolsets:
         - terminal
         - file
         - memory
         - skill
         - delegate
+      # 飞书应用 App ID。
       app_id: ${FEISHU_APP_ID}
+      # 飞书应用 App Secret；建议通过环境变量提供。
       app_secret: ${FEISHU_APP_SECRET}
-      verification_token: ${FEISHU_VERIFICATION_TOKEN}
-      encrypt_key: ""
-      bot_open_id: ""
-      is_lark: false
-      dm_only: true
-      require_mention: true
-      allow_all: false
-      allowed_users: []
-      allowed_chats: []
-
+      # Webhook HTTP 服务监听地址。
       webhook_host: 127.0.0.1
+      # Webhook HTTP 服务监听端口。
       webhook_port: 8787
+      # Webhook 请求路径，必须以 / 开头。
       webhook_path: /feishu/webhook
+      # 单个 Webhook 请求体允许的最大字节数。
       webhook_max_body_bytes: 1048576
+      # 读取 Webhook 请求体的超时时间，单位为秒。
       webhook_read_timeout_seconds: 5.0
+      # Webhook 同时处理的最大请求数。
       webhook_max_concurrent_requests: 32
+      # 按来源 IP 执行的 Webhook 滑动窗口限流。
       webhook_rate_limit:
+        # 限流统计窗口长度，单位为秒。
         window_seconds: 60.0
+        # 每个 IP 在一个窗口内允许的最大请求数。
         max_requests: 120
+        # 限流缓存最多跟踪的 IP 数量。
         max_tracked_ips: 2048
+      # 可信反向代理 IP/CIDR 列表；只有这些代理提供的转发地址才会被信任。
       webhook_trusted_proxies: []
+      # 飞书事件校验 token；建议通过环境变量提供。
+      verification_token: ${FEISHU_VERIFICATION_TOKEN}
+      # 飞书加密事件的 Encrypt Key；未启用加密时可留空。
+      encrypt_key: ""
+      # 机器人 open_id；需要过滤机器人自身消息时使用。
+      bot_open_id: ""
+      # 是否使用国际版 Lark API 域名。
+      is_lark: false
+      # 是否仅允许私聊消息进入 Adapter。
+      dm_only: true
+      # 群聊消息是否必须明确 @机器人。
+      require_mention: true
+      # 是否跳过用户/群聊白名单并允许所有来源。
+      allow_all: false
+      # 允许访问的稳定用户 ID 列表。
+      allowed_users: []
+      # 允许访问的群聊 chat ID 列表。
+      allowed_chats: []
+      # 群聊授权组合：and 要求用户和群都允许，or 表示满足任一白名单即可。
+      group_authorization_mode: and
 
-      # Adapter 内只做少量快速尝试；长期故障由 Gateway Outbox 持久重试。
+      # 飞书 Inbox 暂时失败记录允许的最大处理尝试次数。
+      inbox_retry_max_attempts: 5
+      # Inbox 第一次重试的基础延迟，单位为秒。
+      inbox_retry_base_delay_seconds: 1.0
+      # Inbox 指数退避允许的最大延迟，单位为秒。
+      inbox_retry_max_delay_seconds: 60.0
+      # Inbox 重试延迟的随机抖动比例，范围为 0 到 1。
+      inbox_retry_jitter_ratio: 0.2
+      # Inbox 重试队列的轮询间隔，单位为秒。
+      inbox_retry_poll_interval_seconds: 1.0
+      # Inbox 每轮最多认领的重试记录数。
+      inbox_retry_batch_size: 64
+
+      # Adapter 单次回复的总快速发送尝试次数；长期失败交给 Gateway Outbox。
       send_total_attempts: 3
+      # Adapter 第一次快速重试的基础延迟，单位为秒。
       send_retry_base_delay_seconds: 0.5
+      # Adapter 快速重试允许的最大延迟，单位为秒。
       send_retry_max_delay_seconds: 3.0
+      # Adapter 接受平台 Retry-After 时允许等待的最大秒数。
       adapter_retry_after_max_seconds: 5.0
+      # 每个 chat 每秒允许发送的最大消息数。
       send_rate_limit_per_chat: 5
+      # 不活跃 chat 限流状态的缓存时间，单位为秒。
       send_rate_limit_cache_idle_ttl_seconds: 600.0
+      # 发送限流缓存最多跟踪的 chat 数量。
       send_rate_limit_max_tracked_chats: 1024
 
+    # 个人微信 iLink Bot Adapter。
     weixin:
+      # 是否启用微信 Adapter。
       enabled: false
+      # iLink Bot 账号 ID；留空时尝试读取已持久化凭据。
       account_id: ""
+      # iLink Bot 访问 token；留空时尝试读取已持久化凭据。
       token: ""
+      # iLink Bot API 基础地址；留空时使用 Adapter 默认地址。
       base_url: ""
+      # 当前机器人用户 ID；留空时尝试从持久化凭据恢复。
       user_id: ""
+      # 是否跳过微信用户白名单并允许所有来源。
       allow_all: false
+      # 允许访问的微信用户 ID 列表。
       allowed_users: []

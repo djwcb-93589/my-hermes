@@ -1,42 +1,24 @@
-"""File / Terminal 远程审批的共享协议与保守判定。"""
+"""File / Terminal 远程审批 Tool Result 的共享协议。"""
 
 from __future__ import annotations
 
 import json
-import re
-import shlex
 import uuid
+
+from hermes.approval_policy import (
+    ALLOW,
+    ASK,
+    ApprovalAssessment,
+    emit_approval_audit,
+)
 
 
 APPROVAL_REQUIRED_ERROR = "approval_required"
 REMOTE_APPROVAL_MODE = "remote"
 
-# 只把严格的 cwd 查询/切换视为无需审批。任何 shell 控制符、变量展开、
-# 命令替换或复合命令都会退回审批路径，避免把任意执行伪装成 cd。
-_UNSAFE_CWD_COMMAND_CHARS_RE = re.compile(r"[;&|<>`$\r\n(){}]")
-
-
 def is_remote_approval(kwargs: dict) -> bool:
     """调用是否来自需要远程审批的工具会话。"""
     return kwargs.get("approval_mode") == REMOTE_APPROVAL_MODE
-
-
-def has_approval_grant(
-    kwargs: dict,
-    tool_name: str,
-    arguments: dict,
-) -> bool:
-    """一次性许可必须同时绑定请求 ID、工具名和完整原始参数。"""
-    grant = kwargs.get("approval_grant")
-    if not isinstance(grant, dict):
-        return False
-    request_id = grant.get("id")
-    return (
-        isinstance(request_id, str)
-        and request_id.startswith("approval_")
-        and grant.get("tool_name") == tool_name
-        and grant.get("arguments") == arguments
-    )
 
 
 def build_approval_required(
@@ -79,21 +61,45 @@ def build_approval_deferred() -> str:
     )
 
 
-def is_cwd_only_terminal_command(command: object) -> bool:
-    """只认可单条纯 ``cd`` / ``pwd``，其余 Terminal 命令全部审批。"""
-    if not isinstance(command, str):
-        return False
-    stripped = command.strip()
-    if not stripped or _UNSAFE_CWD_COMMAND_CHARS_RE.search(stripped):
-        return False
-    try:
-        tokens = shlex.split(stripped, posix=True)
-    except ValueError:
-        return False
-    if tokens == ["pwd"]:
-        return True
-    if not tokens or tokens[0] != "cd":
-        return False
-    if len(tokens) <= 2:
-        return True
-    return len(tokens) == 3 and tokens[1] == "--"
+def build_assessment_response(
+    assessment: ApprovalAssessment,
+    summary: str,
+    *,
+    approval_details: dict | None = None,
+    denial_payload: dict | None = None,
+) -> str | None:
+    """把统一策略结论转换为 Tool Result；ALLOW 不产生响应。"""
+    if assessment.decision == ALLOW:
+        return None
+    if assessment.decision == ASK:
+        details = dict(approval_details or {})
+        # 策略身份字段拥有最终解释权，调用方不能覆盖指纹或规范化目标。
+        details.update(assessment.details)
+        return build_approval_required(
+            assessment.tool_name,
+            summary,
+            details=details,
+        )
+
+    payload = dict(denial_payload or {})
+    payload.update({
+        "ok": False,
+        "error_type": assessment.error_type or "approval_denied",
+        "error": assessment.error or "operation denied by approval policy",
+        "fatal": bool(assessment.fatal),
+        "risk_level": assessment.risk_level.value,
+    })
+    emit_approval_audit(
+        request_id=None,
+        session_key=assessment.session_key,
+        tool_name=assessment.tool_name,
+        risk_level=assessment.risk_level.value,
+        reason=assessment.reason,
+        decision="denied",
+        grant_scope=None,
+        decision_source=assessment.details.get(
+            "decision_source",
+            "approval_policy",
+        ),
+    )
+    return json.dumps(payload, ensure_ascii=False)

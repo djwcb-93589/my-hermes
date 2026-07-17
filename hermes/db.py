@@ -9,12 +9,19 @@ JSON 序列化 / 反序列化。上层调用方不应直接 ``json.dumps(tool_ca
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+from hermes.approval_policy import (
+    approval_request_binding_matches,
+    emit_approval_audit,
+    is_grant_scope_allowed,
+)
 
 
 # ===========================================================================
@@ -4935,10 +4942,12 @@ def _gateway_approval_row(row) -> dict | None:
     if not isinstance(tool_args, dict) or not isinstance(details, dict):
         raise DBError("gateway approval JSON has invalid structure")
     agent_state = _normalize_gateway_approval_agent_state(agent_state)
+    fingerprint = details.get("fingerprint")
     return {
         "id": str(row[0]),
         "route_key": str(row[1]),
         "conversation_id": str(row[2]),
+        "session_key": str(row[2]),
         "requester_user_id": str(row[3]),
         "source_message_id": str(row[4]),
         "tool_call_id": str(row[5]),
@@ -4947,6 +4956,7 @@ def _gateway_approval_row(row) -> dict | None:
         "tool_args": tool_args,
         "summary": str(row[9]),
         "details": details,
+        "fingerprint": str(fingerprint) if fingerprint is not None else "",
         "status": str(row[11]),
         "decision_message_id": (
             str(row[12]) if row[12] is not None else None
@@ -4977,25 +4987,57 @@ def _approval_terminal_content(request_id: str, status: str) -> str:
     )
 
 
+def _emit_gateway_approval_audit(
+    request: dict,
+    *,
+    decision: str,
+    grant_scope: str | None,
+    decision_source: str,
+    timestamp: float,
+) -> None:
+    """从持久请求提取安全审计字段，不读取或输出 tool_args。"""
+    details = request.get("details", {})
+    emit_approval_audit(
+        request_id=request.get("id"),
+        session_key=request.get("conversation_id"),
+        tool_name=request.get("tool_name"),
+        risk_level=(
+            details.get("risk_level")
+            if isinstance(details, dict)
+            else "unknown"
+        ),
+        reason=(
+            details.get("reason")
+            if isinstance(details, dict)
+            else "approval state transition"
+        ),
+        decision=decision,
+        grant_scope=grant_scope,
+        decision_source=decision_source,
+        timestamp=timestamp,
+    )
+
+
 def _expire_gateway_approvals_in_transaction(
     conn: sqlite3.Connection,
     now: float,
 ) -> int:
     """在调用方事务内把超时请求转成终态，并同步 Tool Result。"""
     rows = conn.execute(
-        """
-        SELECT id, tool_message_id
+        f"""
+        SELECT {_GATEWAY_APPROVAL_COLUMNS}
         FROM gateway_approval_requests
         WHERE status='pending' AND expires_at<=?
         """,
         (now,),
     ).fetchall()
-    for request_id, tool_message_id in rows:
+    requests = [_gateway_approval_row(row) for row in rows]
+    for request in requests:
         conn.execute(
             "UPDATE messages SET content=? WHERE id=?",
             (
-                _approval_terminal_content(str(request_id), "expired"),
-                int(tool_message_id),
+                _approval_terminal_content(request["id"], "expired"),
+                request["tool_message_id"],
             ),
         )
     if rows:
@@ -5007,7 +5049,15 @@ def _expire_gateway_approvals_in_transaction(
             """,
             (now, now),
         )
-    return len(rows)
+    for request in requests:
+        _emit_gateway_approval_audit(
+            request,
+            decision="expired",
+            grant_scope=None,
+            decision_source="timeout",
+            timestamp=now,
+        )
+    return len(requests)
 
 
 def expire_gateway_approvals(
@@ -5026,21 +5076,22 @@ def recover_gateway_approvals(conn: sqlite3.Connection) -> dict:
     with transaction(conn):
         expired = _expire_gateway_approvals_in_transaction(conn, now)
         rows = conn.execute(
-            """
-            SELECT id, tool_message_id
+            f"""
+            SELECT {_GATEWAY_APPROVAL_COLUMNS}
             FROM gateway_approval_requests
             WHERE status='executing'
             """
         ).fetchall()
-        for request_id, tool_message_id in rows:
+        requests = [_gateway_approval_row(row) for row in rows]
+        for request in requests:
             conn.execute(
                 "UPDATE messages SET content=? WHERE id=?",
                 (
                     _approval_terminal_content(
-                        str(request_id),
+                        request["id"],
                         "execution_unknown",
                     ),
-                    int(tool_message_id),
+                    request["tool_message_id"],
                 ),
             )
         if rows:
@@ -5052,7 +5103,15 @@ def recover_gateway_approvals(conn: sqlite3.Connection) -> dict:
                 """,
                 (now,),
             )
-    return {"expired": expired, "execution_unknown": len(rows)}
+        for request in requests:
+            _emit_gateway_approval_audit(
+                request,
+                decision="execution_unknown",
+                grant_scope=None,
+                decision_source="crash_recovery",
+                timestamp=now,
+            )
+    return {"expired": expired, "execution_unknown": len(requests)}
 
 
 def create_gateway_approval_with_outbox(
@@ -5076,6 +5135,8 @@ def create_gateway_approval_with_outbox(
     tool_call_id = str(request.get("tool_call_id", ""))
     tool_args = request.get("arguments")
     details = request.get("details", {})
+    request_session_key = str(request.get("session_key", "")).strip()
+    request_fingerprint = request.get("fingerprint")
     normalized_requester_user_id = str(requester_user_id or "").strip()
     if not request_id.startswith("approval_"):
         raise DBError("invalid gateway approval request id")
@@ -5085,6 +5146,17 @@ def create_gateway_approval_with_outbox(
         raise DBError("invalid gateway approval tool call")
     if not isinstance(details, dict):
         raise DBError("invalid gateway approval details")
+    if request_session_key != session_id:
+        raise DBError("gateway approval session binding is invalid")
+    if request_fingerprint != details.get("fingerprint"):
+        raise DBError("gateway approval fingerprint binding is invalid")
+    if not approval_request_binding_matches(
+        tool_name,
+        tool_args,
+        details,
+        session_key=session_id,
+    ):
+        raise DBError("invalid gateway approval operation binding")
     if not normalized_requester_user_id:
         raise DBError("gateway approval requester identity is required")
     if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
@@ -5107,8 +5179,22 @@ def create_gateway_approval_with_outbox(
         "approval agent state",
     )
     ttl = float(ttl_seconds)
-    if ttl <= 0:
+    if not math.isfinite(ttl) or ttl <= 0:
         raise DBError("gateway approval ttl must be positive")
+
+    try:
+        created_at = float(request.get("created_at"))
+        expires_at = float(request.get("expires_at"))
+    except (TypeError, ValueError) as exc:
+        raise DBError("gateway approval lifetime binding is invalid") from exc
+    if (
+        not math.isfinite(created_at)
+        or not math.isfinite(expires_at)
+        or created_at >= expires_at
+        or expires_at <= time.time()
+        or abs((expires_at - created_at) - ttl) > 0.001
+    ):
+        raise DBError("gateway approval lifetime binding is invalid")
 
     now = time.time()
     with transaction(conn):
@@ -5138,6 +5224,34 @@ def create_gateway_approval_with_outbox(
         ).fetchone()
         if tool_row is None or request_id not in str(tool_row[1] or ""):
             raise DBError("approval request is not bound to its tool result")
+        try:
+            placeholder = json.loads(str(tool_row[1]))
+            placeholder_request = placeholder["approval_request"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DBError("gateway approval placeholder is invalid") from exc
+        if (
+            not isinstance(placeholder, dict)
+            or not isinstance(placeholder_request, dict)
+            or placeholder_request.get("id") != request_id
+        ):
+            raise DBError("gateway approval placeholder identity mismatch")
+        placeholder_request.update({
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "session_key": session_id,
+            "tool_call_id": tool_call_id,
+            "fingerprint": request_fingerprint,
+        })
+        conn.execute(
+            "UPDATE messages SET content=? WHERE id=?",
+            (
+                _serialize_gateway_json(
+                    placeholder,
+                    "approval placeholder",
+                ),
+                int(tool_row[0]),
+            ),
+        )
 
         existing_row = conn.execute(
             f"""
@@ -5160,6 +5274,8 @@ def create_gateway_approval_with_outbox(
                 or existing["requester_user_id"] != normalized_requester_user_id
                 or existing["source_event_json"] != source_event_json
                 or existing["agent_state"] != normalized_agent_state
+                or existing["created_at"] != created_at
+                or existing["expires_at"] != expires_at
             ):
                 raise DBError("gateway approval idempotency identity mismatch")
             outbox_row = conn.execute(
@@ -5205,8 +5321,8 @@ def create_gateway_approval_with_outbox(
                 encoded_details,
                 source_event_json,
                 encoded_agent_state,
-                now,
-                now + ttl,
+                created_at,
+                expires_at,
                 now,
             ),
         )
@@ -5233,6 +5349,17 @@ def create_gateway_approval_with_outbox(
             "reply_pending",
             now,
         )
+    emit_approval_audit(
+        request_id=request_id,
+        session_key=session_id,
+        tool_name=tool_name,
+        risk_level=details.get("risk_level"),
+        reason=details.get("reason"),
+        decision="pending",
+        grant_scope=None,
+        decision_source=details.get("decision_source", "approval_policy"),
+        timestamp=created_at,
+    )
     return outbox_id
 
 
@@ -5334,6 +5461,7 @@ def claim_gateway_approval(
     requester_user_id: str,
     selector: str,
     decision_message_id: str,
+    grant_scope: str = "once",
 ) -> dict:
     """校验审批归属并以 CAS 把 pending 转为 executing。"""
     now = time.time()
@@ -5354,6 +5482,14 @@ def claim_gateway_approval(
             return {"outcome": "stale_conversation", "request": request}
         if request["status"] != "pending":
             return {"outcome": request["status"], "request": request}
+        normalized_scope = str(grant_scope or "").strip().lower()
+        if normalized_scope not in {"once", "session"}:
+            return {"outcome": "invalid_scope", "request": request}
+        if not is_grant_scope_allowed(
+            request["details"].get("risk_level"),
+            normalized_scope,
+        ):
+            return {"outcome": "scope_forbidden", "request": request}
         changed = conn.execute(
             """
             UPDATE gateway_approval_requests
@@ -5366,6 +5502,15 @@ def claim_gateway_approval(
             return {"outcome": "conflict"}
         request["status"] = "executing"
         request["decision_message_id"] = decision_message_id
+        request["grant_scope"] = normalized_scope
+        request["updated_at"] = now
+        _emit_gateway_approval_audit(
+            request,
+            decision="approved",
+            grant_scope=normalized_scope,
+            decision_source="user",
+            timestamp=now,
+        )
         return {"outcome": "claimed", "request": request}
 
 
@@ -5414,6 +5559,13 @@ def deny_gateway_approval(
             ),
         )
         request["status"] = "denied"
+        _emit_gateway_approval_audit(
+            request,
+            decision="denied",
+            grant_scope=None,
+            decision_source="user",
+            timestamp=now,
+        )
         return {"outcome": "denied", "request": request}
 
 
@@ -5455,6 +5607,13 @@ def finish_gateway_approval(
         )
         request["status"] = final_status
         request["result_content"] = str(result_content)
+        _emit_gateway_approval_audit(
+            request,
+            decision=final_status,
+            grant_scope=None,
+            decision_source="tool_execution",
+            timestamp=now,
+        )
         return request
 
 
@@ -5606,6 +5765,13 @@ def finish_gateway_approval_and_enqueue_resume(
         request["status"] = final_status
         request["result_content"] = str(result_content)
         request["updated_at"] = now
+        _emit_gateway_approval_audit(
+            request,
+            decision=final_status,
+            grant_scope=None,
+            decision_source="tool_execution",
+            timestamp=now,
+        )
         return {
             "approval": request,
             "resume_task": task,
@@ -5670,36 +5836,68 @@ def cancel_pending_gateway_approvals(
     conn: sqlite3.Connection,
     route_key: str,
     conversation_id: str,
+    *,
+    decision_source: str = "conversation_lifecycle",
 ) -> int:
     """取消当前对话的全部 pending 请求，不触碰已经开始执行的请求。"""
+    return cancel_pending_gateway_approvals_for_session(
+        conn,
+        conversation_id,
+        route_key=route_key,
+        decision_source=decision_source,
+    )
+
+
+def cancel_pending_gateway_approvals_for_session(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    *,
+    route_key: str | None = None,
+    decision_source: str = "session_cleanup",
+) -> int:
+    """按真实 session 收敛 pending，可选 route 仅用于进一步限定。"""
     now = time.time()
+    where = "conversation_id=? AND status='pending'"
+    params: list[object] = [conversation_id]
+    if route_key is not None:
+        where = "route_key=? AND " + where
+        params.insert(0, route_key)
     with transaction(conn):
         rows = conn.execute(
-            """
-            SELECT id, tool_message_id
+            f"""
+            SELECT {_GATEWAY_APPROVAL_COLUMNS}
             FROM gateway_approval_requests
-            WHERE route_key=? AND conversation_id=? AND status='pending'
+            WHERE {where}
             """,
-            (route_key, conversation_id),
+            tuple(params),
         ).fetchall()
-        for request_id, tool_message_id in rows:
+        requests = [_gateway_approval_row(row) for row in rows]
+        for request in requests:
             conn.execute(
                 "UPDATE messages SET content=? WHERE id=?",
                 (
-                    _approval_terminal_content(str(request_id), "cancelled"),
-                    int(tool_message_id),
+                    _approval_terminal_content(request["id"], "cancelled"),
+                    request["tool_message_id"],
                 ),
             )
-        if rows:
+        if requests:
             conn.execute(
-                """
+                f"""
                 UPDATE gateway_approval_requests
                 SET status='cancelled', updated_at=?
-                WHERE route_key=? AND conversation_id=? AND status='pending'
+                WHERE {where}
                 """,
-                (now, route_key, conversation_id),
+                (now, *params),
             )
-    return len(rows)
+        for request in requests:
+            _emit_gateway_approval_audit(
+                request,
+                decision="cancelled",
+                grant_scope=None,
+                decision_source=decision_source,
+                timestamp=now,
+            )
+    return len(requests)
 
 
 def add_message(

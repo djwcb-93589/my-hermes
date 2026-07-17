@@ -211,8 +211,9 @@ def _dispatch_conversation_tool_call(loop, tool_call):
     )
     try:
         dispatch_context = dict(getattr(loop, "tool_context", {}))
-        # CLI 与普通 Gateway AgentLoop 都不能注入内部敏感文件许可。
+        # CLI 与普通 Gateway AgentLoop 都不能注入内部审批许可。
         dispatch_context.pop("allow_sensitive", None)
+        dispatch_context.pop("approval_grant", None)
         dispatch_context["session_key"] = loop.session_key
         if loop.cancel_checker is not None and tool_name == "terminal":
             dispatch_context["cancel_checker"] = loop.cancel_checker

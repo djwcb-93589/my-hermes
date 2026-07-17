@@ -121,6 +121,7 @@ class LocalBackend(BaseExecutionEnvironment):
     """
 
     terminal_path_preflight_enabled = True
+    backend_type = "local"
 
     def __init__(
         self,
@@ -128,6 +129,7 @@ class LocalBackend(BaseExecutionEnvironment):
         timeout: int = 180,
         *,
         path_policy: PathAccessPolicy | None = None,
+        tool_approval_policy=None,
         env_passthrough: Iterable[str] = (),
         infrastructure_secret_values: Iterable[str] = (),
     ):
@@ -139,6 +141,7 @@ class LocalBackend(BaseExecutionEnvironment):
             cwd=cwd,
             timeout=timeout,
             path_policy=path_policy,
+            tool_approval_policy=tool_approval_policy,
         )
 
     def _setup_paths(self):

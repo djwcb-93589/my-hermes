@@ -11,6 +11,8 @@ from hermes.backends import BaseExecutionEnvironment
 class SSHBackend(BaseExecutionEnvironment):
     """通过 SSH ControlMaster 在远端机器上执行命令。"""
 
+    backend_type = "ssh"
+
     def __init__(self, host: str, user: str, key_path: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self._host = host

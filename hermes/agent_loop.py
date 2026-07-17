@@ -410,8 +410,9 @@ def dispatch_tool_call(
 
     try:
         dispatch_context = dict(tool_context or {})
-        # 普通 AgentLoop 不得把内部敏感文件许可透传给工具。
+        # 普通 AgentLoop 不得把内部审批许可透传给工具。
         dispatch_context.pop("allow_sensitive", None)
+        dispatch_context.pop("approval_grant", None)
         dispatch_context["session_key"] = session_key
         output = registry.dispatch(tool_name, tool_args, **dispatch_context)
     except Exception as exc:

@@ -81,6 +81,23 @@ class PathAccessPolicy:
         target = self.normalize_path(path, cwd=cwd)
         return self._is_normalized_denied(target)
 
+    def intersects_denied_tree(
+        self,
+        path: str,
+        *,
+        cwd: str | None = None,
+    ) -> bool:
+        """判断路径与任一拒绝子树是否相交，不暴露具体拒绝项。"""
+        target = self.normalize_path(path, cwd=cwd)
+        for denied in self._denied_paths:
+            try:
+                common = os.path.commonpath((target, denied))
+            except ValueError:
+                continue
+            if common in {target, denied}:
+                return True
+        return False
+
     def _is_normalized_denied(self, target: str) -> bool:
         """对已经规范化的路径执行唯一一套包含关系判断。"""
         for denied in self._denied_paths:

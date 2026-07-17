@@ -31,7 +31,16 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
-from hermes.config import PATH_ACCESS_POLICY, _config
+from hermes.approval_policy import (
+    ApprovalSecurityPolicy,
+    DEFAULT_APPROVAL_SECURITY_POLICY,
+)
+from hermes.config import (
+    APPROVAL_SECURITY_POLICY,
+    DB_PATH,
+    PATH_ACCESS_POLICY,
+    _config,
+)
 from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessPolicy
 from hermes.redaction import is_explicit_credential_env_name
 
@@ -177,6 +186,7 @@ class BaseExecutionEnvironment(ABC):
     """
 
     terminal_path_preflight_enabled = False
+    backend_type = "unknown"
 
     def __init__(
         self,
@@ -184,9 +194,15 @@ class BaseExecutionEnvironment(ABC):
         timeout: int = 180,
         *,
         path_policy: PathAccessPolicy | None = None,
+        tool_approval_policy: ApprovalSecurityPolicy | None = None,
     ):
         self.cwd = cwd
         self.path_policy = path_policy or ALLOW_ALL_PATH_POLICY
+        self.tool_approval_policy = (
+            tool_approval_policy or DEFAULT_APPROVAL_SECURITY_POLICY
+        )
+        # 智能审批实现只能由可信 backend 创建上下文注入，默认永久关闭。
+        self.intelligent_approval_advisor = None
         self.timeout = timeout
         self._session_id = uuid.uuid4().hex[:12]
         # 默认：/tmp/hermes-* （POSIX 下 shell == host）。Windows 上的
@@ -228,6 +244,17 @@ class BaseExecutionEnvironment(ABC):
     def _normalize_cwd(self, raw: str) -> str:
         """把 `pwd -P` 的原始输出转回 host 形式。"""
         return raw
+
+    def approval_risk_context(self) -> dict:
+        """返回不含凭证、主机名和挂载源路径的 backend 风险画像。"""
+        return {
+            "backend_type": self.backend_type,
+            "host_mounts": False,
+            "docker_socket": False,
+            "remote_host": self.backend_type == "ssh",
+            "hardline_protected_paths": (),
+            "configured_protected_paths": (),
+        }
 
     def _interrupt_process(self, proc: subprocess.Popen) -> None:
         """请求当前命令尽快退出；LocalBackend 会覆盖为进程组中断。"""
@@ -459,6 +486,7 @@ def create_backend(
     config: dict,
     *,
     path_policy: PathAccessPolicy | None = None,
+    tool_approval_policy: ApprovalSecurityPolicy | None = None,
 ) -> BaseExecutionEnvironment:
     """根据 config 选择合适的后端。"""
     # 局部 import，避免模块加载阶段产生循环引用。
@@ -471,6 +499,9 @@ def create_backend(
         raise ValueError("terminal config must be a mapping")
     backend_type = terminal_cfg.get("backend", "local")
     active_path_policy = path_policy or PATH_ACCESS_POLICY
+    active_approval_policy = (
+        tool_approval_policy or APPROVAL_SECURITY_POLICY
+    )
 
     if backend_type == "docker":
         image = terminal_cfg.get("docker_image", "python:3.11-slim")
@@ -478,6 +509,8 @@ def create_backend(
             image=image,
             cwd="/workspace",
             path_policy=active_path_policy,
+            tool_approval_policy=active_approval_policy,
+            mounts=terminal_cfg.get("docker_mounts", ()),
         )
     elif backend_type == "ssh":
         return SSHBackend(
@@ -486,11 +519,13 @@ def create_backend(
             key_path=terminal_cfg.get("ssh_key"),
             cwd="~",
             path_policy=active_path_policy,
+            tool_approval_policy=active_approval_policy,
         )
     else:
         return LocalBackend(
             cwd=os.getcwd(),
             path_policy=active_path_policy,
+            tool_approval_policy=active_approval_policy,
             env_passthrough=_load_terminal_env_passthrough(terminal_cfg),
             infrastructure_secret_values=(
                 _configured_infrastructure_credential_values(config)
@@ -511,6 +546,32 @@ _backends: dict[str, BaseExecutionEnvironment] = {}
 _backends_lock = threading.Lock()
 
 
+def _clear_session_approval_state(session_key: str) -> None:
+    """backend/session 清理时同步收敛 pending 和 session grant。"""
+    from hermes.approval_policy import clear_session_grants
+    from hermes.db import (
+        cancel_pending_gateway_approvals_for_session,
+        init_db,
+    )
+
+    clear_session_grants(session_key)
+    try:
+        conn = init_db(DB_PATH)
+        try:
+            cancel_pending_gateway_approvals_for_session(
+                conn,
+                session_key,
+                decision_source="backend_cleanup",
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(
+            "  [approval:audit] event=session_cleanup_failed "
+            f"exception={type(exc).__name__}"
+        )
+
+
 def get_backend(session_key: str = "default") -> BaseExecutionEnvironment:
     """按 session_key 取或建 backend。
 
@@ -529,6 +590,7 @@ def cleanup_backend(session_key: str) -> bool:
     """清理指定 session 的 backend。存在则返回 True。"""
     with _backends_lock:
         b = _backends.pop(session_key, None)
+    _clear_session_approval_state(session_key)
     if b is None:
         return False
     try:
@@ -541,9 +603,10 @@ def cleanup_backend(session_key: str) -> bool:
 def cleanup_all_backends() -> None:
     """清理所有缓存的 backend。程序退出时调用。"""
     with _backends_lock:
-        items = list(_backends.values())
+        items = list(_backends.items())
         _backends.clear()
-    for b in items:
+    for session_key, b in items:
+        _clear_session_approval_state(session_key)
         try:
             b.cleanup()
         except Exception:
