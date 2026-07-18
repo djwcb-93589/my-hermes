@@ -1414,7 +1414,7 @@ class GatewayRunner:
         return total
 
     async def _run_retention_cleanup(self) -> None:
-        """Outbox 先释放引用，再清理无引用 ownership；失败不影响运行。"""
+        """清理数据库审计和 Adapter 文件缓存；单项失败不影响运行。"""
         now = time.time()
         try:
             outbox_removed = await self._prune_retention_batches(
@@ -1455,6 +1455,33 @@ class GatewayRunner:
                 f"kind=ownership exception={type(exc).__name__} "
                 f"lease_epoch={self._runtime_lease_epoch}"
             )
+
+        for platform, adapter in self.adapters.items():
+            cleanup_file_cache = getattr(adapter, "cleanup_file_cache", None)
+            if not callable(cleanup_file_cache):
+                continue
+            try:
+                result = await cleanup_file_cache()
+                scanned = int(getattr(result, "scanned_files", 0))
+                removed = int(getattr(result, "removed_files", 0))
+                failed = int(getattr(result, "failed_files", 0))
+                error_code = str(getattr(result, "error_code", None) or "")
+                print(
+                    "  [gateway:audit] event=retention_cleanup "
+                    f"kind=file_cache platform={platform} "
+                    f"scanned={scanned} removed={removed} failed={failed} "
+                    f"error_code={error_code or 'none'} "
+                    f"lease_epoch={self._runtime_lease_epoch}"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    "  [gateway:audit] event=retention_cleanup_failed "
+                    f"kind=file_cache platform={platform} "
+                    f"exception={type(exc).__name__} "
+                    f"lease_epoch={self._runtime_lease_epoch}"
+                )
 
     async def _retention_cleanup_loop(self) -> None:
         """Gateway running 期间周期执行有界审计清理。"""
@@ -1565,6 +1592,104 @@ class GatewayRunner:
             "payloads": payloads,
         }, event)
 
+    def _build_file_failure_outbox(
+        self,
+        delivery: dict,
+    ) -> tuple[dict, MessageEvent]:
+        """构造不暴露本地路径和平台错误细节的永久失败通知。"""
+        source_event = self._deserialize_event(
+            str(delivery.get("source_event_json", ""))
+        )
+        if (
+            source_event.message_id != delivery["source_message_id"]
+            or source_event.source.platform != delivery["platform"]
+            or source_event.source.chat_id != delivery["chat_id"]
+            or build_session_key(source_event.source, self.agent_name)
+            != delivery["route_key"]
+        ):
+            raise ValueError("file delivery source identity mismatch")
+
+        delivery_id = str(delivery["id"])
+        notification_source_id = f"file-delivery-failure:{delivery_id}"
+        outbox_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes:gateway:file-failure-outbox:{delivery_id}",
+        ))
+        display_name = str(delivery.get("display_name") or "文件")
+        content = (
+            f"文件“{display_name}”发送失败，系统已停止重试。"
+            "请重新发起发送。"
+        )
+        event = MessageEvent(
+            message_id=notification_source_id,
+            text=content,
+            source=source_event.source,
+            message_type=MessageType.TEXT,
+            metadata={
+                "file_delivery_id": delivery_id,
+                "notification": "permanent_failure",
+            },
+        )
+        adapter = self.adapters.get(delivery["platform"])
+        if adapter:
+            payloads = adapter.prepare_outbound(
+                content,
+                delivery_id=outbox_id,
+            )
+        else:
+            payloads = [{"content": content}]
+        if not payloads:
+            raise ValueError("adapter produced no failure notification payload")
+        return ({
+            "id": outbox_id,
+            "route_key": delivery["route_key"],
+            "source_message_id": notification_source_id,
+            "queue_message_id": notification_source_id,
+            "event_json": self._serialize_event(event),
+            "platform": delivery["platform"],
+            "chat_id": delivery["chat_id"],
+            "reply_to_message_id": (
+                delivery.get("reply_to_message_id")
+                or delivery["source_message_id"]
+            ),
+            "thread_id": delivery.get("thread_id"),
+            "delivery_kind": "file_delivery_failure",
+            "payloads": payloads,
+        }, event)
+
+    async def _wake_file_delivery_route(
+        self,
+        delivery: dict,
+        event: MessageEvent,
+    ) -> None:
+        """持久 Outbox 已提交后唤醒原 route；停机时交给下次启动恢复。"""
+        if self._lifecycle_phase != "running":
+            return
+        ctx = await self.sessions.get_or_create_async(
+            delivery["route_key"],
+            self._build_gateway_prompt(event.source),
+        )
+        async with self._route_admission(delivery["route_key"]):
+            await self._dispatch_next_locked(ctx)
+
+    async def _fail_file_delivery_with_notification(
+        self,
+        delivery: dict,
+        error_code: str,
+    ) -> bool:
+        """原子持久化永久失败和确定性通知，再唤醒现有 Outbox 调度。"""
+        failure_outbox, event = self._build_file_failure_outbox(delivery)
+        failed = await self.persistence.call(
+            fail_gateway_file_delivery,
+            delivery["id"],
+            error_code,
+            failure_outbox,
+            **self._runtime_fence_kwargs(),
+        )
+        if failed:
+            await self._wake_file_delivery_route(delivery, event)
+        return bool(failed)
+
     async def _schedule_file_outbox(self, delivery: dict) -> None:
         """在 file_key 边界之后原子创建 Outbox，并唤醒既有 route 调度器。"""
         outbox, event = self._build_file_delivery_outbox(delivery)
@@ -1599,14 +1724,7 @@ class GatewayRunner:
             )
             return
 
-        if self._lifecycle_phase != "running":
-            return
-        ctx = await self.sessions.get_or_create_async(
-            delivery["route_key"],
-            self._build_gateway_prompt(event.source),
-        )
-        async with self._route_admission(delivery["route_key"]):
-            await self._dispatch_next_locked(ctx)
+        await self._wake_file_delivery_route(delivery, event)
 
     async def _run_claimed_file_upload(
         self,
@@ -1671,11 +1789,9 @@ class GatewayRunner:
             adapter = self.adapters.get(current["platform"])
             upload_file = getattr(adapter, "upload_file_delivery", None)
             if not callable(upload_file):
-                await self.persistence.call(
-                    fail_gateway_file_delivery,
-                    current["id"],
+                await self._fail_file_delivery_with_notification(
+                    current,
                     "unsupported_platform",
-                    **self._runtime_fence_kwargs(),
                 )
                 return
 
@@ -1745,11 +1861,9 @@ class GatewayRunner:
                         **self._runtime_fence_kwargs(),
                     )
                 else:
-                    await self.persistence.call(
-                        fail_gateway_file_delivery,
-                        current["id"],
+                    await self._fail_file_delivery_with_notification(
+                        current,
                         error_code,
-                        **self._runtime_fence_kwargs(),
                     )
                 return
 

@@ -454,18 +454,38 @@ _COMPLEX_SHELL_SYNTAX_RE = re.compile(
 _SHELL_EXPANSION_RE = re.compile(r"[*?\[\]!]")
 _SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SAFE_GIT_REVISION_RE = re.compile(r"^[A-Za-z0-9._/@:+^~-]+$")
-_LS_SHORT_OPTIONS = frozenset("aAldhF1")
+_LS_SHORT_OPTIONS = frozenset("aAldhF1trSXingopsCxmucvqQ")
 _LS_LONG_OPTIONS = frozenset({
     "--all",
     "--almost-all",
     "--directory",
     "--classify",
     "--human-readable",
+    "--inode",
+    "--size",
+    "--numeric-uid-gid",
+    "--reverse",
+    "--group-directories-first",
+    "--hide-control-chars",
+    "--quote-name",
+    "--literal",
     "--color",
     "--color=always",
     "--color=auto",
     "--color=never",
 })
+_LS_LONG_VALUE_OPTION_RE = re.compile(
+    r"--(?:"
+    r"sort=(?:none|size|time|version|extension|width)"
+    r"|time=(?:atime|access|use|ctime|status|birth|creation)"
+    r"|time-style=(?:full-iso|long-iso|iso|locale)"
+    r"|format=(?:across|commas|horizontal|long|single-column|verbose|vertical)"
+    r"|indicator-style=(?:none|slash|file-type|classify)"
+    r"|width=\d+"
+    r"|tabsize=\d+"
+    r")"
+)
+_TAIL_COUNT_RE = re.compile(r"[+-]?\d+(?:[bBkKmMgGtTpPeEzZyY])?")
 _GIT_STATUS_OPTIONS = frozenset({
     "--short",
     "-s",
@@ -1924,7 +1944,10 @@ def _classify_ls(tokens: Sequence[str]) -> TerminalCommandClassification:
             continue
         if not options_ended and token.startswith("-") and token != "-":
             if token.startswith("--"):
-                if token not in _LS_LONG_OPTIONS:
+                if (
+                    token not in _LS_LONG_OPTIONS
+                    and not _LS_LONG_VALUE_OPTION_RE.fullmatch(token)
+                ):
                     return _terminal_classification(
                         False,
                         "terminal.ls",
@@ -1955,6 +1978,207 @@ def _classify_ls(tokens: Sequence[str]) -> TerminalCommandClassification:
         "terminal.ls",
         LOW,
         "命令命中简单只读 ls 白名单",
+        target_paths,
+    )
+
+
+def _classify_static_query(
+    executable: str,
+    tokens: Sequence[str],
+    *,
+    short_options: str = "",
+    long_options: Sequence[str] = (),
+    require_operands: bool = False,
+    allow_operands: bool = True,
+    target_paths: bool = False,
+    risk_level: ApprovalRiskLevel = LOW,
+) -> TerminalCommandClassification:
+    """识别只接受固定选项和静态参数的常用查询命令。"""
+    operands: list[str] = []
+    options_ended = False
+    allowed_short = frozenset(short_options)
+    allowed_long = frozenset(long_options)
+    for token in tokens:
+        if not options_ended and token == "--":
+            options_ended = True
+            continue
+        if not options_ended and token.startswith("-") and token != "-":
+            if token.startswith("--"):
+                option_allowed = token in allowed_long
+            else:
+                option_allowed = bool(token[1:]) and all(
+                    char in allowed_short for char in token[1:]
+                )
+            if not option_allowed:
+                return _terminal_classification(
+                    False,
+                    f"terminal.{executable}",
+                    MEDIUM,
+                    f"{executable} 包含未列入只读白名单的选项",
+                )
+            continue
+        if not allow_operands:
+            return _terminal_classification(
+                False,
+                f"terminal.{executable}",
+                MEDIUM,
+                f"{executable} 包含不支持的额外参数",
+            )
+        if not _is_static_path_token(token):
+            return _terminal_classification(
+                False,
+                f"terminal.{executable}",
+                HIGH,
+                f"{executable} 的参数需要 Shell 动态展开",
+            )
+        operands.append(token)
+    if require_operands and not operands:
+        return _terminal_classification(
+            False,
+            f"terminal.{executable}",
+            MEDIUM,
+            f"{executable} 缺少可静态识别的目标",
+        )
+    return _terminal_classification(
+        True,
+        f"terminal.{executable}",
+        risk_level,
+        f"命令命中只读 {executable} 白名单",
+        operands if target_paths else (),
+    )
+
+
+def _classify_tail(tokens: Sequence[str]) -> TerminalCommandClassification:
+    """允许有限行数/字节读取，拒绝 follow 和进程等待模式。"""
+    target_paths: list[str] = []
+    options_ended = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not options_ended and token == "--":
+            options_ended = True
+            index += 1
+            continue
+        if not options_ended and token.startswith("-") and token != "-":
+            if token in {
+                "-q", "--quiet", "--silent",
+                "-v", "--verbose",
+                "-z", "--zero-terminated",
+            }:
+                index += 1
+                continue
+            if token in {"-n", "--lines", "-c", "--bytes"}:
+                if (
+                    index + 1 >= len(tokens)
+                    or not _TAIL_COUNT_RE.fullmatch(tokens[index + 1])
+                ):
+                    return _terminal_classification(
+                        False,
+                        "terminal.tail",
+                        MEDIUM,
+                        "tail 的读取范围参数无法安全解析",
+                    )
+                index += 2
+                continue
+            if (
+                re.fullmatch(
+                    r"-(?:n|c)[+-]?\d+(?:[bBkKmMgGtTpPeEzZyY])?",
+                    token,
+                )
+                or re.fullmatch(
+                    r"--(?:lines|bytes)=[+-]?\d+(?:[bBkKmMgGtTpPeEzZyY])?",
+                    token,
+                )
+                or re.fullmatch(r"-\d+", token)
+            ):
+                index += 1
+                continue
+            return _terminal_classification(
+                False,
+                "terminal.tail",
+                MEDIUM,
+                "tail 包含 follow、进程等待或未列入白名单的选项",
+            )
+        if not _is_static_path_token(token):
+            return _terminal_classification(
+                False,
+                "terminal.tail",
+                HIGH,
+                "tail 的目标路径需要 Shell 动态展开",
+            )
+        target_paths.append(token)
+        index += 1
+    return _terminal_classification(
+        True,
+        "terminal.tail",
+        MEDIUM,
+        "命令命中有限读取的 tail 白名单",
+        target_paths,
+    )
+
+
+def _classify_stat(tokens: Sequence[str]) -> TerminalCommandClassification:
+    """允许读取文件或文件系统元数据，不开放未知 stat 扩展选项。"""
+    target_paths: list[str] = []
+    options_ended = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not options_ended and token == "--":
+            options_ended = True
+            index += 1
+            continue
+        if not options_ended and token.startswith("-") and token != "-":
+            if token in {
+                "-L", "--dereference", "-f", "--file-system",
+                "-t", "--terse",
+            }:
+                index += 1
+                continue
+            if token in {"-c", "--format", "--printf"}:
+                if index + 1 >= len(tokens):
+                    return _terminal_classification(
+                        False,
+                        "terminal.stat",
+                        MEDIUM,
+                        "stat 的输出格式参数缺少值",
+                    )
+                index += 2
+                continue
+            if (
+                (token.startswith("-c") and len(token) > 2)
+                or (token.startswith("--format=") and len(token) > 9)
+                or (token.startswith("--printf=") and len(token) > 9)
+            ):
+                index += 1
+                continue
+            return _terminal_classification(
+                False,
+                "terminal.stat",
+                MEDIUM,
+                "stat 包含未列入只读白名单的选项",
+            )
+        if not _is_static_path_token(token):
+            return _terminal_classification(
+                False,
+                "terminal.stat",
+                HIGH,
+                "stat 的目标路径需要 Shell 动态展开",
+            )
+        target_paths.append(token)
+        index += 1
+    if not target_paths:
+        return _terminal_classification(
+            False,
+            "terminal.stat",
+            MEDIUM,
+            "stat 缺少可静态识别的目标路径",
+        )
+    return _terminal_classification(
+        True,
+        "terminal.stat",
+        MEDIUM,
+        "命令命中只读文件元数据 stat 白名单",
         target_paths,
     )
 
@@ -2376,6 +2600,136 @@ def _classify_simple_terminal_tokens(
         )
     if tokens[0] == "ls":
         return _classify_ls(tokens[1:])
+    if tokens[0] == "tail":
+        return _classify_tail(tokens[1:])
+    if tokens[0] == "stat":
+        return _classify_stat(tokens[1:])
+    if tokens[0] == "readlink":
+        return _classify_static_query(
+            "readlink",
+            tokens[1:],
+            short_options="fenqsvz",
+            long_options=(
+                "--canonicalize",
+                "--canonicalize-existing",
+                "--canonicalize-missing",
+                "--no-newline",
+                "--quiet",
+                "--silent",
+                "--verbose",
+                "--zero",
+            ),
+            require_operands=True,
+            target_paths=True,
+            risk_level=MEDIUM,
+        )
+    if tokens[0] == "realpath":
+        return _classify_static_query(
+            "realpath",
+            tokens[1:],
+            short_options="eLmPqsz",
+            long_options=(
+                "--canonicalize-existing",
+                "--canonicalize-missing",
+                "--logical",
+                "--physical",
+                "--quiet",
+                "--strip",
+                "--zero",
+            ),
+            require_operands=True,
+            target_paths=True,
+            risk_level=LOW,
+        )
+    if tokens[0] in {"basename", "dirname"}:
+        return _classify_static_query(
+            tokens[0],
+            tokens[1:],
+            short_options="z",
+            long_options=("--zero",),
+            require_operands=True,
+            risk_level=LOW,
+        )
+    if list(tokens) == ["whoami"]:
+        return _terminal_classification(
+            True,
+            "terminal.whoami",
+            LOW,
+            "命令命中当前用户身份查询白名单",
+        )
+    if tokens[0] == "uname":
+        return _classify_static_query(
+            "uname",
+            tokens[1:],
+            short_options="asnrvmpio",
+            long_options=(
+                "--all",
+                "--kernel-name",
+                "--nodename",
+                "--kernel-release",
+                "--kernel-version",
+                "--machine",
+                "--processor",
+                "--hardware-platform",
+                "--operating-system",
+            ),
+            allow_operands=False,
+            risk_level=LOW,
+        )
+    if tokens[0] == "which":
+        return _classify_static_query(
+            "which",
+            tokens[1:],
+            short_options="as",
+            require_operands=True,
+            risk_level=LOW,
+        )
+    if tokens[0] == "type":
+        return _classify_static_query(
+            "type",
+            tokens[1:],
+            short_options="aPpt",
+            require_operands=True,
+            risk_level=LOW,
+        )
+    if tokens[0] == "command":
+        if (
+            len(tokens) >= 3
+            and tokens[1] in {"-v", "-V"}
+            and all(_is_static_path_token(token) for token in tokens[2:])
+        ):
+            return _terminal_classification(
+                True,
+                "terminal.command_lookup",
+                LOW,
+                "命令命中 command 可执行文件查询白名单",
+            )
+        return _terminal_classification(
+            False,
+            "terminal.command",
+            HIGH,
+            "command 仅允许 -v/-V 查询形式自动执行",
+        )
+    if tokens[0] == "df":
+        return _classify_static_query(
+            "df",
+            tokens[1:],
+            short_options="ahHiklPT",
+            long_options=(
+                "--all",
+                "--human-readable",
+                "--si",
+                "--inodes",
+                "--local",
+                "--portability",
+                "--print-type",
+                "--total",
+                "--sync",
+                "--no-sync",
+            ),
+            target_paths=True,
+            risk_level=LOW,
+        )
     if tokens[0] == "git":
         return _classify_git(tokens[1:])
     if tokens[0] == "rg":

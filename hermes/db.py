@@ -31,7 +31,7 @@ from hermes.approval_policy import (
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 17
+LATEST_SCHEMA_VERSION = 18
 
 _DEFAULT_GATEWAY_APPROVAL_AGENT_STATE = {
     "iterations_used": 0,
@@ -255,6 +255,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _create_gateway_file_delivery_schema(conn)
     _create_gateway_fencing_triggers(conn)
     _create_feishu_inbox_schema(conn)
+    _create_feishu_pending_attachment_schema(conn)
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -577,6 +578,50 @@ def _create_gateway_file_delivery_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_gateway_file_delivery_route
         ON gateway_file_deliveries(route_key, created_at, id)
+        """
+    )
+
+
+def _create_feishu_pending_attachment_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """创建等待下一条用户指令的飞书附件记录。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feishu_pending_attachments (
+            app_id TEXT NOT NULL,
+            route_key TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            attachments_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('awaiting_instruction', 'bound')
+            ),
+            bound_message_id TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (app_id, route_key, source_message_id),
+            CHECK (
+                (state='awaiting_instruction' AND bound_message_id IS NULL)
+                OR (state='bound' AND bound_message_id IS NOT NULL)
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_feishu_pending_attachment_route
+        ON feishu_pending_attachments(
+            app_id, route_key, state, created_at, source_message_id
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_feishu_pending_attachment_bound
+        ON feishu_pending_attachments(
+            app_id, route_key, bound_message_id
+        )
+        WHERE state='bound'
         """
     )
 
@@ -1557,7 +1602,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     v12 → v13 保存每条 route 的历史 conversation 归属，v13 → v14
     增加与 Tool Result 绑定的远程审批请求，v14 → v15 增加持久化审批恢复，
     v15 → v16 增加出站文件任务与 gateway_send_file 审批类型，
-    v16 → v17 增加文件任务到 Outbox 的持久关联。
+    v16 → v17 增加文件任务到 Outbox 的持久关联，v17 → v18
+    增加等待下一条用户指令的飞书附件记录。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -1849,6 +1895,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 17
+
+    if current < 18:
+        conn.execute("BEGIN")
+        try:
+            _create_feishu_pending_attachment_schema(conn)
+            _set_schema_version(conn, 18)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 18
 
     return current
 
@@ -2708,6 +2766,293 @@ def release_feishu_inbox_processing_message(
             ),
         )
     return cursor.rowcount == 1
+
+
+def _validate_feishu_pending_attachment_route(
+    app_id: str,
+    route_key: str,
+) -> str:
+    """校验待绑定附件的应用与路由身份。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu pending attachment app_id must not be empty")
+    normalized_route_key = str(route_key or "")
+    if not normalized_route_key:
+        raise DBError(
+            "Feishu pending attachment route_key must not be empty"
+        )
+    return normalized_route_key
+
+
+def _normalize_feishu_pending_message_ids(
+    app_id: str,
+    message_ids: list[str],
+) -> list[str]:
+    """规范化 source 或绑定消息 ID，保留平台顺序并去重。"""
+    if not isinstance(message_ids, list) or not message_ids:
+        raise DBError("Feishu pending attachment message_ids must not be empty")
+    normalized: list[str] = []
+    for message_id in message_ids:
+        _validate_feishu_inbox_identity(app_id, message_id)
+        if message_id not in normalized:
+            normalized.append(message_id)
+    return normalized
+
+
+def _decode_feishu_pending_attachments(
+    encoded: object,
+) -> list[dict]:
+    """读取待绑定附件 JSON，不让损坏记录静默变成空附件。"""
+    try:
+        decoded = json.loads(str(encoded))
+    except (TypeError, ValueError) as exc:
+        raise DBError(
+            "Feishu pending attachment JSON deserialization failed"
+        ) from exc
+    if (
+        not isinstance(decoded, list)
+        or not decoded
+        or not all(isinstance(item, dict) for item in decoded)
+    ):
+        raise DBError("Feishu pending attachment JSON is invalid")
+    return [dict(item) for item in decoded]
+
+
+def get_feishu_pending_attachment(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+    source_message_id: str,
+) -> list[dict] | None:
+    """读取某个已物化附件，供确认回执重试时复用本地事实。"""
+    normalized_route_key = _validate_feishu_pending_attachment_route(
+        app_id,
+        route_key,
+    )
+    _validate_feishu_inbox_identity(app_id, source_message_id)
+    row = conn.execute(
+        """
+        SELECT attachments_json
+        FROM feishu_pending_attachments
+        WHERE app_id=? AND route_key=? AND source_message_id=?
+        """,
+        (app_id, normalized_route_key, source_message_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return _decode_feishu_pending_attachments(row[0])
+
+
+def upsert_feishu_pending_attachment(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+    source_message_id: str,
+    attachments: list[dict],
+    *,
+    now: float | None = None,
+) -> bool:
+    """持久化已下载附件；已经绑定给文本的记录不得被重置。"""
+    normalized_route_key = _validate_feishu_pending_attachment_route(
+        app_id,
+        route_key,
+    )
+    _validate_feishu_inbox_identity(app_id, source_message_id)
+    if (
+        not isinstance(attachments, list)
+        or not attachments
+        or not all(isinstance(item, dict) for item in attachments)
+    ):
+        raise DBError("Feishu pending attachment list is invalid")
+    try:
+        encoded_attachments = json.dumps(
+            attachments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise DBError(
+            "Feishu pending attachment JSON serialization failed"
+        ) from exc
+    timestamp = time.time() if now is None else float(now)
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            INSERT INTO feishu_pending_attachments (
+                app_id, route_key, source_message_id, attachments_json,
+                state, bound_message_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'awaiting_instruction', NULL, ?, ?)
+            ON CONFLICT(app_id, route_key, source_message_id) DO UPDATE SET
+                attachments_json=excluded.attachments_json,
+                updated_at=excluded.updated_at
+            WHERE feishu_pending_attachments.state='awaiting_instruction'
+            """,
+            (
+                app_id,
+                normalized_route_key,
+                source_message_id,
+                encoded_attachments,
+                timestamp,
+                timestamp,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def claim_feishu_pending_attachments(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+    source_message_ids: list[str],
+    *,
+    now: float | None = None,
+) -> list[dict]:
+    """把一个文本批次绑定到当前 route 全部待指令附件。"""
+    normalized_route_key = _validate_feishu_pending_attachment_route(
+        app_id,
+        route_key,
+    )
+    normalized_message_ids = _normalize_feishu_pending_message_ids(
+        app_id,
+        source_message_ids,
+    )
+    timestamp = time.time() if now is None else float(now)
+    placeholders = ", ".join("?" for _ in normalized_message_ids)
+    with _immediate_transaction(conn):
+        rows = conn.execute(
+            f"""
+            SELECT source_message_id, attachments_json
+            FROM feishu_pending_attachments
+            WHERE app_id=? AND route_key=? AND state='bound'
+              AND bound_message_id IN ({placeholders})
+            ORDER BY created_at, source_message_id
+            """,
+            (app_id, normalized_route_key, *normalized_message_ids),
+        ).fetchall()
+        if not rows:
+            conn.execute(
+                """
+                UPDATE feishu_pending_attachments
+                SET state='bound', bound_message_id=?, updated_at=?
+                WHERE app_id=? AND route_key=?
+                  AND state='awaiting_instruction'
+                """,
+                (
+                    normalized_message_ids[-1],
+                    timestamp,
+                    app_id,
+                    normalized_route_key,
+                ),
+            )
+            rows = conn.execute(
+                """
+                SELECT source_message_id, attachments_json
+                FROM feishu_pending_attachments
+                WHERE app_id=? AND route_key=? AND state='bound'
+                  AND bound_message_id=?
+                ORDER BY created_at, source_message_id
+                """,
+                (
+                    app_id,
+                    normalized_route_key,
+                    normalized_message_ids[-1],
+                ),
+            ).fetchall()
+
+    claimed: list[dict] = []
+    for source_message_id, encoded_attachments in rows:
+        claimed.append({
+            "source_message_id": str(source_message_id),
+            "attachments": _decode_feishu_pending_attachments(
+                encoded_attachments,
+            ),
+        })
+    return claimed
+
+
+def delete_feishu_pending_attachments(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+    source_message_ids: list[str],
+) -> int:
+    """在文本已经被 Gateway 接受后删除已消费的附件记录。"""
+    normalized_route_key = _validate_feishu_pending_attachment_route(
+        app_id,
+        route_key,
+    )
+    normalized_message_ids = _normalize_feishu_pending_message_ids(
+        app_id,
+        source_message_ids,
+    )
+    placeholders = ", ".join("?" for _ in normalized_message_ids)
+    with transaction(conn):
+        cursor = conn.execute(
+            f"""
+            DELETE FROM feishu_pending_attachments
+            WHERE app_id=? AND route_key=?
+              AND source_message_id IN ({placeholders})
+            """,
+            (app_id, normalized_route_key, *normalized_message_ids),
+        )
+    return max(0, cursor.rowcount)
+
+
+def clear_feishu_pending_attachments(
+    conn: sqlite3.Connection,
+    app_id: str,
+    route_key: str,
+) -> int:
+    """新建会话时清除旧 route 未消费附件，避免跨会话自动绑定。"""
+    normalized_route_key = _validate_feishu_pending_attachment_route(
+        app_id,
+        route_key,
+    )
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            DELETE FROM feishu_pending_attachments
+            WHERE app_id=? AND route_key=?
+            """,
+            (app_id, normalized_route_key),
+        )
+    return max(0, cursor.rowcount)
+
+
+def prune_feishu_pending_attachments(
+    conn: sqlite3.Connection,
+    app_id: str,
+    *,
+    created_before: float,
+    limit: int = 200,
+) -> int:
+    """按有界批次清理超出附件缓存保留期的未消费记录。"""
+    if not isinstance(app_id, str) or not app_id:
+        raise DBError("Feishu pending attachment app_id must not be empty")
+    batch_limit = _cleanup_batch_limit(limit, "Feishu pending attachment")
+    cutoff = float(created_before)
+    with _immediate_transaction(conn):
+        rows = conn.execute(
+            """
+            SELECT route_key, source_message_id
+            FROM feishu_pending_attachments
+            WHERE app_id=? AND created_at < ?
+            ORDER BY created_at, source_message_id
+            LIMIT ?
+            """,
+            (app_id, cutoff, batch_limit),
+        ).fetchall()
+        removed = 0
+        for route_key, source_message_id in rows:
+            cursor = conn.execute(
+                """
+                DELETE FROM feishu_pending_attachments
+                WHERE app_id=? AND route_key=? AND source_message_id=?
+                  AND created_at < ?
+                """,
+                (app_id, str(route_key), str(source_message_id), cutoff),
+            )
+            removed += cursor.rowcount
+    return removed
 
 
 def _cleanup_batch_limit(value, label: str) -> int:
@@ -5466,9 +5811,12 @@ def get_recoverable_gateway_file_deliveries(
     effective_now = time.time() if now is None else float(now)
     rows = conn.execute(
         f"""
-        SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS},
+        SELECT delivery.*,
                approval.source_event_json
-        FROM gateway_file_deliveries AS delivery
+        FROM (
+            SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS}
+            FROM gateway_file_deliveries
+        ) AS delivery
         JOIN gateway_approval_requests AS approval
           ON approval.id=delivery.approval_id
         WHERE (
@@ -5606,12 +5954,13 @@ def fail_gateway_file_delivery(
     conn: sqlite3.Connection,
     delivery_id: str,
     error_code: str,
+    failure_outbox: dict | None = None,
     *,
     lease_name: str,
     instance_id: str,
     lease_epoch: int,
 ) -> bool:
-    """把当前上传 claim 收敛为不可再次上传的永久失败。"""
+    """原子收敛上传永久失败；提供通知时在同一事务创建 Outbox。"""
     fence = _gateway_file_delivery_fence(
         lease_name,
         instance_id,
@@ -5646,7 +5995,21 @@ def fail_gateway_file_delivery(
                 fence[2],
             ),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return False
+        if failure_outbox is not None:
+            outbox_id = _insert_gateway_outbox(
+                conn,
+                failure_outbox,
+                lease_name=fence[0],
+                instance_id=fence[1],
+                lease_epoch=fence[2],
+            )
+            if outbox_id != str(failure_outbox.get("id", "")):
+                raise DBError(
+                    "gateway file failure notification identity mismatch"
+                )
+        return True
 
 
 def mark_gateway_file_delivery_outbox_retry(

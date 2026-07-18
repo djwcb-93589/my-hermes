@@ -141,15 +141,21 @@ def _is_sensitive_path(
     return any(pattern.search(normalized) for pattern in sensitive_patterns)
 
 
-def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
-    """提取读文件前后必须保持一致的状态字段。"""
-    return (
+def _stat_identity(
+    info: os.stat_result,
+    *,
+    include_ctime: bool = True,
+) -> tuple[int, ...]:
+    """提取文件身份；Windows 跨 stat API 比较时可排除不稳定 ctime。"""
+    identity = (
         int(info.st_dev),
         int(info.st_ino),
         int(info.st_size),
         int(info.st_mtime_ns),
-        int(info.st_ctime_ns),
     )
+    if include_ctime:
+        return (*identity, int(info.st_ctime_ns))
+    return identity
 
 
 def _opened_descriptor_path(descriptor: int, fallback: str) -> str:
@@ -312,7 +318,19 @@ def capture_outbound_file_snapshot(
             "file_changed_during_validation",
             "outbound file changed after it was validated",
         ) from exc
-    if not stat.S_ISREG(current.st_mode) or _stat_identity(current) != _stat_identity(after):
+    # Windows 的句柄 fstat 与路径 stat 可能用不同语义或精度报告 ctime。
+    # 路径复核仍绑定 device、inode、size、mtime；同一 API 内继续严格比较 ctime。
+    compare_ctime = os.name != "nt"
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or _stat_identity(
+            current,
+            include_ctime=compare_ctime,
+        ) != _stat_identity(
+            after,
+            include_ctime=compare_ctime,
+        )
+    ):
         raise OutboundFileValidationError(
             "file_changed_during_validation",
             "outbound file changed after it was validated",

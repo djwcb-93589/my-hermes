@@ -43,16 +43,22 @@ from urllib.parse import urlsplit
 from hermes.db import (
     InvalidFeishuInboxPayloadError,
     build_feishu_inbox_route_key,
+    claim_feishu_pending_attachments,
+    clear_feishu_pending_attachments,
+    delete_feishu_pending_attachments,
     claim_feishu_inbox_route_message,
     fail_feishu_inbox_message,
+    get_feishu_pending_attachment,
     get_feishu_inbox_dispatch_routes,
     get_feishu_inbox_payload,
     get_feishu_inbox_route_next,
     get_feishu_inbox_status,
     insert_feishu_inbox_message,
     prune_feishu_inbox_messages,
+    prune_feishu_pending_attachments,
     release_feishu_inbox_processing_message,
     reset_feishu_inbox_processing,
+    upsert_feishu_pending_attachment,
     update_feishu_inbox_status,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
@@ -155,6 +161,7 @@ FEISHU_READINESS_TIMEOUT_SECONDS = 2.0
 FEISHU_PROCESSING_REACTION_CACHE_SIZE = 2048
 FEISHU_FILE_DOWNLOAD_CONCURRENCY = 2
 FEISHU_ATTACHMENT_PLACEHOLDER = "[Feishu attachment]"
+FEISHU_ATTACHMENT_RECEIVED_REPLY = "文件已接受。"
 FEISHU_ATTACHMENT_MESSAGE_TYPES = frozenset({
     "image",
     "file",
@@ -247,6 +254,31 @@ class FeishuAttachmentDownloadError(RuntimeError):
             f"attachment_download_{safe_code}"
             if safe_code
             else "attachment_download_failed"
+        )
+        self.retryable = bool(retryable)
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(self.error_code)
+
+
+class FeishuAttachmentReceiptError(RuntimeError):
+    """把固定附件确认的发送结果映射到 Inbox 重试状态机。"""
+
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+    ):
+        safe_code = "".join(
+            char
+            for char in str(error_code or "").strip().lower()
+            if char.isalnum() or char == "_"
+        )[:64]
+        self.error_code = (
+            f"attachment_receipt_{safe_code}"
+            if safe_code
+            else "attachment_receipt_failed"
         )
         self.retryable = bool(retryable)
         self.retry_after_seconds = retry_after_seconds
@@ -825,7 +857,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return persistence
 
     async def _prune_completed_messages(self, *, force: bool = False) -> None:
-        """按保留期分批清理终态 Inbox；失败只记录并等待下轮。"""
+        """按保留期清理终态 Inbox 与失效待绑定附件。"""
         persistence = self._require_persistence()
         now = time.time()
         if (
@@ -834,17 +866,35 @@ class FeishuAdapter(BasePlatformAdapter):
             < self.retention_cleanup_interval_seconds
         ):
             return
-        cutoff = now - self.inbox_retention_seconds
-        removed = 0
+        inbox_cutoff = now - self.inbox_retention_seconds
+        cache_retention = self.inbox_retention_seconds
+        if self.file_transfer_config is not None:
+            cache_retention = float(
+                self.file_transfer_config["cache_retention_seconds"],
+            )
+        attachment_cutoff = now - cache_retention
+        inbox_removed = 0
+        attachment_removed = 0
         try:
             for _ in range(4):
                 batch_removed = await persistence.call(
                     prune_feishu_inbox_messages,
                     self.app_id,
-                    completed_before=cutoff,
+                    completed_before=inbox_cutoff,
                     limit=self.retention_cleanup_batch_size,
                 )
-                removed += int(batch_removed)
+                inbox_removed += int(batch_removed)
+                if int(batch_removed) < self.retention_cleanup_batch_size:
+                    break
+                await asyncio.sleep(0)
+            for _ in range(4):
+                batch_removed = await persistence.call(
+                    prune_feishu_pending_attachments,
+                    self.app_id,
+                    created_before=attachment_cutoff,
+                    limit=self.retention_cleanup_batch_size,
+                )
+                attachment_removed += int(batch_removed)
                 if int(batch_removed) < self.retention_cleanup_batch_size:
                     break
                 await asyncio.sleep(0)
@@ -856,10 +906,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"kind=inbox exception={type(exc).__name__}"
             )
         else:
-            if removed:
+            if inbox_removed or attachment_removed:
                 print(
                     "  [feishu:audit] event=retention_cleanup "
-                    f"kind=inbox removed={removed}"
+                    f"kind=inbox removed={inbox_removed} "
+                    f"pending_attachments_removed={attachment_removed}"
                 )
         # 失败也遵守清理间隔，避免锁故障期间每条 Webhook 都触发写重试。
         self._last_dedup_cleanup = now
@@ -1080,6 +1131,11 @@ class FeishuAdapter(BasePlatformAdapter):
     def _classify_inbox_failure(cls, exc: BaseException) -> InboxFailureDisposition:
         """把消费异常分成可重试与永久失败，不持久化异常原文。"""
         if isinstance(exc, FeishuAttachmentDownloadError):
+            return InboxFailureDisposition(
+                exc.error_code,
+                permanent=not exc.retryable,
+            )
+        if isinstance(exc, FeishuAttachmentReceiptError):
             return InboxFailureDisposition(
                 exc.error_code,
                 permanent=not exc.retryable,
@@ -2111,8 +2167,14 @@ class FeishuAdapter(BasePlatformAdapter):
                         continue
 
                     if not self._is_plain_text_event(event):
-                        await self._materialize_event_attachments(event)
-                        await self._handoff_to_runner(event)
+                        if event.attachments:
+                            await self._defer_event_attachments(
+                                event,
+                                route_key,
+                            )
+                            await self._send_attachment_received_reply(event)
+                        else:
+                            await self._handoff_to_runner(event)
                         await self._complete_messages(
                             [message_id],
                             batch_message_id=message_id,
@@ -2122,6 +2184,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
                     command = _immediate_command_name(event.text)
                     if command is not None:
+                        if command == "/new":
+                            await self._require_persistence().call(
+                                clear_feishu_pending_attachments,
+                                self.app_id,
+                                route_key,
+                            )
                         await self._handoff_to_runner(event)
                         await self._complete_messages(
                             [message_id],
@@ -2252,6 +2320,115 @@ class FeishuAdapter(BasePlatformAdapter):
         event.attachments = materialized
         event.text = self._format_materialized_attachment_text(materialized)
         return event
+
+    async def _defer_event_attachments(
+        self,
+        event: MessageEvent,
+        route_key: str,
+    ) -> MessageEvent:
+        """物化附件并持久化为等待下一条普通文本的 route 状态。"""
+        existing = await self._require_persistence().call(
+            get_feishu_pending_attachment,
+            self.app_id,
+            route_key,
+            event.message_id,
+        )
+        if existing is not None:
+            event.attachments = existing
+            return await self._materialize_event_attachments(event)
+
+        event = await self._materialize_event_attachments(event)
+        await self._require_persistence().call(
+            upsert_feishu_pending_attachment,
+            self.app_id,
+            route_key,
+            event.message_id,
+            event.attachments,
+        )
+        return event
+
+    async def _send_attachment_received_reply(
+        self,
+        event: MessageEvent,
+    ) -> None:
+        """不经过 LLM 发送确定性的文件接收确认。"""
+        delivery_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes:feishu:attachment-received:{self.app_id}:"
+            f"{event.message_id}",
+        ))
+        payloads = self.prepare_outbound(
+            FEISHU_ATTACHMENT_RECEIVED_REPLY,
+            delivery_id=delivery_id,
+        )
+        if len(payloads) != 1:
+            raise RuntimeError("attachment receipt payload is invalid")
+        result = await self.send_prepared(
+            event.source.chat_id,
+            payloads[0],
+            reply_to_message_id=event.message_id,
+            thread_id=event.source.thread_id,
+        )
+        if result.success:
+            return
+        raise FeishuAttachmentReceiptError(
+            result.error_code or result.error or "send_failed",
+            retryable=result.retryable,
+            retry_after_seconds=result.retry_after_seconds,
+        )
+
+    async def _bind_pending_attachments_to_instruction(
+        self,
+        event: MessageEvent,
+        source_message_ids: list[str],
+    ) -> list[str]:
+        """把当前文本批次与 route 内尚未消费的附件合成一次 Agent 输入。"""
+        route_key = self._build_inbox_route_key(event)
+        records = await self._require_persistence().call(
+            claim_feishu_pending_attachments,
+            self.app_id,
+            route_key,
+            source_message_ids,
+        )
+        if not records:
+            return []
+
+        attachments: list[Attachment] = []
+        attachment_source_ids: list[str] = []
+        for record in records:
+            source_message_id = str(record.get("source_message_id", "") or "")
+            raw_attachments = record.get("attachments")
+            if not source_message_id or not isinstance(raw_attachments, list):
+                raise FeishuInboxBusinessDataError(
+                    "pending attachment record is invalid"
+                )
+            try:
+                restored = [
+                    validate_attachment(item)
+                    for item in raw_attachments
+                ]
+            except ValueError as exc:
+                raise FeishuInboxBusinessDataError(
+                    "pending attachment record is invalid"
+                ) from exc
+            if any(attachment["status"] != "ready" for attachment in restored):
+                raise FeishuInboxBusinessDataError(
+                    "pending attachment is not ready"
+                )
+            attachment_source_ids.append(source_message_id)
+            attachments.extend(restored)
+
+        instruction = event.text
+        event.message_type = MessageType.DOCUMENT
+        event.attachments = attachments
+        event.metadata["attachment_source_message_ids"] = (
+            attachment_source_ids
+        )
+        event.text = (
+            f"{self._format_materialized_attachment_text(attachments)}"
+            f"\n\n用户要求：\n{instruction}"
+        )
+        return attachment_source_ids
 
     @staticmethod
     def _format_materialized_attachment_text(
@@ -2433,7 +2610,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
                 for item in events
             ]
+            attachment_source_ids = (
+                await self._bind_pending_attachments_to_instruction(
+                    event,
+                    message_ids,
+                )
+            )
             await self._handoff_to_runner(event)
+            if attachment_source_ids:
+                await self._require_persistence().call(
+                    delete_feishu_pending_attachments,
+                    self.app_id,
+                    self._build_inbox_route_key(event),
+                    attachment_source_ids,
+                )
             await self._complete_messages(
                 message_ids,
                 batch_message_id=event.message_id,
