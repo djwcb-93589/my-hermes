@@ -82,6 +82,7 @@ def register_all():
     from hermes.tools.memory import register as _memory
     from hermes.tools.skill import register as _skill
     from hermes.tools.delegate import register as _delegate
+    from hermes.tools.gateway_send_file import register as _gateway_send_file
     from hermes.cron.tool import register as _cron
 
     _terminal(registry)
@@ -89,4 +90,5 @@ def register_all():
     _memory(registry)
     _skill(registry)
     _delegate(registry)
+    _gateway_send_file(registry)
     _cron(registry)

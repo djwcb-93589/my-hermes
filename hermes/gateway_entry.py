@@ -138,6 +138,7 @@ async def run_gateway():
                 send_rate_limit_max_tracked_chats=feishu_cfg.get(
                     "send_rate_limit_max_tracked_chats", 1024,
                 ),
+                file_transfer_config=runner.file_transfer_config,
             ))
             print("  [gateway] Feishu adapter added")
         except Exception as exc:

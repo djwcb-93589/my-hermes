@@ -1,5 +1,5 @@
 """
-飞书 adapter:基于 Webhook HTTP 回调,接收文本并发送 Markdown 富文本。
+飞书 adapter:基于 Webhook HTTP 回调,接收入站消息并发送 Markdown 富文本。
 
 特性:
   - 内置有界线程 Webhook Server,限制路径、请求体、超时、并发和 IP 速率
@@ -13,8 +13,12 @@
   - 消息回复 / 话题回复和按会话发送限速
   - allowed_users / allowed_chats / allow_all 白名单
   - MessageDeduplicator 防止飞书重复推送
+  - 文件传输开启时把资源标识解析成平台无关附件
+  - 提供复用现有鉴权和 HTTP 客户端的安全流式资源下载能力
+  - 在持久 Inbox route consumer 内物化附件，再交给 GatewayRunner
+  - 把审批后的本地文件流式上传为普通 file，并交给持久 Outbox 发送
 
-不实现:加密事件解密、图片、文件、语音、卡片、流式回复。
+不实现:加密事件解密、内容识别、卡片、流式回复。
 """
 
 from __future__ import annotations
@@ -52,18 +56,36 @@ from hermes.db import (
     update_feishu_inbox_status,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
+from hermes.gateway.adapters.feishu_files import (
+    FeishuFileUploadResult,
+    FeishuResourceDownloadResult,
+    download_feishu_message_resource,
+    upload_feishu_file,
+)
 from hermes.gateway.adapters.webhook_security import (
     BoundedThreadingHTTPServer,
     SlidingWindowRateLimiter,
     TrustedProxyResolver,
     redact_ip,
 )
+from hermes.gateway.file_transfer import GatewayFileTransferConfig
+from hermes.gateway.files.cache import (
+    CacheCleanupResult,
+    cleanup_expired_cache,
+)
 from hermes.gateway.observability import (
     safe_message_digest,
     safe_route_digest,
 )
 from hermes.gateway.persistence import GatewayPersistence
-from hermes.gateway.types import MessageEvent, MessageType, SendResult, SessionSource
+from hermes.gateway.types import (
+    Attachment,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    SessionSource,
+    validate_attachment,
+)
 
 
 FEISHU_POST_LIMIT_BYTES = 30 * 1024  # 飞书单条富文本请求体上限
@@ -131,6 +153,17 @@ FEISHU_DEDUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 FEISHU_DEDUP_CLEANUP_BATCH_SIZE = 200
 FEISHU_READINESS_TIMEOUT_SECONDS = 2.0
 FEISHU_PROCESSING_REACTION_CACHE_SIZE = 2048
+FEISHU_FILE_DOWNLOAD_CONCURRENCY = 2
+FEISHU_ATTACHMENT_PLACEHOLDER = "[Feishu attachment]"
+FEISHU_ATTACHMENT_MESSAGE_TYPES = frozenset({
+    "image",
+    "file",
+    "audio",
+    "media",
+})
+FEISHU_SUPPORTED_INBOUND_MESSAGE_TYPES = (
+    FEISHU_ATTACHMENT_MESSAGE_TYPES | {"text"}
+)
 FEISHU_REACTION_ALREADY_GONE_CODES = frozenset({
     230110,  # 原消息已经删除
     231003,  # 原消息不存在或已经撤回
@@ -195,8 +228,33 @@ class FeishuInboxBusinessDataError(ValueError):
     """已落库但无法解析为业务事件的永久数据错误。"""
 
 
+class FeishuAttachmentDownloadError(RuntimeError):
+    """把附件下载结果安全地传递给现有 Inbox 失败状态机。"""
+
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+    ):
+        safe_code = "".join(
+            char
+            for char in str(error_code or "").strip().lower()
+            if char.isalnum() or char == "_"
+        )[:64]
+        self.error_code = (
+            f"attachment_download_{safe_code}"
+            if safe_code
+            else "attachment_download_failed"
+        )
+        self.retryable = bool(retryable)
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(self.error_code)
+
+
 class FeishuAdapter(BasePlatformAdapter):
-    """飞书 Webhook 文本 adapter。"""
+    """飞书 Webhook 消息 adapter。"""
 
     PLATFORM = "feishu"
 
@@ -246,11 +304,14 @@ class FeishuAdapter(BasePlatformAdapter):
         send_rate_limit_per_chat: int = 5,
         send_rate_limit_cache_idle_ttl_seconds: float = 600.0,
         send_rate_limit_max_tracked_chats: int = 1024,
+        file_transfer_config: GatewayFileTransferConfig | None = None,
     ):
         super().__init__("feishu")
         self.app_id = str(app_id or "").strip()
         self.app_secret = str(app_secret or "")
         self.db_path = db_path
+        # 配置由 GatewayRunner 在启动前集中校验；Adapter 只保存，不读取文件。
+        self.file_transfer_config = file_transfer_config
         self.webhook_host = str(webhook_host or "127.0.0.1").strip()
         self.webhook_port = int(webhook_port)
         self.webhook_path = self._validate_webhook_path(webhook_path)
@@ -401,6 +462,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._last_dedup_cleanup = 0.0
         self._route_tasks: dict[str, asyncio.Task] = {}
         self._route_wakeups: dict[str, asyncio.Event] = {}
+        # route task 保持会话内串行；该信号量只限制跨 route 的下载并发。
+        self._file_download_semaphore = asyncio.Semaphore(
+            FEISHU_FILE_DOWNLOAD_CONCURRENCY,
+        )
         self._inbox_dispatcher_task: asyncio.Task | None = None
         self._inbox_dispatch_wakeup: asyncio.Event | None = None
         self._inbox_deferred_failures: dict[
@@ -1014,6 +1079,11 @@ class FeishuAdapter(BasePlatformAdapter):
     @classmethod
     def _classify_inbox_failure(cls, exc: BaseException) -> InboxFailureDisposition:
         """把消费异常分成可重试与永久失败，不持久化异常原文。"""
+        if isinstance(exc, FeishuAttachmentDownloadError):
+            return InboxFailureDisposition(
+                exc.error_code,
+                permanent=not exc.retryable,
+            )
         if isinstance(exc, InvalidFeishuInboxPayloadError):
             return InboxFailureDisposition("invalid_payload", permanent=True)
         if isinstance(exc, FeishuInboxBusinessDataError):
@@ -1071,7 +1141,22 @@ class FeishuAdapter(BasePlatformAdapter):
             not disposition.permanent
             and attempt_number < self.inbox_retry_max_attempts
         ):
-            next_attempt_at = now + self._inbox_retry_delay(attempt_number)
+            retry_delay = self._inbox_retry_delay(attempt_number)
+            if isinstance(exc, FeishuAttachmentDownloadError):
+                suggested_delay = exc.retry_after_seconds
+                if (
+                    suggested_delay is not None
+                    and math.isfinite(suggested_delay)
+                    and suggested_delay >= 0
+                ):
+                    retry_delay = max(
+                        retry_delay,
+                        min(
+                            self.inbox_retry_max_delay_seconds,
+                            suggested_delay,
+                        ),
+                    )
+            next_attempt_at = now + retry_delay
         try:
             result = await self._persistence.call(
                 fail_feishu_inbox_message,
@@ -1817,15 +1902,31 @@ class FeishuAdapter(BasePlatformAdapter):
         if not msg_id or not chat_id or not sender_id:
             raise ValueError("Feishu message identity is incomplete")
 
-        # 当前 Gateway 飞书链路严格只处理文本消息。
-        msg_type = str(message.get("message_type") or message.get("msg_type") or "")
+        msg_type = str(
+            message.get("message_type")
+            or message.get("msg_type")
+            or ""
+        )
         if not msg_type:
             raise ValueError("Feishu message_type is required")
-        if msg_type != "text":
+        if msg_type not in FEISHU_SUPPORTED_INBOUND_MESSAGE_TYPES:
             return
-        text = self._parse_text(message)
-        if not text.strip():
-            return
+
+        attachments: list[Attachment] = []
+        if msg_type == "text":
+            text = self._parse_text(message)
+            message_type = MessageType.TEXT
+            if not text.strip():
+                return
+        else:
+            if (
+                self.file_transfer_config is None
+                or self.file_transfer_config.get("enabled") is not True
+            ):
+                return
+            text = FEISHU_ATTACHMENT_PLACEHOLDER
+            message_type = MessageType.DOCUMENT
+            attachments = [self._parse_attachment(message, msg_type)]
 
         chat_type_raw = str(message.get("chat_type", "p2p") or "p2p")
         chat_type = "dm" if chat_type_raw == "p2p" else chat_type_raw
@@ -1849,7 +1950,7 @@ class FeishuAdapter(BasePlatformAdapter):
         event_obj = MessageEvent(
             message_id=msg_id,
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=SessionSource(
                 platform=self.PLATFORM,
                 account_id=self.app_id,
@@ -1861,6 +1962,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 thread_id=str(thread_id) if thread_id else None,
             ),
             reply_to_message_id=message.get("parent_id"),
+            attachments=attachments,
             metadata={
                 "mentioned_bot": mentioned_bot,
                 "mentioned_all": False,
@@ -1966,6 +2068,14 @@ class FeishuAdapter(BasePlatformAdapter):
             allow_existing_processing=allow_existing_processing,
         )
 
+    @staticmethod
+    def _is_plain_text_event(event: MessageEvent) -> bool:
+        """只有没有附件的 TEXT 才属于命令与连续文本批处理域。"""
+        return (
+            event.message_type is MessageType.TEXT
+            and not event.attachments
+        )
+
     async def _consume_inbox_route(
         self,
         route_key: str,
@@ -1993,6 +2103,16 @@ class FeishuAdapter(BasePlatformAdapter):
                         event is None
                         or await self.persisted_message_state(event) is not None
                     ):
+                        await self._complete_messages(
+                            [message_id],
+                            batch_message_id=message_id,
+                        )
+                        processing.pop(message_id, None)
+                        continue
+
+                    if not self._is_plain_text_event(event):
+                        await self._materialize_event_attachments(event)
+                        await self._handoff_to_runner(event)
                         await self._complete_messages(
                             [message_id],
                             batch_message_id=message_id,
@@ -2070,6 +2190,89 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         return event
 
+    async def _materialize_event_attachments(
+        self,
+        event: MessageEvent,
+    ) -> MessageEvent:
+        """在 processing route task 内把 pending 附件变成本地 ready 事实。"""
+        if not event.attachments:
+            return event
+
+        materialized: list[Attachment] = []
+        for raw_attachment in event.attachments:
+            try:
+                attachment = validate_attachment(raw_attachment)
+            except ValueError as exc:
+                raise FeishuAttachmentDownloadError(
+                    "invalid_attachment",
+                    retryable=False,
+                ) from exc
+
+            status = attachment["status"]
+            if status == "failed":
+                raise FeishuAttachmentDownloadError(
+                    attachment.get("error_code") or "attachment_failed",
+                    retryable=False,
+                )
+            if status == "pending":
+                async with self._file_download_semaphore:
+                    result = await self.download_message_resource(
+                        event.message_id,
+                        attachment,
+                    )
+                if not result.success:
+                    raise FeishuAttachmentDownloadError(
+                        result.error_code or "download_failed",
+                        retryable=(
+                            result.status == "retry_wait"
+                            and result.retryable
+                        ),
+                        retry_after_seconds=result.retry_after_seconds,
+                    )
+                attachment.update({
+                    "local_path": result.local_path,
+                    "mime_type": result.mime_type,
+                    "size_bytes": result.size_bytes,
+                    "sha256": result.sha256,
+                    "status": "ready",
+                    "error_code": None,
+                })
+
+            if (
+                not attachment.get("local_path")
+                or attachment.get("size_bytes") is None
+                or not attachment.get("sha256")
+            ):
+                raise FeishuAttachmentDownloadError(
+                    "invalid_ready_metadata",
+                    retryable=False,
+                )
+            materialized.append(validate_attachment(attachment))
+
+        event.attachments = materialized
+        event.text = self._format_materialized_attachment_text(materialized)
+        return event
+
+    @staticmethod
+    def _format_materialized_attachment_text(
+        attachments: list[Attachment],
+    ) -> str:
+        """生成不含资源凭据、也不暗示已识别正文的稳定 Agent 文本。"""
+        if len(attachments) == 1:
+            lines = ["用户发送了一个文件。"]
+        else:
+            lines = [f"用户发送了 {len(attachments)} 个文件。"]
+        for index, attachment in enumerate(attachments, start=1):
+            if len(attachments) > 1:
+                lines.append(f"附件 {index}：")
+            lines.extend([
+                f"文件名：{attachment.get('original_name') or '未提供'}",
+                f"文件类型：{attachment['source_type']}",
+                f"文件大小：{attachment['size_bytes']} bytes",
+                f"本地路径：{attachment['local_path']}",
+            ])
+        return "\n".join(lines)
+
     async def _handoff_to_runner(self, event: MessageEvent) -> None:
         """把 Runner 不可用和生命周期拒绝转换成明确瞬时分类。"""
         if not self._on_message:
@@ -2094,6 +2297,10 @@ class FeishuAdapter(BasePlatformAdapter):
         processing: dict[str, int],
     ) -> None:
         """在单 route consumer 内等待静默窗口并合并相邻普通文本。"""
+        if not self._is_plain_text_event(first_event):
+            raise FeishuInboxBusinessDataError(
+                "text batch requires an attachment-free TEXT event"
+            )
         events = [first_event]
         started_at = time.monotonic()
         last_message_at = started_at
@@ -2161,6 +2368,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 await self._finish_text_batch(events, processing)
                 return
 
+            if not self._is_plain_text_event(next_event):
+                await self._finish_text_batch(events, processing)
+                return
+
             command = _immediate_command_name(next_event.text)
             if command is not None:
                 if command in {"/new", "/stop"}:
@@ -2197,6 +2408,10 @@ class FeishuAdapter(BasePlatformAdapter):
         cancelled: bool = False,
     ) -> None:
         """提交或取消已经由当前 route consumer claim 的完整文本批次。"""
+        if not all(self._is_plain_text_event(event) for event in events):
+            raise FeishuInboxBusinessDataError(
+                "text batch contains a non-text or attachment event"
+            )
         message_ids = [event.message_id for event in events]
         if cancelled:
             await self._complete_messages(
@@ -2239,16 +2454,111 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _parse_text(message: dict) -> str:
+    def _parse_message_content(message: dict, msg_type: str) -> dict:
+        """把字符串或对象 content 收敛为普通 dict，不暴露原始正文。"""
         if "content" not in message:
-            raise ValueError("Feishu text content is required")
-        raw = message.get("content", "{}")
-        try:
-            content = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("invalid Feishu text content") from exc
+            raise ValueError(f"Feishu {msg_type} content is required")
+        raw = message.get("content")
+        if isinstance(raw, str):
+            try:
+                content = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid Feishu {msg_type} content"
+                ) from exc
+        elif isinstance(raw, dict):
+            content = raw
+        else:
+            raise ValueError(
+                f"Feishu {msg_type} content must be an object"
+            )
         if not isinstance(content, dict):
-            raise ValueError("Feishu text content must be an object")
+            raise ValueError(
+                f"Feishu {msg_type} content must be an object"
+            )
+        return dict(content)
+
+    @staticmethod
+    def _required_content_string(
+        content: dict,
+        msg_type: str,
+        field_name: str,
+    ) -> str:
+        """读取必须的非空字符串字段，错误中不包含实际字段值。"""
+        value = content.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"Feishu {msg_type} content.{field_name} is required"
+            )
+        return value.strip()
+
+    @staticmethod
+    def _optional_content_string(
+        content: dict,
+        msg_type: str,
+        field_name: str,
+    ) -> str | None:
+        """读取可选字符串字段；存在但类型错误时拒绝事件。"""
+        value = content.get(field_name)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(
+                f"Feishu {msg_type} content.{field_name} must be a string"
+            )
+        return value.strip() or None
+
+    @classmethod
+    def _parse_attachment(
+        cls,
+        message: dict,
+        msg_type: str,
+    ) -> Attachment:
+        """只提取平台资源身份和安全元数据，不执行任何网络操作。"""
+        content = cls._parse_message_content(message, msg_type)
+        resource_field = "image_key" if msg_type == "image" else "file_key"
+        resource_key = cls._required_content_string(
+            content,
+            msg_type,
+            resource_field,
+        )
+
+        original_name = None
+        if msg_type == "file":
+            original_name = cls._required_content_string(
+                content,
+                msg_type,
+                "file_name",
+            )
+        elif msg_type == "media":
+            original_name = cls._optional_content_string(
+                content,
+                msg_type,
+                "file_name",
+            )
+
+        attachment: dict[str, object] = {
+            "source_type": msg_type,
+            "resource_key": resource_key,
+            "resource_type": "image" if msg_type == "image" else "file",
+            "original_name": original_name,
+            "status": "pending",
+        }
+        duration = content.get("duration")
+        if (
+            msg_type in {"audio", "media"}
+            and not isinstance(duration, bool)
+            and isinstance(duration, (int, float))
+            and math.isfinite(duration)
+            and duration >= 0
+        ):
+            # duration 是平台提供的非敏感标量，保留原字段语义供后续阶段使用。
+            attachment["duration"] = duration
+        return validate_attachment(attachment)
+
+    @classmethod
+    def _parse_text(cls, message: dict) -> str:
+        content = cls._parse_message_content(message, "text")
         return str(content.get("text", "") or "")
 
     def _bot_mentioned(self, message: dict) -> bool:
@@ -2646,6 +2956,62 @@ class FeishuAdapter(BasePlatformAdapter):
                 type(exc).__name__,
             )
 
+    # ===================== 文件资源 =====================
+
+    async def download_message_resource(
+        self,
+        message_id: str,
+        attachment: Attachment,
+    ) -> FeishuResourceDownloadResult:
+        """复用 Adapter 的 token、失效刷新和 HTTP 客户端下载资源。"""
+        return await download_feishu_message_resource(
+            http_client=self._http,
+            api_base=self.api_base,
+            message_id=message_id,
+            attachment=attachment,
+            file_transfer_config=self.file_transfer_config,
+            refresh_token=self._refresh_token,
+            invalidate_token=self._invalidate_token,
+            classify_error=self._classify_send_error,
+        )
+
+    async def cleanup_file_cache(self) -> CacheCleanupResult:
+        """按集中配置清理过期缓存；普通失败不影响 Gateway 生命周期。"""
+        config = self.file_transfer_config
+        if config is None:
+            return CacheCleanupResult(
+                failed_files=1,
+                error_code="file_transfer_config_unavailable",
+            )
+        return await cleanup_expired_cache(
+            config["download_dir"],
+            config["cache_retention_seconds"],
+        )
+
+    async def upload_file_delivery(
+        self,
+        *,
+        local_path: str,
+        display_name: str,
+        size_bytes: int,
+        sha256: str,
+        database_path: str,
+    ) -> FeishuFileUploadResult:
+        """复用当前 token 与 HTTP client，把本地文件上传为普通 file。"""
+        return await upload_feishu_file(
+            http_client=self._http,
+            api_base=self.api_base,
+            local_path=local_path,
+            display_name=display_name,
+            expected_size_bytes=size_bytes,
+            expected_sha256=sha256,
+            database_path=database_path,
+            file_transfer_config=self.file_transfer_config,
+            refresh_token=self._refresh_token,
+            invalidate_token=self._invalidate_token,
+            classify_error=self._classify_send_error,
+        )
+
     # ===================== 消息出站 =====================
 
     async def _refresh_token(self, *, force: bool = False) -> TokenResult:
@@ -2856,6 +3222,30 @@ class FeishuAdapter(BasePlatformAdapter):
             })
         return payloads
 
+    @staticmethod
+    def prepare_file_outbound(
+        platform_file_key: str,
+        *,
+        delivery_id: str,
+    ) -> list[dict]:
+        """生成不参与 Markdown 分片的单片普通 file payload。"""
+        file_key = str(platform_file_key or "").strip()
+        if not file_key:
+            raise ValueError("platform_file_key must not be empty")
+        request_uuid = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes:feishu:file:{delivery_id}",
+        ))
+        return [{
+            "msg_type": "file",
+            "content": json.dumps(
+                {"file_key": file_key},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "request_uuid": request_uuid,
+        }]
+
     async def send(
         self,
         chat_id: str,
@@ -2918,6 +3308,31 @@ class FeishuAdapter(BasePlatformAdapter):
         request_uuid = str(payload.get("request_uuid", "") or "")
         msg_type = str(payload.get("msg_type", "post") or "post")
         message_content = str(payload.get("content", "") or "")
+        if msg_type == "file":
+            try:
+                file_content = json.loads(message_content)
+            except (TypeError, ValueError):
+                return SendResult(
+                    success=False,
+                    error="invalid_outbox_payload",
+                    retryable=False,
+                )
+            if (
+                not isinstance(file_content, dict)
+                or not isinstance(file_content.get("file_key"), str)
+                or not file_content["file_key"].strip()
+            ):
+                return SendResult(
+                    success=False,
+                    error="invalid_outbox_payload",
+                    retryable=False,
+                )
+        elif msg_type != "post":
+            return SendResult(
+                success=False,
+                error="invalid_outbox_payload",
+                retryable=False,
+            )
         if reply_to_message_id and thread_id:
             delivery_mode = "thread_reply"
         elif reply_to_message_id:

@@ -1496,7 +1496,7 @@ def issue_trusted_approval_grant(
     session_key = normalize_approval_session_key(
         request.get("conversation_id")
     )
-    if tool_name not in {"file", "terminal"}:
+    if tool_name not in {"file", "terminal", "gateway_send_file"}:
         raise ValueError("unsupported approval grant tool")
     if not isinstance(arguments, dict) or not isinstance(details, dict):
         raise ValueError("approval grant request is invalid")
@@ -1572,6 +1572,29 @@ def issue_trusted_approval_grant(
             normalized_command=normalized_command,
             cwd=cwd,
             session_rule=session_rule,
+            _issuer=_TRUSTED_GRANT_ISSUER,
+        )
+
+    if tool_name == "gateway_send_file":
+        if normalized_scope != "once":
+            raise ValueError(
+                "gateway_send_file approval only supports once scope"
+            )
+        file_snapshot = _normalize_gateway_send_file_snapshot(
+            details.get("file_snapshot")
+        )
+        approved_abs_path = details.get("abs_path")
+        if approved_abs_path != file_snapshot["abs_path"]:
+            raise ValueError("approval grant file path is invalid")
+        return TrustedApprovalGrant(
+            scope=normalized_scope,
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            fingerprint=fingerprint,
+            session_key=session_key,
+            approved_abs_path=approved_abs_path,
+            file_snapshot=file_snapshot,
             _issuer=_TRUSTED_GRANT_ISSUER,
         )
 
@@ -1744,6 +1767,153 @@ def _is_static_path_token(token: str) -> bool:
     )
 
 
+_SAFE_STDERR_NULL_RE = re.compile(
+    r"(?i)(?<!\S)2\s*>>?\s*/dev/null(?=$|\s|[;&|])"
+)
+_FIND_MUTATING_PRIMARIES = frozenset({
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "-fls",
+    "-fprint",
+    "-fprint0",
+    "-fprintf",
+})
+
+
+def _unquoted_shell_view(command: str) -> str:
+    """保留未引用字符的位置，隐藏引号内容和反斜杠转义字符。"""
+    view = list(command)
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote is not None:
+            view[index] = " "
+            if char == "\\" and quote == '"' and index + 1 < len(command):
+                index += 1
+                view[index] = " "
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            view[index] = " "
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(command):
+            view[index] = " "
+            index += 1
+            view[index] = " "
+        index += 1
+    return "".join(view)
+
+
+def _strip_safe_stderr_null_redirects(command: str) -> str:
+    """移除明确只丢弃 stderr 的重定向，保留其余 Shell 语义位置。"""
+    view = _unquoted_shell_view(command)
+    matches = tuple(_SAFE_STDERR_NULL_RE.finditer(view))
+    if not matches:
+        return command
+    stripped = list(command)
+    for match in matches:
+        stripped[match.start():match.end()] = " " * (
+            match.end() - match.start()
+        )
+    return "".join(stripped)
+
+
+def _split_static_shell_segments(
+    command: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """按引号感知方式拆分简单 Shell；动态语义或写重定向返回 None。"""
+    command = _strip_safe_stderr_null_redirects(command)
+    segments: list[str] = []
+    operators: list[str] = []
+    buffer: list[str] = []
+    quote: str | None = None
+    index = 0
+
+    def flush_segment() -> bool:
+        segment = "".join(buffer).strip()
+        buffer.clear()
+        if not segment:
+            return False
+        segments.append(segment)
+        return True
+
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            buffer.append(char)
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            buffer.append(char)
+            if char == "\\" and index + 1 < len(command):
+                index += 1
+                buffer.append(command[index])
+            elif char == '"':
+                quote = None
+            elif char in {"$", "`"}:
+                return None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            buffer.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(command):
+            buffer.extend((char, command[index + 1]))
+            index += 2
+            continue
+        if char in "\r\n`$(){}<>":
+            return None
+        if char in "*?[]!":
+            return None
+        if char == "#" and (
+            not buffer or str(buffer[-1]).isspace()
+        ):
+            return None
+        if char == "&":
+            if index + 1 >= len(command) or command[index + 1] != "&":
+                return None
+            if not flush_segment():
+                return None
+            operators.append("&&")
+            index += 2
+            continue
+        if char == "|":
+            operator = "||" if (
+                index + 1 < len(command) and command[index + 1] == "|"
+            ) else "|"
+            if not flush_segment():
+                return None
+            operators.append(operator)
+            index += len(operator)
+            continue
+        if char == ";":
+            if not flush_segment():
+                return None
+            operators.append(";")
+            index += 1
+            continue
+        buffer.append(char)
+        index += 1
+
+    if quote is not None or not flush_segment():
+        return None
+    if len(segments) != len(operators) + 1:
+        return None
+    return tuple(segments), tuple(operators)
+
+
 def _classify_ls(tokens: Sequence[str]) -> TerminalCommandClassification:
     """识别不会写入、执行外部 helper 或依赖 Shell 展开的 ls 形式。"""
     target_paths: list[str] = []
@@ -1786,6 +1956,82 @@ def _classify_ls(tokens: Sequence[str]) -> TerminalCommandClassification:
         LOW,
         "命令命中简单只读 ls 白名单",
         target_paths,
+    )
+
+
+def _classify_find(tokens: Sequence[str]) -> TerminalCommandClassification:
+    """允许不含执行、删除或文件输出 primary 的只读 find。"""
+    lowered = [str(token).casefold() for token in tokens]
+    if any(
+        token.split("=", 1)[0] in _FIND_MUTATING_PRIMARIES
+        for token in lowered
+    ):
+        return _terminal_classification(
+            False,
+            "terminal.find",
+            HIGH,
+            "find 包含删除、执行外部命令或写文件操作",
+        )
+
+    target_paths: list[str] = []
+    expression_started = False
+    for token in tokens:
+        if not expression_started and token.startswith("-"):
+            expression_started = True
+            continue
+        if expression_started:
+            continue
+        if not _is_static_path_token(token):
+            return _terminal_classification(
+                False,
+                "terminal.find",
+                HIGH,
+                "find 的搜索根路径需要 Shell 动态展开",
+            )
+        target_paths.append(token)
+    if not target_paths:
+        target_paths.append(".")
+    return _terminal_classification(
+        True,
+        "terminal.find",
+        MEDIUM,
+        "命令命中不执行、不删除且不写文件的只读 find 白名单",
+        target_paths,
+    )
+
+
+def _classify_du(tokens: Sequence[str]) -> TerminalCommandClassification:
+    """识别只统计磁盘占用的 du；du 本身没有写入或 helper 执行能力。"""
+    target_paths = [
+        token for token in tokens
+        if token == "-" or not token.startswith("-")
+    ]
+    if any(not _is_static_path_token(path) for path in target_paths):
+        return _terminal_classification(
+            False,
+            "terminal.du",
+            HIGH,
+            "du 的目标路径需要 Shell 动态展开",
+        )
+    return _terminal_classification(
+        True,
+        "terminal.du",
+        MEDIUM,
+        "命令命中只读磁盘占用统计白名单",
+        target_paths or (".",),
+    )
+
+
+def _classify_readonly_filter(
+    executable: str,
+    tokens: Sequence[str],
+) -> TerminalCommandClassification:
+    """允许只从参数、文件或 stdin 读取并向 stdout 输出的过滤命令。"""
+    return _terminal_classification(
+        True,
+        f"terminal.{executable}",
+        MEDIUM,
+        f"命令命中只读 {executable} 白名单",
     )
 
 
@@ -2079,46 +2325,16 @@ def _classify_rg(tokens: Sequence[str]) -> TerminalCommandClassification:
     )
 
 
-def classify_terminal_command(command: object) -> TerminalCommandClassification:
-    """保守识别可免审命令；任何静态不确定性都返回非自动放行。"""
-    try:
-        normalized = normalize_terminal_command(command).strip()
-    except ValueError:
+def _classify_simple_terminal_tokens(
+    tokens: Sequence[str],
+) -> TerminalCommandClassification:
+    """对已经确认无动态 Shell 结构的单个 argv 命令做白名单分类。"""
+    if not tokens or _SHELL_ASSIGNMENT_RE.match(tokens[0]):
         return _terminal_classification(
             False,
             "terminal.shell",
             HIGH,
-            "命令为空或格式无效，无法静态确认安全性",
-        )
-    if _COMPLEX_SHELL_SYNTAX_RE.search(normalized):
-        return _terminal_classification(
-            False,
-            "terminal.shell",
-            HIGH,
-            "命令包含管道、重定向、复合控制或动态 Shell 语法",
-        )
-    if _SHELL_EXPANSION_RE.search(normalized):
-        return _terminal_classification(
-            False,
-            "terminal.shell",
-            HIGH,
-            "命令包含 glob 或其它需要 Shell 展开的语法",
-        )
-    if any(ord(char) < 32 and char not in "\t " for char in normalized):
-        return _terminal_classification(
-            False,
-            "terminal.shell",
-            HIGH,
-            "命令包含无法静态解释的控制字符",
-        )
-    try:
-        tokens = shlex.split(normalized, posix=True)
-    except ValueError:
-        return _terminal_classification(
-            False,
-            "terminal.shell",
-            HIGH,
-            "命令词法解析失败，无法静态确认安全性",
+            "命令包含环境赋值或缺少可识别命令",
         )
     if any(token.startswith("~") for token in tokens):
         return _terminal_classification(
@@ -2127,14 +2343,7 @@ def classify_terminal_command(command: object) -> TerminalCommandClassification:
             HIGH,
             "命令包含依赖用户目录状态的 Shell 路径展开",
         )
-    if not tokens or _SHELL_ASSIGNMENT_RE.match(tokens[0]):
-        return _terminal_classification(
-            False,
-            "terminal.shell",
-            HIGH,
-            "命令包含环境赋值或缺少可识别命令",
-        )
-    if tokens == ["pwd"]:
+    if list(tokens) == ["pwd"]:
         return _terminal_classification(
             True,
             "terminal.pwd",
@@ -2142,20 +2351,16 @@ def classify_terminal_command(command: object) -> TerminalCommandClassification:
             "命令命中 pwd 白名单",
         )
     if tokens[0] == "cd":
-        if len(tokens) == 1:
-            return _terminal_classification(
-                True,
-                "terminal.cd",
-                LOW,
-                "命令命中简单 cd 白名单",
-                ("~",),
-            )
         target = None
-        if len(tokens) == 2:
+        if len(tokens) == 1:
+            target = "~"
+        elif len(tokens) == 2:
             target = tokens[1]
         elif len(tokens) == 3 and tokens[1] == "--":
             target = tokens[2]
-        if target is not None and _is_static_path_token(target):
+        if target is not None and (
+            target == "~" or _is_static_path_token(target)
+        ):
             return _terminal_classification(
                 True,
                 "terminal.cd",
@@ -2175,11 +2380,92 @@ def classify_terminal_command(command: object) -> TerminalCommandClassification:
         return _classify_git(tokens[1:])
     if tokens[0] == "rg":
         return _classify_rg(tokens[1:])
+    if tokens[0] == "find":
+        return _classify_find(tokens[1:])
+    if tokens[0] == "du":
+        return _classify_du(tokens[1:])
+    if tokens[0] in {"grep", "head", "wc"}:
+        return _classify_readonly_filter(tokens[0], tokens[1:])
+    if tokens[0] in {"echo", "true", "false"}:
+        return _terminal_classification(
+            True,
+            f"terminal.{tokens[0]}",
+            LOW,
+            f"命令命中无文件写入的 {tokens[0]} 白名单",
+        )
     return _terminal_classification(
         False,
         f"terminal.{tokens[0]}",
         HIGH,
         "命令不在简单只读白名单中",
+    )
+
+
+def classify_terminal_command(command: object) -> TerminalCommandClassification:
+    """保守识别可免审命令；任何静态不确定性都返回非自动放行。"""
+    try:
+        normalized = normalize_terminal_command(command).strip()
+    except ValueError:
+        return _terminal_classification(
+            False,
+            "terminal.shell",
+            HIGH,
+            "命令为空或格式无效，无法静态确认安全性",
+        )
+    if any(ord(char) < 32 and char not in "\t " for char in normalized):
+        return _terminal_classification(
+            False,
+            "terminal.shell",
+            HIGH,
+            "命令包含无法静态解释的控制字符",
+        )
+    structure = _split_static_shell_segments(normalized)
+    if structure is None:
+        return _terminal_classification(
+            False,
+            "terminal.shell",
+            HIGH,
+            "命令包含动态 Shell、后台执行、写重定向或无法解析的语法",
+        )
+    segments, operators = structure
+    classifications: list[TerminalCommandClassification] = []
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            return _terminal_classification(
+                False,
+                "terminal.shell",
+                HIGH,
+                "命令词法解析失败，无法静态确认安全性",
+            )
+        classification = _classify_simple_terminal_tokens(tokens)
+        if not classification.automatically_allowed:
+            return classification
+        classifications.append(classification)
+
+    if not operators:
+        return classifications[0]
+    risk_level = max(
+        (item.risk_level for item in classifications),
+        key=lambda risk: _RISK_ORDER[risk],
+    )
+    target_paths = tuple(dict.fromkeys(
+        path
+        for item in classifications
+        for path in item.target_paths
+    ))
+    is_pipeline_only = all(operator == "|" for operator in operators)
+    return _terminal_classification(
+        True,
+        (
+            "terminal.readonly_pipeline"
+            if is_pipeline_only
+            else "terminal.readonly_compound"
+        ),
+        risk_level,
+        "复合命令的每个阶段均命中已知只读白名单",
+        target_paths,
     )
 
 
@@ -2277,6 +2563,227 @@ def _file_fingerprint_payload(
     return payload
 
 
+_GATEWAY_SEND_FILE_IDENTITY_FIELDS = (
+    "session_key_fingerprint",
+    "route_key_fingerprint",
+    "source_message_fingerprint",
+    "chat_id_fingerprint",
+    "reply_to_message_fingerprint",
+    "thread_id_fingerprint",
+)
+
+
+def _normalize_gateway_send_file_snapshot(value: object) -> dict:
+    """校验审批持久层中的出站文件快照，不读取文件正文。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("gateway send file snapshot must be an object")
+    abs_path = value.get("abs_path")
+    sha256 = value.get("sha256")
+    if not isinstance(abs_path, str) or not abs_path:
+        raise ValueError("gateway send file snapshot path is invalid")
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("gateway send file snapshot sha256 is invalid")
+    normalized = {"abs_path": abs_path, "sha256": sha256}
+    for field_name in (
+        "size_bytes",
+        "device",
+        "inode",
+        "mtime_ns",
+        "ctime_ns",
+    ):
+        raw = value.get(field_name)
+        if isinstance(raw, bool):
+            raise ValueError(
+                f"gateway send file snapshot {field_name} is invalid"
+            )
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"gateway send file snapshot {field_name} is invalid"
+            ) from exc
+        if parsed < 0 or (field_name == "size_bytes" and parsed <= 0):
+            raise ValueError(
+                f"gateway send file snapshot {field_name} is invalid"
+            )
+        normalized[field_name] = parsed
+    return normalized
+
+
+def _gateway_send_file_identity_details(
+    *,
+    session_key: str,
+    route_key: str,
+    source_message_id: str,
+    platform: str,
+    chat_id: str,
+    reply_to_message_id: str | None,
+    thread_id: str | None,
+) -> dict:
+    """把平台身份收敛为审批可持久化但不可逆推出原值的摘要。"""
+    values = {
+        "session_key": session_key,
+        "route_key": route_key,
+        "source_message": source_message_id,
+        "platform": platform,
+        "chat_id": chat_id,
+    }
+    if any(not isinstance(value, str) or not value.strip() for value in values.values()):
+        raise ValueError("gateway send file identity is incomplete")
+    return {
+        "session_key_fingerprint": _identifier_fingerprint(session_key),
+        "route_key_fingerprint": _identifier_fingerprint(route_key),
+        "source_message_fingerprint": _identifier_fingerprint(
+            source_message_id
+        ),
+        "platform": platform.strip().lower(),
+        "chat_id_fingerprint": _identifier_fingerprint(chat_id),
+        "reply_to_message_fingerprint": (
+            _identifier_fingerprint(reply_to_message_id)
+            if isinstance(reply_to_message_id, str) and reply_to_message_id
+            else None
+        ),
+        "thread_id_fingerprint": (
+            _identifier_fingerprint(thread_id)
+            if isinstance(thread_id, str) and thread_id
+            else None
+        ),
+    }
+
+
+def _gateway_send_file_fingerprint_payload(
+    arguments: dict,
+    file_snapshot: dict,
+    identity_details: Mapping,
+) -> dict:
+    """生成只绑定摘要身份、不持久化完整聊天标识的任务指纹。"""
+    return {
+        "version": 1,
+        "tool_name": "gateway_send_file",
+        "arguments": dict(arguments),
+        "file_snapshot": _normalize_gateway_send_file_snapshot(
+            file_snapshot
+        ),
+        "target_identity": {
+            field_name: identity_details.get(field_name)
+            for field_name in _GATEWAY_SEND_FILE_IDENTITY_FIELDS
+        },
+        "platform": identity_details.get("platform"),
+    }
+
+
+def assess_gateway_send_file(
+    arguments: dict,
+    *,
+    file_snapshot: dict,
+    session_key: str,
+    route_key: str,
+    source_message_id: str,
+    platform: str,
+    chat_id: str,
+    reply_to_message_id: str | None,
+    thread_id: str | None,
+    remote_approval: bool,
+    approval_grant: object = None,
+) -> ApprovalAssessment:
+    """出站文件每次都要求一次性审批，并绑定文件与目标会话摘要。"""
+    normalized_arguments = dict(arguments)
+    normalized_session_key = normalize_approval_session_key(session_key)
+    normalized_snapshot = _normalize_gateway_send_file_snapshot(
+        file_snapshot
+    )
+    identity = _gateway_send_file_identity_details(
+        session_key=normalized_session_key,
+        route_key=route_key,
+        source_message_id=source_message_id,
+        platform=platform,
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+        thread_id=thread_id,
+    )
+    fingerprint = _canonical_fingerprint(
+        _gateway_send_file_fingerprint_payload(
+            normalized_arguments,
+            normalized_snapshot,
+            identity,
+        )
+    )
+    grant_matches = (
+        approval_grant_identity_matches(
+            approval_grant,
+            "gateway_send_file",
+            arguments,
+        )
+        and approval_grant.scope == "once"
+        and approval_grant.session_key == normalized_session_key
+        and approval_grant.fingerprint == fingerprint
+        and approval_grant.approved_abs_path == normalized_snapshot["abs_path"]
+        and approval_grant.file_snapshot == normalized_snapshot
+    )
+    if grant_matches:
+        decision = ALLOW
+        reason = "一次性审批与当前文件快照和目标会话完全一致"
+        error_type = None
+        error = None
+        fatal = False
+        decision_source = "once_grant"
+    elif approval_grant is not None:
+        decision = DENY
+        reason = "出站文件审批已过期或文件、目标身份发生变化"
+        error_type = "approval_stale"
+        error = "approved file or Gateway target changed; request approval again"
+        fatal = False
+        decision_source = "grant_validation"
+    elif remote_approval:
+        decision = ASK
+        reason = "向平台会话发送本地文件属于受控副作用"
+        error_type = None
+        error = None
+        fatal = False
+        decision_source = "approval_policy"
+    else:
+        decision = DENY
+        reason = "出站文件只允许通过 Gateway 远程审批链执行"
+        error_type = "forbidden"
+        error = "gateway_send_file requires a Gateway remote approval context"
+        fatal = True
+        decision_source = "gateway_context"
+
+    details = {
+        "operation_type": "messaging.send_file",
+        "target_path": normalized_snapshot["abs_path"],
+        "abs_path": normalized_snapshot["abs_path"],
+        "file_snapshot": normalized_snapshot,
+        "size_bytes": normalized_snapshot["size_bytes"],
+        "sha256": normalized_snapshot["sha256"],
+        "target_platform": identity["platform"],
+        "target_chat_fingerprint": identity["chat_id_fingerprint"],
+        "reason": reason,
+        "fingerprint": fingerprint,
+        "risk_level": HIGH.value,
+        "allowed_grant_scopes": list(allowed_grant_scopes(HIGH)),
+        "backend_risk": _backend_fingerprint_payload({
+            "backend_type": "gateway",
+        }),
+        "decision_source": decision_source,
+        **identity,
+    }
+    return ApprovalAssessment(
+        tool_name="gateway_send_file",
+        decision=decision,
+        risk_level=HIGH,
+        fingerprint=fingerprint,
+        reason=reason,
+        normalized_arguments=normalized_arguments,
+        details=details,
+        normalized_path=normalized_snapshot["abs_path"],
+        session_key=normalized_session_key,
+        error_type=error_type,
+        error=error,
+        fatal=fatal,
+    )
+
+
 def approval_request_binding_matches(
     tool_name: str,
     arguments: dict,
@@ -2307,6 +2814,52 @@ def approval_request_binding_matches(
         "sha256:"
     ):
         return False
+
+    if tool_name == "gateway_send_file":
+        try:
+            normalized_session_key = normalize_approval_session_key(
+                session_key
+            )
+            file_snapshot = _normalize_gateway_send_file_snapshot(
+                details.get("file_snapshot")
+            )
+        except ValueError:
+            return False
+        if (
+            details.get("abs_path") != file_snapshot["abs_path"]
+            or details.get("size_bytes") != file_snapshot["size_bytes"]
+            or details.get("sha256") != file_snapshot["sha256"]
+            or details.get("session_key_fingerprint")
+            != _identifier_fingerprint(normalized_session_key)
+            or not isinstance(details.get("platform"), str)
+            or details.get("target_platform") != details.get("platform")
+            or details.get("target_chat_fingerprint")
+            != details.get("chat_id_fingerprint")
+            or any(
+                not isinstance(details.get(field_name), str)
+                for field_name in (
+                    "route_key_fingerprint",
+                    "source_message_fingerprint",
+                    "chat_id_fingerprint",
+                )
+            )
+        ):
+            return False
+        for field_name in _GATEWAY_SEND_FILE_IDENTITY_FIELDS:
+            value = details.get(field_name)
+            if value is not None and (
+                not isinstance(value, str)
+                or not value.startswith("sha256:")
+            ):
+                return False
+        expected = _canonical_fingerprint(
+            _gateway_send_file_fingerprint_payload(
+                arguments,
+                file_snapshot,
+                details,
+            )
+        )
+        return fingerprint == expected
 
     if tool_name == "file":
         normalized_path = details.get("abs_path")

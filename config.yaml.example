@@ -140,6 +140,25 @@ gateway:
   # readiness 数据库与 lease 探针结果的短缓存时间，单位为秒。
   readiness_probe_cache_seconds: 1.0
 
+  # 平台无关的文件传输边界；入站下载和受审批的出站发送均走持久任务。
+  file_transfer:
+    # 默认关闭；开启后允许飞书附件下载和普通 file 上传发送。
+    enabled: false
+    # 入站文件缓存目录；相对路径以 HERMES_HOME 为基准解析。
+    download_dir: cache/files
+    # 单个入站文件允许的最大字节数。
+    max_inbound_file_bytes: 20971520
+    # 单个出站文件允许的最大字节数。
+    max_outbound_file_bytes: 20971520
+    # 单次文件下载的超时时间，单位为秒。
+    download_timeout_seconds: 30.0
+    # 单次普通文件上传的超时时间，单位为秒。
+    upload_timeout_seconds: 60.0
+    # 下载缓存的保留时间，单位为秒。
+    cache_retention_seconds: 86400
+    # 出站任务只允许读取这些根目录；download_dir 会自动加入。
+    outbound_allowed_roots: []
+
   # Gateway 终态记录保留与分批清理策略；非终态和仍被引用的记录不会删除。
   retention:
     # 飞书 Inbox 终态记录保留时间，单位为秒。
@@ -214,6 +233,7 @@ gateway:
         - memory
         - skill
         - delegate
+        - messaging
       # 飞书应用 App ID。
       app_id: ${FEISHU_APP_ID}
       # 飞书应用 App Secret；建议通过环境变量提供。

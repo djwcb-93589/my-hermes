@@ -26,7 +26,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hermes.config import APPROVAL_REQUEST_TTL_SECONDS
+from hermes.config import (
+    APPROVAL_REQUEST_TTL_SECONDS,
+    HERMES_HOME,
+    PATH_ACCESS_POLICY,
+)
 from hermes.db import (
     acquire_gateway_runtime_lease,
     add_final_message_with_gateway_outbox,
@@ -34,21 +38,26 @@ from hermes.db import (
     cancel_gateway_delivery,
     cancel_pending_gateway_approvals,
     check_gateway_runtime_readiness,
+    claim_gateway_file_delivery,
     claim_gateway_approval,
     complete_gateway_delivery,
     complete_gateway_message,
+    create_gateway_file_delivery_outbox,
     create_gateway_approval_with_outbox,
     delete_gateway_messages,
     deny_gateway_approval,
     enqueue_gateway_outbox,
     enqueue_gateway_message,
     fail_gateway_delivery,
+    fail_gateway_file_delivery,
     fail_gateway_approval_identity_unavailable,
     finish_gateway_approval,
     finish_gateway_approval_and_enqueue_resume,
+    gateway_file_delivery_claim_is_valid,
     gateway_outbox_claim_is_valid,
     gateway_runtime_lease_is_valid,
     get_gateway_conversation_for_route,
+    get_gateway_file_delivery,
     get_gateway_message_persistence_state,
     get_gateway_routes_with_pending_outbox,
     get_next_recoverable_gateway_outbox_for_route,
@@ -57,10 +66,14 @@ from hermes.db import (
     get_pending_gateway_approval,
     get_gateway_queued_messages,
     get_recoverable_gateway_outbox,
+    get_recoverable_gateway_file_deliveries,
     init_db,
     list_gateway_conversations,
     mark_gateway_message_delivery_failed,
     mark_gateway_message_processing,
+    mark_gateway_file_delivery_outbox_retry,
+    mark_gateway_file_delivery_retry,
+    mark_gateway_file_delivery_uploaded,
     mark_gateway_outbox_chunk_sent,
     mark_gateway_outbox_retry,
     mark_gateway_outbox_sending,
@@ -72,6 +85,7 @@ from hermes.db import (
     renew_gateway_runtime_lease,
     reset_gateway_processing_messages,
     reset_gateway_sending_outbox,
+    reset_gateway_uploading_file_deliveries,
 )
 from hermes.approval_policy import (
     TrustedApprovalGrant,
@@ -80,6 +94,7 @@ from hermes.approval_policy import (
     issue_trusted_approval_grant,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
+from hermes.gateway.file_transfer import load_file_transfer_config
 from hermes.gateway.observability import (
     safe_identifier_digest,
     safe_message_digest,
@@ -110,6 +125,7 @@ _GATEWAY_SUPPORTED_TOOLSETS = frozenset({
     "memory",
     "skill",
     "delegate",
+    "messaging",
 })
 _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
     "default": {
@@ -138,6 +154,8 @@ _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
     },
 }
 _GATEWAY_RUNTIME_LEASE_NAME = "gateway-main"
+_FILE_UPLOAD_CONCURRENCY = 2
+_FILE_DELIVERY_POLL_SECONDS = 0.5
 _SAFE_MODEL_TIMEOUT_REPLY = "处理失败：模型响应超时，请稍后重试。"
 _SAFE_MODEL_UNAVAILABLE_REPLY = "处理失败：模型服务暂时不可用，请稍后重试。"
 _SAFE_PERSISTENCE_REPLY = "处理失败：系统暂时不可用，请稍后重试。"
@@ -266,6 +284,23 @@ def _format_approval_question(request: dict) -> str:
         lines.append(
             f"目标路径：{_approval_value_preview(target_path, 1000)}"
         )
+    if tool_name == "gateway_send_file":
+        display_name = _approval_value_preview(
+            details.get("display_name", ""),
+            300,
+        )
+        if display_name:
+            lines.append(f"显示文件名：{display_name}")
+        lines.extend([
+            "文件大小："
+            f"{_approval_value_preview(details.get('size_bytes', ''), 80)} bytes",
+            "SHA-256："
+            f"{_approval_value_preview(details.get('sha256', ''), 100)}",
+            "目标平台："
+            f"{_approval_value_preview(details.get('target_platform', ''), 80)}",
+            "目标会话摘要："
+            f"{_approval_value_preview(details.get('target_chat_fingerprint', ''), 100)}",
+        ])
     raw_scopes = details.get("allowed_grant_scopes")
     scopes = (
         [scope for scope in raw_scopes if scope in {"once", "session"}]
@@ -274,9 +309,9 @@ def _format_approval_question(request: dict) -> str:
     )
     lines.append("")
     if "once" in scopes:
-        lines.append(f"单次批准：/approve {request_id} once")
+        lines.append("单次批准：/approve")
     if "session" in scopes:
-        lines.append(f"本会话授权：/approve {request_id} session")
+        lines.append("本会话授权：/approve session")
         lines.append(
             "会话授权仅匹配结构化命令/路径规则、当前 session 和风险上限。"
         )
@@ -290,7 +325,7 @@ def _format_approval_question(request: dict) -> str:
     except (TypeError, ValueError):
         remaining_seconds = int(_GATEWAY_APPROVAL_TTL_SECONDS)
     lines.extend([
-        f"拒绝：/deny {request_id}",
+        "拒绝：/deny",
         f"该请求约 {remaining_seconds} 秒后失效，只能由原请求者处理。",
     ])
     return "\n".join(lines)
@@ -299,9 +334,13 @@ def _format_approval_question(request: dict) -> str:
 def _parse_approval_selector_and_scope(
     value: object,
 ) -> tuple[str, str] | None:
-    """兼容省略 once，并接受 selector/scope 两种排列。"""
+    """默认选择当前对话唯一 pending，同时兼容旧 selector 语法。"""
     parts = str(value or "").strip().split()
+    if not parts:
+        return "", "once"
     if len(parts) == 1:
+        if parts[0].lower() in {"once", "session"}:
+            return "", parts[0].lower()
         return parts[0], "once"
     if len(parts) != 2:
         return None
@@ -332,6 +371,12 @@ def _approval_command_reply(outcome: str, selector: str) -> str:
         "scope_forbidden": "当前风险级别不允许该授权范围。",
         "conflict": "审批状态刚刚发生变化，请重新查看。",
     }
+    if not selector:
+        if outcome == "not_found":
+            return "当前对话没有待审批请求。"
+        if outcome == "ambiguous":
+            return "当前对话存在多个待审批请求，无法安全地自动选择。"
+        return labels.get(outcome, "当前待审批请求不可处理。")
     return labels.get(outcome, f"审批请求 {selector} 当前不可处理。")
 
 
@@ -550,6 +595,11 @@ class GatewayRunner:
         gateway_cfg = config.get("gateway", {})
         if not isinstance(gateway_cfg, dict):
             raise ValueError("gateway must be a mapping")
+        self.file_transfer_config = load_file_transfer_config(
+            gateway_cfg,
+            hermes_home=HERMES_HOME,
+            path_policy=PATH_ACCESS_POLICY,
+        )
         self._gateway_context_policies = _load_gateway_context_config(
             gateway_cfg
         )
@@ -652,6 +702,10 @@ class GatewayRunner:
         self._lease_heartbeat_task: asyncio.Task | None = None
         self._session_cleanup_task: asyncio.Task | None = None
         self._retention_cleanup_task: asyncio.Task | None = None
+        self._file_delivery_dispatcher_task: asyncio.Task | None = None
+        self._file_delivery_tasks: dict[str, asyncio.Task] = {}
+        self._file_delivery_task_routes: dict[str, str] = {}
+        self._file_delivery_wakeup = asyncio.Event()
         self._lease_shutdown_task: asyncio.Task | None = None
         self._readiness_probe_lock = asyncio.Lock()
         self._readiness_probe_cached_at = 0.0
@@ -1135,6 +1189,29 @@ class GatewayRunner:
             "lease_epoch": self._runtime_lease_epoch,
         }
 
+    def _gateway_tool_context(
+        self,
+        event: MessageEvent,
+        route_key: str,
+        conversation_id: str,
+    ) -> dict:
+        """构造模型参数不可覆盖的 Gateway 工具身份与 fencing 上下文。"""
+        fence = self._runtime_fence_kwargs()
+        return {
+            "gateway_context": True,
+            "gateway_route_key": route_key,
+            "gateway_conversation_id": conversation_id,
+            "gateway_source_message_id": event.message_id,
+            "gateway_platform": event.source.platform,
+            "gateway_chat_id": event.source.chat_id,
+            # 文件任务回复当前触发消息，和文本 Outbox 保持一致。
+            "gateway_reply_to_message_id": event.message_id,
+            "gateway_thread_id": event.source.thread_id,
+            "gateway_db_path": self.db_path,
+            "gateway_file_transfer_config": self.file_transfer_config,
+            "gateway_runtime_fence": fence if fence else None,
+        }
+
     def _database_delivery_fence_state(
         self,
         outbox_id: str,
@@ -1418,6 +1495,367 @@ class GatewayRunner:
             name="gateway-retention-cleanup",
         )
 
+    async def _durable_file_transition(self, operation, *args, **kwargs):
+        """平台成功后的本地事务即使遇到 shutdown 取消也必须完成提交。"""
+        task = asyncio.create_task(
+            self.persistence.call(operation, *args, **kwargs)
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # persistence.call 自身会保护线程内事务；这里继续等待，确保 stop
+            # 不会在 file_key 或 Outbox 提交尚未结束时执行 uploading 恢复。
+            try:
+                await task
+            except Exception:
+                pass
+            raise
+
+    def _build_file_delivery_outbox(self, delivery: dict) -> tuple[dict, MessageEvent]:
+        """用已持久化 file_key 构造单片 file Outbox，不暴露本地路径。"""
+        source_event = self._deserialize_event(
+            str(delivery.get("source_event_json", ""))
+        )
+        if (
+            source_event.message_id != delivery["source_message_id"]
+            or source_event.source.platform != delivery["platform"]
+            or source_event.source.chat_id != delivery["chat_id"]
+            or build_session_key(source_event.source, self.agent_name)
+            != delivery["route_key"]
+        ):
+            raise ValueError("file delivery source identity mismatch")
+
+        adapter = self.adapters.get(delivery["platform"])
+        prepare_file = getattr(adapter, "prepare_file_outbound", None)
+        if not callable(prepare_file):
+            raise ValueError("file delivery adapter is unsupported")
+        platform_file_key = str(
+            delivery.get("platform_file_key") or ""
+        ).strip()
+        if not platform_file_key:
+            raise ValueError("file delivery platform key is missing")
+        payloads = prepare_file(
+            platform_file_key,
+            delivery_id=delivery["id"],
+        )
+
+        event = MessageEvent(
+            message_id=delivery["id"],
+            text="Gateway file delivery.",
+            source=source_event.source,
+            message_type=MessageType.DOCUMENT,
+            metadata={"file_delivery_id": delivery["id"]},
+        )
+        outbox_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes:gateway:file-outbox:{delivery['id']}",
+        ))
+        return ({
+            "id": outbox_id,
+            "route_key": delivery["route_key"],
+            # 文件任务使用自己的稳定 ID，避免占用原入站消息的 Outbox 唯一键。
+            "source_message_id": delivery["id"],
+            "queue_message_id": delivery["id"],
+            "event_json": self._serialize_event(event),
+            "platform": delivery["platform"],
+            "chat_id": delivery["chat_id"],
+            "reply_to_message_id": delivery["reply_to_message_id"],
+            "thread_id": delivery["thread_id"],
+            "delivery_kind": f"file_delivery:{delivery['id']}",
+            "payloads": payloads,
+        }, event)
+
+    async def _schedule_file_outbox(self, delivery: dict) -> None:
+        """在 file_key 边界之后原子创建 Outbox，并唤醒既有 route 调度器。"""
+        outbox, event = self._build_file_delivery_outbox(delivery)
+        try:
+            await self._durable_file_transition(
+                create_gateway_file_delivery_outbox,
+                delivery["id"],
+                outbox,
+                **self._runtime_fence_kwargs(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            delay = self._delivery_retry_delay(
+                max(1, int(delivery.get("attempt_count", 1)))
+            )
+            try:
+                await self.persistence.call(
+                    mark_gateway_file_delivery_outbox_retry,
+                    delivery["id"],
+                    "outbox_create_failed",
+                    time.time() + delay,
+                    **self._runtime_fence_kwargs(),
+                )
+            except Exception:
+                pass
+            print(
+                "  [gateway:audit] event=file_outbox_create_failed "
+                f"{safe_route_digest(delivery['route_key'])} "
+                f"{safe_identifier_digest(delivery['id'], label='delivery')} "
+                f"exception={type(exc).__name__}"
+            )
+            return
+
+        if self._lifecycle_phase != "running":
+            return
+        ctx = await self.sessions.get_or_create_async(
+            delivery["route_key"],
+            self._build_gateway_prompt(event.source),
+        )
+        async with self._route_admission(delivery["route_key"]):
+            await self._dispatch_next_locked(ctx)
+
+    async def _run_claimed_file_upload(
+        self,
+        delivery_id: str,
+        upload_file,
+        **kwargs,
+    ):
+        """上传期间持续确认 claim；失租后立即取消尚未完成的 HTTP 流。"""
+        valid = await self.persistence.call(
+            gateway_file_delivery_claim_is_valid,
+            delivery_id,
+            **self._runtime_fence_kwargs(),
+        )
+        if not valid:
+            raise asyncio.CancelledError
+
+        upload_task = asyncio.create_task(upload_file(**kwargs))
+        check_interval = min(
+            1.0,
+            max(0.1, self.runtime_lease_heartbeat_seconds / 2),
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (upload_task,),
+                    timeout=check_interval,
+                )
+                if done:
+                    result = await upload_task
+                    if not await self.persistence.call(
+                        gateway_file_delivery_claim_is_valid,
+                        delivery_id,
+                        **self._runtime_fence_kwargs(),
+                    ):
+                        raise asyncio.CancelledError
+                    return result
+                if not await self.persistence.call(
+                    gateway_file_delivery_claim_is_valid,
+                    delivery_id,
+                    **self._runtime_fence_kwargs(),
+                ):
+                    raise asyncio.CancelledError
+        finally:
+            if not upload_task.done():
+                upload_task.cancel()
+            await asyncio.gather(upload_task, return_exceptions=True)
+
+    async def _process_file_delivery(self, delivery: dict) -> None:
+        """claim、上传、保存 file_key，再交给持久 Outbox 发送。"""
+        current = dict(delivery)
+        if current["status"] in {"pending", "retry_wait"}:
+            claimed = await self.persistence.call(
+                claim_gateway_file_delivery,
+                current["id"],
+                **self._runtime_fence_kwargs(),
+            )
+            if claimed is None:
+                return
+            claimed["source_event_json"] = current["source_event_json"]
+            current = claimed
+
+            adapter = self.adapters.get(current["platform"])
+            upload_file = getattr(adapter, "upload_file_delivery", None)
+            if not callable(upload_file):
+                await self.persistence.call(
+                    fail_gateway_file_delivery,
+                    current["id"],
+                    "unsupported_platform",
+                    **self._runtime_fence_kwargs(),
+                )
+                return
+
+            try:
+                result = await self._run_claimed_file_upload(
+                    current["id"],
+                    upload_file,
+                    local_path=current["local_path"],
+                    display_name=current["display_name"],
+                    size_bytes=current["size_bytes"],
+                    sha256=current["sha256"],
+                    database_path=self.db_path,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    "  [gateway:audit] event=file_upload_error "
+                    f"{safe_route_digest(current['route_key'])} "
+                    f"{safe_identifier_digest(current['id'], label='delivery')} "
+                    f"exception={type(exc).__name__}"
+                )
+                result = None
+
+            platform_file_key = str(
+                getattr(result, "platform_file_key", "") or ""
+            ).strip()
+            if platform_file_key:
+                saved = await self._durable_file_transition(
+                    mark_gateway_file_delivery_uploaded,
+                    current["id"],
+                    platform_file_key,
+                    **self._runtime_fence_kwargs(),
+                )
+                if not saved:
+                    persisted = await self.persistence.call(
+                        get_gateway_file_delivery,
+                        current["id"],
+                    )
+                    if not persisted or (
+                        persisted.get("platform_file_key")
+                        != platform_file_key
+                    ):
+                        return
+                    current.update(persisted)
+                else:
+                    current["status"] = "uploaded"
+                    current["platform_file_key"] = platform_file_key
+                    current["next_attempt_at"] = None
+            else:
+                retryable = bool(getattr(result, "retryable", True))
+                error_code = str(
+                    getattr(result, "error_code", None)
+                    or "internal_upload_error"
+                )[:120]
+                attempt = int(current.get("attempt_count", 1))
+                if retryable and attempt < self.delivery_max_attempts:
+                    delay = self._delivery_retry_delay(
+                        attempt,
+                        getattr(result, "retry_after_seconds", None),
+                    )
+                    await self.persistence.call(
+                        mark_gateway_file_delivery_retry,
+                        current["id"],
+                        error_code,
+                        time.time() + delay,
+                        **self._runtime_fence_kwargs(),
+                    )
+                else:
+                    await self.persistence.call(
+                        fail_gateway_file_delivery,
+                        current["id"],
+                        error_code,
+                        **self._runtime_fence_kwargs(),
+                    )
+                return
+
+        if current["status"] == "uploaded":
+            await self._schedule_file_outbox(current)
+
+    def _on_file_delivery_done(
+        self,
+        delivery_id: str,
+        task: asyncio.Task,
+    ) -> None:
+        """回收上传任务并唤醒 dispatcher，日志只使用不可逆摘要。"""
+        route_key = self._file_delivery_task_routes.pop(delivery_id, "")
+        self._file_delivery_tasks.pop(delivery_id, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=file_delivery_worker_failed "
+                f"{safe_route_digest(route_key)} "
+                f"{safe_identifier_digest(delivery_id, label='delivery')} "
+                f"exception={type(exc).__name__}"
+            )
+        self._file_delivery_wakeup.set()
+
+    async def _file_delivery_dispatcher_loop(self) -> None:
+        """以保守全局并发和 route 串行约束恢复持久文件任务。"""
+        try:
+            while self._lifecycle_phase == "running":
+                capacity = _FILE_UPLOAD_CONCURRENCY - len(
+                    self._file_delivery_tasks
+                )
+                if capacity > 0 and not self._runtime_lease_blocks_delivery():
+                    try:
+                        rows = await self.persistence.call(
+                            get_recoverable_gateway_file_deliveries,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        print(
+                            "  [gateway:audit] event=file_delivery_poll_failed "
+                            f"exception={type(exc).__name__}"
+                        )
+                        rows = []
+                    active_routes = set(
+                        self._file_delivery_task_routes.values()
+                    )
+                    for row in rows:
+                        delivery_id = str(row["id"])
+                        route_key = str(row["route_key"])
+                        if (
+                            delivery_id in self._file_delivery_tasks
+                            or route_key in active_routes
+                        ):
+                            continue
+                        task = asyncio.create_task(
+                            self._process_file_delivery(row),
+                            name=(
+                                "gateway-file-delivery-"
+                                f"{hashlib.sha256(delivery_id.encode('utf-8')).hexdigest()[:12]}"
+                            ),
+                        )
+                        self._file_delivery_tasks[delivery_id] = task
+                        self._file_delivery_task_routes[delivery_id] = route_key
+                        active_routes.add(route_key)
+                        task.add_done_callback(
+                            lambda completed, item_id=delivery_id: (
+                                self._on_file_delivery_done(
+                                    item_id,
+                                    completed,
+                                )
+                            )
+                        )
+                        capacity -= 1
+                        if capacity <= 0:
+                            break
+
+                self._file_delivery_wakeup.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._file_delivery_wakeup.wait(),
+                        timeout=_FILE_DELIVERY_POLL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=file_delivery_dispatcher_failed "
+                f"exception={type(exc).__name__}"
+            )
+
+    def _start_file_delivery_dispatcher(self) -> None:
+        """在完整恢复结束后启动唯一文件任务 dispatcher。"""
+        task = self._file_delivery_dispatcher_task
+        if task is not None and not task.done():
+            return
+        self._file_delivery_dispatcher_task = asyncio.create_task(
+            self._file_delivery_dispatcher_loop(),
+            name="gateway-file-delivery-dispatcher",
+        )
+
     async def _cancel_background_tasks(self) -> None:
         """取消并回收长期后台任务，避免事件循环退出时残留 Task。"""
         current = asyncio.current_task()
@@ -1427,6 +1865,8 @@ class GatewayRunner:
                 self._lease_heartbeat_task,
                 self._session_cleanup_task,
                 self._retention_cleanup_task,
+                self._file_delivery_dispatcher_task,
+                *tuple(self._file_delivery_tasks.values()),
             )
             if task is not None and task is not current and not task.done()
         ]
@@ -1440,6 +1880,10 @@ class GatewayRunner:
             self._session_cleanup_task = None
         if self._retention_cleanup_task is not current:
             self._retention_cleanup_task = None
+        if self._file_delivery_dispatcher_task is not current:
+            self._file_delivery_dispatcher_task = None
+        self._file_delivery_tasks.clear()
+        self._file_delivery_task_routes.clear()
 
     async def _require_startup_runtime_lease(self) -> None:
         """启动阶段一旦失租，等待统一安全停止完成后终止启动。"""
@@ -1557,6 +2001,11 @@ class GatewayRunner:
             await self._reconcile_terminal_deliveries_async()
             self._lifecycle_phase = "gateway_approval_reconcile"
             await self.persistence.call(recover_gateway_approvals)
+            self._lifecycle_phase = "gateway_file_delivery_reconcile"
+            await self.persistence.call(
+                reset_gateway_uploading_file_deliveries,
+                **self._runtime_fence_kwargs(),
+            )
             await self._require_startup_runtime_lease()
         except Exception as exc:
             # 终态无法收敛时不能继续恢复，也不能开放外部入口。
@@ -1625,6 +2074,7 @@ class GatewayRunner:
         self._lifecycle_phase = "running"
         self._start_session_cleanup()
         self._start_retention_cleanup()
+        self._start_file_delivery_dispatcher()
 
     async def stop(self):
         """取消运行中任务,断开 adapter,关闭模型客户端并清理 backend。"""
@@ -1654,6 +2104,17 @@ class GatewayRunner:
             # 入站关闭后再停止 heartbeat / housekeeping 和 route worker。
             self._signal_all_running_approvals()
             await self._cancel_background_tasks()
+            try:
+                await self.persistence.call(
+                    reset_gateway_uploading_file_deliveries,
+                    **self._runtime_fence_kwargs(),
+                )
+            except Exception as exc:
+                # 当前 lease 已失效时由下一实例的启动恢复再次执行，不阻塞关闭。
+                print(
+                    "  [gateway:audit] event=file_delivery_shutdown_reset_failed "
+                    f"exception={type(exc).__name__}"
+                )
             active_tasks = self.sessions.cancel_all(reason="shutdown")
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
@@ -3216,6 +3677,24 @@ class GatewayRunner:
                 "approval_mode": "remote",
                 "approval_grant": approval_grant,
             }
+            if request["tool_name"] == "gateway_send_file":
+                source_event = self._deserialize_event(
+                    str(request.get("source_event_json", ""))
+                )
+                if (
+                    build_session_key(source_event.source, self.agent_name)
+                    != request.get("route_key")
+                    or source_event.message_id
+                    != request.get("source_message_id")
+                ):
+                    raise ValueError(
+                        "approval source event identity mismatch"
+                    )
+                dispatch_context.update(self._gateway_tool_context(
+                    source_event,
+                    str(request["route_key"]),
+                    str(request["conversation_id"]),
+                ))
             if (
                 request["tool_name"] == "terminal"
                 and callable(cancel_checker)
@@ -3489,22 +3968,17 @@ class GatewayRunner:
                 content = (
                     "当前平台事件缺少可验证的用户身份，无法处理审批请求。"
                 )
-            elif not command_argument:
-                content = (
-                    "用法：/approve <审批编号> [once|session]"
-                    if cmd == "/approve"
-                    else "用法：/deny <审批编号>"
-                )
             elif cmd == "/deny":
-                if len(command_argument.split()) != 1:
-                    content = "用法：/deny <审批编号>"
+                if len(command_argument.split()) > 1:
+                    content = "用法：/deny"
                 else:
+                    approval_selector = command_argument
                     decision = await self.persistence.call(
                         deny_gateway_approval,
                         route_key,
                         ctx.conversation_id,
                         actor_id,
-                        command_argument,
+                        approval_selector,
                         event.message_id,
                     )
                     outcome = str(decision.get("outcome", ""))
@@ -3513,16 +3987,14 @@ class GatewayRunner:
                     else:
                         content = _approval_command_reply(
                             outcome,
-                            command_argument,
+                            approval_selector,
                         )
             else:
                 parsed_approval = _parse_approval_selector_and_scope(
                     command_argument
                 )
                 if parsed_approval is None:
-                    content = (
-                        "用法：/approve <审批编号> [once|session]"
-                    )
+                    content = "用法：/approve [once|session]"
                 else:
                     approval_selector, grant_scope = parsed_approval
                     decision = await self.persistence.call(
@@ -3615,14 +4087,10 @@ class GatewayRunner:
                     f"当前有待审批操作 {request_id}，原任务已暂停。"
                 ]
                 if "once" in scopes:
-                    lines.append(
-                        f"单次批准：/approve {request_id} once"
-                    )
+                    lines.append("单次批准：/approve")
                 if "session" in scopes:
-                    lines.append(
-                        f"本会话授权：/approve {request_id} session"
-                    )
-                lines.append(f"拒绝：/deny {request_id}")
+                    lines.append("本会话授权：/approve session")
+                lines.append("拒绝：/deny")
                 content = "\n".join(lines)
                 if event.source.platform not in self.adapters:
                     await self._reply(event, content)
@@ -4526,6 +4994,19 @@ class GatewayRunner:
             if approval_resume is not None
             else None
         )
+        enabled_toolsets = self._enabled_toolsets_for_source(
+            task_event.source
+        )
+        tool_context = {
+            "interactive_approval": False,
+            "approval_mode": "remote",
+        }
+        if "messaging" in enabled_toolsets:
+            tool_context.update(self._gateway_tool_context(
+                task_event,
+                route_key,
+                conversation_id,
+            ))
         result = await run_conversation_async(
             event.text,
             None,
@@ -4542,11 +5023,8 @@ class GatewayRunner:
                 approval["tool_call_id"] if approval is not None else None
             ),
             resume_state=(approval["agent_state"] if approval is not None else None),
-            enabled_toolsets=self._enabled_toolsets_for_source(task_event.source),
-            tool_context={
-                "interactive_approval": False,
-                "approval_mode": "remote",
-            },
+            enabled_toolsets=enabled_toolsets,
+            tool_context=tool_context,
         )
         if result.get("status") == "awaiting_approval":
             request = result.get("approval_request")

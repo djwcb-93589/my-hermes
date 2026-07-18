@@ -7,8 +7,118 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal, Mapping, TypedDict, cast
+
+
+AttachmentSourceType = Literal["image", "file", "audio", "media"]
+AttachmentResourceType = Literal["image", "file"]
+AttachmentStatus = Literal["pending", "ready", "failed"]
+
+
+class Attachment(TypedDict):
+    """可直接写入 Queue JSON 的平台无关附件描述。"""
+
+    source_type: AttachmentSourceType
+    resource_key: str
+    resource_type: AttachmentResourceType
+    original_name: str | None
+    local_path: str | None
+    mime_type: str | None
+    size_bytes: int | None
+    sha256: str | None
+    status: AttachmentStatus
+    error_code: str | None
+
+
+# 允许平台以后增加自己的扩展字段，同时集中约束跨平台公共字段。
+_ATTACHMENT_SOURCE_TYPES = frozenset({"image", "file", "audio", "media"})
+_ATTACHMENT_RESOURCE_TYPES = frozenset({"image", "file"})
+_ATTACHMENT_STATUSES = frozenset({"pending", "ready", "failed"})
+_ATTACHMENT_NULLABLE_STRING_FIELDS = (
+    "original_name",
+    "local_path",
+    "mime_type",
+    "sha256",
+    "error_code",
+)
+
+
+def validate_attachment(value: object) -> Attachment:
+    """校验并补齐一个附件，不把它转换成非 JSON 对象。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("attachment must be a mapping")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError("attachment keys must be strings")
+
+    attachment = dict(value)
+    source_type = attachment.get("source_type")
+    if (
+        not isinstance(source_type, str)
+        or source_type not in _ATTACHMENT_SOURCE_TYPES
+    ):
+        raise ValueError(
+            "attachment.source_type must be one of: "
+            "image, file, audio, media"
+        )
+
+    resource_key = attachment.get("resource_key")
+    if not isinstance(resource_key, str) or not resource_key.strip():
+        raise ValueError("attachment.resource_key must be a non-empty string")
+
+    resource_type = attachment.get("resource_type")
+    if (
+        not isinstance(resource_type, str)
+        or resource_type not in _ATTACHMENT_RESOURCE_TYPES
+    ):
+        raise ValueError(
+            "attachment.resource_type must be one of: image, file"
+        )
+
+    status = attachment.get("status")
+    if not isinstance(status, str) or status not in _ATTACHMENT_STATUSES:
+        raise ValueError(
+            "attachment.status must be one of: pending, ready, failed"
+        )
+
+    for field_name in _ATTACHMENT_NULLABLE_STRING_FIELDS:
+        field_value = attachment.setdefault(field_name, None)
+        if field_value is not None and not isinstance(field_value, str):
+            raise ValueError(
+                f"attachment.{field_name} must be a string or null"
+            )
+
+    size_bytes = attachment.setdefault("size_bytes", None)
+    if (
+        size_bytes is not None
+        and (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        )
+    ):
+        raise ValueError(
+            "attachment.size_bytes must be a non-negative integer or null"
+        )
+
+    try:
+        json.dumps(attachment, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "attachment values must be JSON-compatible"
+        ) from exc
+
+    # 复制后的普通 dict 保持旧 Queue / Outbox 可直接 JSON 序列化的语义。
+    return cast(Attachment, attachment)
+
+
+def validate_attachments(values: object) -> list[Attachment]:
+    """集中校验附件列表，并返回不共享调用方容器的新列表。"""
+    if not isinstance(values, list):
+        raise ValueError("attachments must be a list")
+    return [validate_attachment(value) for value in values]
 
 
 class MessageType(Enum):
@@ -44,7 +154,7 @@ class MessageEvent:
     message_type: MessageType = MessageType.TEXT
     media_urls: list[str] = field(default_factory=list)
     reply_to_message_id: str | None = None
-    attachments: list[dict] = field(default_factory=list)
+    attachments: list[Attachment] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
 

@@ -43,7 +43,13 @@ _ALLOWED_CHILD_TOOLS = {
 }
 
 # 始终禁用的工具名(理论上白名单已覆盖,保留作第二层防御)。
-DELEGATE_BLOCKED_TOOLS = {"delegate_task", "memory", "skill_manage", "cron"}
+DELEGATE_BLOCKED_TOOLS = {
+    "delegate_task",
+    "memory",
+    "skill_manage",
+    "cron",
+    "gateway_send_file",
+}
 
 _DEFAULT_TOOLSETS = ["terminal", "file"]
 

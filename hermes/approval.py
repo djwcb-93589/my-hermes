@@ -1,4 +1,4 @@
-"""File / Terminal 远程审批 Tool Result 的共享协议。"""
+"""受控工具远程审批 Tool Result 的共享协议。"""
 
 from __future__ import annotations
 

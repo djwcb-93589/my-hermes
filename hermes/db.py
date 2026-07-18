@@ -31,7 +31,7 @@ from hermes.approval_policy import (
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 15
+LATEST_SCHEMA_VERSION = 17
 
 _DEFAULT_GATEWAY_APPROVAL_AGENT_STATE = {
     "iterations_used": 0,
@@ -50,6 +50,17 @@ GATEWAY_APPROVAL_STATUSES = frozenset({
     "cancelled",
     "failed",
     "execution_unknown",
+})
+
+GATEWAY_FILE_DELIVERY_STATUSES = frozenset({
+    "pending",
+    "uploading",
+    "uploaded",
+    "retry_wait",
+    "outbox_created",
+    "delivered",
+    "cancelled",
+    "permanent_failed",
 })
 
 # 允许的 role 白名单。非法 role 显式报错,不静默吞掉。
@@ -241,6 +252,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _create_gateway_source_message_ownership_schema(conn)
     _create_gateway_runtime_lease_schema(conn)
     _create_gateway_approval_schema(conn)
+    _create_gateway_file_delivery_schema(conn)
     _create_gateway_fencing_triggers(conn)
     _create_feishu_inbox_schema(conn)
 
@@ -464,7 +476,9 @@ def _create_gateway_approval_schema(conn: sqlite3.Connection) -> None:
             source_message_id TEXT NOT NULL,
             tool_call_id TEXT NOT NULL,
             tool_message_id INTEGER NOT NULL UNIQUE,
-            tool_name TEXT NOT NULL CHECK (tool_name IN ('file', 'terminal')),
+            tool_name TEXT NOT NULL CHECK (
+                tool_name IN ('file', 'terminal', 'gateway_send_file')
+            ),
             tool_args_json TEXT NOT NULL,
             summary TEXT NOT NULL,
             details_json TEXT NOT NULL,
@@ -501,6 +515,68 @@ def _create_gateway_approval_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_gateway_approval_expiry
             ON gateway_approval_requests(status, expires_at)
+        """
+    )
+
+
+def _create_gateway_file_delivery_schema(conn: sqlite3.Connection) -> None:
+    """创建带上传快照、Outbox 关联和 fencing claim 的文件任务表。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gateway_file_deliveries (
+            id TEXT PRIMARY KEY,
+            approval_id TEXT NOT NULL UNIQUE,
+            route_key TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            reply_to_message_id TEXT,
+            thread_id TEXT,
+            local_path TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+            sha256 TEXT NOT NULL,
+            platform_file_key TEXT,
+            outbox_id TEXT UNIQUE,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'uploading', 'uploaded', 'retry_wait',
+                    'outbox_created', 'delivered', 'cancelled',
+                    'permanent_failed'
+                )
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            next_attempt_at REAL,
+            last_error TEXT,
+            last_error_code TEXT,
+            claimed_by TEXT,
+            claim_epoch INTEGER CHECK (claim_epoch IS NULL OR claim_epoch > 0),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (approval_id)
+                REFERENCES gateway_approval_requests(id) ON DELETE RESTRICT,
+            FOREIGN KEY (outbox_id)
+                REFERENCES gateway_outbox(id) ON DELETE SET NULL,
+            FOREIGN KEY (conversation_id)
+                REFERENCES sessions(id) ON DELETE CASCADE,
+            CHECK (
+                (claimed_by IS NULL AND claim_epoch IS NULL)
+                OR (claimed_by IS NOT NULL AND claim_epoch IS NOT NULL)
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gateway_file_delivery_status_retry
+        ON gateway_file_deliveries(status, next_attempt_at, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gateway_file_delivery_route
+        ON gateway_file_deliveries(route_key, created_at, id)
         """
     )
 
@@ -1403,6 +1479,71 @@ def _migrate_v14_to_v15(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v15_to_v16(conn: sqlite3.Connection) -> None:
+    """扩展审批工具白名单，并增加带 fencing 的出站文件任务表。"""
+    conn.execute(
+        "ALTER TABLE gateway_approval_requests "
+        "RENAME TO gateway_approval_requests_v15"
+    )
+    _create_gateway_approval_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO gateway_approval_requests (
+            id, route_key, conversation_id, requester_user_id,
+            source_message_id, tool_call_id, tool_message_id, tool_name,
+            tool_args_json, summary, details_json, status,
+            decision_message_id, result_content, source_event_json,
+            agent_state_json, created_at, expires_at, updated_at
+        )
+        SELECT
+            id, route_key, conversation_id, requester_user_id,
+            source_message_id, tool_call_id, tool_message_id, tool_name,
+            tool_args_json, summary, details_json, status,
+            decision_message_id, result_content, source_event_json,
+            agent_state_json, created_at, expires_at, updated_at
+        FROM gateway_approval_requests_v15
+        """
+    )
+    conn.execute("DROP TABLE gateway_approval_requests_v15")
+    # 旧表重命名期间同名索引仍存在，删除旧表后补建新版索引。
+    _create_gateway_approval_schema(conn)
+    _create_gateway_file_delivery_schema(conn)
+
+
+def _migrate_v16_to_v17(conn: sqlite3.Connection) -> None:
+    """为文件任务增加明确的 Outbox 持久关联。"""
+    if "outbox_id" in _table_columns(conn, "gateway_file_deliveries"):
+        _create_gateway_file_delivery_schema(conn)
+        return
+    conn.execute(
+        "ALTER TABLE gateway_file_deliveries "
+        "RENAME TO gateway_file_deliveries_v16"
+    )
+    _create_gateway_file_delivery_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO gateway_file_deliveries (
+            id, approval_id, route_key, conversation_id,
+            source_message_id, platform, chat_id, reply_to_message_id,
+            thread_id, local_path, display_name, size_bytes, sha256,
+            platform_file_key, status, attempt_count, next_attempt_at,
+            last_error, last_error_code, claimed_by, claim_epoch,
+            created_at, updated_at
+        )
+        SELECT
+            id, approval_id, route_key, conversation_id,
+            source_message_id, platform, chat_id, reply_to_message_id,
+            thread_id, local_path, display_name, size_bytes, sha256,
+            platform_file_key, status, attempt_count, next_attempt_at,
+            last_error, last_error_code, claimed_by, claim_epoch,
+            created_at, updated_at
+        FROM gateway_file_deliveries_v16
+        """
+    )
+    conn.execute("DROP TABLE gateway_file_deliveries_v16")
+    _create_gateway_file_delivery_schema(conn)
+
+
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
     """按版本号顺序执行 migration,返回最新版本。
 
@@ -1414,7 +1555,9 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     v9 → v10 正式接管 Feishu Inbox schema，v10 → v11 持久化 Inbox
     route_key，v11 → v12 增加运行租约 epoch 与 Outbox claim fencing，
     v12 → v13 保存每条 route 的历史 conversation 归属，v13 → v14
-    增加与 Tool Result 绑定的远程审批请求，v14 → v15 增加持久化审批恢复。
+    增加与 Tool Result 绑定的远程审批请求，v14 → v15 增加持久化审批恢复，
+    v15 → v16 增加出站文件任务与 gateway_send_file 审批类型，
+    v16 → v17 增加文件任务到 Outbox 的持久关联。
     旧数据不满足新约束时拒绝迁移。
     """
     if current < 1:
@@ -1683,6 +1826,30 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
             conn.commit()
             current = 15
 
+    if current < 16:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v15_to_v16(conn)
+            _set_schema_version(conn, 16)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 16
+
+    if current < 17:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v16_to_v17(conn)
+            _set_schema_version(conn, 17)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 17
+
     return current
 
 
@@ -1838,6 +2005,12 @@ def reconcile_gateway_terminal_deliveries(
                 event_json=str(event_json),
                 status=status,
                 updated_at=now,
+            )
+            _sync_gateway_file_delivery_terminal(
+                conn,
+                str(outbox_id),
+                status,
+                now,
             )
             if queue_status == "reply_pending":
                 if status == "permanent_failed":
@@ -4331,6 +4504,48 @@ def _validate_gateway_delivery_identity(
         )
 
 
+def _sync_gateway_file_delivery_terminal(
+    conn: sqlite3.Connection,
+    outbox_id: str,
+    outbox_status: str,
+    now: float,
+    *,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    """在 Outbox 终态事务内同步关联文件任务，旧 Outbox 无关联即跳过。"""
+    if outbox_status == "delivered":
+        file_status = "delivered"
+        safe_error = None
+        safe_code = None
+    elif outbox_status == "permanent_failed":
+        file_status = "permanent_failed"
+        safe_error = str(error or "file message delivery failed")[:120]
+        safe_code = str(error_code or "outbox_permanent_failed")[:120]
+    elif outbox_status in {"cancelled", "partial_cancelled"}:
+        file_status = "cancelled"
+        safe_error = "file message delivery cancelled"
+        safe_code = outbox_status
+    else:
+        return
+    conn.execute(
+        """
+        UPDATE gateway_file_deliveries
+        SET status=?, next_attempt_at=NULL, last_error=?,
+            last_error_code=?, claimed_by=NULL, claim_epoch=NULL,
+            updated_at=?
+        WHERE outbox_id=? AND status='outbox_created'
+        """,
+        (
+            file_status,
+            safe_error,
+            safe_code,
+            float(now),
+            str(outbox_id),
+        ),
+    )
+
+
 def complete_gateway_delivery(
     conn: sqlite3.Connection,
     outbox_id: str,
@@ -4415,6 +4630,12 @@ def complete_gateway_delivery(
             status="delivered",
             updated_at=now,
         )
+        _sync_gateway_file_delivery_terminal(
+            conn,
+            outbox_id,
+            "delivered",
+            now,
+        )
         _finish_gateway_queue_for_delivery(
             conn,
             route_key,
@@ -4497,6 +4718,14 @@ def fail_gateway_delivery(
             event_json=str(row[6]),
             status="permanent_failed",
             updated_at=now,
+        )
+        _sync_gateway_file_delivery_terminal(
+            conn,
+            outbox_id,
+            "permanent_failed",
+            now,
+            error=safe_error,
+            error_code=safe_error_code,
         )
         _finish_gateway_queue_for_delivery(
             conn,
@@ -4600,6 +4829,12 @@ def cancel_gateway_delivery(
             event_json=str(row[6]),
             status=status,
             updated_at=now,
+        )
+        _sync_gateway_file_delivery_terminal(
+            conn,
+            outbox_id,
+            status,
+            now,
         )
         _finish_gateway_queue_for_delivery(
             conn,
@@ -4883,6 +5118,752 @@ def add_final_message_with_gateway_outbox(
 
 
 # ===========================================================================
+# Gateway 出站文件任务
+# ===========================================================================
+
+_GATEWAY_FILE_DELIVERY_COLUMNS = """
+    id, approval_id, route_key, conversation_id, source_message_id,
+    platform, chat_id, reply_to_message_id, thread_id, local_path,
+    display_name, size_bytes, sha256, platform_file_key, status,
+    attempt_count, next_attempt_at, last_error, last_error_code,
+    claimed_by, claim_epoch, created_at, updated_at, outbox_id
+"""
+
+
+def _gateway_file_delivery_row(row) -> dict | None:
+    """把出站文件任务查询行恢复为稳定字典。"""
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]),
+        "approval_id": str(row[1]),
+        "route_key": str(row[2]),
+        "conversation_id": str(row[3]),
+        "source_message_id": str(row[4]),
+        "platform": str(row[5]),
+        "chat_id": str(row[6]),
+        "reply_to_message_id": str(row[7]) if row[7] is not None else None,
+        "thread_id": str(row[8]) if row[8] is not None else None,
+        "local_path": str(row[9]),
+        "display_name": str(row[10]),
+        "size_bytes": int(row[11]),
+        "sha256": str(row[12]),
+        "platform_file_key": str(row[13]) if row[13] is not None else None,
+        "status": str(row[14]),
+        "attempt_count": int(row[15]),
+        "next_attempt_at": float(row[16]) if row[16] is not None else None,
+        "last_error": str(row[17]) if row[17] is not None else None,
+        "last_error_code": str(row[18]) if row[18] is not None else None,
+        "claimed_by": str(row[19]) if row[19] is not None else None,
+        "claim_epoch": int(row[20]) if row[20] is not None else None,
+        "created_at": float(row[21]),
+        "updated_at": float(row[22]),
+        "outbox_id": str(row[23]) if row[23] is not None else None,
+    }
+
+
+def _gateway_file_delivery_fence(
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> tuple[str, str, int]:
+    """文件任务不提供无 fencing 兼容路径。"""
+    if not isinstance(lease_name, str) or not lease_name:
+        raise DBError("gateway file delivery lease_name is required")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise DBError("gateway file delivery instance_id is required")
+    return lease_name, instance_id, _gateway_lease_epoch_value(lease_epoch)
+
+
+def _validate_gateway_file_delivery_identity(delivery: dict) -> dict:
+    """校验任务不可变身份，避免模型值直接进入 SQL 状态字段。"""
+    if not isinstance(delivery, dict):
+        raise DBError("gateway file delivery must be an object")
+    normalized = dict(delivery)
+    for field_name in (
+        "id",
+        "approval_id",
+        "route_key",
+        "conversation_id",
+        "source_message_id",
+        "platform",
+        "chat_id",
+        "local_path",
+        "display_name",
+        "sha256",
+    ):
+        value = normalized.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise DBError(
+                f"gateway file delivery {field_name} is required"
+            )
+    if not normalized["id"].startswith("delivery_"):
+        raise DBError("invalid gateway file delivery id")
+    if not normalized["approval_id"].startswith("approval_"):
+        raise DBError("invalid gateway file delivery approval id")
+    digest = normalized["sha256"]
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise DBError("invalid gateway file delivery sha256")
+    size_bytes = normalized.get("size_bytes")
+    if isinstance(size_bytes, bool):
+        raise DBError("gateway file delivery size_bytes must be positive")
+    try:
+        size_bytes = int(size_bytes)
+    except (TypeError, ValueError) as exc:
+        raise DBError(
+            "gateway file delivery size_bytes must be positive"
+        ) from exc
+    if size_bytes <= 0:
+        raise DBError("gateway file delivery size_bytes must be positive")
+    normalized["size_bytes"] = size_bytes
+    for field_name in ("reply_to_message_id", "thread_id"):
+        value = normalized.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise DBError(
+                f"gateway file delivery {field_name} must be a string or null"
+            )
+    return normalized
+
+
+def create_gateway_file_delivery(
+    conn: sqlite3.Connection,
+    delivery: dict,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> dict:
+    """在当前 lease 下幂等创建 pending 文件任务，不执行任何平台网络调用。"""
+    normalized = _validate_gateway_file_delivery_identity(delivery)
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            raise DBError("gateway runtime lease is not valid")
+
+        existing_row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS}
+            FROM gateway_file_deliveries
+            WHERE approval_id=?
+            """,
+            (normalized["approval_id"],),
+        ).fetchone()
+        existing = _gateway_file_delivery_row(existing_row)
+        if existing is not None:
+            for field_name in (
+                "id",
+                "route_key",
+                "conversation_id",
+                "source_message_id",
+                "platform",
+                "chat_id",
+                "reply_to_message_id",
+                "thread_id",
+                "local_path",
+                "display_name",
+                "size_bytes",
+                "sha256",
+            ):
+                if existing[field_name] != normalized.get(field_name):
+                    raise DBError(
+                        "gateway file delivery idempotency identity mismatch"
+                    )
+            return existing
+
+        approval = conn.execute(
+            """
+            SELECT route_key, conversation_id, source_message_id, tool_name,
+                   status
+            FROM gateway_approval_requests
+            WHERE id=?
+            """,
+            (normalized["approval_id"],),
+        ).fetchone()
+        if approval is None or tuple(str(value) for value in approval) != (
+            normalized["route_key"],
+            normalized["conversation_id"],
+            normalized["source_message_id"],
+            "gateway_send_file",
+            "executing",
+        ):
+            raise DBError(
+                "gateway file delivery is not bound to an executing approval"
+            )
+
+        conn.execute(
+            """
+            INSERT INTO gateway_file_deliveries (
+                id, approval_id, route_key, conversation_id,
+                source_message_id, platform, chat_id, reply_to_message_id,
+                thread_id, local_path, display_name, size_bytes, sha256,
+                status, attempt_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            """,
+            (
+                normalized["id"],
+                normalized["approval_id"],
+                normalized["route_key"],
+                normalized["conversation_id"],
+                normalized["source_message_id"],
+                normalized["platform"],
+                normalized["chat_id"],
+                normalized.get("reply_to_message_id"),
+                normalized.get("thread_id"),
+                normalized["local_path"],
+                normalized["display_name"],
+                normalized["size_bytes"],
+                normalized["sha256"],
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS}
+            FROM gateway_file_deliveries WHERE id=?
+            """,
+            (normalized["id"],),
+        ).fetchone()
+        created = _gateway_file_delivery_row(row)
+        if created is None:
+            raise DBError("gateway file delivery creation failed")
+        return created
+
+
+def get_gateway_file_delivery(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+) -> dict | None:
+    """按任务 ID 读取出站文件状态。"""
+    row = conn.execute(
+        f"""
+        SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS}
+        FROM gateway_file_deliveries WHERE id=?
+        """,
+        (str(delivery_id),),
+    ).fetchone()
+    return _gateway_file_delivery_row(row)
+
+
+def claim_gateway_file_delivery(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    now: float | None = None,
+) -> dict | None:
+    """仅由当前 runtime lease 原子 claim 一个待上传任务。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    with _immediate_transaction(conn):
+        effective_now = time.time() if now is None else float(now)
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=effective_now,
+        ):
+            return None
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET status='uploading', attempt_count=attempt_count+1,
+                next_attempt_at=NULL, claimed_by=?, claim_epoch=?,
+                updated_at=?
+            WHERE id=?
+              AND (
+                  status='pending'
+                  OR (
+                      status='retry_wait'
+                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                  )
+              )
+            """,
+            (
+                fence[1],
+                fence[2],
+                effective_now,
+                str(delivery_id),
+                effective_now,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS}
+            FROM gateway_file_deliveries WHERE id=?
+            """,
+            (str(delivery_id),),
+        ).fetchone()
+        return _gateway_file_delivery_row(row)
+
+
+def gateway_file_delivery_claim_is_valid(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    now: float | None = None,
+) -> bool:
+    """校验 uploading 任务的 claim 与当前未过期 lease 完全一致。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    effective_now = time.time() if now is None else float(now)
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM gateway_file_deliveries AS delivery
+        JOIN gateway_runtime_lease AS lease
+          ON lease.lease_name=?
+         AND lease.instance_id=?
+         AND lease.lease_epoch=?
+         AND lease.expires_at>?
+        WHERE delivery.id=? AND delivery.status='uploading'
+          AND delivery.claimed_by=? AND delivery.claim_epoch=?
+        """,
+        (
+            fence[0],
+            fence[1],
+            fence[2],
+            effective_now,
+            str(delivery_id),
+            fence[1],
+            fence[2],
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def get_recoverable_gateway_file_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    now: float | None = None,
+) -> list[dict]:
+    """读取当前可上传或已上传待建 Outbox 的文件任务。"""
+    effective_now = time.time() if now is None else float(now)
+    rows = conn.execute(
+        f"""
+        SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS},
+               approval.source_event_json
+        FROM gateway_file_deliveries AS delivery
+        JOIN gateway_approval_requests AS approval
+          ON approval.id=delivery.approval_id
+        WHERE (
+            delivery.status='pending'
+            OR (
+                delivery.status='retry_wait'
+                AND (
+                    delivery.next_attempt_at IS NULL
+                    OR delivery.next_attempt_at<=?
+                )
+            )
+            OR (
+                delivery.status='uploaded'
+                AND delivery.platform_file_key IS NOT NULL
+                AND delivery.outbox_id IS NULL
+                AND (
+                    delivery.next_attempt_at IS NULL
+                    OR delivery.next_attempt_at<=?
+                )
+            )
+        )
+        ORDER BY delivery.created_at, delivery.id
+        """,
+        (effective_now, effective_now),
+    ).fetchall()
+    deliveries: list[dict] = []
+    for row in rows:
+        delivery = _gateway_file_delivery_row(row[:24])
+        if delivery is None:
+            continue
+        delivery["source_event_json"] = str(row[24])
+        deliveries.append(delivery)
+    return deliveries
+
+
+def mark_gateway_file_delivery_uploaded(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    platform_file_key: str,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> bool:
+    """把平台上传成功事实先于 Outbox 独立持久化。"""
+    file_key = str(platform_file_key or "").strip()
+    if not file_key:
+        raise DBError("platform_file_key must not be empty")
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            return False
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET platform_file_key=?, status='uploaded',
+                next_attempt_at=NULL, last_error=NULL,
+                last_error_code=NULL, claimed_by=NULL, claim_epoch=NULL,
+                updated_at=?
+            WHERE id=? AND status='uploading'
+              AND claimed_by=? AND claim_epoch=?
+            """,
+            (
+                file_key,
+                now,
+                str(delivery_id),
+                fence[1],
+                fence[2],
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def mark_gateway_file_delivery_retry(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    error_code: str,
+    next_attempt_at: float,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> bool:
+    """把当前 claim 的上传故障持久化为可恢复等待。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    safe_code = str(error_code or "upload_failed")[:120]
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            return False
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET status='retry_wait', next_attempt_at=?,
+                last_error='file upload retry scheduled',
+                last_error_code=?, claimed_by=NULL, claim_epoch=NULL,
+                updated_at=?
+            WHERE id=? AND status='uploading'
+              AND claimed_by=? AND claim_epoch=?
+            """,
+            (
+                float(next_attempt_at),
+                safe_code,
+                now,
+                str(delivery_id),
+                fence[1],
+                fence[2],
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def fail_gateway_file_delivery(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    error_code: str,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> bool:
+    """把当前上传 claim 收敛为不可再次上传的永久失败。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    safe_code = str(error_code or "upload_failed")[:120]
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            return False
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET status='permanent_failed', next_attempt_at=NULL,
+                last_error='file upload permanently failed',
+                last_error_code=?, claimed_by=NULL, claim_epoch=NULL,
+                updated_at=?
+            WHERE id=? AND status='uploading'
+              AND claimed_by=? AND claim_epoch=?
+            """,
+            (
+                safe_code,
+                now,
+                str(delivery_id),
+                fence[1],
+                fence[2],
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def mark_gateway_file_delivery_outbox_retry(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    error_code: str,
+    next_attempt_at: float,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> bool:
+    """上传事实保留为 uploaded，只延后 Outbox 创建重试。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    safe_code = str(error_code or "outbox_create_failed")[:120]
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            return False
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET next_attempt_at=?, last_error='file Outbox retry scheduled',
+                last_error_code=?, updated_at=?
+            WHERE id=? AND status='uploaded'
+              AND platform_file_key IS NOT NULL AND outbox_id IS NULL
+            """,
+            (
+                float(next_attempt_at),
+                safe_code,
+                now,
+                str(delivery_id),
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def create_gateway_file_delivery_outbox(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    outbox: dict,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> str:
+    """复用已保存 file_key 原子创建 Outbox 并推进 outbox_created。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            raise DBError("gateway runtime lease is not valid")
+        row = conn.execute(
+            f"""
+            SELECT {_GATEWAY_FILE_DELIVERY_COLUMNS}
+            FROM gateway_file_deliveries WHERE id=?
+            """,
+            (str(delivery_id),),
+        ).fetchone()
+        delivery = _gateway_file_delivery_row(row)
+        if delivery is None:
+            raise DBError("gateway file delivery not found")
+        if delivery["status"] == "outbox_created":
+            existing_id = delivery.get("outbox_id")
+            if not existing_id:
+                raise DBError("file delivery Outbox binding is incomplete")
+            existing = conn.execute(
+                "SELECT 1 FROM gateway_outbox WHERE id=?",
+                (existing_id,),
+            ).fetchone()
+            if existing is None:
+                raise DBError("file delivery Outbox is missing")
+            return str(existing_id)
+        if (
+            delivery["status"] != "uploaded"
+            or not delivery.get("platform_file_key")
+            or delivery.get("outbox_id") is not None
+        ):
+            raise DBError("gateway file delivery is not ready for Outbox")
+
+        expected_kind = f"file_delivery:{delivery['id']}"
+        if (
+            str(outbox.get("route_key", "")) != delivery["route_key"]
+            or str(outbox.get("source_message_id", "")) != delivery["id"]
+            or str(outbox.get("platform", "")) != delivery["platform"]
+            or str(outbox.get("chat_id", "")) != delivery["chat_id"]
+            or outbox.get("reply_to_message_id")
+            != delivery["reply_to_message_id"]
+            or outbox.get("thread_id") != delivery["thread_id"]
+            or str(outbox.get("delivery_kind", "")) != expected_kind
+        ):
+            raise DBError("gateway file Outbox identity mismatch")
+        payloads = outbox.get("payloads")
+        if not isinstance(payloads, list) or len(payloads) != 1:
+            raise DBError("gateway file Outbox must contain one payload")
+        payload = payloads[0]
+        if not isinstance(payload, dict) or payload.get("msg_type") != "file":
+            raise DBError("gateway file Outbox payload is invalid")
+        try:
+            content = json.loads(str(payload.get("content", "")))
+        except (TypeError, ValueError) as exc:
+            raise DBError("gateway file Outbox content is invalid") from exc
+        if (
+            not isinstance(content, dict)
+            or content.get("file_key") != delivery["platform_file_key"]
+        ):
+            raise DBError("gateway file Outbox file_key binding mismatch")
+
+        outbox_id = _insert_gateway_outbox(
+            conn,
+            outbox,
+            lease_name=fence[0],
+            instance_id=fence[1],
+            lease_epoch=fence[2],
+        )
+        stored_outbox = conn.execute(
+            """
+            SELECT id, event_json, platform, chat_id,
+                   reply_to_message_id, thread_id, delivery_kind,
+                   payloads_json
+            FROM gateway_outbox WHERE id=?
+            """,
+            (outbox_id,),
+        ).fetchone()
+        expected_outbox = (
+            str(outbox["id"]),
+            str(outbox["event_json"]),
+            str(outbox["platform"]),
+            str(outbox["chat_id"]),
+            outbox.get("reply_to_message_id"),
+            outbox.get("thread_id"),
+            str(outbox["delivery_kind"]),
+            _serialize_gateway_json(payloads, "payloads"),
+        )
+        if stored_outbox is None or tuple(stored_outbox) != expected_outbox:
+            raise DBError("gateway file Outbox idempotency mismatch")
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET status='outbox_created', outbox_id=?,
+                next_attempt_at=NULL, last_error=NULL,
+                last_error_code=NULL, claimed_by=NULL, claim_epoch=NULL,
+                updated_at=?
+            WHERE id=? AND status='uploaded' AND outbox_id IS NULL
+            """,
+            (outbox_id, now, delivery["id"]),
+        )
+        if cursor.rowcount != 1:
+            raise DBError("gateway file delivery Outbox transition failed")
+        return outbox_id
+
+
+def reset_gateway_uploading_file_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> int:
+    """新 lease 接管时按 file_key 边界恢复中断的 uploading。"""
+    fence = _gateway_file_delivery_fence(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    with _immediate_transaction(conn):
+        now = time.time()
+        if not gateway_runtime_lease_is_valid(
+            conn,
+            fence[0],
+            fence[1],
+            fence[2],
+            now=now,
+        ):
+            return 0
+        cursor = conn.execute(
+            """
+            UPDATE gateway_file_deliveries
+            SET status=CASE
+                    WHEN platform_file_key IS NULL THEN 'retry_wait'
+                    ELSE 'uploaded'
+                END,
+                next_attempt_at=CASE
+                    WHEN platform_file_key IS NULL THEN ?
+                    ELSE NULL
+                END,
+                last_error='upload interrupted before completion',
+                last_error_code='gateway_restart',
+                claimed_by=NULL, claim_epoch=NULL, updated_at=?
+            WHERE status='uploading'
+            """,
+            (now, now),
+        )
+        return cursor.rowcount
+
+
+# ===========================================================================
 # Gateway 远程工具审批
 # ===========================================================================
 
@@ -5140,7 +6121,7 @@ def create_gateway_approval_with_outbox(
     normalized_requester_user_id = str(requester_user_id or "").strip()
     if not request_id.startswith("approval_"):
         raise DBError("invalid gateway approval request id")
-    if tool_name not in {"file", "terminal"}:
+    if tool_name not in {"file", "terminal", "gateway_send_file"}:
         raise DBError("invalid gateway approval tool")
     if not tool_call_id or not isinstance(tool_args, dict):
         raise DBError("invalid gateway approval tool call")
@@ -5427,11 +6408,34 @@ def get_pending_gateway_approval(
 def _select_gateway_approval(
     conn: sqlite3.Connection,
     route_key: str,
-    selector: str,
+    selector: str | None,
+    *,
+    conversation_id: str | None = None,
 ) -> tuple[str, dict | None]:
-    """按 route 内的完整 ID 或唯一前缀选择审批请求。"""
+    """选择审批请求；省略 selector 时仅接受当前对话唯一 pending。"""
     normalized = str(selector or "").strip()
-    if not normalized or any(
+    if not normalized:
+        normalized_conversation_id = str(conversation_id or "").strip()
+        if not normalized_conversation_id:
+            return "invalid_id", None
+        rows = conn.execute(
+            f"""
+            SELECT {_GATEWAY_APPROVAL_COLUMNS}
+            FROM gateway_approval_requests
+            WHERE route_key=? AND conversation_id=? AND status='pending'
+            ORDER BY created_at
+            LIMIT 2
+            """,
+            (route_key, normalized_conversation_id),
+        ).fetchall()
+        if not rows:
+            return "not_found", None
+        if len(rows) > 1:
+            # 正常 Agent 暂停链路只会产生一个 pending。历史异常或并发
+            # 状态下宁可拒绝自动选择，也不能让无编号命令批准错误请求。
+            return "ambiguous", None
+        return "found", _gateway_approval_row(rows[0])
+    if any(
         not (char.isalnum() or char in {"_", "-"})
         for char in normalized
     ):
@@ -5459,15 +6463,20 @@ def claim_gateway_approval(
     route_key: str,
     conversation_id: str,
     requester_user_id: str,
-    selector: str,
+    selector: str | None,
     decision_message_id: str,
     grant_scope: str = "once",
 ) -> dict:
-    """校验审批归属并以 CAS 把 pending 转为 executing。"""
+    """校验审批归属并以 CAS 把当前唯一 pending 转为 executing。"""
     now = time.time()
     with transaction(conn):
         _expire_gateway_approvals_in_transaction(conn, now)
-        outcome, request = _select_gateway_approval(conn, route_key, selector)
+        outcome, request = _select_gateway_approval(
+            conn,
+            route_key,
+            selector,
+            conversation_id=conversation_id,
+        )
         if request is None:
             return {"outcome": outcome}
         current_actor_id = str(requester_user_id or "").strip()
@@ -5519,14 +6528,19 @@ def deny_gateway_approval(
     route_key: str,
     conversation_id: str,
     requester_user_id: str,
-    selector: str,
+    selector: str | None,
     decision_message_id: str,
 ) -> dict:
-    """校验审批归属并把 pending 原子转为 denied。"""
+    """校验审批归属并把当前唯一 pending 原子转为 denied。"""
     now = time.time()
     with transaction(conn):
         _expire_gateway_approvals_in_transaction(conn, now)
-        outcome, request = _select_gateway_approval(conn, route_key, selector)
+        outcome, request = _select_gateway_approval(
+            conn,
+            route_key,
+            selector,
+            conversation_id=conversation_id,
+        )
         if request is None:
             return {"outcome": outcome}
         current_actor_id = str(requester_user_id or "").strip()
