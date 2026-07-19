@@ -10,7 +10,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from hermes.cron.executor import CronExecutor
+from hermes.cron.executor import (
+    CronExecutionResult,
+    CronExecutor,
+    delivery_preparation_status,
+)
 from hermes.cron.job import CronJob, CronRun
 from hermes.cron.parser import next_schedule_fire
 from hermes.db import (
@@ -48,7 +52,6 @@ class GatewayCronScheduler:
         poll_seconds: float = 5.0,
         max_concurrent: int = 1,
         misfire_grace_seconds: float = 60.0,
-        artifact_root: str | None = None,
         execution_finished: Callable[[CronJob, CronRun, object, dict], Awaitable[None]] | None = None,
     ):
         if poll_seconds <= 0:
@@ -65,7 +68,6 @@ class GatewayCronScheduler:
         self._poll_seconds = float(poll_seconds)
         self._misfire_grace_seconds = float(misfire_grace_seconds)
         self._max_concurrent = int(max_concurrent)
-        self._artifact_root = artifact_root
         self._execution_finished = execution_finished
         self._cron_semaphore = asyncio.Semaphore(self._max_concurrent)
         self._dispatch_task: asyncio.Task | None = None
@@ -287,7 +289,6 @@ class GatewayCronScheduler:
                         CronExecutor(
                             self._db_path,
                             cancel_checker=cancel_event.is_set,
-                            artifact_root=self._artifact_root,
                             **fence,
                         ).execute,
                         job,
@@ -311,18 +312,45 @@ class GatewayCronScheduler:
         except Exception as exc:
             if not self._lease_is_valid():
                 return
+            summary = (
+                "Cron task failed because required execution infrastructure "
+                "was unavailable. Review the run history and retry the task if appropriate."
+            )
             try:
                 await self._persistence.call(
                     transition_cron_run,
                     run.run_id,
                     "failed",
-                    error_type="cron_executor_error",
-                    result_summary=f"Cron executor failed: {type(exc).__name__}",
+                    error_type="infrastructure_error",
+                    result_summary=summary,
+                    delivery_status=delivery_preparation_status(job, "failed"),
                     **fence,
                 )
             except Exception:
                 # lease 已失效或状态已被其它合法执行者推进时，不覆盖事实。
                 return
+            result = CronExecutionResult(
+                job_id=job.job_id,
+                run_id=run.run_id,
+                session_id=f"cron:{job.job_id}:{run.run_id}",
+                status="failed",
+                final_response=summary,
+                iterations=0,
+                tools_used=(),
+                artifacts=(),
+                error_type="infrastructure_error",
+                error="infrastructure_error",
+                retryable=True,
+            )
+            if self._execution_finished is not None and self._lease_is_valid():
+                try:
+                    await self._execution_finished(job, run, result, fence)
+                except Exception as callback_error:
+                    print(
+                        "  [gateway:cron] delivery preparation failed: "
+                        f"{type(callback_error).__name__}"
+                    )
+            await self._schedule_retry_if_eligible(job, run, result)
 
     async def _dispatch_loop(self) -> None:
         """周期扫描；每轮只执行一次 tick，异常不终止 Gateway 主生命周期。"""

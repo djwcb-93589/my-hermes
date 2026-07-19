@@ -426,6 +426,7 @@ class TrustedApprovalGrant:
     arguments: dict
     fingerprint: str
     session_key: str
+    cron_candidate_job_id: str | None = None
     approved_abs_path: str | None = None
     normalized_command: str | None = None
     cwd: str | None = None
@@ -1598,6 +1599,11 @@ def issue_trusted_approval_grant(
     if tool_name == "cron":
         if normalized_scope != "once":
             raise ValueError("cron capability approval only supports once scope")
+        candidate_job_id = details.get("cron_candidate_job_id")
+        if not isinstance(candidate_job_id, str) or not re.fullmatch(
+            r"[a-f0-9]{12}", candidate_job_id
+        ):
+            raise ValueError("cron capability approval candidate is invalid")
         return TrustedApprovalGrant(
             scope=normalized_scope,
             request_id=request_id,
@@ -1605,6 +1611,7 @@ def issue_trusted_approval_grant(
             arguments=dict(arguments),
             fingerprint=fingerprint,
             session_key=session_key,
+            cron_candidate_job_id=candidate_job_id,
             _issuer=_TRUSTED_GRANT_ISSUER,
         )
 
@@ -3236,6 +3243,7 @@ def approval_request_binding_matches(
         cron_action = details.get("cron_action")
         scope_digest = details.get("scope_digest")
         prompt_digest = details.get("prompt_digest")
+        candidate_job_id = details.get("cron_candidate_job_id")
         if (
             details.get("operation_type") != "cron.capability_grant"
             or details.get("session_key_fingerprint")
@@ -3246,6 +3254,8 @@ def approval_request_binding_matches(
             or not scope_digest.startswith("sha256:")
             or not isinstance(prompt_digest, str)
             or len(prompt_digest) != 64
+            or not isinstance(candidate_job_id, str)
+            or re.fullmatch(r"[a-f0-9]{12}", candidate_job_id) is None
         ):
             return False
         expected = _canonical_fingerprint({

@@ -110,6 +110,7 @@ from hermes.gateway.observability import (
 )
 from hermes.gateway.persistence import GatewayPersistence
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
+from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
 from hermes.cron.job import CronJob
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import (
@@ -804,7 +805,6 @@ class GatewayRunner:
             poll_seconds=self.cron_poll_seconds,
             max_concurrent=self.cron_max_concurrent,
             misfire_grace_seconds=self.cron_misfire_grace_seconds,
-            artifact_root=self.file_transfer_config["download_dir"],
             execution_finished=self._prepare_cron_delivery,
         )
         self.outbound_delivery = OutboundDeliveryService(
@@ -1629,10 +1629,7 @@ class GatewayRunner:
                 updated_before=now - self.cron_run_retention_seconds,
                 limit=self.retention_cleanup_batch_size,
             )
-            artifact_root = (
-                Path(self.file_transfer_config["download_dir"])
-                / "cron-artifacts"
-            ).resolve()
+            artifact_root = cron_artifact_base_dir().resolve()
             removed_files = 0
             for raw_path in artifact_paths:
                 try:
@@ -1901,7 +1898,7 @@ class GatewayRunner:
         failed_artifact_ids: list[str] = []
         skipped_artifact_ids: list[str] = []
         if policy == "text_and_files" and self.file_transfer_config.get("enabled") is True:
-            artifact_dir = Path(self.file_transfer_config["download_dir"]) / "cron-artifacts" / job.job_id / run["run_id"]
+            artifact_dir = cron_run_artifact_dir(job.job_id, run["run_id"])
             candidates: list[tuple[object, bool]] = [
                 (item.get("path") if isinstance(item, dict) else None, False)
                 for item in run.get("artifacts", [])

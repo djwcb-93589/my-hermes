@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes.approval_policy import classify_terminal_command
+from hermes.cron.artifacts import cron_job_artifact_root
 
 
 CRON_CAPABILITY_POLICY_VERSION = 1
@@ -113,10 +114,8 @@ def build_capability_scope(job: Any) -> dict:
     """从任务定义建立可比较的最小能力快照。"""
     spec = dict(getattr(job, "capability_spec", {}) or {})
     workdir = _normalise_path(getattr(job, "workdir", None) or os.getcwd())
-    artifact_root = _normalise_path(
-        spec.get("artifact_root")
-        or Path.cwd() / "cache" / "files" / "cron-artifacts" / str(job.job_id)
-    )
+    # 产物目录由系统配置统一决定；遗留的任务级 artifact_root 不能改变边界。
+    artifact_root = _normalise_path(cron_job_artifact_root(str(job.job_id)))
     configured_roots = list(spec.get("allowed_roots") or [workdir]) + [artifact_root]
     allowed_roots = sorted({_normalise_path(root) for root in configured_roots})
     max_risk = str(spec.get("terminal_risk_max", "high")).lower()

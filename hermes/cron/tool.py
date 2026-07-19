@@ -104,11 +104,8 @@ def _approval_scope_for_job(job: CronJob) -> tuple[dict, dict]:
 
 
 def _approval_scope_identity(canonical_scope: dict, *, action: str) -> dict:
-    """创建审批不绑定临时 job ID；更新审批则绑定正在修改的任务版本。"""
+    """审批始终绑定候选任务身份、版本和完整能力范围。"""
     scope = dict(canonical_scope["capability_scope"])
-    if action == "create":
-        scope.pop("job_id", None)
-        scope.pop("job_version", None)
     return {
         "capability_scope": scope,
         "allowed_tool_names": list(canonical_scope["allowed_tool_names"]),
@@ -206,6 +203,7 @@ def _cron_approval_response(
             "decision_source": "cron_capability_policy",
             "session_key_fingerprint": "sha256:" + hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:16],
             "cron_action": action,
+            "cron_candidate_job_id": job.job_id,
             "scope_digest": _fingerprint(scope_identity),
             "prompt_digest": canonical_scope["capability_scope"]["prompt_digest"],
             "cron_scope_display": _cron_scope_display(job, canonical_scope),
@@ -327,6 +325,29 @@ def _validate_terminal_capability(toolsets: list[str], capability_spec: dict) ->
         )
 
 
+def _validate_system_capability_spec(capability_spec: dict) -> None:
+    """拒绝模型指定产物根目录，避免授权范围与运行目录分离。"""
+    if "artifact_root" in capability_spec:
+        raise ValueError("capability_spec.artifact_root is system-managed")
+
+
+def _approved_candidate_job_id(args: dict, kwargs: dict) -> str | None:
+    """仅复用 Gateway 已签发的一次性审批中保存的候选任务身份。"""
+    grant = kwargs.get("approval_grant")
+    candidate_job_id = getattr(grant, "cron_candidate_job_id", None)
+    if (
+        approval_grant_identity_matches(grant, "cron", args)
+        and getattr(grant, "scope", None) == "once"
+        and getattr(grant, "session_key", None)
+        == str(kwargs.get("session_key") or "cli")
+        and isinstance(candidate_job_id, str)
+        and len(candidate_job_id) == 12
+        and all(char in "0123456789abcdef" for char in candidate_job_id)
+    ):
+        return candidate_job_id
+    return None
+
+
 def _new_job(args: dict, **kwargs) -> CronJob:
     """从公开参数和可信来源构造新的任务定义。"""
     schedule = args.get("schedule")
@@ -350,13 +371,15 @@ def _new_job(args: dict, **kwargs) -> CronJob:
     artifact_policy = args.get("artifact_policy", {})
     if not all(isinstance(item, dict) for item in (capability_spec, artifact_policy)):
         raise ValueError("capability_spec and artifact_policy must be objects")
+    _validate_system_capability_spec(capability_spec)
     _validate_terminal_capability(toolsets, capability_spec)
     session_key = str(kwargs.get("session_key") or "cli")
     gateway_origin = _trusted_origin(kwargs)
     source = "gateway" if gateway_origin else "cli"
     creator_id = str(kwargs.get("creator_id") or (f"cli:{session_key}" if source == "cli" else session_key))
     return CronJob(
-        job_id=uuid.uuid4().hex[:12], schedule=schedule.strip(), prompt=prompt.strip(),
+        job_id=_approved_candidate_job_id(args, kwargs) or uuid.uuid4().hex[:12],
+        schedule=schedule.strip(), prompt=prompt.strip(),
         session_key=session_key, created_at=datetime.now().isoformat(), next_fire=next_fire,
         one_shot=one_shot, name=str(args.get("name") or ""), created_source=source,
         creator_id=creator_id, timezone=timezone,
@@ -549,6 +572,8 @@ def handle_cron_tool(args, **kwargs):
             candidate_record.update(changes)
             candidate_record["version"] = current.version + 1
             candidate = CronJob.from_record(candidate_record)
+            if "capability_spec" in args:
+                _validate_system_capability_spec(candidate.capability_spec)
             _validate_terminal_capability(candidate.toolsets, candidate.capability_spec)
             sensitive = capability_change_requires_reauthorization(current, candidate)
             canonical_scope, _ = _approval_scope_for_job(candidate)

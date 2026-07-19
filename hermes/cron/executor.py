@@ -21,6 +21,7 @@ from hermes.config import (
 )
 from hermes.conversation import ConversationAgentLoop
 from hermes.cron.job import CronJob, CronRun
+from hermes.cron.artifacts import cron_run_artifact_dir
 from hermes.cron.capability import (
     CronCapabilityGuard,
     validate_cron_capability_grant,
@@ -156,7 +157,7 @@ def _load_cron_skills(job: CronJob) -> str:
     return "\n\n".join(sections)
 
 
-def _delivery_preparation_status(job: CronJob, status: str) -> str:
+def delivery_preparation_status(job: CronJob, status: str) -> str:
     """判断执行终态是否需要由 Gateway 后续持久准备投递。"""
     policy = str(dict(job.delivery_config or {}).get("policy", "text")).strip().lower()
     if policy in {"silent", "none"}:
@@ -180,12 +181,12 @@ def _terminal_outcome(loop_result, *, timed_out: bool, cancelled: bool, guard: C
             "Cron capability authorization does not permit a requested operation. Update the task or request authorization again.",
             "cron_capability_denied",
         )
-    if loop_result.ok:
-        return "completed", None, str(loop_result.summary or ""), None
     if timed_out:
         return "cancelled", "timeout", "Cron task timed out before completion.", "timeout"
     if cancelled or loop_result.status == "cancelled":
         return "cancelled", "cancelled", "Cron task was cancelled before completion.", "cancelled"
+    if loop_result.ok:
+        return "completed", None, str(loop_result.summary or ""), None
     return (
         "failed",
         str(loop_result.error_type or loop_result.status or "cron_execution_failed"),
@@ -205,11 +206,9 @@ class CronExecutor:
         lease_name: str | None = None,
         instance_id: str | None = None,
         lease_epoch: int | None = None,
-        artifact_root: str | Path | None = None,
     ):
         self._db_path = db_path or DB_PATH
         self._external_cancel_checker = cancel_checker
-        self._artifact_root = Path(artifact_root or Path.cwd() / "cache" / "files")
         fence_values = (lease_name, instance_id, lease_epoch)
         if any(value is not None for value in fence_values):
             if any(value is None for value in fence_values):
@@ -234,9 +233,7 @@ class CronExecutor:
         workdir = Path(job.workdir or os.getcwd()).expanduser().resolve()
         if not workdir.is_dir():
             raise ValueError("Cron workdir does not exist or is not a directory")
-        artifact_dir = (
-            self._artifact_root / "cron-artifacts" / job.job_id / run.run_id
-        ).resolve()
+        artifact_dir = cron_run_artifact_dir(job.job_id, run.run_id).resolve()
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         scope = dict(grant.get("scope") or {})
@@ -321,7 +318,7 @@ class CronExecutor:
                     status="blocked",
                     summary=summary,
                     error_type="cron_capability_grant_invalid",
-                    delivery_status=_delivery_preparation_status(job, "blocked"),
+                    delivery_status=delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
@@ -339,7 +336,7 @@ class CronExecutor:
                     status="blocked",
                     summary=summary,
                     error_type="invalid_execution_context",
-                    delivery_status=_delivery_preparation_status(job, "blocked"),
+                    delivery_status=delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
@@ -371,7 +368,7 @@ class CronExecutor:
                     status="blocked",
                     summary=summary,
                     error_type="cron_capability_grant_invalid",
-                    delivery_status=_delivery_preparation_status(job, "blocked"),
+                    delivery_status=delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
@@ -410,7 +407,7 @@ class CronExecutor:
                     status="blocked",
                     summary=summary,
                     error_type="cron_skill_unavailable",
-                    delivery_status=_delivery_preparation_status(job, "blocked"),
+                    delivery_status=delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
@@ -458,7 +455,11 @@ class CronExecutor:
             )
             loop_result = loop.run(run_prompt)
             timed_out = bool(time.monotonic() >= deadline)
-            cancelled = bool(context.cancel_checker and context.cancel_checker())
+            cancelled = bool(
+                not timed_out
+                and context.cancel_checker
+                and context.cancel_checker()
+            )
             artifacts = _result_artifacts(loop_result.messages, context.artifact_dir)
             status, error_type, summary, final_error = _terminal_outcome(
                 loop_result,
@@ -474,7 +475,7 @@ class CronExecutor:
                 summary=summary,
                 error_type=error_type,
                 artifacts=artifacts,
-                delivery_status=_delivery_preparation_status(job, status),
+                delivery_status=delivery_preparation_status(job, status),
             )
             return CronExecutionResult(
                 job_id=job.job_id,
@@ -487,8 +488,8 @@ class CronExecutor:
                 artifacts=tuple(artifacts),
                 error_type=error_type,
                 error=final_error,
-                timed_out=timed_out,
-                cancelled=cancelled,
+                timed_out=error_type == "timeout",
+                cancelled=error_type == "cancelled",
                 retryable=bool(loop_result.retryable and status == "failed"),
             )
         finally:
