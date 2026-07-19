@@ -17,7 +17,7 @@ from hermes.cron.capability import (
     capability_change_requires_reauthorization,
 )
 from hermes.cron.job import CronJob
-from hermes.cron.parser import parse_schedule
+from hermes.cron.parser import parse_schedule, validate_timezone
 from hermes.cron.store import JobStore
 from hermes.db import (
     DBError,
@@ -30,7 +30,13 @@ from hermes.db import (
     soft_delete_cron_job,
     update_cron_job_schedule_state,
 )
-from hermes.tools import ExecutionEnvironment, ToolPolicy, ToolRiskLevel, registry
+from hermes.tools import (
+    ExecutionEnvironment,
+    ToolPolicy,
+    ToolRiskLevel,
+    register_all,
+    registry,
+)
 from hermes.redaction import redact_explicit_secrets
 
 
@@ -76,13 +82,119 @@ def _contains_internal_field(value: Any) -> str | None:
     return None
 
 
-def _cron_approval_response(args: dict, session_key: str) -> str:
-    """请求一次只用于创建或替换 Cron 持久授权的远程审批。"""
+def _approval_scope_for_job(job: CronJob) -> tuple[dict, dict]:
+    """从同一份 registry 解析可展示且可写入 grant 的规范化能力范围。"""
+    register_all()
+    scope = build_capability_scope(job)
+    resolution = registry.resolve(ToolPolicy(
+        ExecutionEnvironment.CRON,
+        enabled_toolsets=frozenset(scope["toolsets"]),
+        unattended=True,
+        trusted_context=frozenset({"cron_execution"}),
+        # 工具声明风险不能替代命令风险上限；终端命令仍由 guard 逐次限制。
+        max_risk_level=ToolRiskLevel.HIGH,
+    ))
+    if not resolution.allowed_tool_names:
+        raise ValueError("Cron capability grant has no eligible tools")
+    canonical_scope = {
+        "capability_scope": scope,
+        "allowed_tool_names": sorted(resolution.allowed_tool_names),
+    }
+    return canonical_scope, scope
+
+
+def _approval_scope_identity(canonical_scope: dict, *, action: str) -> dict:
+    """创建审批不绑定临时 job ID；更新审批则绑定正在修改的任务版本。"""
+    scope = dict(canonical_scope["capability_scope"])
+    if action == "create":
+        scope.pop("job_id", None)
+        scope.pop("job_version", None)
+    return {
+        "capability_scope": scope,
+        "allowed_tool_names": list(canonical_scope["allowed_tool_names"]),
+    }
+
+
+def _scope_display_path(value: object, limit: int = 180) -> str:
+    """审批界面只显示限长、脱敏的授权路径。"""
+    text = redact_explicit_secrets(str(value or ""))
+    return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+def _cron_scope_display(job: CronJob, canonical_scope: dict) -> dict:
+    """为 Gateway 审批构造不含 route key、密钥和原始命令的展示摘要。"""
+    scope = canonical_scope["capability_scope"]
+    tools = list(canonical_scope["allowed_tool_names"])
+    display_tools = tools[:12]
+    if len(tools) > len(display_tools):
+        display_tools.append(f"… and {len(tools) - len(display_tools)} more")
+    roots = [_scope_display_path(root) for root in scope["allowed_roots"][:8]]
+    if len(scope["allowed_roots"]) > len(roots):
+        roots.append(f"… and {len(scope['allowed_roots']) - len(roots)} more")
+    target = dict(scope.get("delivery_target") or {})
+    target_kind = "thread" if target.get("thread_id") else ("chat" if target.get("chat_id") else "none")
+    prompt_summary = redact_explicit_secrets(str(job.prompt).strip().replace("\n", " "))[:240]
+    return {
+        "name": redact_explicit_secrets(str(job.name or "(unnamed Cron task)"))[:160],
+        "prompt_summary": prompt_summary,
+        "prompt_digest": scope["prompt_digest"],
+        "schedule": str(job.schedule),
+        "timezone": str(job.timezone),
+        "toolsets": list(scope["toolsets"]),
+        "tool_names": display_tools,
+        "workdir": _scope_display_path(scope["workdir"]),
+        "allowed_roots": roots,
+        "allow_file_write": bool(scope["allow_file_write"]),
+        "terminal_risk_max": scope["terminal_risk_max"],
+        "terminal_allowed_executables": list(scope["terminal_allowed_executables"][:12]),
+        "terminal_allow_shell_operators": bool(scope["terminal_allow_shell_operators"]),
+        "terminal_allow_redirection": bool(scope["terminal_allow_redirection"]),
+        "terminal_allow_background": bool(scope["terminal_allow_background"]),
+        "terminal_allow_network": bool(scope["terminal_allow_network"]),
+        "terminal_allowed_workdirs": [
+            _scope_display_path(value)
+            for value in scope["terminal_allowed_workdirs"][:8]
+        ],
+        "delivery_platform": str(target.get("platform") or "none"),
+        "delivery_target_kind": target_kind,
+        "delivery_policy": str(job.delivery_config.get("policy") or "text"),
+        "timeout_seconds": scope["timeout_seconds"],
+        "max_artifact_file_bytes": scope["max_artifact_file_bytes"],
+        "max_artifact_total_bytes": scope["max_artifact_total_bytes"],
+    }
+
+
+def _cron_approval_fingerprint(
+    args: dict,
+    session_key: str,
+    action: str,
+    canonical_scope: dict,
+) -> str:
+    """将一次性审批同时绑定调用参数、会话、动作和完整规范化能力范围。"""
     backend_risk = {"backend_type": "gateway", "host_mounts": False, "docker_socket": False, "remote_host": False}
-    fingerprint = _fingerprint({
-        "version": 1, "tool_name": "cron", "arguments": args,
+    return _fingerprint({
+        "version": 2, "tool_name": "cron", "arguments": args,
         "session_key": session_key, "backend_risk": backend_risk,
+        "action": action,
+        "capability_scope_digest": _fingerprint(
+            _approval_scope_identity(canonical_scope, action=action)
+        ),
+        "prompt_digest": canonical_scope["capability_scope"]["prompt_digest"],
     })
+
+
+def _cron_approval_response(
+    args: dict,
+    job: CronJob,
+    *,
+    action: str,
+    canonical_scope: dict,
+) -> str:
+    """请求一次只用于创建或替换 Cron 持久授权的远程审批。"""
+    session_key = job.session_key
+    backend_risk = {"backend_type": "gateway", "host_mounts": False, "docker_socket": False, "remote_host": False}
+    scope_identity = _approval_scope_identity(canonical_scope, action=action)
+    fingerprint = _cron_approval_fingerprint(args, session_key, action, canonical_scope)
     return build_approval_required(
         "cron",
         "Authorize this Cron task's bounded unattended capabilities",
@@ -93,6 +205,10 @@ def _cron_approval_response(args: dict, session_key: str) -> str:
             "backend_risk": backend_risk,
             "decision_source": "cron_capability_policy",
             "session_key_fingerprint": "sha256:" + hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:16],
+            "cron_action": action,
+            "scope_digest": _fingerprint(scope_identity),
+            "prompt_digest": canonical_scope["capability_scope"]["prompt_digest"],
+            "cron_scope_display": _cron_scope_display(job, canonical_scope),
             "fingerprint": fingerprint,
         },
     )
@@ -129,17 +245,98 @@ def _delivery_config(args: dict, *, existing: dict | None, origin: dict) -> dict
     return config
 
 
+def _cron_tool_policy(toolsets: frozenset[str] | None = None) -> ToolPolicy:
+    """构造 Cron 无人值守工具解析条件，避免管理入口各自维护默认列表。"""
+    return ToolPolicy(
+        ExecutionEnvironment.CRON,
+        enabled_toolsets=toolsets,
+        unattended=True,
+        trusted_context=frozenset({"cron_execution"}),
+        max_risk_level=ToolRiskLevel.HIGH,
+    )
+
+
+def _validated_cron_toolsets(value: object) -> list[str]:
+    """校验显式最小工具集，Cron 管理工具永不进入执行集。"""
+    register_all()
+    if value is None:
+        raise ValueError(
+            "toolsets is required; submit only the minimum toolsets needed "
+            "for this Cron task"
+        )
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValueError("toolsets must be a list of non-empty strings")
+    normalized = frozenset(item.strip().lower() for item in value)
+    if "cron" in normalized:
+        raise ValueError("Cron management toolset cannot run inside Cron")
+    resolution = registry.resolve(_cron_tool_policy(normalized))
+    unsupported = normalized - resolution.toolsets
+    if unsupported:
+        raise ValueError(f"toolsets are not eligible for Cron: {sorted(unsupported)}")
+    if not resolution.allowed_tool_names:
+        raise ValueError("Cron toolsets must resolve to at least one tool")
+    return sorted(normalized)
+
+
+def _validated_retry_policy(value: object) -> dict:
+    """校验跨 CronRun 重试的有限退避配置。"""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("retry_policy must be an object")
+    allowed = {"max_attempts", "base_delay_seconds", "max_delay_seconds", "jitter_ratio", "retryable_error_types"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"unsupported retry_policy fields: {sorted(unknown)}")
+    try:
+        max_attempts = int(value.get("max_attempts", 1))
+        base_delay = float(value.get("base_delay_seconds", 5.0))
+        max_delay = float(value.get("max_delay_seconds", 300.0))
+        jitter = float(value.get("jitter_ratio", 0.2))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("retry_policy fields must be numeric") from exc
+    retryable = value.get("retryable_error_types", [
+        "model_error",
+    ])
+    allowed_retryable = {
+        "model_service_unavailable", "model_timeout", "infrastructure_error",
+        "model_error", "network_or_timeout", "rate_limit", "server_error",
+    }
+    if (max_attempts < 1 or base_delay < 0 or max_delay < base_delay
+            or not 0 <= jitter <= 1 or not isinstance(retryable, list)
+            or not all(isinstance(item, str) and item in allowed_retryable for item in retryable)):
+        raise ValueError("retry_policy values are invalid")
+    return {
+        "max_attempts": max_attempts,
+        "base_delay_seconds": base_delay,
+        "max_delay_seconds": max_delay,
+        "jitter_ratio": jitter,
+        "retryable_error_types": sorted(set(retryable)),
+    }
+
+
+def _validate_terminal_capability(toolsets: list[str], capability_spec: dict) -> None:
+    """Cron 选择 terminal 时必须同时给出可审计的可执行文件白名单。"""
+    if "terminal" not in toolsets:
+        return
+    allowed = capability_spec.get("terminal_allowed_executables")
+    if not isinstance(allowed, list) or not allowed:
+        raise ValueError(
+            "Cron terminal requires a non-empty "
+            "terminal_allowed_executables allowlist"
+        )
+
+
 def _new_job(args: dict, **kwargs) -> CronJob:
     """从公开参数和可信来源构造新的任务定义。"""
     schedule = args.get("schedule")
     prompt = args.get("prompt")
     if not isinstance(schedule, str) or not schedule.strip() or not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("'schedule' and 'prompt' are required")
-    next_fire, one_shot = parse_schedule(schedule)
-    toolsets = args.get("toolsets", ["terminal", "file", "memory", "skill", "delegate"])
+    timezone = validate_timezone(str(args.get("timezone") or "UTC"))
+    next_fire, one_shot = parse_schedule(schedule, timezone_name=timezone)
+    toolsets = _validated_cron_toolsets(args.get("toolsets"))
     skills = args.get("skills", [])
-    if not isinstance(toolsets, list) or not all(isinstance(item, str) for item in toolsets):
-        raise ValueError("toolsets must be a list of strings")
     if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
         raise ValueError("skills must be a list of strings")
     try:
@@ -149,10 +346,11 @@ def _new_job(args: dict, **kwargs) -> CronJob:
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     capability_spec = args.get("capability_spec", {})
-    retry_policy = args.get("retry_policy", {})
+    retry_policy = _validated_retry_policy(args.get("retry_policy", {}))
     artifact_policy = args.get("artifact_policy", {})
-    if not all(isinstance(item, dict) for item in (capability_spec, retry_policy, artifact_policy)):
-        raise ValueError("capability_spec, retry_policy, and artifact_policy must be objects")
+    if not all(isinstance(item, dict) for item in (capability_spec, artifact_policy)):
+        raise ValueError("capability_spec and artifact_policy must be objects")
+    _validate_terminal_capability(toolsets, capability_spec)
     session_key = str(kwargs.get("session_key") or "cli")
     gateway_origin = _trusted_origin(kwargs)
     source = "gateway" if gateway_origin else "cli"
@@ -161,32 +359,33 @@ def _new_job(args: dict, **kwargs) -> CronJob:
         job_id=uuid.uuid4().hex[:12], schedule=schedule.strip(), prompt=prompt.strip(),
         session_key=session_key, created_at=datetime.now().isoformat(), next_fire=next_fire,
         one_shot=one_shot, name=str(args.get("name") or ""), created_source=source,
-        creator_id=creator_id, timezone=str(args.get("timezone") or "UTC"),
+        creator_id=creator_id, timezone=timezone,
         toolsets=list(toolsets), skills=list(skills), workdir=args.get("workdir"),
         execution_timeout_seconds=timeout,
         max_agent_iterations=int(args.get("max_agent_iterations", 20)),
         overlap_policy=str(args.get("overlap_policy", "skip")),
         misfire_policy=str(args.get("misfire_policy", "run_once")),
-        retry_policy=dict(retry_policy), artifact_policy=dict(artifact_policy),
+        retry_policy=retry_policy, artifact_policy=dict(artifact_policy),
         delivery_config=_delivery_config(args, existing=None, origin=gateway_origin),
         capability_spec=dict(capability_spec), approval_status="pending",
     )
 
 
-def _grant_for_job(job: CronJob, approval_id: str | None) -> dict:
+def _grant_for_job(
+    job: CronJob,
+    approval_id: str | None,
+    *,
+    canonical_scope: dict | None = None,
+) -> dict:
     """冻结当前注册表中同时满足 Cron 策略和本任务授权的工具名。"""
-    scope = build_capability_scope(job)
-    resolution = registry.resolve(ToolPolicy(
-        ExecutionEnvironment.CRON,
-        enabled_toolsets=frozenset(scope["toolsets"]), unattended=True,
-        trusted_context=frozenset({"cron_execution"}),
-        max_risk_level=ToolRiskLevel(scope["terminal_risk_max"]),
-    ))
-    if not resolution.allowed_tool_names:
-        raise ValueError("Cron capability grant has no eligible tools")
+    canonical_scope, scope = (canonical_scope, build_capability_scope(job)) if canonical_scope is not None else _approval_scope_for_job(job)
+    if canonical_scope["capability_scope"] != scope:
+        raise ValueError("Cron approval scope does not match the task definition")
     return build_cron_capability_grant(
         job, creator_id=job.creator_id,
-        allowed_tool_names=set(resolution.allowed_tool_names), approval_id=approval_id,
+        allowed_tool_names=set(canonical_scope["allowed_tool_names"]),
+        approval_id=approval_id,
+        scope=scope,
     )
 
 
@@ -196,13 +395,14 @@ def _requires_gateway_authorization(job: CronJob) -> bool:
     return bool("terminal" in scope["toolsets"] or scope["allow_file_write"] or scope["allow_external_communication"])
 
 
-def _approved(args: dict, kwargs: dict) -> bool:
+def _approved(args: dict, kwargs: dict, expected_fingerprint: str) -> bool:
     """确认本次调用确实由 Gateway 已领取的一次性 grant 恢复。"""
     grant = kwargs.get("approval_grant")
     return bool(
         approval_grant_identity_matches(grant, "cron", args)
         and getattr(grant, "scope", None) == "once"
         and getattr(grant, "session_key", None) == str(kwargs.get("session_key") or "cli")
+        and getattr(grant, "fingerprint", None) == expected_fingerprint
     )
 
 
@@ -235,6 +435,14 @@ def _history_payload(records: list[dict], limit: int) -> list[dict]:
                 str(record.get("result_summary") or "")[:500]
             ),
             "delivery_status": record["delivery_status"],
+            "attempt_number": record.get("attempt_number", 1),
+            "root_run_id": record.get("root_run_id"),
+            "delivery_summary": {
+                key: int(value)
+                for key, value in dict(record.get("delivery_ref") or {}).items()
+                if key in {"prepared_count", "skipped_count", "failed_count", "delivered_count", "delivery_failed_count"}
+                and isinstance(value, int)
+            },
         })
     return result
 
@@ -247,9 +455,15 @@ def _update_changes(args: dict, current: CronJob, kwargs: dict) -> tuple[dict, f
         raise ValueError(f"unsupported update fields: {sorted(unknown)}")
     changes: dict = {}
     next_run_at = None
-    for name in ("name", "timezone", "prompt", "toolsets", "skills", "workdir", "max_agent_iterations", "overlap_policy", "misfire_policy", "retry_policy", "artifact_policy", "capability_spec"):
+    for name in ("name", "prompt", "skills", "workdir", "max_agent_iterations", "overlap_policy", "misfire_policy", "artifact_policy", "capability_spec"):
         if name in args:
             changes[name] = args[name]
+    if "timezone" in args:
+        changes["timezone"] = validate_timezone(str(args["timezone"]))
+    if "toolsets" in args:
+        changes["toolsets"] = _validated_cron_toolsets(args["toolsets"])
+    if "retry_policy" in args:
+        changes["retry_policy"] = _validated_retry_policy(args["retry_policy"])
     if "timeout" in args:
         changes["execution_timeout_seconds"] = args["timeout"]
     if "delivery_policy" in args:
@@ -260,9 +474,15 @@ def _update_changes(args: dict, current: CronJob, kwargs: dict) -> tuple[dict, f
         schedule = args["schedule"]
         if not isinstance(schedule, str) or not schedule.strip():
             raise ValueError("schedule must be a non-empty string")
-        next_run_at, one_shot = parse_schedule(schedule)
+        timezone = str(changes.get("timezone", current.timezone))
+        next_run_at, one_shot = parse_schedule(schedule, timezone_name=timezone)
         changes["schedule_expr"] = schedule.strip()
         changes["schedule_type"] = "one_shot" if one_shot else ("interval" if schedule.strip().startswith("every ") else "cron")
+    elif "timezone" in changes and current.schedule_type == "cron":
+        next_run_at, _ = parse_schedule(
+            current.schedule,
+            timezone_name=str(changes["timezone"]),
+        )
     return changes, next_run_at
 
 
@@ -281,15 +501,30 @@ def handle_cron_tool(args, **kwargs):
     try:
         if action == "create":
             job = _new_job(args, **kwargs)
-            approved = _approved(args, kwargs)
+            canonical_scope, _ = _approval_scope_for_job(job)
+            approval_fingerprint = _cron_approval_fingerprint(
+                args, job.session_key, "create", canonical_scope
+            )
+            approved = _approved(args, kwargs, approval_fingerprint)
             if is_remote_approval(kwargs) and not approved:
-                return _cron_approval_response(args, job.session_key)
+                return _cron_approval_response(
+                    args, job, action="create", canonical_scope=canonical_scope
+                )
             if not is_remote_approval(kwargs) and _requires_gateway_authorization(job):
                 return _json({"ok": False, "error_type": "approval_required", "error": "Cron unattended execution requires Gateway remote authorization."})
             stored = store.add(job)
             conn = init_db(str(db_path))
             try:
-                create_cron_capability_grant(conn, _grant_for_job(stored, getattr(kwargs.get("approval_grant"), "request_id", None) if approved else None))
+                stored_scope, _ = _approval_scope_for_job(stored)
+                create_cron_capability_grant(
+                    conn,
+                    _grant_for_job(
+                        stored,
+                        getattr(kwargs.get("approval_grant"), "request_id", None)
+                        if approved else None,
+                        canonical_scope=stored_scope,
+                    ),
+                )
             finally:
                 conn.close()
             return _json({"ok": True, "action": action, "job": _job_payload(store.get(stored.job_id) or stored)})
@@ -314,10 +549,17 @@ def handle_cron_tool(args, **kwargs):
             candidate_record.update(changes)
             candidate_record["version"] = current.version + 1
             candidate = CronJob.from_record(candidate_record)
+            _validate_terminal_capability(candidate.toolsets, candidate.capability_spec)
             sensitive = capability_change_requires_reauthorization(current, candidate)
-            approved = _approved(args, kwargs)
+            canonical_scope, _ = _approval_scope_for_job(candidate)
+            approval_fingerprint = _cron_approval_fingerprint(
+                args, current.session_key, "update", canonical_scope
+            )
+            approved = _approved(args, kwargs, approval_fingerprint)
             if sensitive and is_remote_approval(kwargs) and not approved:
-                return _cron_approval_response(args, current.session_key)
+                return _cron_approval_response(
+                    args, candidate, action="update", canonical_scope=canonical_scope
+                )
             if sensitive and not is_remote_approval(kwargs):
                 return _json({"ok": False, "error_type": "approval_required", "error": "Capability-expanding Cron updates require Gateway remote authorization."})
             updated = store.update(job_id, changes)
@@ -331,7 +573,15 @@ def handle_cron_tool(args, **kwargs):
             if sensitive:
                 conn = init_db(str(db_path))
                 try:
-                    create_cron_capability_grant(conn, _grant_for_job(updated, getattr(kwargs.get("approval_grant"), "request_id", None)))
+                    updated_scope, _ = _approval_scope_for_job(updated)
+                    create_cron_capability_grant(
+                        conn,
+                        _grant_for_job(
+                            updated,
+                            getattr(kwargs.get("approval_grant"), "request_id", None),
+                            canonical_scope=updated_scope,
+                        ),
+                    )
                 finally:
                     conn.close()
                 updated = store.get(job_id) or updated
@@ -348,7 +598,10 @@ def handle_cron_tool(args, **kwargs):
             ):
                 next_run_at = current.next_fire
             else:
-                next_run_at, _ = parse_schedule(current.schedule)
+                next_run_at, _ = parse_schedule(
+                    current.schedule,
+                    timezone_name=current.timezone,
+                )
             conn = init_db(str(db_path))
             try:
                 resumed = CronJob.from_record(resume_cron_job(conn, job_id, next_run_at))
@@ -380,7 +633,9 @@ def handle_cron_tool(args, **kwargs):
         finally:
             conn.close()
         return _json({"ok": True, "action": action, "runs": _history_payload(records, limit)})
-    except (DBError, ValueError) as exc:
+    except ValueError as exc:
+        return _json({"ok": False, "error_type": "invalid_args", "error": str(exc)[:240]})
+    except DBError as exc:
         return _json({"ok": False, "error_type": "cron_management_error", "error": str(exc)[:240]})
 
 
@@ -389,20 +644,38 @@ def register(registry):
         name="cron", toolset="cron",
         schema={
             "name": "cron",
-            "description": "Manage Cron task lifecycle: create, list, get, update, pause, resume, run, delete, and history. Cron management is unavailable inside Cron execution.",
+            "description": (
+                "Manage Cron task lifecycle: create, list, get, update, pause, "
+                "resume, run, delete, and history. Cron management is unavailable "
+                "inside Cron execution. A create request must explicitly provide the "
+                "minimum toolsets needed by the task: read-only file work normally "
+                "uses only file; do not request terminal unless command execution is "
+                "needed, and do not request delegate unless a child agent is needed. "
+                "Cron terminal also requires a narrow terminal_allowed_executables "
+                "allowlist in capability_spec."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["create", "list", "get", "update", "pause", "resume", "run", "delete", "history"]},
                     "job_id": {"type": "string"}, "name": {"type": "string"},
                     "schedule": {"type": "string"}, "timezone": {"type": "string"},
-                    "prompt": {"type": "string"}, "toolsets": {"type": "array", "items": {"type": "string"}},
+                    "prompt": {"type": "string"},
+                    "toolsets": {
+                        "type": "array",
+                        "description": "Required for create. Request only the minimum Cron toolsets required; never include cron.",
+                        "items": {"type": "string"},
+                    },
                     "skills": {"type": "array", "items": {"type": "string"}}, "workdir": {"type": "string"},
                     "timeout": {"type": "number"}, "max_agent_iterations": {"type": "integer"},
                     "overlap_policy": {"type": "string", "enum": ["skip", "queue", "parallel"]},
                     "misfire_policy": {"type": "string", "enum": ["skip", "run_once", "catch_up"]},
                     "retry_policy": {"type": "object"}, "delivery_policy": {"oneOf": [{"type": "string"}, {"type": "object"}]},
-                    "artifact_policy": {"type": "object"}, "capability_spec": {"type": "object"},
+                    "artifact_policy": {"type": "object"},
+                    "capability_spec": {
+                        "type": "object",
+                        "description": "Capability constraints. terminal_allowed_executables is required when toolsets includes terminal; shell operators, redirection, background execution, and network access default to false.",
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
                 "required": ["action"],

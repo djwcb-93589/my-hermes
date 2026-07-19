@@ -39,6 +39,8 @@ from hermes.db import (
     cancel_gateway_delivery,
     cancel_pending_gateway_approvals,
     check_gateway_runtime_readiness,
+    claim_cron_delivery_preparation,
+    create_cron_run_artifact,
     claim_gateway_file_delivery,
     claim_gateway_approval,
     complete_gateway_delivery,
@@ -48,6 +50,7 @@ from hermes.db import (
     delete_gateway_messages,
     deny_gateway_approval,
     enqueue_gateway_outbox,
+    finish_cron_delivery_preparation,
     enqueue_gateway_message,
     fail_gateway_delivery,
     fail_gateway_file_delivery,
@@ -70,6 +73,7 @@ from hermes.db import (
     get_recoverable_gateway_file_deliveries,
     init_db,
     list_gateway_conversations,
+    list_cron_delivery_preparation_candidates,
     mark_gateway_message_delivery_failed,
     mark_gateway_message_processing,
     mark_gateway_file_delivery_outbox_retry,
@@ -85,10 +89,10 @@ from hermes.db import (
     recover_gateway_approvals,
     release_gateway_runtime_lease,
     renew_gateway_runtime_lease,
+    refresh_cron_delivery_statuses,
     reset_gateway_processing_messages,
     reset_gateway_sending_outbox,
     reset_gateway_uploading_file_deliveries,
-    update_cron_run_delivery,
 )
 from hermes.approval_policy import (
     TrustedApprovalGrant,
@@ -106,6 +110,7 @@ from hermes.gateway.observability import (
 )
 from hermes.gateway.persistence import GatewayPersistence
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
+from hermes.cron.job import CronJob
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import (
     MessageEvent,
@@ -304,6 +309,84 @@ def _format_approval_question(request: dict) -> str:
             "目标会话摘要："
             f"{_approval_value_preview(details.get('target_chat_fingerprint', ''), 100)}",
         ])
+    if tool_name == "cron":
+        cron_scope = details.get("cron_scope_display")
+        if isinstance(cron_scope, dict):
+            name = _approval_value_preview(
+                cron_scope.get("name", "(unnamed Cron task)"), 180
+            )
+            schedule = _approval_value_preview(
+                cron_scope.get("schedule", ""), 180
+            )
+            timezone = _approval_value_preview(
+                cron_scope.get("timezone", "UTC"), 80
+            )
+            prompt_summary = _approval_value_preview(
+                cron_scope.get("prompt_summary", ""), 260
+            )
+            lines.extend([
+                "",
+                f"定时任务：{name}",
+                f"执行时间：{schedule}，{timezone}",
+            ])
+            if prompt_summary:
+                lines.append(f"任务摘要：{prompt_summary}")
+            lines.extend(["", "允许工具："])
+            toolsets = cron_scope.get("toolsets", [])
+            tool_names = cron_scope.get("tool_names", [])
+            if isinstance(toolsets, list):
+                for value in toolsets[:12]:
+                    lines.append(f"- toolset: {_approval_value_preview(value, 120)}")
+            if isinstance(tool_names, list):
+                for value in tool_names[:12]:
+                    lines.append(f"- tool: {_approval_value_preview(value, 120)}")
+            lines.extend([
+                "",
+                "文件范围：",
+                f"工作目录：{_approval_value_preview(cron_scope.get('workdir', ''), 220)}",
+            ])
+            roots = cron_scope.get("allowed_roots", [])
+            if isinstance(roots, list):
+                for value in roots[:8]:
+                    lines.append(f"- {_approval_value_preview(value, 220)}")
+            lines.append(
+                "文件写入：" + ("允许" if cron_scope.get("allow_file_write") else "禁止")
+            )
+            if "terminal" not in set(cron_scope.get("toolsets", [])):
+                lines.append("Terminal：未授权")
+            else:
+                executables = cron_scope.get("terminal_allowed_executables", [])
+                executable_text = ", ".join(
+                    _approval_value_preview(value, 80)
+                    for value in executables[:12]
+                ) if isinstance(executables, list) else ""
+                lines.extend([
+                    "Terminal：",
+                    f"- 最大风险：{_approval_value_preview(cron_scope.get('terminal_risk_max', ''), 80)}",
+                    f"- 可执行文件：{executable_text or '未授权'}",
+                    "- Shell 操作符：" + ("允许" if cron_scope.get("terminal_allow_shell_operators") else "禁止"),
+                    "- 重定向：" + ("允许" if cron_scope.get("terminal_allow_redirection") else "禁止"),
+                    "- 后台执行：" + ("允许" if cron_scope.get("terminal_allow_background") else "禁止"),
+                    "- 网络访问：" + ("允许" if cron_scope.get("terminal_allow_network") else "禁止"),
+                ])
+                terminal_workdirs = cron_scope.get("terminal_allowed_workdirs", [])
+                if isinstance(terminal_workdirs, list):
+                    for value in terminal_workdirs[:8]:
+                        lines.append(
+                            "- 终端工作目录："
+                            f"{_approval_value_preview(value, 220)}"
+                        )
+            lines.extend([
+                "",
+                "投递：",
+                f"- 平台：{_approval_value_preview(cron_scope.get('delivery_platform', 'none'), 80)}",
+                f"- 目标类型：{_approval_value_preview(cron_scope.get('delivery_target_kind', 'none'), 80)}",
+                f"- 策略：{_approval_value_preview(cron_scope.get('delivery_policy', 'text'), 80)}",
+                f"最长执行：{_approval_value_preview(cron_scope.get('timeout_seconds', ''), 80)} 秒",
+                "产物限制："
+                f"单文件 {_approval_value_preview(cron_scope.get('max_artifact_file_bytes', ''), 80)} bytes，"
+                f"总计 {_approval_value_preview(cron_scope.get('max_artifact_total_bytes', ''), 80)} bytes",
+            ])
     raw_scopes = details.get("allowed_grant_scopes")
     scopes = (
         [scope for scope in raw_scopes if scope in {"once", "session"}]
@@ -745,6 +828,8 @@ class GatewayRunner:
         self._session_cleanup_task: asyncio.Task | None = None
         self._retention_cleanup_task: asyncio.Task | None = None
         self._file_delivery_dispatcher_task: asyncio.Task | None = None
+        self._cron_delivery_preparation_task: asyncio.Task | None = None
+        self._cron_delivery_preparation_wakeup = asyncio.Event()
         self._file_delivery_tasks: dict[str, asyncio.Task] = {}
         self._file_delivery_task_routes: dict[str, str] = {}
         self._file_delivery_wakeup = asyncio.Event()
@@ -1674,7 +1759,77 @@ class GatewayRunner:
         task.add_done_callback(lambda completed, item_id=outbox_id: self._system_outbox_tasks.pop(item_id, None))
 
     async def _prepare_cron_delivery(self, job, run, result, fence: dict) -> None:
-        """把已结束的 Cron 执行结果写入 Outbox；平台失败不会回滚或重跑 Agent。"""
+        """执行结束后的即时唤醒；真正的投递准备始终由持久扫描器领取。"""
+        if self._runtime_lease_valid:
+            self._cron_delivery_preparation_wakeup.set()
+
+    async def _cron_delivery_preparation_loop(self) -> None:
+        """用 runtime lease 领取可恢复的投递准备，进程重启后也会继续处理。"""
+        try:
+            while self._runtime_lease_valid:
+                try:
+                    fence = self._cron_runtime_fence()
+                    if fence is not None:
+                        await self.persistence.call(
+                            refresh_cron_delivery_statuses,
+                            **fence,
+                        )
+                        candidates = await self.persistence.call(
+                            list_cron_delivery_preparation_candidates,
+                            stale_after_seconds=max(30.0, self.cron_poll_seconds * 3),
+                            limit=max(1, self.cron_max_concurrent),
+                        )
+                        for candidate in candidates:
+                            if not self._runtime_lease_valid:
+                                return
+                            claimed = await self.persistence.call(
+                                claim_cron_delivery_preparation,
+                                candidate["run_id"],
+                                stale_after_seconds=max(30.0, self.cron_poll_seconds * 3),
+                                **fence,
+                            )
+                            if claimed.get("outcome") != "claimed":
+                                continue
+                            try:
+                                await self._prepare_claimed_cron_delivery(
+                                    CronJob.from_record(claimed["job"]),
+                                    claimed["run"],
+                                    fence,
+                                )
+                            except Exception as exc:
+                                await self.persistence.call(
+                                    finish_cron_delivery_preparation,
+                                    candidate["run_id"],
+                                    "permanent_failed",
+                                    {"error_type": "delivery_preparation_failed"},
+                                    **fence,
+                                )
+                                print("  [gateway:cron] delivery preparation failed: " f"{type(exc).__name__}")
+                except Exception as exc:
+                    print("  [gateway:cron] delivery preparation scan failed: " f"{type(exc).__name__}")
+                self._cron_delivery_preparation_wakeup.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._cron_delivery_preparation_wakeup.wait(),
+                        timeout=self.cron_poll_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+
+    def _start_cron_delivery_preparation(self) -> None:
+        """只在 lease 有效的 Gateway 生命周期内启动唯一的投递准备扫描器。"""
+        task = self._cron_delivery_preparation_task
+        if task is None or task.done():
+            self._cron_delivery_preparation_task = asyncio.create_task(
+                self._cron_delivery_preparation_loop(),
+                name="gateway-cron-delivery-preparation",
+            )
+        self._cron_delivery_preparation_wakeup.set()
+
+    async def _prepare_claimed_cron_delivery(self, job: CronJob, run: dict, fence: dict) -> None:
+        """为已领取的投递准备幂等创建文本 Outbox 与文件投递，绝不重跑 Agent。"""
         config = dict(job.delivery_config or {})
         policy = str(config.get("policy", "text")).strip().lower()
         aliases = {
@@ -1686,49 +1841,51 @@ class GatewayRunner:
         target = config.get("target", config.get("origin", {}))
         if not isinstance(target, dict) or policy == "silent":
             await self.persistence.call(
-                update_cron_run_delivery, run.run_id, "not_requested", None, **fence
+                finish_cron_delivery_preparation, run["run_id"], "not_requested", {}, **fence
             )
             return
         platform = str(target.get("platform", "")).strip()
         chat_id = str(target.get("chat_id", "")).strip()
         if not platform or not chat_id:
             await self.persistence.call(
-                update_cron_run_delivery, run.run_id, "invalid_target", None, **fence
+                finish_cron_delivery_preparation, run["run_id"], "invalid_target",
+                {"error_type": "invalid_delivery_target"}, **fence
             )
             return
-        failed = str(result.status) != "completed"
+        failed = str(run["status"]) != "completed"
         if policy == "failure_only" and not failed:
             await self.persistence.call(
-                update_cron_run_delivery, run.run_id, "not_requested", None, **fence
+                finish_cron_delivery_preparation, run["run_id"], "not_requested", {}, **fence
             )
             return
         adapter = self.adapters.get(platform)
         if adapter is None:
             await self.persistence.call(
-                update_cron_run_delivery, run.run_id, "adapter_unavailable", None, **fence
+                finish_cron_delivery_preparation, run["run_id"], "permanent_failed",
+                {"error_type": "delivery_adapter_unavailable"}, **fence
             )
             return
-        text = str(result.final_response or "").strip()
+        text = str(run.get("result_summary") or "").strip()
         if not text and failed:
             text = "Cron task failed without a final response."
         if not text and policy != "text_and_files":
             await self.persistence.call(
-                update_cron_run_delivery, run.run_id, "not_requested", None, **fence
+                finish_cron_delivery_preparation, run["run_id"], "not_requested", {}, **fence
             )
             return
 
         route_key = str(target.get("route_key") or f"cron:{platform}:{chat_id}")
         outbox_ids: list[str] = []
         if text:
-            outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes:cron:text:{run.run_id}"))
-            system_identity = f"cron-outbox:{run.run_id}:text"
+            outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes:cron:text:{run['run_id']}"))
+            system_identity = f"cron-outbox:{run['run_id']}:text"
             outbox = {
                 "id": outbox_id,
                 "route_key": route_key,
                 # 这是 Outbox 的内部幂等键，不是平台 source message ID。
                 "source_message_id": system_identity,
                 "queue_message_id": system_identity,
-                "event_json": json.dumps({"origin_kind": "cron", "run_id": run.run_id}),
+                "event_json": json.dumps({"origin_kind": "cron", "run_id": run["run_id"]}),
                 "platform": platform,
                 "chat_id": chat_id,
                 "reply_to_message_id": None,
@@ -1741,50 +1898,121 @@ class GatewayRunner:
             await self._launch_system_outbox(created, route_key)
 
         file_delivery_ids: list[str] = []
+        failed_artifact_ids: list[str] = []
+        skipped_artifact_ids: list[str] = []
         if policy == "text_and_files" and self.file_transfer_config.get("enabled") is True:
-            artifact_dir = Path(self.file_transfer_config["download_dir"]) / "cron-artifacts" / job.job_id / run.run_id
+            artifact_dir = Path(self.file_transfer_config["download_dir"]) / "cron-artifacts" / job.job_id / run["run_id"]
             candidates: list[tuple[object, bool]] = [
                 (item.get("path") if isinstance(item, dict) else None, False)
-                for item in result.artifacts
+                for item in run.get("artifacts", [])
             ]
             fixed_files = config.get("fixed_files", [])
             if isinstance(fixed_files, list):
                 candidates.extend((item, True) for item in fixed_files)
             for index, (path, is_fixed_path) in enumerate(candidates):
                 if not isinstance(path, str):
+                    artifact_id = hashlib.sha256(
+                        f"{run['run_id']}:candidate:{index}".encode("utf-8")
+                    ).hexdigest()[:32]
+                    await self.persistence.call(
+                        create_cron_run_artifact,
+                        {
+                            "artifact_id": f"artifact_{artifact_id}", "run_id": run["run_id"],
+                            "display_name": f"artifact-{index + 1}", "local_path": "unavailable",
+                            "size_bytes": 1, "sha256": artifact_id,
+                            "delivery_status": "failed",
+                            "preparation_error_type": "artifact_path_invalid",
+                            "preparation_retryable": False,
+                        },
+                    )
+                    failed_artifact_ids.append(f"artifact_{artifact_id}")
                     continue
                 try:
                     if not is_fixed_path:
                         self.outbound_delivery.require_artifact_path(path, str(artifact_dir))
                     snapshot = self.outbound_delivery.capture_file(path)
-                    digest = hashlib.sha256(f"{run.run_id}:{snapshot['abs_path']}".encode("utf-8")).hexdigest()
+                    digest = hashlib.sha256(
+                        f"{run['run_id']}:{index}:{snapshot['abs_path']}".encode("utf-8")
+                    ).hexdigest()
                     delivery_id = f"delivery_{digest[:32]}"
                     artifact_id = f"artifact_{digest[:32]}"
                     delivery = {
-                        "id": delivery_id, "cron_run_id": run.run_id,
-                        "route_key": route_key, "conversation_id": result.session_id,
-                        "source_message_id": f"cron-file:{run.run_id}:{index}",
+                        "id": delivery_id, "cron_run_id": run["run_id"],
+                        "route_key": route_key, "conversation_id": f"cron:{job.job_id}:{run['run_id']}",
+                        "source_message_id": f"cron-file:{run['run_id']}:{index}",
                         "platform": platform, "chat_id": chat_id,
                         "reply_to_message_id": None, "thread_id": target.get("thread_id"),
                         "local_path": snapshot["abs_path"], "display_name": snapshot["display_name"],
                         "size_bytes": snapshot["size_bytes"], "sha256": snapshot["sha256"],
                     }
                     self.outbound_delivery.create_cron_artifact_delivery(
-                        artifact={"artifact_id": artifact_id, "run_id": run.run_id,
+                        artifact={"artifact_id": artifact_id, "run_id": run["run_id"],
                                   "display_name": snapshot["display_name"], "local_path": snapshot["abs_path"],
                                   "size_bytes": snapshot["size_bytes"], "sha256": snapshot["sha256"]},
                         delivery=delivery, runtime_fence=fence,
                     )
                     file_delivery_ids.append(delivery_id)
                 except Exception as exc:
+                    digest = hashlib.sha256(
+                        f"{run['run_id']}:candidate:{index}".encode("utf-8")
+                    ).hexdigest()
+                    artifact_id = f"artifact_{digest[:32]}"
+                    await self.persistence.call(
+                        create_cron_run_artifact,
+                        {
+                            "artifact_id": artifact_id, "run_id": run["run_id"],
+                            "display_name": f"artifact-{index + 1}",
+                            "local_path": "unavailable", "size_bytes": 1, "sha256": digest,
+                            "delivery_status": "failed",
+                            "preparation_error_type": "artifact_validation_failed",
+                            "preparation_retryable": isinstance(exc, OSError),
+                        },
+                    )
+                    failed_artifact_ids.append(artifact_id)
                     print("  [gateway:cron] artifact preparation skipped: " f"{type(exc).__name__}")
+        elif policy == "text_and_files":
+            candidates = [
+                item.get("path") if isinstance(item, dict) else None
+                for item in run.get("artifacts", [])
+            ]
+            fixed_files = config.get("fixed_files", [])
+            if isinstance(fixed_files, list):
+                candidates.extend(fixed_files)
+            for index, _path in enumerate(candidates):
+                digest = hashlib.sha256(
+                    f"{run['run_id']}:candidate:{index}".encode("utf-8")
+                ).hexdigest()
+                artifact_id = f"artifact_{digest[:32]}"
+                await self.persistence.call(
+                    create_cron_run_artifact,
+                    {
+                        "artifact_id": artifact_id, "run_id": run["run_id"],
+                        "display_name": f"artifact-{index + 1}", "local_path": "unavailable",
+                        "size_bytes": 1, "sha256": digest, "delivery_status": "skipped",
+                        "preparation_error_type": "file_delivery_disabled",
+                        "preparation_retryable": True,
+                    },
+                )
+                skipped_artifact_ids.append(artifact_id)
         if file_delivery_ids:
             self._file_delivery_wakeup.set()
+        prepared_count = len(outbox_ids) + len(file_delivery_ids)
+        final_delivery_status = (
+            "partial_failed" if failed_artifact_ids and prepared_count
+            else ("permanent_failed" if failed_artifact_ids else (
+                "pending" if prepared_count else "not_requested"
+            ))
+        )
         await self.persistence.call(
-            update_cron_run_delivery,
-            run.run_id,
-            "pending" if outbox_ids or file_delivery_ids else "not_requested",
-            {"outbox_ids": outbox_ids, "file_delivery_ids": file_delivery_ids},
+            finish_cron_delivery_preparation,
+            run["run_id"],
+            final_delivery_status,
+            {
+                "outbox_ids": outbox_ids, "file_delivery_ids": file_delivery_ids,
+                "prepared_count": prepared_count, "skipped_count": len(skipped_artifact_ids),
+                "failed_count": len(failed_artifact_ids), "failed_artifact_ids": failed_artifact_ids,
+                "skipped_artifact_ids": skipped_artifact_ids,
+            },
             **fence,
         )
 
@@ -2276,6 +2504,7 @@ class GatewayRunner:
                 self._session_cleanup_task,
                 self._retention_cleanup_task,
                 self._file_delivery_dispatcher_task,
+                self._cron_delivery_preparation_task,
                 *tuple(self._file_delivery_tasks.values()),
                 *tuple(self._system_outbox_tasks.values()),
             )
@@ -2293,6 +2522,8 @@ class GatewayRunner:
             self._retention_cleanup_task = None
         if self._file_delivery_dispatcher_task is not current:
             self._file_delivery_dispatcher_task = None
+        if self._cron_delivery_preparation_task is not current:
+            self._cron_delivery_preparation_task = None
         self._file_delivery_tasks.clear()
         self._file_delivery_task_routes.clear()
         self._system_outbox_tasks.clear()
@@ -2491,6 +2722,7 @@ class GatewayRunner:
         self._start_session_cleanup()
         self._start_retention_cleanup()
         self._start_file_delivery_dispatcher()
+        self._start_cron_delivery_preparation()
         self._cron_scheduler.start()
 
     async def stop(self):

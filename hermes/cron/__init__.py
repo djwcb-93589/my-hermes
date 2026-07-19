@@ -1,4 +1,4 @@
-"""Scheduled tasks subsystem: parser, JobStore, JobScheduler, cron tool."""
+"""Scheduled tasks subsystem: database-backed Cron execution and management."""
 
 from hermes.cron.store import (
     JobStore,
@@ -7,7 +7,6 @@ from hermes.cron.store import (
 )
 from hermes.cron.job import CronJob, CronRun
 from hermes.cron.executor import CronExecutionContext, CronExecutionResult, CronExecutor
-from hermes.cron.scheduler import JobScheduler
 from hermes.cron.parser import parse_schedule
 
 __all__ = [
@@ -19,6 +18,5 @@ __all__ = [
     "CronExecutionContext",
     "CronExecutionResult",
     "CronExecutor",
-    "JobScheduler",
     "parse_schedule",
 ]

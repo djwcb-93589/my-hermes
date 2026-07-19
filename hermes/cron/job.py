@@ -159,6 +159,9 @@ class CronRun:
     artifacts: list = field(default_factory=list)
     delivery_status: str = "not_requested"
     delivery_ref: dict | None = None
+    root_run_id: str | None = None
+    attempt_number: int = 1
+    retry_due_at: float | None = None
 
     @classmethod
     def from_record(cls, record: dict) -> "CronRun":
@@ -180,6 +183,9 @@ class CronRun:
             artifacts=list(record["artifacts"]),
             delivery_status=str(record["delivery_status"]),
             delivery_ref=record["delivery_ref"],
+            root_run_id=record.get("root_run_id"),
+            attempt_number=int(record.get("attempt_number") or 1),
+            retry_due_at=record.get("retry_due_at"),
         )
 
     def to_record(self) -> dict:
@@ -197,4 +203,7 @@ class CronRun:
             "artifacts": list(self.artifacts),
             "delivery_status": self.delivery_status,
             "delivery_ref": self.delivery_ref,
+            "root_run_id": self.root_run_id,
+            "attempt_number": self.attempt_number,
+            "retry_due_at": self.retry_due_at,
         }

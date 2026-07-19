@@ -52,7 +52,7 @@ def run_terminal(args, **kwargs):
 
     cron_guard = kwargs.get("cron_capability_guard")
     if cron_guard is not None:
-        denial = cron_guard.authorize_terminal(command)
+        denial = cron_guard.authorize_terminal(command, cwd=backend.cwd)
         if denial is not None:
             return json.dumps(denial, ensure_ascii=False)
 

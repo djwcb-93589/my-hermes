@@ -3233,19 +3233,30 @@ def approval_request_binding_matches(
             normalized_session_key = normalize_approval_session_key(session_key)
         except ValueError:
             return False
+        cron_action = details.get("cron_action")
+        scope_digest = details.get("scope_digest")
+        prompt_digest = details.get("prompt_digest")
         if (
             details.get("operation_type") != "cron.capability_grant"
             or details.get("session_key_fingerprint")
             != _identifier_fingerprint(normalized_session_key)
             or details.get("allowed_grant_scopes") != ["once"]
+            or cron_action not in {"create", "update"}
+            or not isinstance(scope_digest, str)
+            or not scope_digest.startswith("sha256:")
+            or not isinstance(prompt_digest, str)
+            or len(prompt_digest) != 64
         ):
             return False
         expected = _canonical_fingerprint({
-            "version": 1,
+            "version": 2,
             "tool_name": "cron",
             "arguments": arguments,
             "session_key": normalized_session_key,
             "backend_risk": backend_risk,
+            "action": cron_action,
+            "capability_scope_digest": scope_digest,
+            "prompt_digest": prompt_digest,
         })
         return fingerprint == expected
 

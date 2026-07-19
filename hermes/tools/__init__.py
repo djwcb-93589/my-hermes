@@ -221,6 +221,12 @@ class ToolRegistry:
             if normalized in entry.execution_environments
         )
 
+    def default_toolsets_for_policy(self, policy: ToolPolicy) -> frozenset[str]:
+        """返回在给定运行条件下实际默认启用且至少含一个工具的工具集。"""
+        if policy.enabled_toolsets is not None:
+            raise ValueError("default toolsets require a policy without explicit toolsets")
+        return self.resolve(policy).toolsets
+
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
         """查找工具并调用 handler；调用方必须先执行会话级授权。"""
         entry = self._tools.get(name)
@@ -231,6 +237,10 @@ class ToolRegistry:
             denial = guard.authorize_tool(name)
             if denial is not None:
                 return json.dumps(denial, ensure_ascii=False)
+            if name == "skill_view":
+                denial = guard.authorize_skill(args.get("name"))
+                if denial is not None:
+                    return json.dumps(denial, ensure_ascii=False)
         return entry.handler(args, **kwargs)
 
     def get_definitions(

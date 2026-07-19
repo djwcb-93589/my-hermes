@@ -143,7 +143,7 @@ class JobStore:
                     conn.close()
             return CronJob.from_record(record)
 
-        next_fire, _ = parse_schedule(job.schedule)
+        next_fire, _ = parse_schedule(job.schedule, timezone_name=job.timezone)
         with self._lock:
             conn = self._open()
             try:

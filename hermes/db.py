@@ -33,7 +33,7 @@ from hermes.approval_policy import (
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 24
+LATEST_SCHEMA_VERSION = 25
 
 _DEFAULT_GATEWAY_APPROVAL_AGENT_STATE = {
     "iterations_used": 0,
@@ -105,6 +105,11 @@ CRON_RUN_TRANSITIONS = {
     "blocked": frozenset(),
     "cancelled": frozenset(),
 }
+
+CRON_DELIVERY_STATUSES = frozenset({
+    "not_requested", "preparation_pending", "preparing", "pending",
+    "delivered", "partial_failed", "permanent_failed", "invalid_target",
+})
 
 
 class DBError(Exception):
@@ -396,6 +401,9 @@ def _create_cron_schema(conn: sqlite3.Connection) -> None:
             artifacts_json TEXT NOT NULL DEFAULT '[]',
             delivery_status TEXT NOT NULL DEFAULT 'not_requested',
             delivery_ref_json TEXT,
+            root_run_id TEXT,
+            attempt_number INTEGER NOT NULL DEFAULT 1 CHECK (attempt_number > 0),
+            retry_due_at REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             UNIQUE(job_id, scheduled_for),
@@ -416,6 +424,13 @@ def _create_cron_schema(conn: sqlite3.Connection) -> None:
             ON cron_runs(status, claimed_at, run_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_active_job
             ON cron_runs(job_id, status, scheduled_for);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_delivery_prepare
+            ON cron_runs(delivery_status, updated_at, run_id);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_retry_due
+            ON cron_runs(status, retry_due_at, run_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_retry_attempt
+            ON cron_runs(root_run_id, attempt_number)
+            WHERE root_run_id IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS cron_legacy_imports (
             source_path TEXT PRIMARY KEY,
@@ -433,6 +448,10 @@ def _create_cron_schema(conn: sqlite3.Connection) -> None:
             sha256 TEXT NOT NULL,
             delivery_id TEXT,
             delivery_status TEXT NOT NULL DEFAULT 'not_requested',
+            preparation_error_type TEXT,
+            preparation_retryable INTEGER NOT NULL DEFAULT 0 CHECK (
+                preparation_retryable IN (0, 1)
+            ),
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             FOREIGN KEY (run_id) REFERENCES cron_runs(run_id) ON DELETE CASCADE,
@@ -1988,6 +2007,40 @@ def _migrate_v23_to_v24(conn: sqlite3.Connection) -> None:
         ("artifact_policy_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("deleted_at", "REAL"),
     )
+
+
+def _migrate_v24_to_v25(conn: sqlite3.Connection) -> None:
+    """为可恢复投递准备和跨运行重试补充最小运行事实字段。"""
+    columns = _table_columns(conn, "cron_runs")
+    additions = (
+        ("root_run_id", "TEXT"),
+        ("attempt_number", "INTEGER NOT NULL DEFAULT 1"),
+        ("retry_due_at", "REAL"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE cron_runs ADD COLUMN {name} {definition}")
+    artifact_columns = _table_columns(conn, "cron_run_artifacts")
+    for name, definition in (
+        ("preparation_error_type", "TEXT"),
+        ("preparation_retryable", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in artifact_columns:
+            conn.execute(
+                f"ALTER TABLE cron_run_artifacts ADD COLUMN {name} {definition}"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cron_runs_delivery_prepare "
+        "ON cron_runs(delivery_status, updated_at, run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cron_runs_retry_due "
+        "ON cron_runs(status, retry_due_at, run_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_retry_attempt "
+        "ON cron_runs(root_run_id, attempt_number) WHERE root_run_id IS NOT NULL"
+    )
     for name, definition in additions:
         if name not in columns:
             conn.execute(f"ALTER TABLE cron_jobs ADD COLUMN {name} {definition}")
@@ -2390,6 +2443,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
             conn.commit()
             current = 24
 
+    if current < 25:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v24_to_v25(conn)
+            _set_schema_version(conn, 25)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 25
+
     return current
 
 
@@ -2684,7 +2749,8 @@ _CRON_RUN_COLUMNS = """
     run_id, job_id, scheduled_for, claimed_at, started_at, finished_at,
     execution_instance_id, claim_lease_name, claim_instance_id, claim_epoch,
     status, error_type, result_summary,
-    artifacts_json, delivery_status, delivery_ref_json, created_at, updated_at
+    artifacts_json, delivery_status, delivery_ref_json, root_run_id,
+    attempt_number, retry_due_at, created_at, updated_at
 """
 
 
@@ -3404,6 +3470,67 @@ def create_manual_cron_run(conn: sqlite3.Connection, job_id: str, run_id: str) -
     return run
 
 
+def create_cron_retry_run(
+    conn: sqlite3.Connection,
+    previous_run_id: str,
+    run_id: str,
+    retry_due_at: float,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> dict:
+    """为一次可重试失败追加新的运行事实，不覆盖原失败记录或任务计划。"""
+    try:
+        due = float(retry_due_at)
+    except (TypeError, ValueError) as exc:
+        raise DBError("Cron retry_due_at must be a timestamp") from exc
+    if not math.isfinite(due):
+        raise DBError("Cron retry_due_at must be finite")
+    fence = _cron_run_fence_values(lease_name, instance_id, lease_epoch)
+    now = time.time()
+    with _immediate_transaction(conn):
+        if not gateway_runtime_lease_is_valid(conn, *fence, now=now):
+            raise DBError("Cron retry lease is no longer valid")
+        previous = get_cron_run(conn, previous_run_id)
+        if previous is None or previous["status"] != "failed":
+            raise DBError("Cron retry requires a failed run")
+        if (
+            previous["claim_lease_name"], previous["claim_instance_id"], previous["claim_epoch"]
+        ) != fence:
+            raise DBError("Cron retry run no longer belongs to this lease")
+        job = get_cron_job(conn, previous["job_id"])
+        if job is None or job.get("deleted_at") is not None:
+            raise DBError("Cron retry job is unavailable")
+        root_run_id = str(previous.get("root_run_id") or previous["run_id"])
+        attempt = int(previous.get("attempt_number") or 1) + 1
+        try:
+            conn.execute(
+                """
+                INSERT INTO cron_runs (
+                    run_id, job_id, scheduled_for, claimed_at, started_at,
+                    finished_at, execution_instance_id, claim_lease_name,
+                    claim_instance_id, claim_epoch, status, error_type,
+                    result_summary, artifacts_json, delivery_status,
+                    delivery_ref_json, root_run_id, attempt_number, retry_due_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL,
+                          'claimed', NULL, NULL, '[]', 'not_requested', NULL,
+                          ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id, previous["job_id"], due, now,
+                    f"retry-request-{run_id}", root_run_id, attempt, due, now, now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DBError("Cron retry run identity already exists") from exc
+    run = get_cron_run(conn, run_id)
+    if run is None:
+        raise DBError("Cron retry run could not be read back")
+    return run
+
+
 def list_unclaimed_manual_cron_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict]:
     """读取尚未归属任何 Gateway lease 的手工运行请求。"""
     rows = conn.execute(
@@ -3411,13 +3538,14 @@ def list_unclaimed_manual_cron_runs(conn: sqlite3.Connection, *, limit: int = 20
         SELECT {_CRON_RUN_COLUMNS}
         FROM cron_runs AS run
         WHERE run.status='claimed' AND run.claim_lease_name IS NULL
+          AND (run.retry_due_at IS NULL OR run.retry_due_at <= ?)
           AND EXISTS (
               SELECT 1 FROM cron_jobs AS job
               WHERE job.job_id=run.job_id AND job.deleted_at IS NULL
           )
         ORDER BY run.claimed_at, run.run_id LIMIT ?
         """,
-        (max(1, int(limit)),),
+        (time.time(), max(1, int(limit))),
     ).fetchall()
     return [item for row in rows if (item := _cron_run_row(row)) is not None]
 
@@ -3755,7 +3883,8 @@ def _cron_run_row(row) -> dict | None:
             "finished_at", "execution_instance_id", "claim_lease_name",
             "claim_instance_id", "claim_epoch", "status", "error_type",
             "result_summary", "artifacts_json", "delivery_status",
-            "delivery_ref_json", "created_at", "updated_at",
+        "delivery_ref_json", "root_run_id", "attempt_number", "retry_due_at",
+        "created_at", "updated_at",
         ),
         row,
     ))
@@ -3852,6 +3981,8 @@ def transition_cron_run(
         raise DBError("Cron artifacts must be a list or null")
     if delivery_status is not None and not isinstance(delivery_status, str):
         raise DBError("Cron delivery_status must be a string or null")
+    if delivery_status is not None and delivery_status not in CRON_DELIVERY_STATUSES:
+        raise DBError("invalid Cron delivery_status")
     if delivery_ref is not None and not isinstance(delivery_ref, dict):
         raise DBError("Cron delivery_ref must contain an object or null")
     fence_values = (lease_name, instance_id, lease_epoch)
@@ -3975,6 +4106,10 @@ def create_cron_run_artifact(conn: sqlite3.Connection, artifact: dict) -> dict:
     if size_bytes <= 0:
         raise DBError("Cron artifact size_bytes must be positive")
     delivery_status = str(artifact.get("delivery_status", "not_requested"))
+    preparation_error_type = artifact.get("preparation_error_type")
+    if preparation_error_type is not None and not isinstance(preparation_error_type, str):
+        raise DBError("Cron artifact preparation_error_type must be a string or null")
+    preparation_retryable = bool(artifact.get("preparation_retryable", False))
     delivery_id = artifact.get("delivery_id")
     if delivery_id is not None and not isinstance(delivery_id, str):
         raise DBError("Cron artifact delivery_id must be a string or null")
@@ -3984,17 +4119,21 @@ def create_cron_run_artifact(conn: sqlite3.Connection, artifact: dict) -> dict:
             """
             INSERT INTO cron_run_artifacts (
                 artifact_id, run_id, display_name, local_path, size_bytes,
-                sha256, delivery_id, delivery_status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sha256, delivery_id, delivery_status, preparation_error_type,
+                preparation_retryable, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(artifact_id) DO UPDATE SET
                 delivery_id=excluded.delivery_id,
                 delivery_status=excluded.delivery_status,
+                preparation_error_type=excluded.preparation_error_type,
+                preparation_retryable=excluded.preparation_retryable,
                 updated_at=excluded.updated_at
             """,
             (
                 artifact["artifact_id"], artifact["run_id"],
                 artifact["display_name"], artifact["local_path"], size_bytes,
-                artifact["sha256"], delivery_id, delivery_status, now, now,
+                artifact["sha256"], delivery_id, delivery_status,
+                preparation_error_type, int(preparation_retryable), now, now,
             ),
         )
     return get_cron_run_artifact(conn, str(artifact["artifact_id"])) or {}
@@ -4005,7 +4144,8 @@ def get_cron_run_artifact(conn: sqlite3.Connection, artifact_id: str) -> dict | 
     row = conn.execute(
         """
         SELECT artifact_id, run_id, display_name, local_path, size_bytes,
-               sha256, delivery_id, delivery_status, created_at, updated_at
+               sha256, delivery_id, delivery_status, preparation_error_type,
+               preparation_retryable, created_at, updated_at
         FROM cron_run_artifacts WHERE artifact_id=?
         """,
         (artifact_id,),
@@ -4017,8 +4157,9 @@ def get_cron_run_artifact(conn: sqlite3.Connection, artifact_id: str) -> dict | 
         "display_name": str(row[2]), "local_path": str(row[3]),
         "size_bytes": int(row[4]), "sha256": str(row[5]),
         "delivery_id": str(row[6]) if row[6] is not None else None,
-        "delivery_status": str(row[7]), "created_at": float(row[8]),
-        "updated_at": float(row[9]),
+        "delivery_status": str(row[7]), "preparation_error_type": row[8],
+        "preparation_retryable": bool(row[9]), "created_at": float(row[10]),
+        "updated_at": float(row[11]),
     }
 
 
@@ -4066,6 +4207,191 @@ def update_cron_run_delivery(
             ),
         )
         return cursor.rowcount == 1
+
+
+def list_cron_delivery_preparation_candidates(
+    conn: sqlite3.Connection,
+    *,
+    stale_after_seconds: float = 120.0,
+    limit: int = 20,
+) -> list[dict]:
+    """读取待准备或已由失效实例遗留的 Cron 投递，不触碰 Agent 执行终态。"""
+    now = time.time()
+    stale_before = now - max(1.0, float(stale_after_seconds))
+    rows = conn.execute(
+        f"""
+        SELECT {_CRON_RUN_COLUMNS}
+        FROM cron_runs
+        WHERE status IN ('completed', 'failed', 'blocked', 'cancelled')
+          AND (
+              delivery_status='preparation_pending'
+              OR (delivery_status='preparing' AND updated_at <= ?)
+          )
+        ORDER BY updated_at, run_id LIMIT ?
+        """,
+        (stale_before, max(1, int(limit))),
+    ).fetchall()
+    return [item for row in rows if (item := _cron_run_row(row)) is not None]
+
+
+def claim_cron_delivery_preparation(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    stale_after_seconds: float,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> dict:
+    """以当前 runtime lease 原子领取投递准备；旧 preparing 仅在超时后可恢复。"""
+    fence = _cron_run_fence_values(lease_name, instance_id, lease_epoch)
+    now = time.time()
+    stale_before = now - max(1.0, float(stale_after_seconds))
+    with _immediate_transaction(conn):
+        if not gateway_runtime_lease_is_valid(conn, *fence, now=now):
+            return {"outcome": "lease_lost"}
+        current = get_cron_run(conn, run_id)
+        if current is None:
+            return {"outcome": "not_found"}
+        if current["delivery_status"] == "preparation_pending":
+            eligible = True
+        elif current["delivery_status"] == "preparing" and float(current["updated_at"]) <= stale_before:
+            eligible = True
+        else:
+            eligible = False
+        if not eligible:
+            return {"outcome": "not_pending"}
+        reference = dict(current.get("delivery_ref") or {})
+        reference["preparation_claim"] = {
+            "lease_name": fence[0], "instance_id": fence[1], "lease_epoch": fence[2],
+        }
+        changed = conn.execute(
+            """
+            UPDATE cron_runs SET delivery_status='preparing', delivery_ref_json=?, updated_at=?
+            WHERE run_id=? AND delivery_status=?
+            """,
+            (
+                _serialize_cron_json(reference, "delivery_ref"), now, run_id,
+                current["delivery_status"],
+            ),
+        ).rowcount
+        if changed != 1:
+            return {"outcome": "lost_claim"}
+        job = get_cron_job(conn, current["job_id"])
+    claimed = get_cron_run(conn, run_id)
+    if claimed is None or job is None:
+        raise DBError("Cron delivery preparation claim could not be read back")
+    return {"outcome": "claimed", "run": claimed, "job": job}
+
+
+def finish_cron_delivery_preparation(
+    conn: sqlite3.Connection,
+    run_id: str,
+    delivery_status: str,
+    delivery_ref: dict,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> bool:
+    """只有领取准备的当前 lease 可以结束准备，避免旧实例覆盖新实例。"""
+    if delivery_status not in CRON_DELIVERY_STATUSES - {"preparation_pending", "preparing"}:
+        raise DBError("invalid completed Cron delivery status")
+    if not isinstance(delivery_ref, dict):
+        raise DBError("Cron delivery_ref must contain an object")
+    fence = _cron_run_fence_values(lease_name, instance_id, lease_epoch)
+    now = time.time()
+    with _immediate_transaction(conn):
+        if not gateway_runtime_lease_is_valid(conn, *fence, now=now):
+            return False
+        current = get_cron_run(conn, run_id)
+        if current is None or current["delivery_status"] != "preparing":
+            return False
+        claim = dict(current.get("delivery_ref") or {}).get("preparation_claim")
+        if not isinstance(claim, dict) or (
+            claim.get("lease_name"), claim.get("instance_id"), claim.get("lease_epoch")
+        ) != fence:
+            return False
+        changed = conn.execute(
+            """
+            UPDATE cron_runs SET delivery_status=?, delivery_ref_json=?, updated_at=?
+            WHERE run_id=? AND delivery_status='preparing'
+            """,
+            (delivery_status, _serialize_cron_json(delivery_ref, "delivery_ref"), now, run_id),
+        ).rowcount
+        return changed == 1
+
+
+def refresh_cron_delivery_statuses(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    limit: int = 50,
+) -> int:
+    """汇总已准备文本和文件的实际投递终态，不改变对应 Agent 运行结果。"""
+    fence = _cron_run_fence_values(lease_name, instance_id, lease_epoch)
+    now = time.time()
+    changed_count = 0
+    with _immediate_transaction(conn):
+        if not gateway_runtime_lease_is_valid(conn, *fence, now=now):
+            return 0
+        rows = conn.execute(
+            f"""
+            SELECT {_CRON_RUN_COLUMNS} FROM cron_runs
+            WHERE delivery_status IN ('pending', 'partial_failed')
+            ORDER BY updated_at, run_id LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        for row in rows:
+            run = _cron_run_row(row)
+            if run is None:
+                continue
+            reference = dict(run.get("delivery_ref") or {})
+            ids = [str(value) for value in reference.get("outbox_ids", [])]
+            file_ids = [str(value) for value in reference.get("file_delivery_ids", [])]
+            states: list[str] = []
+            for outbox_id in ids:
+                item = conn.execute(
+                    "SELECT status FROM gateway_outbox WHERE id=?", (outbox_id,)
+                ).fetchone()
+                if item is not None:
+                    states.append(str(item[0]))
+            for delivery_id in file_ids:
+                item = conn.execute(
+                    "SELECT status FROM gateway_file_deliveries WHERE id=?", (delivery_id,)
+                ).fetchone()
+                if item is not None:
+                    states.append(str(item[0]))
+            if not states:
+                continue
+            successful = sum(state == "delivered" for state in states)
+            failed = sum(state in {"permanent_failed", "cancelled"} for state in states)
+            unfinished = len(states) - successful - failed
+            if unfinished:
+                target = "partial_failed" if successful and failed else "pending"
+            elif failed and successful:
+                target = "partial_failed"
+            elif failed:
+                target = "permanent_failed"
+            else:
+                target = "delivered"
+            if target == run["delivery_status"]:
+                continue
+            reference["delivered_count"] = successful
+            reference["delivery_failed_count"] = failed
+            cursor = conn.execute(
+                "UPDATE cron_runs SET delivery_status=?, delivery_ref_json=?, updated_at=? "
+                "WHERE run_id=? AND delivery_status=?",
+                (
+                    target, _serialize_cron_json(reference, "delivery_ref"), now,
+                    run["run_id"], run["delivery_status"],
+                ),
+            )
+            changed_count += cursor.rowcount
+    return changed_count
 
 
 def _parse_legacy_cron_timestamp(value) -> float:

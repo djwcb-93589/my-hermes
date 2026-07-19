@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import threading
 import time
 import uuid
@@ -16,6 +17,7 @@ from hermes.db import (
     advance_due_cron_job_without_run,
     claim_manual_cron_run,
     claim_due_cron_job_run,
+    create_cron_retry_run,
     list_due_cron_jobs,
     list_unclaimed_manual_cron_runs,
     transition_cron_run,
@@ -71,6 +73,49 @@ class GatewayCronScheduler:
         self._tick_lock = asyncio.Lock()
         self._wakeup = asyncio.Event()
         self._accepting = False
+
+    async def _schedule_retry_if_eligible(
+        self,
+        job: CronJob,
+        run: CronRun,
+        result: object,
+    ) -> None:
+        """仅为明确的暂时性 Agent 故障追加重试运行，不改变正常计划窗口。"""
+        if str(getattr(result, "status", "")) != "failed":
+            return
+        if not bool(getattr(result, "retryable", False)):
+            return
+        policy = dict(job.retry_policy or {})
+        max_attempts = int(policy.get("max_attempts", 1))
+        error_type = str(getattr(result, "error_type", "") or "")
+        allowed = set(policy.get("retryable_error_types", ()))
+        transient = {
+            "model_service_unavailable", "model_timeout", "infrastructure_error",
+            "model_error", "network_or_timeout", "rate_limit", "server_error",
+        }
+        if (max_attempts <= int(run.attempt_number)
+                or error_type not in transient
+                or error_type not in allowed):
+            return
+        base = max(0.0, float(policy.get("base_delay_seconds", 5.0)))
+        maximum = max(base, float(policy.get("max_delay_seconds", 300.0)))
+        jitter_ratio = min(1.0, max(0.0, float(policy.get("jitter_ratio", 0.2))))
+        delay = min(maximum, base * (2 ** max(0, int(run.attempt_number) - 1)))
+        delay += random.uniform(-delay * jitter_ratio, delay * jitter_ratio)
+        fence = self._lease_fence_provider()
+        if fence is None or not self._lease_is_valid():
+            return
+        try:
+            await self._persistence.call(
+                create_cron_retry_run,
+                run.run_id,
+                uuid.uuid4().hex,
+                time.time() + max(0.0, delay),
+                **fence,
+            )
+            self._wakeup.set()
+        except Exception as exc:
+            print("  [gateway:cron] retry scheduling failed: " f"{type(exc).__name__}")
 
     def start(self) -> None:
         """lease 有效且 Gateway 已进入 running 后启动唯一调度循环。"""
@@ -167,7 +212,11 @@ class GatewayCronScheduler:
         if job.one_shot:
             return None, True
         after = job.next_fire if job.misfire_policy == "catch_up" else now
-        next_fire = next_schedule_fire(job.schedule, float(after))
+        next_fire = next_schedule_fire(
+            job.schedule,
+            float(after),
+            timezone_name=job.timezone,
+        )
         return next_fire, False
 
     async def _claim_one(self, record: dict, fence: dict) -> None:
@@ -255,6 +304,7 @@ class GatewayCronScheduler:
                             "  [gateway:cron] delivery preparation failed: "
                             f"{type(exc).__name__}"
                         )
+                await self._schedule_retry_if_eligible(job, run, result)
         except asyncio.CancelledError:
             cancel_event.set()
             raise

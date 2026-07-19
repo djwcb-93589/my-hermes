@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +18,23 @@ from hermes.approval_policy import classify_terminal_command
 CRON_CAPABILITY_POLICY_VERSION = 1
 _RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 _WRITE_ACTIONS = frozenset({"write", "append", "replace", "delete", "move"})
+_TERMINAL_BOUNDARY_FIELDS = frozenset({
+    "terminal_allowed_executables",
+    "terminal_allow_shell_operators",
+    "terminal_allow_redirection",
+    "terminal_allow_background",
+    "terminal_allow_network",
+    "terminal_allowed_workdirs",
+})
+_NETWORK_EXECUTABLES = frozenset({
+    "curl", "wget", "ftp", "sftp", "scp", "ssh", "telnet", "nc",
+    "ncat", "netcat", "ping", "tracert", "traceroute",
+    "invoke-webrequest", "invoke-restmethod",
+})
+_NETWORK_ARGUMENT_RE = re.compile(r"(?:https?://|ftp://|\b(?:ssh|tcp|udp)://)", re.IGNORECASE)
+_SHELL_OPERATOR_RE = re.compile(r"(?:\r|\n|&&|\|\||[;|`]|\$\(|\$\{|\b(?:if|then|fi|for|while|do|done)\b)")
+_REDIRECTION_RE = re.compile(r"(?:\d?>>?|<<|&>)")
+_BACKGROUND_RE = re.compile(r"(?<!&)&(?!&)|\b(?:nohup|start|start-process)\b", re.IGNORECASE)
 
 
 def _canonical(value: Any) -> str:
@@ -40,6 +59,56 @@ def _normalise_target(value: Any) -> dict:
     return {key: str(value[key]) for key in allowed if value.get(key) not in (None, "")}
 
 
+def _normalise_terminal_executables(value: Any) -> list[str]:
+    """将终端可执行文件收敛为简单名称，避免路径形式绕过授权比较。"""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError("terminal_allowed_executables must be a list of non-empty strings")
+    names: set[str] = set()
+    for item in value:
+        name = item.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not name or name in {".", ".."}:
+            raise ValueError("terminal_allowed_executables contains an invalid executable")
+        names.add(name)
+    return sorted(names)
+
+
+def _normalise_terminal_workdirs(value: Any, workdir: str) -> list[str]:
+    """固定终端工作目录授权；此检查不是 Local Terminal 的沙箱。"""
+    if value is None:
+        return [workdir]
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError("terminal_allowed_workdirs must be a list of non-empty paths")
+    return sorted({_normalise_path(item) for item in value})
+
+
+def _terminal_scope(spec: dict, workdir: str) -> dict:
+    """构造可持久化、可比较的终端最小权限约束。"""
+    def enabled(name: str) -> bool:
+        value = spec.get(name, False)
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean")
+        return value
+
+    return {
+        "terminal_allowed_executables": _normalise_terminal_executables(
+            spec.get("terminal_allowed_executables")
+        ),
+        "terminal_allow_shell_operators": enabled("terminal_allow_shell_operators"),
+        "terminal_allow_redirection": enabled("terminal_allow_redirection"),
+        "terminal_allow_background": enabled("terminal_allow_background"),
+        "terminal_allow_network": enabled("terminal_allow_network"),
+        "terminal_allowed_workdirs": _normalise_terminal_workdirs(
+            spec.get("terminal_allowed_workdirs"), workdir
+        ),
+    }
+
+
 def build_capability_scope(job: Any) -> dict:
     """从任务定义建立可比较的最小能力快照。"""
     spec = dict(getattr(job, "capability_spec", {}) or {})
@@ -53,6 +122,7 @@ def build_capability_scope(job: Any) -> dict:
     max_risk = str(spec.get("terminal_risk_max", "high")).lower()
     if max_risk not in {"low", "medium", "high"}:
         raise ValueError("Cron terminal_risk_max is invalid")
+    terminal = _terminal_scope(spec, workdir)
 
     delivery_config = dict(getattr(job, "delivery_config", {}) or {})
     artifact_policy = dict(getattr(job, "artifact_policy", {}) or {})
@@ -65,11 +135,13 @@ def build_capability_scope(job: Any) -> dict:
         "policy_version": CRON_CAPABILITY_POLICY_VERSION,
         "prompt_digest": hashlib.sha256(str(job.prompt).encode("utf-8")).hexdigest(),
         "toolsets": sorted({str(item) for item in getattr(job, "toolsets", [])}),
+        "skills": sorted({str(item) for item in getattr(job, "skills", [])}),
         "execution_environments": ["cron"],
         "workdir": workdir,
         "allowed_roots": allowed_roots,
         "artifact_root": artifact_root,
         "terminal_risk_max": max_risk,
+        **terminal,
         "allow_file_write": bool(spec.get("allow_file_write", False)),
         "delivery_target": delivery_target,
         "delivery_config_digest": _digest(delivery_config),
@@ -95,9 +167,16 @@ def capability_change_requires_reauthorization(previous: Any, current: Any) -> b
     protected = (
         "prompt_digest",
         "toolsets",
+        "skills",
         "workdir",
         "allowed_roots",
         "terminal_risk_max",
+        "terminal_allowed_executables",
+        "terminal_allow_shell_operators",
+        "terminal_allow_redirection",
+        "terminal_allow_background",
+        "terminal_allow_network",
+        "terminal_allowed_workdirs",
         "allow_file_write",
         "delivery_target",
         "delivery_config_digest",
@@ -117,9 +196,13 @@ def build_cron_capability_grant(
     creator_id: str,
     allowed_tool_names: set[str] | list[str],
     approval_id: str | None = None,
+    scope: dict | None = None,
 ) -> dict:
     """构造持久 Cron grant；审计仅保存摘要和能力标识。"""
-    scope = build_capability_scope(job)
+    expected_scope = build_capability_scope(job)
+    scope = dict(scope or expected_scope)
+    if scope != expected_scope:
+        raise ValueError("Cron capability scope does not match the task definition")
     return {
         "grant_id": str(uuid.uuid4()),
         "job_id": scope["job_id"],
@@ -150,10 +233,24 @@ def validate_cron_capability_grant(job: Any, grant: dict | None, *, resolved_too
         return "policy_version_mismatch"
     if grant.get("prompt_digest") != expected["prompt_digest"]:
         return "prompt_digest_mismatch"
-    if grant.get("capability_fingerprint") != capability_fingerprint(expected):
-        return "capability_mismatch"
     if scope != expected:
-        return "scope_mismatch"
+        # 旧数据库中的非 Terminal grant 没有新增字段，保留其原有只读边界；
+        # 历史 Terminal grant 必须重新授权，不能用缺少可执行文件白名单的记录继续运行。
+        legacy_expected = {
+            key: value for key, value in expected.items()
+            if key not in _TERMINAL_BOUNDARY_FIELDS
+        }
+        legacy_compatible = (
+            "terminal" not in set(expected.get("toolsets", []))
+            and not (_TERMINAL_BOUNDARY_FIELDS & set(scope))
+            and scope == legacy_expected
+            and grant.get("capability_fingerprint")
+            == capability_fingerprint(legacy_expected)
+        )
+        if not legacy_compatible:
+            return "scope_mismatch"
+    elif grant.get("capability_fingerprint") != capability_fingerprint(expected):
+        return "capability_mismatch"
     allowed_names = {str(name) for name in grant.get("allowed_tool_names", [])}
     if not allowed_names or not allowed_names.issubset(resolved_tool_names):
         return "tool_declaration_mismatch"
@@ -199,13 +296,59 @@ class CronCapabilityGuard:
             return self._deny(tool_name, "tool_not_granted")
         return None
 
-    def authorize_terminal(self, command: str) -> dict | None:
+    def authorize_skill(self, name: object) -> dict | None:
+        """Cron 只能读取任务显式预加载的 Skill，不能借由 Skill 名称扩大能力。"""
+        if not isinstance(name, str) or name not in set(self._scope.get("skills", [])):
+            return self._deny("skill_view", "skill_not_granted")
+        return None
+
+    def authorize_terminal(self, command: str, *, cwd: str | None = None) -> dict | None:
+        """在 backend 执行前检查 Cron 明确授予的单命令终端边界。"""
         denied = self.authorize_tool("terminal")
         if denied:
             return denied
         risk = str(classify_terminal_command(command).risk_level.value).lower()
         if _RISK_ORDER.get(risk, _RISK_ORDER["critical"]) > _RISK_ORDER[self._scope["terminal_risk_max"]]:
             return self._deny("terminal", "terminal_risk_exceeded")
+        if _SHELL_OPERATOR_RE.search(command) and not bool(
+            self._scope.get("terminal_allow_shell_operators")
+        ):
+            return self._deny("terminal", "terminal_shell_operator_not_granted")
+        if _REDIRECTION_RE.search(command) and not bool(
+            self._scope.get("terminal_allow_redirection")
+        ):
+            return self._deny("terminal", "terminal_redirection_not_granted")
+        if _BACKGROUND_RE.search(command) and not bool(
+            self._scope.get("terminal_allow_background")
+        ):
+            return self._deny("terminal", "terminal_background_not_granted")
+        try:
+            argv = shlex.split(command, posix=False)
+        except ValueError:
+            return self._deny("terminal", "terminal_command_not_auditable")
+        if not argv:
+            return self._deny("terminal", "terminal_command_not_auditable")
+        executable = argv[0].strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if executable not in set(self._scope.get("terminal_allowed_executables", [])):
+            return self._deny("terminal", "terminal_executable_not_granted")
+        git_network_action = executable == "git" and any(
+            item.lower() in {"clone", "fetch", "pull", "push", "ls-remote"}
+            for item in argv[1:3]
+        )
+        if (
+            (executable in _NETWORK_EXECUTABLES or git_network_action or _NETWORK_ARGUMENT_RE.search(command))
+            and not bool(self._scope.get("terminal_allow_network"))
+        ):
+            return self._deny("terminal", "terminal_network_not_granted")
+        try:
+            actual_cwd = _normalise_path(cwd or self._scope["workdir"])
+            if not any(
+                Path(actual_cwd).is_relative_to(Path(root).resolve())
+                for root in self._scope.get("terminal_allowed_workdirs", [])
+            ):
+                return self._deny("terminal", "terminal_workdir_not_granted")
+        except (OSError, ValueError):
+            return self._deny("terminal", "terminal_workdir_not_granted")
         return None
 
     def authorize_file(self, action: str, path: str) -> dict | None:

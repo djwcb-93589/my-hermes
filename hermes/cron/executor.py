@@ -35,6 +35,7 @@ from hermes.db import (
     transition_cron_run,
 )
 from hermes.prompt import build_system_prompt
+from hermes.tools.skill import handle_skill_view
 from hermes.tools import (
     ExecutionEnvironment,
     ToolPolicy,
@@ -78,6 +79,7 @@ class CronExecutionResult:
     error: str | None = None
     timed_out: bool = False
     cancelled: bool = False
+    retryable: bool = False
 
 
 def _cron_session_id(job_id: str, run_id: str) -> str:
@@ -132,6 +134,64 @@ def _artifact_limits_exceeded(artifact_dir: str, grant: dict) -> bool:
     except OSError:
         return True
     return False
+
+
+def _load_cron_skills(job: CronJob) -> str:
+    """在启动循环前验证并装载任务明确允许的 Skill，不依赖模型临时发现。"""
+    if not job.skills:
+        return ""
+    sections: list[str] = []
+    for name in job.skills:
+        response = handle_skill_view(
+            {"name": name},
+            interactive_approval=False,
+        )
+        try:
+            payload = json.loads(response)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Cron skill could not be loaded") from exc
+        if not payload.get("ok") or not isinstance(payload.get("body"), str):
+            raise ValueError("Cron skill is unavailable")
+        sections.append(f"## Preloaded Skill: {payload.get('name', name)}\n{payload['body']}")
+    return "\n\n".join(sections)
+
+
+def _delivery_preparation_status(job: CronJob, status: str) -> str:
+    """判断执行终态是否需要由 Gateway 后续持久准备投递。"""
+    policy = str(dict(job.delivery_config or {}).get("policy", "text")).strip().lower()
+    if policy in {"silent", "none"}:
+        return "not_requested"
+    if policy == "failure_only" and status == "completed":
+        return "not_requested"
+    return "preparation_pending"
+
+
+def _terminal_outcome(loop_result, *, timed_out: bool, cancelled: bool, guard: CronCapabilityGuard, artifact_limit: bool) -> tuple[str, str | None, str, str | None]:
+    """单点决定 Cron 的用户可见终态，非完成状态绝不采用模型自述。"""
+    if artifact_limit:
+        return (
+            "blocked", "cron_artifact_limit_exceeded",
+            "Cron artifact limits were exceeded. Update the task or request authorization again.",
+            "cron_artifact_limit_exceeded",
+        )
+    if guard.violation is not None:
+        return (
+            "blocked", "cron_capability_denied",
+            "Cron capability authorization does not permit a requested operation. Update the task or request authorization again.",
+            "cron_capability_denied",
+        )
+    if loop_result.ok:
+        return "completed", None, str(loop_result.summary or ""), None
+    if timed_out:
+        return "cancelled", "timeout", "Cron task timed out before completion.", "timeout"
+    if cancelled or loop_result.status == "cancelled":
+        return "cancelled", "cancelled", "Cron task was cancelled before completion.", "cancelled"
+    return (
+        "failed",
+        str(loop_result.error_type or loop_result.status or "cron_execution_failed"),
+        "Cron task failed before completion. Review the run history and retry the task if appropriate.",
+        str(loop_result.error_type or loop_result.status or "cron_execution_failed"),
+    )
 
 
 class CronExecutor:
@@ -221,6 +281,7 @@ class CronExecutor:
         summary: str,
         error_type: str | None,
         artifacts: list[dict] | None = None,
+        delivery_status: str | None = None,
     ) -> None:
         """将执行结论原子写回独立运行事实。"""
         transition_cron_run(
@@ -230,6 +291,7 @@ class CronExecutor:
             error_type=error_type,
             result_summary=summary[:8000],
             artifacts=artifacts or [],
+            delivery_status=delivery_status,
             **self._lease_fence,
         )
 
@@ -259,6 +321,7 @@ class CronExecutor:
                     status="blocked",
                     summary=summary,
                     error_type="cron_capability_grant_invalid",
+                    delivery_status=_delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
@@ -269,13 +332,14 @@ class CronExecutor:
             try:
                 context = self._build_context(job, run, deadline=deadline, grant=grant or {})
             except ValueError as exc:
-                summary = str(exc)
+                summary = "Cron execution context is invalid. Update the task configuration and try again."
                 self._write_terminal_result(
                     conn,
                     run.run_id,
                     status="blocked",
                     summary=summary,
                     error_type="invalid_execution_context",
+                    delivery_status=_delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
@@ -307,10 +371,11 @@ class CronExecutor:
                     status="blocked",
                     summary=summary,
                     error_type="cron_capability_grant_invalid",
+                    delivery_status=_delivery_preparation_status(job, "blocked"),
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
-                    0, (), (), "cron_capability_grant_invalid", validation_error,
+                    0, (), (), "cron_capability_grant_invalid", "cron_capability_grant_invalid",
                 )
             allowed_tool_names = set(grant["allowed_tool_names"])
             guarded_definitions = tuple(
@@ -335,13 +400,38 @@ class CronExecutor:
 
             ensure_session(conn, session_id, source="cron")
             add_messages(conn, session_id, [{"role": "user", "content": job.prompt}])
+            try:
+                preloaded_skills = _load_cron_skills(job)
+            except ValueError:
+                summary = "A configured Cron skill is unavailable. Update the task or choose an available skill."
+                self._write_terminal_result(
+                    conn,
+                    run.run_id,
+                    status="blocked",
+                    summary=summary,
+                    error_type="cron_skill_unavailable",
+                    delivery_status=_delivery_preparation_status(job, "blocked"),
+                )
+                return CronExecutionResult(
+                    job.job_id, run.run_id, session_id, "blocked", summary,
+                    0, (), (), "cron_skill_unavailable", "cron_skill_unavailable",
+                )
             loop = ConversationAgentLoop(
                 model=MODEL,
                 max_iterations=job.max_agent_iterations,
                 tools=list(guarded_definitions),
                 system_prompt=build_system_prompt(
                     context.workdir,
-                    enabled_toolsets=sorted(resolution.toolsets),
+                    enabled_toolsets=sorted(
+                        toolset for toolset in resolution.toolsets
+                        if toolset != "skill"
+                    ),
+                ) + (
+                    "\n\n# Cron Execution Context\n"
+                    "This is an unattended task. Follow the trusted execution context; "
+                    "do not create, modify, or delete Cron tasks.\n"
+                    f"Artifact directory: {context.artifact_dir}\n\n"
+                    + ("# Preloaded Skills\n" + preloaded_skills if preloaded_skills else "")
                 ),
                 registry=registry,
                 client=client,
@@ -370,27 +460,13 @@ class CronExecutor:
             timed_out = bool(time.monotonic() >= deadline)
             cancelled = bool(context.cancel_checker and context.cancel_checker())
             artifacts = _result_artifacts(loop_result.messages, context.artifact_dir)
-            if _artifact_limits_exceeded(context.artifact_dir, grant):
-                status = "blocked"
-                error_type = "cron_artifact_limit_exceeded"
-                summary = "Cron capability authorization does not permit the generated artifact size. Update the task or request authorization again."
-            elif guard.violation is not None:
-                status = "blocked"
-                error_type = "cron_capability_denied"
-                summary = "Cron capability authorization does not permit a requested operation. Update the task or request authorization again."
-            elif loop_result.ok:
-                status = "completed"
-                error_type = None
-            elif timed_out:
-                status = "cancelled"
-                error_type = "timeout"
-            elif loop_result.status == "cancelled" or cancelled:
-                status = "cancelled"
-                error_type = loop_result.error_type or "cancelled"
-            else:
-                status = "failed"
-                error_type = loop_result.error_type or loop_result.status
-            summary = loop_result.summary or loop_result.error or ""
+            status, error_type, summary, final_error = _terminal_outcome(
+                loop_result,
+                timed_out=timed_out,
+                cancelled=cancelled,
+                guard=guard,
+                artifact_limit=_artifact_limits_exceeded(context.artifact_dir, grant),
+            )
             self._write_terminal_result(
                 conn,
                 run.run_id,
@@ -398,22 +474,22 @@ class CronExecutor:
                 summary=summary,
                 error_type=error_type,
                 artifacts=artifacts,
+                delivery_status=_delivery_preparation_status(job, status),
             )
             return CronExecutionResult(
                 job_id=job.job_id,
                 run_id=run.run_id,
                 session_id=session_id,
                 status=status,
-                final_response=(
-                    summary if status == "blocked" else loop_result.summary
-                ),
+                final_response=summary,
                 iterations=loop_result.iterations,
                 tools_used=tuple(loop_result.tools_used),
                 artifacts=tuple(artifacts),
                 error_type=error_type,
-                error=(summary if status == "blocked" else loop_result.error),
+                error=final_error,
                 timed_out=timed_out,
                 cancelled=cancelled,
+                retryable=bool(loop_result.retryable and status == "failed"),
             )
         finally:
             if backend_created:
