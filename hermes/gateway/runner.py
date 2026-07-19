@@ -25,6 +25,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from hermes.config import (
     APPROVAL_REQUEST_TTL_SECONDS,
@@ -86,6 +87,7 @@ from hermes.db import (
     reset_gateway_processing_messages,
     reset_gateway_sending_outbox,
     reset_gateway_uploading_file_deliveries,
+    update_cron_run_delivery,
 )
 from hermes.approval_policy import (
     TrustedApprovalGrant,
@@ -95,12 +97,14 @@ from hermes.approval_policy import (
 )
 from hermes.gateway.adapters import BasePlatformAdapter
 from hermes.gateway.file_transfer import load_file_transfer_config
+from hermes.gateway.outbound_delivery import OutboundDeliveryService
 from hermes.gateway.observability import (
     safe_identifier_digest,
     safe_message_digest,
     safe_route_digest,
 )
 from hermes.gateway.persistence import GatewayPersistence
+from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.gateway.session_store import SessionStore
 from hermes.gateway.types import (
     MessageEvent,
@@ -111,6 +115,12 @@ from hermes.gateway.types import (
 )
 from hermes.prompt import build_system_prompt
 from hermes.redaction import redact_explicit_secrets
+from hermes.tools import (
+    ExecutionEnvironment,
+    ToolPolicy,
+    register_all,
+    registry,
+)
 
 
 _GATEWAY_CONTEXT_FIELDS = (
@@ -119,14 +129,6 @@ _GATEWAY_CONTEXT_FIELDS = (
     "include_user_profile",
     "include_project_context",
 )
-_GATEWAY_SUPPORTED_TOOLSETS = frozenset({
-    "terminal",
-    "file",
-    "memory",
-    "skill",
-    "delegate",
-    "messaging",
-})
 _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
     "default": {
         "include_soul": True,
@@ -496,14 +498,17 @@ def _load_gateway_platform_toolsets(
                 "of strings"
             )
 
+        supported_toolsets = registry.toolsets_for_environment(
+            ExecutionEnvironment.GATEWAY
+        )
         normalized: list[str] = []
         for raw_toolset in configured:
             toolset = raw_toolset.strip().lower()
-            if toolset not in _GATEWAY_SUPPORTED_TOOLSETS:
+            if toolset not in supported_toolsets:
                 raise ValueError(
                     f"gateway.platforms.{platform}.toolsets contains "
                     f"unsupported toolset: {raw_toolset!r}; allowed: "
-                    f"{sorted(_GATEWAY_SUPPORTED_TOOLSETS)}"
+                    f"{sorted(supported_toolsets)}"
                 )
             if toolset not in normalized:
                 normalized.append(toolset)
@@ -589,6 +594,8 @@ class GatewayRunner:
     """
 
     def __init__(self, config: dict, db_path: str):
+        # Gateway 的配置校验依赖全局元数据，先完成幂等注册。
+        register_all()
         self.config = config
         self.db_path = db_path
         self.adapters: dict[str, BasePlatformAdapter] = {}
@@ -660,6 +667,22 @@ class GatewayRunner:
             persistence=self.persistence,
         )
         self.max_concurrent_llm_requests = max(1, int(max_concurrent))
+        cron_cfg = gateway_cfg.get("cron", {})
+        if not isinstance(cron_cfg, dict):
+            raise ValueError("gateway.cron must be a mapping")
+        self.cron_poll_seconds = _load_positive_seconds(
+            cron_cfg,
+            "poll_seconds",
+            5.0,
+        )
+        self.cron_max_concurrent = max(
+            1,
+            int(cron_cfg.get("max_concurrent", 1)),
+        )
+        self.cron_misfire_grace_seconds = max(
+            0.0,
+            float(cron_cfg.get("misfire_grace_seconds", 60.0)),
+        )
         self.delivery_max_attempts = max(
             1,
             int(gateway_cfg.get("delivery_max_attempts", 20)),
@@ -686,6 +709,22 @@ class GatewayRunner:
         self._llm_semaphore = asyncio.Semaphore(
             self.max_concurrent_llm_requests
         )
+        self._cron_scheduler = GatewayCronScheduler(
+            self.persistence,
+            self.db_path,
+            llm_semaphore=self._llm_semaphore,
+            lease_fence_provider=self._cron_runtime_fence,
+            lease_is_valid=lambda: self._runtime_lease_valid,
+            poll_seconds=self.cron_poll_seconds,
+            max_concurrent=self.cron_max_concurrent,
+            misfire_grace_seconds=self.cron_misfire_grace_seconds,
+            artifact_root=self.file_transfer_config["download_dir"],
+            execution_finished=self._prepare_cron_delivery,
+        )
+        self.outbound_delivery = OutboundDeliveryService(
+            self.db_path,
+            self.file_transfer_config,
+        )
         self._accepted_messages: set[tuple[str, str]] = set()
         self._startup_message_states: dict[tuple[str, str], dict] = {}
         self._adapter_initialized: dict[str, bool] = {}
@@ -706,6 +745,7 @@ class GatewayRunner:
         self._file_delivery_tasks: dict[str, asyncio.Task] = {}
         self._file_delivery_task_routes: dict[str, str] = {}
         self._file_delivery_wakeup = asyncio.Event()
+        self._system_outbox_tasks: dict[str, asyncio.Task] = {}
         self._lease_shutdown_task: asyncio.Task | None = None
         self._readiness_probe_lock = asyncio.Lock()
         self._readiness_probe_cached_at = 0.0
@@ -750,13 +790,35 @@ class GatewayRunner:
             **context_policy,
         )
 
+    def _tool_policy_for_source(self, source: SessionSource) -> ToolPolicy:
+        """为平台消息构造唯一工具解析策略；Cron 一律无人值守。"""
+        platform = str(source.platform or "").strip().lower()
+        if platform == ExecutionEnvironment.CRON.value:
+            return ToolPolicy(
+                ExecutionEnvironment.CRON,
+                unattended=True,
+            )
+        enabled_toolsets = frozenset(
+            self._gateway_platform_toolsets.get(platform, ())
+        )
+        trusted_context = frozenset(
+            {"gateway_file_delivery"}
+            if "messaging" in enabled_toolsets
+            else ()
+        )
+        return ToolPolicy(
+            ExecutionEnvironment.GATEWAY,
+            enabled_toolsets=enabled_toolsets,
+            trusted_context=trusted_context,
+        )
+
     def _enabled_toolsets_for_source(
         self,
         source: SessionSource,
     ) -> list[str]:
-        """返回来源平台的工具集副本，避免会话修改共享配置。"""
-        platform = str(source.platform or "").strip().lower()
-        return list(self._gateway_platform_toolsets.get(platform, ()))
+        """返回解析后确实会暴露给当前会话的工具集。"""
+        resolution = registry.resolve(self._tool_policy_for_source(source))
+        return sorted(resolution.toolsets)
 
     @staticmethod
     def _is_processing_event(event: MessageEvent) -> bool:
@@ -777,7 +839,7 @@ class GatewayRunner:
 
     async def _mark_processing_best_effort(
         self,
-        event: MessageEvent,
+        event: MessageEvent | None,
     ) -> None:
         if not self._is_processing_event(event):
             return
@@ -1189,6 +1251,20 @@ class GatewayRunner:
             "lease_epoch": self._runtime_lease_epoch,
         }
 
+    def _cron_runtime_fence(self) -> dict | None:
+        """只有持有且本地仍有效的 Gateway lease 才能领取 Cron。"""
+        if (
+            not self._runtime_lease_acquired
+            or not self._runtime_lease_valid
+            or self._runtime_lease_epoch is None
+        ):
+            return None
+        return {
+            "lease_name": self._runtime_lease_name,
+            "instance_id": self._runtime_instance_id,
+            "lease_epoch": self._runtime_lease_epoch,
+        }
+
     def _gateway_tool_context(
         self,
         event: MessageEvent,
@@ -1315,6 +1391,7 @@ class GatewayRunner:
         # 失租等同 shutdown：保留可恢复 Outbox，不把它误标为用户取消。
         for adapter in self.adapters.values():
             adapter.revoke_receiving()
+        self._cron_scheduler.revoke()
         self._signal_all_running_approvals()
         self.sessions.cancel_all(reason="shutdown")
         if (
@@ -1538,8 +1615,170 @@ class GatewayRunner:
                 pass
             raise
 
-    def _build_file_delivery_outbox(self, delivery: dict) -> tuple[dict, MessageEvent]:
+    @staticmethod
+    def _is_cron_delivery(delivery: dict) -> bool:
+        return str(delivery.get("origin_kind", "")) == "cron"
+
+    async def _launch_system_outbox(self, outbox_id: str, route_key: str) -> None:
+        """发送无入站消息归属的 Cron Outbox，不创建会话或伪造用户事件。"""
+        task = self._system_outbox_tasks.get(outbox_id)
+        if task is not None and not task.done():
+            return
+
+        async def deliver() -> None:
+            await self._deliver_outbox(route_key, None, outbox_id)
+
+        task = asyncio.create_task(deliver(), name=f"gateway-system-outbox-{outbox_id}")
+        self._system_outbox_tasks[outbox_id] = task
+        task.add_done_callback(lambda completed, item_id=outbox_id: self._system_outbox_tasks.pop(item_id, None))
+
+    async def _prepare_cron_delivery(self, job, run, result, fence: dict) -> None:
+        """把已结束的 Cron 执行结果写入 Outbox；平台失败不会回滚或重跑 Agent。"""
+        config = dict(job.delivery_config or {})
+        policy = str(config.get("policy", "text")).strip().lower()
+        aliases = {
+            "text": "text", "text_only": "text",
+            "text_and_files": "text_and_files", "text_with_files": "text_and_files",
+            "failure_only": "failure_only", "silent": "silent",
+        }
+        policy = aliases.get(policy, "text")
+        target = config.get("target", config.get("origin", {}))
+        if not isinstance(target, dict) or policy == "silent":
+            await self.persistence.call(
+                update_cron_run_delivery, run.run_id, "not_requested", None, **fence
+            )
+            return
+        platform = str(target.get("platform", "")).strip()
+        chat_id = str(target.get("chat_id", "")).strip()
+        if not platform or not chat_id:
+            await self.persistence.call(
+                update_cron_run_delivery, run.run_id, "invalid_target", None, **fence
+            )
+            return
+        failed = str(result.status) != "completed"
+        if policy == "failure_only" and not failed:
+            await self.persistence.call(
+                update_cron_run_delivery, run.run_id, "not_requested", None, **fence
+            )
+            return
+        adapter = self.adapters.get(platform)
+        if adapter is None:
+            await self.persistence.call(
+                update_cron_run_delivery, run.run_id, "adapter_unavailable", None, **fence
+            )
+            return
+        text = str(result.final_response or "").strip()
+        if not text and failed:
+            text = "Cron task failed without a final response."
+        if not text and policy != "text_and_files":
+            await self.persistence.call(
+                update_cron_run_delivery, run.run_id, "not_requested", None, **fence
+            )
+            return
+
+        route_key = str(target.get("route_key") or f"cron:{platform}:{chat_id}")
+        outbox_ids: list[str] = []
+        if text:
+            outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes:cron:text:{run.run_id}"))
+            system_identity = f"cron-outbox:{run.run_id}:text"
+            outbox = {
+                "id": outbox_id,
+                "route_key": route_key,
+                # 这是 Outbox 的内部幂等键，不是平台 source message ID。
+                "source_message_id": system_identity,
+                "queue_message_id": system_identity,
+                "event_json": json.dumps({"origin_kind": "cron", "run_id": run.run_id}),
+                "platform": platform,
+                "chat_id": chat_id,
+                "reply_to_message_id": None,
+                "thread_id": target.get("thread_id"),
+                "delivery_kind": "cron_text",
+                "payloads": adapter.prepare_outbound(text, delivery_id=outbox_id),
+            }
+            created = await self.persistence.call(enqueue_gateway_outbox, outbox, **fence)
+            outbox_ids.append(created)
+            await self._launch_system_outbox(created, route_key)
+
+        file_delivery_ids: list[str] = []
+        if policy == "text_and_files" and self.file_transfer_config.get("enabled") is True:
+            artifact_dir = Path(self.file_transfer_config["download_dir"]) / "cron-artifacts" / job.job_id / run.run_id
+            candidates: list[tuple[object, bool]] = [
+                (item.get("path") if isinstance(item, dict) else None, False)
+                for item in result.artifacts
+            ]
+            fixed_files = config.get("fixed_files", [])
+            if isinstance(fixed_files, list):
+                candidates.extend((item, True) for item in fixed_files)
+            for index, (path, is_fixed_path) in enumerate(candidates):
+                if not isinstance(path, str):
+                    continue
+                try:
+                    if not is_fixed_path:
+                        self.outbound_delivery.require_artifact_path(path, str(artifact_dir))
+                    snapshot = self.outbound_delivery.capture_file(path)
+                    digest = hashlib.sha256(f"{run.run_id}:{snapshot['abs_path']}".encode("utf-8")).hexdigest()
+                    delivery_id = f"delivery_{digest[:32]}"
+                    artifact_id = f"artifact_{digest[:32]}"
+                    delivery = {
+                        "id": delivery_id, "cron_run_id": run.run_id,
+                        "route_key": route_key, "conversation_id": result.session_id,
+                        "source_message_id": f"cron-file:{run.run_id}:{index}",
+                        "platform": platform, "chat_id": chat_id,
+                        "reply_to_message_id": None, "thread_id": target.get("thread_id"),
+                        "local_path": snapshot["abs_path"], "display_name": snapshot["display_name"],
+                        "size_bytes": snapshot["size_bytes"], "sha256": snapshot["sha256"],
+                    }
+                    self.outbound_delivery.create_cron_artifact_delivery(
+                        artifact={"artifact_id": artifact_id, "run_id": run.run_id,
+                                  "display_name": snapshot["display_name"], "local_path": snapshot["abs_path"],
+                                  "size_bytes": snapshot["size_bytes"], "sha256": snapshot["sha256"]},
+                        delivery=delivery, runtime_fence=fence,
+                    )
+                    file_delivery_ids.append(delivery_id)
+                except Exception as exc:
+                    print("  [gateway:cron] artifact preparation skipped: " f"{type(exc).__name__}")
+        if file_delivery_ids:
+            self._file_delivery_wakeup.set()
+        await self.persistence.call(
+            update_cron_run_delivery,
+            run.run_id,
+            "pending" if outbox_ids or file_delivery_ids else "not_requested",
+            {"outbox_ids": outbox_ids, "file_delivery_ids": file_delivery_ids},
+            **fence,
+        )
+
+    def _build_file_delivery_outbox(self, delivery: dict) -> tuple[dict, MessageEvent | None]:
         """用已持久化 file_key 构造单片 file Outbox，不暴露本地路径。"""
+        if self._is_cron_delivery(delivery):
+            adapter = self.adapters.get(delivery["platform"])
+            prepare_file = getattr(adapter, "prepare_file_outbound", None)
+            if not callable(prepare_file):
+                raise ValueError("file delivery adapter is unsupported")
+            platform_file_key = str(delivery.get("platform_file_key") or "").strip()
+            if not platform_file_key:
+                raise ValueError("file delivery platform key is missing")
+            outbox_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes:cron:file-outbox:{delivery['id']}",
+            ))
+            system_identity = f"cron-file-outbox:{delivery['id']}"
+            return ({
+                "id": outbox_id,
+                "route_key": delivery["route_key"],
+                "source_message_id": system_identity,
+                "queue_message_id": system_identity,
+                "event_json": json.dumps({
+                    "origin_kind": "cron",
+                    "run_id": delivery.get("cron_run_id"),
+                    "delivery_id": delivery["id"],
+                }),
+                "platform": delivery["platform"],
+                "chat_id": delivery["chat_id"],
+                "reply_to_message_id": None,
+                "thread_id": delivery.get("thread_id"),
+                "delivery_kind": f"cron_file:{delivery['id']}",
+                "payloads": prepare_file(platform_file_key, delivery_id=delivery["id"]),
+            }, None)
         source_event = self._deserialize_event(
             str(delivery.get("source_event_json", ""))
         )
@@ -1660,10 +1899,16 @@ class GatewayRunner:
     async def _wake_file_delivery_route(
         self,
         delivery: dict,
-        event: MessageEvent,
+        event: MessageEvent | None,
     ) -> None:
         """持久 Outbox 已提交后唤醒原 route；停机时交给下次启动恢复。"""
         if self._lifecycle_phase != "running":
+            return
+        if event is None:
+            await self._launch_system_outbox(
+                str(delivery.get("outbox_id") or ""),
+                str(delivery["route_key"]),
+            )
             return
         ctx = await self.sessions.get_or_create_async(
             delivery["route_key"],
@@ -1678,6 +1923,15 @@ class GatewayRunner:
         error_code: str,
     ) -> bool:
         """原子持久化永久失败和确定性通知，再唤醒现有 Outbox 调度。"""
+        if self._is_cron_delivery(delivery):
+            failed = await self.persistence.call(
+                fail_gateway_file_delivery,
+                delivery["id"],
+                error_code,
+                None,
+                **self._runtime_fence_kwargs(),
+            )
+            return bool(failed)
         failure_outbox, event = self._build_file_failure_outbox(delivery)
         failed = await self.persistence.call(
             fail_gateway_file_delivery,
@@ -1694,12 +1948,13 @@ class GatewayRunner:
         """在 file_key 边界之后原子创建 Outbox，并唤醒既有 route 调度器。"""
         outbox, event = self._build_file_delivery_outbox(delivery)
         try:
-            await self._durable_file_transition(
+            outbox_id = await self._durable_file_transition(
                 create_gateway_file_delivery_outbox,
                 delivery["id"],
                 outbox,
                 **self._runtime_fence_kwargs(),
             )
+            delivery["outbox_id"] = outbox_id
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1981,6 +2236,7 @@ class GatewayRunner:
                 self._retention_cleanup_task,
                 self._file_delivery_dispatcher_task,
                 *tuple(self._file_delivery_tasks.values()),
+                *tuple(self._system_outbox_tasks.values()),
             )
             if task is not None and task is not current and not task.done()
         ]
@@ -1998,6 +2254,7 @@ class GatewayRunner:
             self._file_delivery_dispatcher_task = None
         self._file_delivery_tasks.clear()
         self._file_delivery_task_routes.clear()
+        self._system_outbox_tasks.clear()
 
     async def _require_startup_runtime_lease(self) -> None:
         """启动阶段一旦失租，等待统一安全停止完成后终止启动。"""
@@ -2046,6 +2303,10 @@ class GatewayRunner:
             finally:
                 self._runtime_lease_acquired = False
                 self._runtime_lease_epoch = None
+
+    async def tick_cron(self) -> None:
+        """供受控手工入口复用同一 lease、claim 与无重入边界。"""
+        await self._cron_scheduler.tick()
 
     async def start(self):
         """按初始化、终态收敛、持久恢复、接收阶段启动 Gateway。"""
@@ -2189,6 +2450,7 @@ class GatewayRunner:
         self._start_session_cleanup()
         self._start_retention_cleanup()
         self._start_file_delivery_dispatcher()
+        self._cron_scheduler.start()
 
     async def stop(self):
         """取消运行中任务,断开 adapter,关闭模型客户端并清理 backend。"""
@@ -2201,6 +2463,7 @@ class GatewayRunner:
             self._lifecycle_phase = "stopping"
             self._accepting_external_messages = False
             self._runtime_lease_valid = False
+            self._cron_scheduler.revoke()
 
             # 先同步关闭所有外部入站资格，不能在等待 worker 时继续落库。
             for name, adapter in self.adapters.items():
@@ -2217,6 +2480,7 @@ class GatewayRunner:
 
             # 入站关闭后再停止 heartbeat / housekeeping 和 route worker。
             self._signal_all_running_approvals()
+            await self._cron_scheduler.stop()
             await self._cancel_background_tasks()
             try:
                 await self.persistence.call(
@@ -2669,13 +2933,13 @@ class GatewayRunner:
         self,
         outbox_id: str,
         route_key: str,
-        event: MessageEvent,
+        source_message_id: str,
     ) -> bool:
         completed = await self.persistence.call(
             complete_gateway_delivery,
             outbox_id,
             route_key,
-            event.message_id,
+            source_message_id,
             **self._runtime_fence_kwargs(),
         )
         if not completed:
@@ -2684,7 +2948,7 @@ class GatewayRunner:
             if not completed and self._runtime_lease_acquired:
                 await self._outbox_send_fence_is_valid_async(outbox_id)
         if completed:
-            self._accepted_messages.discard((route_key, event.message_id))
+            self._accepted_messages.discard((route_key, source_message_id))
         return completed
 
     def _fail_outbox(
@@ -2713,7 +2977,7 @@ class GatewayRunner:
         self,
         outbox_id: str,
         route_key: str,
-        event: MessageEvent,
+        source_message_id: str,
         error: str,
         error_code: str | None,
     ) -> bool:
@@ -2721,7 +2985,7 @@ class GatewayRunner:
             fail_gateway_delivery,
             outbox_id,
             route_key,
-            event.message_id,
+            source_message_id,
             error,
             error_code,
             **self._runtime_fence_kwargs(),
@@ -2836,7 +3100,7 @@ class GatewayRunner:
     def _mark_delivery_failed_without_outbox(
         self,
         route_key: str,
-        event: MessageEvent,
+        event: MessageEvent | None,
     ) -> None:
         """兼容无 Outbox 的嵌入式回复，只保留入站失败审计。"""
         conn = init_db(self.db_path)
@@ -2899,7 +3163,7 @@ class GatewayRunner:
     async def _deliver_outbox(
         self,
         route_key: str,
-        event: MessageEvent,
+        event: MessageEvent | None,
         outbox_id: str,
         ctx=None,
         generation: int | None = None,
@@ -3070,7 +3334,7 @@ class GatewayRunner:
                     delivered = await self._complete_outbox_async(
                         outbox_id,
                         route_key,
-                        event,
+                        outbox["source_message_id"],
                     )
                     if delivered and self._outbox_tracks_processing(outbox):
                         await self._finish_processing_best_effort(
@@ -3104,7 +3368,7 @@ class GatewayRunner:
                 delivered = await self._complete_outbox_async(
                     outbox_id,
                     route_key,
-                    event,
+                    outbox["source_message_id"],
                 )
                 if delivered and self._outbox_tracks_processing(outbox):
                     await self._finish_processing_best_effort(
@@ -3137,7 +3401,7 @@ class GatewayRunner:
                 permanently_failed = await self._fail_outbox_async(
                     outbox_id,
                     route_key,
-                    event,
+                    outbox["source_message_id"],
                     error,
                     failed_result.error_code,
                 )
@@ -3386,6 +3650,14 @@ class GatewayRunner:
             **self._runtime_fence_kwargs(),
         )
         rows = await self.persistence.call(get_recoverable_gateway_outbox)
+
+        system_rows = [
+            row for row in rows
+            if str(row.get("delivery_kind", "")).startswith("cron_")
+        ]
+        for row in system_rows:
+            await self._launch_system_outbox(row["id"], row["route_key"])
+        rows = [row for row in rows if row not in system_rows]
 
         grouped: dict[str, list[dict]] = {}
         for row in rows:
@@ -4655,7 +4927,7 @@ class GatewayRunner:
                         event_completed = await self._fail_outbox_async(
                             delivery_id,
                             route_key,
-                            delivery_event,
+                            delivery_event.message_id,
                             result.error or "internal_send_error",
                             result.error_code,
                         )
@@ -5108,9 +5380,8 @@ class GatewayRunner:
             if approval_resume is not None
             else None
         )
-        enabled_toolsets = self._enabled_toolsets_for_source(
-            task_event.source
-        )
+        tool_policy = self._tool_policy_for_source(task_event.source)
+        enabled_toolsets = registry.resolve(tool_policy).toolsets
         tool_context = {
             "interactive_approval": False,
             "approval_mode": "remote",
@@ -5137,8 +5408,8 @@ class GatewayRunner:
                 approval["tool_call_id"] if approval is not None else None
             ),
             resume_state=(approval["agent_state"] if approval is not None else None),
-            enabled_toolsets=enabled_toolsets,
             tool_context=tool_context,
+            tool_policy=tool_policy,
         )
         if result.get("status") == "awaiting_approval":
             request = result.get("approval_request")

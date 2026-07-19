@@ -13,8 +13,6 @@ import sys
 
 from hermes.config import DB_PATH, MODEL, BASE_URL, HERMES_HOME
 from hermes.conversation import run_conversation
-from hermes.cron import get_job_store, JobScheduler
-from hermes.cron.job import CronJob
 from hermes.db import init_db, create_session
 from hermes.backends import cleanup_all_backends
 from hermes.prompt import build_system_prompt
@@ -22,7 +20,7 @@ from hermes.tools import register_all
 
 
 def cli_loop():
-    """默认模式：原始 input → run_conversation REPL，带 scheduler。"""
+    """默认模式：原始 input → run_conversation REPL。"""
     register_all()
 
     print("=== s15: Scheduled Tasks (CLI mode) ===")
@@ -34,17 +32,6 @@ def cli_loop():
     cached_prompt = build_system_prompt(os.getcwd())
     print(f"System prompt: {len(cached_prompt)} chars")
 
-    store = get_job_store()
-
-    def fire_cli(job: CronJob):
-        """CLI 模式的 fire callback：直接调 run_conversation。"""
-        print(f"\n  [cron] firing job {job.job_id}: {job.prompt[:60]}")
-        result = run_conversation(job.prompt, conn, session_id, cached_prompt)
-        print(f"\n  [cron] result: {result['final_response'][:200]}\n")
-
-    scheduler = JobScheduler(store, fire_callback=fire_cli, interval=30)
-    scheduler.start()
-    print(f"Scheduler started ({len(store.list_all())} jobs loaded)")
     print("Type 'quit' to exit.\n")
 
     try:
@@ -58,7 +45,6 @@ def cli_loop():
             )
             print(f"\nAssistant: {result['final_response']}\n")
     finally:
-        scheduler.stop()
         conn.close()
         cleanup_all_backends()
 
@@ -73,7 +59,7 @@ def main():
         from hermes.gateway_weixin_login import run as run_weixin_login
         run_weixin_login()
     elif "--gateway-console" in sys.argv:
-        # 旧版 ConsoleAdapter + scheduler 入口(保留向后兼容)
+        # ConsoleAdapter Gateway 入口（保留向后兼容）
         from hermes.gateway_console import run_gateway_console
         asyncio.run(run_gateway_console())
     elif "--simulate" in sys.argv:

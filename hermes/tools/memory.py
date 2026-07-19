@@ -425,4 +425,9 @@ def register(registry):
             },
         },
         handler=handle_memory,
+        execution_environments=("cli", "gateway", "cron"),
+        unattended_allowed=True,
+        approval_mode="none",
+        risk_level="medium",
+        default_enabled_environments=("cli", "cron"),
     )

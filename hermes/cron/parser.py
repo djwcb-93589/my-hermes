@@ -54,7 +54,7 @@ def _parse_cron_field(field_str: str, value_range: tuple[int, int]):
     return lambda v, e=exact: v == e
 
 
-def _next_cron_fire(expr: str) -> float:
+def _next_cron_fire(expr: str, *, after: float | None = None) -> float:
     """Find the next datetime matching a 5-field cron expression."""
     fields = expr.split()
     if len(fields) != 5:
@@ -65,7 +65,8 @@ def _next_cron_fire(expr: str) -> float:
         zip(fields, [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)])
     ]
 
-    t = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
+    base = datetime.now() if after is None else datetime.fromtimestamp(after)
+    t = base.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
     for _ in range(366 * 24 * 60):
         # Python weekday: 0=Mon..6=Sun → cron weekday: 0=Sun..6=Sat
@@ -100,3 +101,15 @@ def parse_schedule(expr: str) -> tuple[float, bool]:
 
     next_ts = _next_cron_fire(expr)
     return next_ts, False
+
+
+def next_schedule_fire(expr: str, after: float) -> float | None:
+    """从指定计划窗口之后计算下一次运行，不依赖调度器当前时钟。"""
+    expression = expr.strip()
+    if expression.startswith("every "):
+        return float(after) + _parse_duration(expression[6:])
+    try:
+        _parse_duration(expression)
+    except ValueError:
+        return _next_cron_fire(expression, after=float(after))
+    return None

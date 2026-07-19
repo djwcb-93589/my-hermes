@@ -34,6 +34,8 @@ def handle_cron_tool(args, **kwargs):
             created_at=datetime.now().isoformat(),
             next_fire=next_fire,
             one_shot=one_shot,
+            created_source=str(kwargs.get("source", "cli")),
+            creator_id=str(kwargs.get("creator_id", session_key)),
         )
         store.add(job)
         fire_time = datetime.fromtimestamp(next_fire).strftime("%Y-%m-%d %H:%M")
@@ -46,7 +48,11 @@ def handle_cron_tool(args, **kwargs):
             return "No scheduled jobs."
         lines = []
         for j in jobs:
-            fire_time = datetime.fromtimestamp(j.next_fire).strftime("%m-%d %H:%M")
+            fire_time = (
+                datetime.fromtimestamp(j.next_fire).strftime("%m-%d %H:%M")
+                if j.next_fire is not None
+                else "-"
+            )
             kind = "once" if j.one_shot else "recurring"
             lines.append(
                 f"  {j.job_id}  {j.schedule:15s}  {kind:9s}  "
@@ -107,4 +113,9 @@ def register(registry):
             },
         },
         handler=handle_cron_tool,
+        execution_environments=("cli",),
+        unattended_allowed=False,
+        approval_mode="none",
+        risk_level="medium",
+        default_enabled_environments=("cli",),
     )

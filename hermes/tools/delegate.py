@@ -6,9 +6,9 @@ agent 循环,所有工具调用透传 child_session_key 实现 cwd / 文件状�
 无论成功 / 异常 / max_iter,都通过 finally 清理对应 backend。
 
 子 agent 是 leaf agent:
-  - toolsets 严格校验,只允许 ``_ALLOWED_CHILD_TOOLSETS`` 内的项;未知
+  - toolsets 严格校验,只接受全局 registry 声明支持 Delegate 的项；未知
     或不允许的 toolset 立即返 ``invalid_args``,不静默丢弃。
-  - 即使 schema 已过滤 blocked tools,``_run`` 内还有第二层防御。
+  - schema 与 dispatch 名称集合来自同一次解析，调用未暴露工具仍会被拒绝。
 """
 
 from __future__ import annotations
@@ -23,33 +23,13 @@ from hermes.agent_loop import AgentLoop
 from hermes.backends import cleanup_backend
 from hermes.config import MAX_CHILD_ITERATIONS, MODEL, client as _default_client
 from hermes.delegate_jobs import get_delegate_job_manager
-from hermes.tools import registry
+from hermes.tools import (
+    ExecutionEnvironment,
+    ToolPolicy,
+    ToolResolution,
+    registry,
+)
 
-
-# 子 agent 允许的 toolset 取值(用于 _validate_args 严格校验 toolsets 参数)。
-# memory / delegate / cron 等持久副作用工具集整组禁掉。
-_ALLOWED_CHILD_TOOLSETS = {"terminal", "file", "skill"}
-
-# 子 agent 可用的具体工具名白名单(终极策略,按工具名而非 toolset)。
-# terminal / file 单工具,自然全允许(它们自己已有安全边界);
-# skill 只放行只读工具,**不**因为 toolsets=["skill"] 就放行整个 skill
-# toolset —— 避免未来新增 skill 写工具(如 skill_create / skill_delete)
-# 自动泄漏给子 agent。
-_ALLOWED_CHILD_TOOLS = {
-    "terminal",
-    "file",
-    "skill_view",
-    "skills_list",
-}
-
-# 始终禁用的工具名(理论上白名单已覆盖,保留作第二层防御)。
-DELEGATE_BLOCKED_TOOLS = {
-    "delegate_task",
-    "memory",
-    "skill_manage",
-    "cron",
-    "gateway_send_file",
-}
 
 _DEFAULT_TOOLSETS = ["terminal", "file"]
 
@@ -125,9 +105,8 @@ def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str |
     返回 ``(goal, context, toolsets, error_json)``。error_json 非空表示
     拒绝;此时 goal / toolsets 为 None。
 
-    toolsets 策略:每个 toolset 必须在 ``_ALLOWED_CHILD_TOOLSETS`` 内,
-    出现未知 / 不允许的项(如 ``memory`` / ``delegate`` / ``cron``)立即
-    返 ``invalid_args``,**不**静默丢弃。
+    toolsets 策略:每个 toolset 都必须由全局 registry 声明支持 Delegate。
+    这样新工具只需要注册自己的环境元数据，不需要在此维护第二份列表。
     """
     goal = args.get("goal", "")
     if not isinstance(goal, str) or not goal.strip():
@@ -149,14 +128,17 @@ def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str |
             error="toolsets must be a list of strings",
         )
 
-    # 严格校验:出现未知 / 不允许的 toolset 直接拒绝,不静默过滤
-    invalid = [t for t in requested if t not in _ALLOWED_CHILD_TOOLSETS]
+    allowed_toolsets = registry.toolsets_for_environment(
+        ExecutionEnvironment.DELEGATE
+    )
+    # 严格校验:出现未知 / 不允许的项直接拒绝,不静默过滤。
+    invalid = [t for t in requested if t not in allowed_toolsets]
     if invalid:
         return None, "", None, _result(
             False, "invalid_args", "",
             error=(
                 f"unsupported toolsets: {invalid}; "
-                f"allowed: {sorted(_ALLOWED_CHILD_TOOLSETS)}"
+                f"allowed: {sorted(allowed_toolsets)}"
             ),
         )
 
@@ -169,25 +151,14 @@ def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str |
     return goal, context, requested, None
 
 
-def _filter_definitions(toolsets: list[str]) -> list[dict]:
-    """从 toolsets 里筛出子 agent 可用的 tool schema。
-
-    策略:**工具名白名单**(不靠 toolset 黑名单)。即便 toolsets 含 "skill",
-    也只会拿到 ``_ALLOWED_CHILD_TOOLS`` 列出的只读 skill 工具。
-    未来 skill toolset 新增写工具不会自动放行。
-
-    显式处理空列表:registry 现在同样把 ``[]`` 解释为“没工具”；这里保留
-    前置拒绝作为 delegate 自己的参数边界，避免未来 registry 语义变化时
-    子 agent 意外获得工具。
-    """
-    if not toolsets:
-        return []
-    defs = registry.get_definitions(toolsets)
-    return [
-        d for d in defs
-        if d["function"]["name"] in _ALLOWED_CHILD_TOOLS
-        and d["function"]["name"] not in DELEGATE_BLOCKED_TOOLS
-    ]
+def _resolve_delegate_tools(toolsets: list[str]) -> ToolResolution:
+    """从全局 registry 解析子 agent 的 schema 与 dispatch 边界。"""
+    return registry.resolve(
+        ToolPolicy(
+            ExecutionEnvironment.DELEGATE,
+            enabled_toolsets=frozenset(toolsets),
+        )
+    )
 
 
 def _build_child_prompt(context: str) -> str:
@@ -220,7 +191,7 @@ class DelegateAgentLoop(AgentLoop):
       - 无 DB 持久化(不覆盖 on_assistant_message / on_tool_message 等)
       - 无 compression(不覆盖 pre_model_call)
       - 无 fallback / retry / continuation(不启用主会话策略)
-      - 无 blocked tools 之外的工具限制变更
+      - 不额外扩大解析器确定的工具能力
 
     handle_model_error 覆盖为返 ``"abort"``:模型 API 异常走
     ``status="model_error"`` 路径,而不是默认 ``"raise"`` 冒泡到
@@ -233,6 +204,22 @@ class DelegateAgentLoop(AgentLoop):
     def handle_model_error(self, exc, messages) -> str:
         # 子 agent 不做 fallback / retry;模型异常直接 abort 出 model_error
         return "abort"
+
+    def __init__(self, *, allowed_tool_names: frozenset[str], **kwargs):
+        """保存由解析器产生的会话级 dispatch 边界。"""
+        super().__init__(**kwargs)
+        self.allowed_tool_names = allowed_tool_names
+
+    def dispatch_one(self, tool_call):
+        """拒绝未暴露在本子会话 schema 中的伪造工具调用。"""
+        tool_name = tool_call.function.name
+        if tool_name not in self.allowed_tool_names:
+            return (
+                f"(error: tool '{tool_name}' is disabled in this child session)",
+                "disabled",
+                f"disabled tool invoked: {tool_name!r}",
+            )
+        return super().dispatch_one(tool_call)
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +241,8 @@ def run_delegate_child(
     里保证执行,无论成功 / 异常 / 取消 / max_iter。
     """
     try:
-        tools = _filter_definitions(toolsets)
-        if not tools:
+        resolution = _resolve_delegate_tools(toolsets)
+        if not resolution.definitions:
             return {
                 "ok": False, "status": "invalid_args",
                 "summary": "", "iterations": 0, "tools_used": [],
@@ -266,12 +253,12 @@ def run_delegate_child(
         loop = DelegateAgentLoop(
             model=MODEL,
             max_iterations=MAX_CHILD_ITERATIONS,
-            tools=tools,
+            tools=list(resolution.definitions),
             system_prompt=_build_child_prompt(context),
             registry=registry,
             client=_default_client,
             session_key=child_session_key,
-            blocked_tools=DELEGATE_BLOCKED_TOOLS,
+            allowed_tool_names=resolution.allowed_tool_names,
             # provider-specific 参数留空,需要时由调用方注入
             model_kwargs=None,
             cancel_checker=cancel_checker,
@@ -338,7 +325,7 @@ def handle_delegate(args, **kwargs) -> str:
         )
 
     # 提前过滤:无可用工具直接返,不创建 backend / job
-    if not _filter_definitions(toolsets):
+    if not _resolve_delegate_tools(toolsets).definitions:
         return _result(
             False, "invalid_args", "",
             error=(f"no usable tools after applying child restrictions; "
@@ -346,6 +333,16 @@ def handle_delegate(args, **kwargs) -> str:
         )
 
     background = bool(args.get("background", False))
+    if kwargs.get("cron_execution_context") is not None and background:
+        return _result(
+            False,
+            "background_delegate_disabled",
+            "",
+            error=(
+                "Background delegate is disabled in Cron execution; "
+                "use background=false so the parent run waits for the child."
+            ),
+        )
     parent_session_key = kwargs.get("session_key")
     child_session_key = f"child-{uuid.uuid4().hex[:12]}"
     child_tool_context = {
@@ -356,6 +353,14 @@ def handle_delegate(args, **kwargs) -> str:
     }
     if kwargs.get("approval_mode") is not None:
         child_tool_context["approval_mode"] = kwargs.get("approval_mode")
+    if kwargs.get("cron_execution_context") is not None:
+        child_tool_context["cron_execution_context"] = kwargs[
+            "cron_execution_context"
+        ]
+    child_cancel_checker = None
+    cron_context = kwargs.get("cron_execution_context")
+    if cron_context is not None:
+        child_cancel_checker = cron_context.cancel_checker
 
     if not background:
         # ---------- 同步模式 ----------
@@ -365,6 +370,7 @@ def handle_delegate(args, **kwargs) -> str:
             context,
             toolsets,
             child_session_key,
+            cancel_checker=child_cancel_checker,
             tool_context=child_tool_context,
         )
         return _result(
@@ -517,6 +523,11 @@ def register(registry):
             },
         },
         handler=handle_delegate,
+        execution_environments=("cli", "gateway", "cron"),
+        unattended_allowed=True,
+        approval_mode="none",
+        risk_level="high",
+        default_enabled_environments=("cli", "cron"),
     )
     registry.register(
         name="delegate_status",
@@ -540,6 +551,11 @@ def register(registry):
             },
         },
         handler=handle_delegate_status,
+        execution_environments=("cli", "gateway"),
+        unattended_allowed=False,
+        approval_mode="none",
+        risk_level="low",
+        default_enabled_environments=("cli",),
     )
     registry.register(
         name="delegate_result",
@@ -563,6 +579,11 @@ def register(registry):
             },
         },
         handler=handle_delegate_result,
+        execution_environments=("cli", "gateway"),
+        unattended_allowed=False,
+        approval_mode="none",
+        risk_level="low",
+        default_enabled_environments=("cli",),
     )
     registry.register(
         name="delegate_cancel",
@@ -584,4 +605,9 @@ def register(registry):
             },
         },
         handler=handle_delegate_cancel,
+        execution_environments=("cli", "gateway"),
+        unattended_allowed=False,
+        approval_mode="none",
+        risk_level="medium",
+        default_enabled_environments=("cli",),
     )

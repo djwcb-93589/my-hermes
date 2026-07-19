@@ -5,7 +5,8 @@ from hermes.cron.store import (
     get_job_store,
     set_job_store,
 )
-from hermes.cron.job import CronJob
+from hermes.cron.job import CronJob, CronRun
+from hermes.cron.executor import CronExecutionContext, CronExecutionResult, CronExecutor
 from hermes.cron.scheduler import JobScheduler
 from hermes.cron.parser import parse_schedule
 
@@ -14,6 +15,10 @@ __all__ = [
     "get_job_store",
     "set_job_store",
     "CronJob",
+    "CronRun",
+    "CronExecutionContext",
+    "CronExecutionResult",
+    "CronExecutor",
     "JobScheduler",
     "parse_schedule",
 ]

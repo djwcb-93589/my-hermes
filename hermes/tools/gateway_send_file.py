@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections.abc import Mapping
 
 from hermes.approval import build_assessment_response, is_remote_approval
 from hermes.approval_policy import assess_gateway_send_file
-from hermes.config import PATH_ACCESS_POLICY, SENSITIVE_FILE_PATTERNS
-from hermes.db import DBError, create_gateway_file_delivery, init_db
+from hermes.db import DBError
+from hermes.gateway.outbound_delivery import OutboundDeliveryService
 from hermes.outbound_file import (
     OutboundFileValidationError,
-    capture_outbound_file_snapshot,
-    normalize_display_name,
 )
 
 
@@ -111,18 +108,12 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
         )
     path = args.get("path")
     try:
-        snapshot = capture_outbound_file_snapshot(
-            path,
-            path_policy=PATH_ACCESS_POLICY,
-            allowed_roots=file_config.get("outbound_allowed_roots"),
-            max_file_bytes=file_config.get("max_outbound_file_bytes"),
-            database_path=context["db_path"],
-            sensitive_patterns=SENSITIVE_FILE_PATTERNS,
+        delivery_service = OutboundDeliveryService(
+            context["db_path"],
+            file_config,
         )
-        display_name = normalize_display_name(
-            args.get("display_name"),
-            fallback=os.path.basename(snapshot["abs_path"]),
-        )
+        snapshot = delivery_service.capture_file(path, args.get("display_name"))
+        display_name = snapshot["display_name"]
     except OutboundFileValidationError as exc:
         return _error(exc.error_code, str(exc))
 
@@ -172,12 +163,10 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
         "size_bytes": snapshot["size_bytes"],
         "sha256": snapshot["sha256"],
     }
-    conn = init_db(context["db_path"])
     try:
-        created = create_gateway_file_delivery(
-            conn,
+        created = delivery_service.create_gateway_file_delivery(
             delivery,
-            **dict(context["runtime_fence"]),
+            runtime_fence=context["runtime_fence"],
         )
     except DBError:
         return _error(
@@ -185,8 +174,6 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
             "pending file delivery could not be created",
             fatal=False,
         )
-    finally:
-        conn.close()
     return _json({
         "ok": True,
         "delivery_id": created["id"],
@@ -232,4 +219,10 @@ def register(registry) -> None:
             },
         },
         handler=handle_gateway_send_file,
+        execution_environments=("gateway",),
+        unattended_allowed=False,
+        required_trusted_context=("gateway_file_delivery",),
+        approval_mode="remote_once",
+        risk_level="high",
+        default_enabled_environments=(),
     )

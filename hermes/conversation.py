@@ -47,20 +47,7 @@ from hermes.errors import (
     switch_to_fallback,
 )
 from hermes.tokens import compress, compress_async, estimate_tokens
-from hermes.tools import registry
-
-
-ENABLED_TOOLSETS = ["terminal", "file", "memory", "skill", "delegate", "cron"]
-
-
-def _tool_names_from_definitions(tools: list[dict]) -> set[str]:
-    """从本会话实际暴露给模型的 schema 派生 dispatch 白名单。"""
-    names: set[str] = set()
-    for definition in tools:
-        function = definition.get("function", {})
-        if isinstance(function, dict) and function.get("name"):
-            names.add(str(function["name"]))
-    return names
+from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
 
 
 def _disabled_tool_result(tool_name: str) -> tuple[str, str, str]:
@@ -721,15 +708,17 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
 
 def _select_conversation_tools(
     enabled_toolsets: list[str] | None,
+    tool_policy: ToolPolicy | None = None,
 ) -> tuple[list[dict], set[str]]:
-    """选择本会话工具，并用同一份定义建立 dispatch 能力边界。"""
-    selected_toolsets = (
-        ENABLED_TOOLSETS
-        if enabled_toolsets is None
-        else enabled_toolsets
+    """用全局解析器同时建立模型 schema 和 dispatch 能力边界。"""
+    policy = tool_policy or ToolPolicy(
+        ExecutionEnvironment.CLI,
+        enabled_toolsets=(
+            None if enabled_toolsets is None else frozenset(enabled_toolsets)
+        ),
     )
-    tools = registry.get_definitions(selected_toolsets)
-    return tools, _tool_names_from_definitions(tools)
+    resolution = registry.resolve(policy)
+    return list(resolution.definitions), set(resolution.allowed_tool_names)
 
 
 def run_conversation(
@@ -741,6 +730,7 @@ def run_conversation(
     cancel_checker=None,
     enabled_toolsets: list[str] | None = None,
     tool_context: dict | None = None,
+    tool_policy: ToolPolicy | None = None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -761,7 +751,10 @@ def run_conversation(
     except Exception as exc:
         return _persistence_error_response(exc)
 
-    tools, allowed_tool_names = _select_conversation_tools(enabled_toolsets)
+    tools, allowed_tool_names = _select_conversation_tools(
+        enabled_toolsets,
+        tool_policy,
+    )
     loop = ConversationAgentLoop(
         model=MODEL,
         max_iterations=MAX_ITERATIONS,
@@ -807,6 +800,7 @@ async def run_conversation_async(
     resume_state: dict | None = None,
     enabled_toolsets: list[str] | None = None,
     tool_context: dict | None = None,
+    tool_policy: ToolPolicy | None = None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。
 
@@ -860,7 +854,8 @@ async def run_conversation_async(
             )
 
         tools, allowed_tool_names = _select_conversation_tools(
-            enabled_toolsets
+            enabled_toolsets,
+            tool_policy,
         )
         remaining_iterations = max(
             0,

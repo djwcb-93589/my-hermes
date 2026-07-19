@@ -535,6 +535,11 @@ def register(registry):
             },
         },
         handler=handle_skill_view,
+        execution_environments=("cli", "gateway", "cron", "delegate"),
+        unattended_allowed=True,
+        approval_mode="none",
+        risk_level="low",
+        default_enabled_environments=("cli", "cron"),
     )
     registry.register(
         name="skills_list",
@@ -548,6 +553,11 @@ def register(registry):
             "parameters": {"type": "object", "properties": {}},
         },
         handler=handle_skill_list,
+        execution_environments=("cli", "gateway", "cron", "delegate"),
+        unattended_allowed=True,
+        approval_mode="none",
+        risk_level="low",
+        default_enabled_environments=("cli", "cron"),
     )
     registry.register(
         name="skill_manage",
@@ -588,4 +598,9 @@ def register(registry):
             },
         },
         handler=handle_skill_manage,
+        execution_environments=("cli", "gateway", "cron"),
+        unattended_allowed=True,
+        approval_mode="none",
+        risk_level="medium",
+        default_enabled_environments=("cli", "cron"),
     )
