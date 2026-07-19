@@ -21,11 +21,16 @@ from hermes.config import (
 )
 from hermes.conversation import ConversationAgentLoop
 from hermes.cron.job import CronJob, CronRun
+from hermes.cron.capability import (
+    CronCapabilityGuard,
+    validate_cron_capability_grant,
+)
 from hermes.db import (
     DBError,
     add_messages,
     ensure_session,
     get_cron_run,
+    get_active_cron_capability_grant,
     init_db,
     transition_cron_run,
 )
@@ -105,6 +110,30 @@ def _result_artifacts(messages: list[dict], artifact_dir: str) -> list[dict]:
     return artifacts
 
 
+def _artifact_limits_exceeded(artifact_dir: str, grant: dict) -> bool:
+    """在运行结束前按当前文件状态检查授权中的单文件和总产物上限。"""
+    scope = dict(grant.get("scope") or {})
+    try:
+        per_file_limit = int(scope["max_artifact_file_bytes"])
+        total_limit = int(scope["max_artifact_total_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    total = 0
+    try:
+        for candidate in Path(artifact_dir).rglob("*"):
+            if not candidate.is_file():
+                continue
+            size = candidate.stat().st_size
+            if size > per_file_limit:
+                return True
+            total += size
+            if total > total_limit:
+                return True
+    except OSError:
+        return True
+    return False
+
+
 class CronExecutor:
     """把一条已领取的 CronRun 交给现有 ConversationAgentLoop 执行。"""
 
@@ -139,6 +168,7 @@ class CronExecutor:
         run: CronRun,
         *,
         deadline: float,
+        grant: dict,
     ) -> CronExecutionContext:
         """规范化受控运行上下文，拒绝不存在的工作目录。"""
         workdir = Path(job.workdir or os.getcwd()).expanduser().resolve()
@@ -149,8 +179,8 @@ class CronExecutor:
         ).resolve()
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
-        raw_grant = job.capability_grant or {}
-        raw_risk = raw_grant.get("max_risk_level", ToolRiskLevel.HIGH.value)
+        scope = dict(grant.get("scope") or {})
+        raw_risk = scope.get("terminal_risk_max", ToolRiskLevel.HIGH.value)
         try:
             max_risk_level = ToolRiskLevel(str(raw_risk).lower())
         except (TypeError, ValueError) as exc:
@@ -171,10 +201,10 @@ class CronExecutor:
             workdir=str(workdir),
             artifact_dir=str(artifact_dir),
             toolsets=tuple(job.toolsets),
-            file_access_scope=(str(workdir), str(artifact_dir)),
+            file_access_scope=tuple(str(value) for value in scope.get("allowed_roots", [])),
             max_risk_level=max_risk_level,
             timeout_seconds=float(job.execution_timeout_seconds),
-            delivery_target=MappingProxyType(dict(job.delivery_config)),
+            delivery_target=MappingProxyType(dict(scope.get("delivery_target") or {})),
             trusted_source=MappingProxyType({
                 "created_source": job.created_source,
                 "creator_id": job.creator_id,
@@ -221,30 +251,23 @@ class CronExecutor:
             ):
                 raise DBError("Cron run claim does not match executor lease")
 
-            if job.approval_status not in {"not_required", "granted"}:
-                summary = "Cron capability approval is not granted."
+            if job.approval_status != "granted":
+                summary = "Cron capability authorization is not active. Update the task or request authorization again."
                 self._write_terminal_result(
                     conn,
                     run.run_id,
                     status="blocked",
                     summary=summary,
-                    error_type="approval_not_granted",
+                    error_type="cron_capability_grant_invalid",
                 )
                 return CronExecutionResult(
                     job.job_id, run.run_id, session_id, "blocked", summary,
-                    0, (), (), "approval_not_granted", summary,
+                    0, (), (), "cron_capability_grant_invalid", summary,
                 )
-
-            self._write_terminal_result(
-                conn,
-                run.run_id,
-                status="running",
-                summary="",
-                error_type=None,
-            )
             deadline = time.monotonic() + float(job.execution_timeout_seconds)
+            grant = get_active_cron_capability_grant(conn, job.job_id)
             try:
-                context = self._build_context(job, run, deadline=deadline)
+                context = self._build_context(job, run, deadline=deadline, grant=grant or {})
             except ValueError as exc:
                 summary = str(exc)
                 self._write_terminal_result(
@@ -270,9 +293,41 @@ class CronExecutor:
                 max_risk_level=context.max_risk_level,
             )
             resolution = registry.resolve(policy)
+            validation_error = validate_cron_capability_grant(
+                job,
+                grant,
+                resolved_tool_names=set(resolution.allowed_tool_names),
+                context=context,
+            )
+            if validation_error is not None:
+                summary = "Cron capability authorization is no longer valid. Update the task or request authorization again."
+                self._write_terminal_result(
+                    conn,
+                    run.run_id,
+                    status="blocked",
+                    summary=summary,
+                    error_type="cron_capability_grant_invalid",
+                )
+                return CronExecutionResult(
+                    job.job_id, run.run_id, session_id, "blocked", summary,
+                    0, (), (), "cron_capability_grant_invalid", validation_error,
+                )
+            allowed_tool_names = set(grant["allowed_tool_names"])
+            guarded_definitions = tuple(
+                definition for definition in resolution.definitions
+                if definition.get("function", {}).get("name") in allowed_tool_names
+            )
+            guard = CronCapabilityGuard(grant)
             context = replace(
                 context,
                 toolsets=tuple(sorted(resolution.toolsets)),
+            )
+            self._write_terminal_result(
+                conn,
+                run.run_id,
+                status="running",
+                summary="",
+                error_type=None,
             )
             backend = get_backend(session_id)
             backend_created = True
@@ -283,7 +338,7 @@ class CronExecutor:
             loop = ConversationAgentLoop(
                 model=MODEL,
                 max_iterations=job.max_agent_iterations,
-                tools=list(resolution.definitions),
+                tools=list(guarded_definitions),
                 system_prompt=build_system_prompt(
                     context.workdir,
                     enabled_toolsets=sorted(resolution.toolsets),
@@ -299,9 +354,10 @@ class CronExecutor:
                 compression_threshold=COMPRESSION_THRESHOLD,
                 model_kwargs=None,
                 cancel_checker=context.cancel_checker,
-                allowed_tool_names=set(resolution.allowed_tool_names),
+                allowed_tool_names=allowed_tool_names,
                 tool_context={
                     "cron_execution_context": context,
+                    "cron_capability_guard": guard,
                     "interactive_approval": False,
                 },
             )
@@ -314,7 +370,15 @@ class CronExecutor:
             timed_out = bool(time.monotonic() >= deadline)
             cancelled = bool(context.cancel_checker and context.cancel_checker())
             artifacts = _result_artifacts(loop_result.messages, context.artifact_dir)
-            if loop_result.ok:
+            if _artifact_limits_exceeded(context.artifact_dir, grant):
+                status = "blocked"
+                error_type = "cron_artifact_limit_exceeded"
+                summary = "Cron capability authorization does not permit the generated artifact size. Update the task or request authorization again."
+            elif guard.violation is not None:
+                status = "blocked"
+                error_type = "cron_capability_denied"
+                summary = "Cron capability authorization does not permit a requested operation. Update the task or request authorization again."
+            elif loop_result.ok:
                 status = "completed"
                 error_type = None
             elif timed_out:
@@ -340,12 +404,14 @@ class CronExecutor:
                 run_id=run.run_id,
                 session_id=session_id,
                 status=status,
-                final_response=loop_result.summary,
+                final_response=(
+                    summary if status == "blocked" else loop_result.summary
+                ),
                 iterations=loop_result.iterations,
                 tools_used=tuple(loop_result.tools_used),
                 artifacts=tuple(artifacts),
                 error_type=error_type,
-                error=loop_result.error,
+                error=(summary if status == "blocked" else loop_result.error),
                 timed_out=timed_out,
                 cancelled=cancelled,
             )

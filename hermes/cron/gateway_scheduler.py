@@ -14,8 +14,10 @@ from hermes.cron.job import CronJob, CronRun
 from hermes.cron.parser import next_schedule_fire
 from hermes.db import (
     advance_due_cron_job_without_run,
+    claim_manual_cron_run,
     claim_due_cron_job_run,
     list_due_cron_jobs,
+    list_unclaimed_manual_cron_runs,
     transition_cron_run,
 )
 from hermes.gateway.persistence import GatewayPersistence
@@ -113,6 +115,16 @@ class GatewayCronScheduler:
             fence = self._lease_fence_provider()
             if fence is None:
                 return
+            manual_runs = await self._persistence.call(
+                list_unclaimed_manual_cron_runs,
+                limit=max(1, self._max_concurrent - len(self._running)),
+            )
+            for pending_run in manual_runs:
+                if not self._accepting or not self._lease_is_valid():
+                    return
+                if len(self._running) >= self._max_concurrent:
+                    return
+                await self._claim_manual(pending_run, fence)
             due_jobs = await self._persistence.call(list_due_cron_jobs)
             for record in due_jobs:
                 if not self._accepting or not self._lease_is_valid():
@@ -120,6 +132,30 @@ class GatewayCronScheduler:
                 if len(self._running) >= self._max_concurrent:
                     return
                 await self._claim_one(record, fence)
+
+    async def _claim_manual(self, pending_run: dict, fence: dict) -> None:
+        """让手工请求走与到期任务相同的 lease、并发和执行器边界。"""
+        claimed = await self._persistence.call(
+            claim_manual_cron_run,
+            str(pending_run["run_id"]),
+            f"gateway-cron-manual-{uuid.uuid4().hex}",
+            **fence,
+        )
+        if claimed.get("outcome") != "claimed":
+            return
+        job = CronJob.from_record(claimed["job"])
+        run = CronRun.from_record(claimed["run"])
+        cancel_event = threading.Event()
+        if not self._accepting or not self._lease_is_valid():
+            cancel_event.set()
+        task = asyncio.create_task(
+            self._execute_claimed(job, run, cancel_event, fence),
+            name=f"gateway-cron-{run.run_id}",
+        )
+        self._running[run.run_id] = _RunningCron(run.run_id, task, cancel_event)
+        task.add_done_callback(
+            lambda completed, run_id=run.run_id: self._running.pop(run_id, None)
+        )
 
     def _next_schedule_state(
         self,

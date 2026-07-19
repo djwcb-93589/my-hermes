@@ -194,6 +194,12 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
                            "error_type": "invalid_path", "error": str(exc)})
 
     # denied_paths 已在 grant 解析前后各检查一次，审批只能影响后续敏感层。
+    cron_guard = kwargs.get("cron_capability_guard")
+    if cron_guard is not None:
+        denial = cron_guard.authorize_file(str(action), abs_path)
+        if denial is not None:
+            return _json(denial)
+
     sensitive = _is_sensitive(abs_path)
     # hardline、用户路径规则和 sensitive 必须在快照读取与 grant 复检之前收敛。
     guardrail_assessment = assess_file_operation(

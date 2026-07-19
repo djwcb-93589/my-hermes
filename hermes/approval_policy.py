@@ -1516,7 +1516,7 @@ def issue_trusted_approval_grant(
     session_key = normalize_approval_session_key(
         request.get("conversation_id")
     )
-    if tool_name not in {"file", "terminal", "gateway_send_file"}:
+    if tool_name not in {"file", "terminal", "gateway_send_file", "cron"}:
         raise ValueError("unsupported approval grant tool")
     if not isinstance(arguments, dict) or not isinstance(details, dict):
         raise ValueError("approval grant request is invalid")
@@ -1592,6 +1592,19 @@ def issue_trusted_approval_grant(
             normalized_command=normalized_command,
             cwd=cwd,
             session_rule=session_rule,
+            _issuer=_TRUSTED_GRANT_ISSUER,
+        )
+
+    if tool_name == "cron":
+        if normalized_scope != "once":
+            raise ValueError("cron capability approval only supports once scope")
+        return TrustedApprovalGrant(
+            scope=normalized_scope,
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            fingerprint=fingerprint,
+            session_key=session_key,
             _issuer=_TRUSTED_GRANT_ISSUER,
         )
 
@@ -3213,6 +3226,27 @@ def approval_request_binding_matches(
                 details,
             )
         )
+        return fingerprint == expected
+
+    if tool_name == "cron":
+        try:
+            normalized_session_key = normalize_approval_session_key(session_key)
+        except ValueError:
+            return False
+        if (
+            details.get("operation_type") != "cron.capability_grant"
+            or details.get("session_key_fingerprint")
+            != _identifier_fingerprint(normalized_session_key)
+            or details.get("allowed_grant_scopes") != ["once"]
+        ):
+            return False
+        expected = _canonical_fingerprint({
+            "version": 1,
+            "tool_name": "cron",
+            "arguments": arguments,
+            "session_key": normalized_session_key,
+            "backend_risk": backend_risk,
+        })
         return fingerprint == expected
 
     if tool_name == "file":

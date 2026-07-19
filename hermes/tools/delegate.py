@@ -357,6 +357,10 @@ def handle_delegate(args, **kwargs) -> str:
         child_tool_context["cron_execution_context"] = kwargs[
             "cron_execution_context"
         ]
+    if kwargs.get("cron_capability_guard") is not None:
+        child_tool_context["cron_capability_guard"] = kwargs[
+            "cron_capability_guard"
+        ]
     child_cancel_checker = None
     cron_context = kwargs.get("cron_execution_context")
     if cron_context is not None:

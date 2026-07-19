@@ -40,11 +40,15 @@ class CronJob:
     overlap_policy: str = "skip"
     misfire_policy: str = "run_once"
     delivery_config: dict = field(default_factory=dict)
+    retry_policy: dict = field(default_factory=dict)
+    artifact_policy: dict = field(default_factory=dict)
+    capability_spec: dict = field(default_factory=dict)
     capability_grant: dict | None = None
     approval_status: str = "not_required"
     paused: bool = False
     last_run_at: float | None = None
     consecutive_failures: int = 0
+    deleted_at: float | None = None
 
     def __post_init__(self) -> None:
         """补齐旧调用点没有提供的新字段。"""
@@ -83,11 +87,15 @@ class CronJob:
             overlap_policy=str(record["overlap_policy"]),
             misfire_policy=str(record["misfire_policy"]),
             delivery_config=dict(record["delivery_config"]),
+            retry_policy=dict(record.get("retry_policy") or {}),
+            artifact_policy=dict(record.get("artifact_policy") or {}),
+            capability_spec=dict(record.get("capability_spec") or {}),
             capability_grant=record["capability_grant"],
             approval_status=str(record["approval_status"]),
             paused=bool(record["paused"]),
             last_run_at=record["last_run_at"],
             consecutive_failures=int(record["consecutive_failures"]),
+            deleted_at=record.get("deleted_at"),
         )
 
     def to_record(self) -> dict:
@@ -117,12 +125,16 @@ class CronJob:
             "overlap_policy": self.overlap_policy,
             "misfire_policy": self.misfire_policy,
             "delivery_config": dict(self.delivery_config),
+            "retry_policy": dict(self.retry_policy),
+            "artifact_policy": dict(self.artifact_policy),
+            "capability_spec": dict(self.capability_spec),
             "capability_grant": self.capability_grant,
             "approval_status": self.approval_status,
             "paused": self.paused,
             "next_run_at": self.next_fire,
             "last_run_at": self.last_run_at,
             "consecutive_failures": self.consecutive_failures,
+            "deleted_at": self.deleted_at,
             "created_at": created_at,
         }
 

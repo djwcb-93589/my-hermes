@@ -50,6 +50,12 @@ def run_terminal(args, **kwargs):
             "error": str(exc),
         }, ensure_ascii=False)
 
+    cron_guard = kwargs.get("cron_capability_guard")
+    if cron_guard is not None:
+        denial = cron_guard.authorize_terminal(command)
+        if denial is not None:
+            return json.dumps(denial, ensure_ascii=False)
+
     path_policy = getattr(
         backend,
         "path_policy",

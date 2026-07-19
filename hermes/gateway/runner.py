@@ -80,6 +80,7 @@ from hermes.db import (
     mark_gateway_outbox_sending,
     prune_gateway_terminal_outbox,
     prune_gateway_terminal_ownership,
+    prune_cron_terminal_history,
     reconcile_gateway_terminal_deliveries,
     recover_gateway_approvals,
     release_gateway_runtime_lease,
@@ -547,6 +548,7 @@ def _load_retention_config(gateway_cfg: dict) -> dict[str, float | int]:
         "feishu_inbox_seconds": 72 * 60 * 60,
         "ownership_seconds": 30 * 24 * 60 * 60,
         "outbox_seconds": 30 * 24 * 60 * 60,
+        "cron_run_seconds": 30 * 24 * 60 * 60,
         "cleanup_interval_seconds": 60 * 60,
     }
     loaded: dict[str, float | int] = {}
@@ -644,6 +646,7 @@ class GatewayRunner:
             retention["ownership_seconds"]
         )
         self.outbox_retention_seconds = float(retention["outbox_seconds"])
+        self.cron_run_retention_seconds = float(retention["cron_run_seconds"])
         self.retention_cleanup_interval_seconds = float(
             retention["cleanup_interval_seconds"]
         )
@@ -1283,6 +1286,8 @@ class GatewayRunner:
             # 文件任务回复当前触发消息，和文本 Outbox 保持一致。
             "gateway_reply_to_message_id": event.message_id,
             "gateway_thread_id": event.source.thread_id,
+            "creator_id": event.source.user_id or event.source.user_id_alt,
+            "source": "gateway",
             "gateway_db_path": self.db_path,
             "gateway_file_transfer_config": self.file_transfer_config,
             "gateway_runtime_fence": fence if fence else None,
@@ -1530,6 +1535,42 @@ class GatewayRunner:
             print(
                 "  [gateway:audit] event=retention_cleanup_failed "
                 f"kind=ownership exception={type(exc).__name__} "
+                f"lease_epoch={self._runtime_lease_epoch}"
+            )
+
+        try:
+            artifact_paths = await self.persistence.call(
+                prune_cron_terminal_history,
+                updated_before=now - self.cron_run_retention_seconds,
+                limit=self.retention_cleanup_batch_size,
+            )
+            artifact_root = (
+                Path(self.file_transfer_config["download_dir"])
+                / "cron-artifacts"
+            ).resolve()
+            removed_files = 0
+            for raw_path in artifact_paths:
+                try:
+                    candidate = Path(str(raw_path)).resolve()
+                    candidate.relative_to(artifact_root)
+                    if candidate.is_file():
+                        candidate.unlink()
+                        removed_files += 1
+                except (OSError, ValueError):
+                    continue
+            if artifact_paths:
+                print(
+                    "  [gateway:audit] event=retention_cleanup "
+                    f"kind=cron_runs removed={len(artifact_paths)} "
+                    f"artifact_files={removed_files} "
+                    f"lease_epoch={self._runtime_lease_epoch}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=retention_cleanup_failed "
+                f"kind=cron_runs exception={type(exc).__name__} "
                 f"lease_epoch={self._runtime_lease_epoch}"
             )
 
@@ -4063,7 +4104,7 @@ class GatewayRunner:
                 "approval_mode": "remote",
                 "approval_grant": approval_grant,
             }
-            if request["tool_name"] == "gateway_send_file":
+            if request["tool_name"] in {"gateway_send_file", "cron"}:
                 source_event = self._deserialize_event(
                     str(request.get("source_event_json", ""))
                 )

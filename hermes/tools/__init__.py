@@ -226,6 +226,11 @@ class ToolRegistry:
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        guard = kwargs.get("cron_capability_guard")
+        if guard is not None:
+            denial = guard.authorize_tool(name)
+            if denial is not None:
+                return json.dumps(denial, ensure_ascii=False)
         return entry.handler(args, **kwargs)
 
     def get_definitions(
