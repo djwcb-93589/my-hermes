@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 
-def _create_gateway_approval_schema(conn: sqlite3.Connection) -> None:
-    """创建远程工具审批表；请求与原始 Tool Result 一一绑定。"""
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    """创建远程工具审批表;请求与原始 Tool Result 一一绑定。"""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS gateway_approval_requests (
@@ -56,3 +57,6 @@ def _create_gateway_approval_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+
+# 向后兼容:migration 仍通过私有名引用同一份 DDL。
+_create_gateway_approval_schema = create_schema

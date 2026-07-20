@@ -12,7 +12,8 @@ from pathlib import Path
 from .database import (
     CRON_APPROVAL_STATUSES, CRON_DELIVERY_STATUSES, CRON_MISFIRE_POLICIES,
     CRON_OVERLAP_POLICIES, CRON_RUN_STATUSES, CRON_RUN_TRANSITIONS,
-    CRON_SCHEDULE_TYPES, DBError, _cleanup_batch_limit, transaction,
+    CRON_SCHEDULE_TYPES, DBError, _cleanup_batch_limit, _immediate_transaction,
+    transaction,
 )
 from .gateway import _gateway_lease_epoch_value, gateway_runtime_lease_is_valid
 

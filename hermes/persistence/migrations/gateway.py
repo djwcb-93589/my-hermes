@@ -4,7 +4,6 @@ import json
 import sqlite3
 
 from ..database import DBError, _table_columns, _table_exists
-from ..gateway import _upsert_gateway_source_message_ownership, gateway_event_source_message_ids
 from ..schemas.gateway import _create_gateway_runtime_lease_schema, _create_gateway_source_message_ownership_schema, _create_gateway_fencing_triggers
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -247,7 +246,7 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
-    from .gateway import (
+    from ..gateway import (
         _upsert_gateway_source_message_ownership,
         gateway_event_source_message_ids,
     )

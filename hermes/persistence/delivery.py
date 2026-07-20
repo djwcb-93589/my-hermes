@@ -9,187 +9,25 @@ from .database import (
     DBError,
     GATEWAY_FILE_DELIVERY_STATUSES,
     InvalidMessageError,
+    _immediate_transaction,
     transaction,
 )
 from .core import _insert_message
 from .gateway import (
-    _finish_gateway_queue_for_delivery, _gateway_outbox_claim_clause,
-    _gateway_outbox_fence_values, _gateway_outbox_lease_clause,
-    _gateway_lease_epoch_value, _mark_gateway_message_delivery_terminal,
+    _gateway_lease_epoch_value,
+    _insert_gateway_outbox,
+    _serialize_gateway_json,
     _set_gateway_queue_status,
-    _gateway_terminal_outbox_row, _immediate_transaction,
-    _infer_cancelled_gateway_outbox_status, _insert_gateway_outbox,
-    _serialize_gateway_json, _update_gateway_outbox_ownership_status,
-    gateway_outbox_claim_is_valid, gateway_runtime_lease_is_valid,
+    gateway_runtime_lease_is_valid,
 )
 
 _GATEWAY_FILE_DELIVERY_COLUMNS = (
-    "delivery_id, route_key, source_message_id, queue_message_id, outbox_id, platform, "
-    "chat_id, reply_to_message_id, thread_id, local_path, display_name, status, "
+    "id, origin_kind, approval_id, cron_run_id, route_key, conversation_id, "
+    "source_message_id, platform, chat_id, reply_to_message_id, thread_id, "
+    "local_path, display_name, size_bytes, sha256, platform_file_key, status, "
     "attempt_count, next_attempt_at, last_error, last_error_code, claimed_by, "
-    "claim_epoch, created_at, updated_at"
+    "claim_epoch, created_at, updated_at, outbox_id"
 )
-
-def reconcile_gateway_terminal_deliveries(
-    conn: sqlite3.Connection,
-    *,
-    lease_name: str | None = None,
-    instance_id: str | None = None,
-    lease_epoch: int | None = None,
-) -> int:
-    """收敛旧版本遗留的终态 Outbox 与 ``reply_pending`` queue。
-
-    新代码通过统一终态函数一次提交三层状态；这里仅修复升级前已经形成的
-    孤儿记录，以及“取消先提交、最后一个平台成功随后落进度”留下的可推导
-    状态。终态审计行不会被删除。
-    """
-    fence = _gateway_outbox_fence_values(
-        lease_name,
-        instance_id,
-        lease_epoch,
-    )
-    manager = (
-        _immediate_transaction(conn)
-        if fence is not None
-        else transaction(conn)
-    )
-    reconciled = 0
-    with manager:
-        now = time.time()
-        if fence is not None and not gateway_runtime_lease_is_valid(
-            conn,
-            fence[0],
-            fence[1],
-            fence[2],
-            now=now,
-        ):
-            return 0
-        rows = conn.execute(
-            """
-            SELECT o.id, o.route_key, o.source_message_id,
-                   o.queue_message_id, o.status,
-                   o.next_chunk_index, o.payloads_json,
-                   q.status, o.event_json
-            FROM gateway_outbox AS o
-            LEFT JOIN gateway_message_queue AS q
-              ON q.route_key=o.route_key
-             AND q.message_id=o.queue_message_id
-            WHERE (
-                o.status IN (
-                    'delivered', 'permanent_failed',
-                    'cancelled', 'partial_cancelled'
-                )
-                AND q.status='reply_pending'
-            )
-            OR (o.status='cancelled' AND o.next_chunk_index > 0)
-            OR (
-                o.status='partial_cancelled'
-                AND json_valid(o.payloads_json)=1
-                AND o.next_chunk_index >= json_array_length(o.payloads_json)
-            )
-            ORDER BY o.created_at, o.id
-            """
-        ).fetchall()
-        for (
-            outbox_id,
-            route_key,
-            source_message_id,
-            queue_message_id,
-            stored_status,
-            next_chunk_index,
-            payloads_json,
-            queue_status,
-            event_json,
-        ) in rows:
-            status = str(stored_status)
-            if status in {"cancelled", "partial_cancelled"}:
-                status = _infer_cancelled_gateway_outbox_status(
-                    int(next_chunk_index),
-                    str(payloads_json),
-                )
-            if status != stored_status:
-                lease_clause, lease_params = _gateway_outbox_lease_clause(
-                    fence,
-                    now,
-                )
-                claim_assignment = ""
-                claim_params: tuple = ()
-                if fence is not None:
-                    claim_assignment = ", claimed_by=?, claim_epoch=?"
-                    claim_params = (fence[1], fence[2])
-                cursor = conn.execute(
-                    f"""
-                    UPDATE gateway_outbox
-                    SET status=?, next_attempt_at=NULL,
-                        last_error=CASE WHEN ?='delivered' THEN NULL
-                                        ELSE last_error END,
-                        last_error_code=CASE WHEN ?='delivered' THEN NULL
-                                             ELSE last_error_code END,
-                        updated_at=? {claim_assignment}
-                    WHERE id=? AND status=?
-                    {lease_clause}
-                    """,
-                    (
-                        status,
-                        status,
-                        status,
-                        now,
-                        *claim_params,
-                        outbox_id,
-                        stored_status,
-                        *lease_params,
-                    ),
-                )
-                if cursor.rowcount <= 0:
-                    continue
-
-            _mark_gateway_message_delivery_terminal(
-                conn,
-                str(outbox_id),
-                status,
-                now,
-                route_key=str(route_key),
-                source_message_id=str(source_message_id),
-            )
-            _update_gateway_outbox_ownership_status(
-                conn,
-                outbox_id=str(outbox_id),
-                route_key=str(route_key),
-                source_message_id=str(source_message_id),
-                event_json=str(event_json),
-                status=status,
-                updated_at=now,
-            )
-            _sync_gateway_file_delivery_terminal(
-                conn,
-                str(outbox_id),
-                status,
-                now,
-            )
-            if queue_status == "reply_pending":
-                if status == "permanent_failed":
-                    _finish_gateway_queue_for_delivery(
-                        conn,
-                        str(route_key),
-                        str(queue_message_id),
-                        status="delivery_failed",
-                        now=now,
-                    )
-                else:
-                    _finish_gateway_queue_for_delivery(
-                        conn,
-                        str(route_key),
-                        str(queue_message_id),
-                        status=(
-                            "cancelled"
-                            if status in {"cancelled", "partial_cancelled"}
-                            else "completed"
-                        ),
-                        now=now,
-                    )
-            reconciled += 1
-    return reconciled
-
 
 def _insert_gateway_message_delivery(
     conn: sqlite3.Connection,
@@ -1143,55 +981,4 @@ def reset_gateway_uploading_file_deliveries(
         )
         return cursor.rowcount
 
-
-def _sync_gateway_file_delivery_terminal(
-    conn: sqlite3.Connection,
-    outbox_id: str,
-    outbox_status: str,
-    now: float,
-    *,
-    error: str | None = None,
-    error_code: str | None = None,
-) -> None:
-    """在 Outbox 终态事务内同步关联文件任务，旧 Outbox 无关联即跳过。"""
-    if outbox_status == "delivered":
-        file_status = "delivered"
-        safe_error = None
-        safe_code = None
-    elif outbox_status == "permanent_failed":
-        file_status = "permanent_failed"
-        safe_error = str(error or "file message delivery failed")[:120]
-        safe_code = str(error_code or "outbox_permanent_failed")[:120]
-    elif outbox_status in {"cancelled", "partial_cancelled"}:
-        file_status = "cancelled"
-        safe_error = "file message delivery cancelled"
-        safe_code = outbox_status
-    else:
-        return
-    conn.execute(
-        """
-        UPDATE gateway_file_deliveries
-        SET status=?, next_attempt_at=NULL, last_error=?,
-            last_error_code=?, claimed_by=NULL, claim_epoch=NULL,
-            updated_at=?
-        WHERE outbox_id=? AND status='outbox_created'
-        """,
-        (
-            file_status,
-            safe_error,
-            safe_code,
-            float(now),
-            str(outbox_id),
-        ),
-    )
-    conn.execute(
-        """
-        UPDATE cron_run_artifacts
-        SET delivery_status=?, updated_at=?
-        WHERE delivery_id IN (
-            SELECT id FROM gateway_file_deliveries WHERE outbox_id=?
-        )
-        """,
-        (file_status, float(now), str(outbox_id)),
-    )
 

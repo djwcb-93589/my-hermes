@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
-def _create_cron_schema(conn: sqlite3.Connection) -> None:
+
+def create_schema(conn: sqlite3.Connection) -> None:
     """创建 Cron 任务定义、运行事实与旧数据导入标记。"""
     conn.executescript(
         """
@@ -172,3 +173,6 @@ def _create_cron_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+
+# 向后兼容:migration 仍通过私有名引用同一份 DDL。
+_create_cron_schema = create_schema

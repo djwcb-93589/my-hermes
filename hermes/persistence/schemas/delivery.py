@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
-def _create_gateway_file_delivery_schema(conn: sqlite3.Connection) -> None:
+
+def create_schema(conn: sqlite3.Connection) -> None:
     """创建带上传快照、Outbox 关联和 fencing claim 的文件任务表。"""
     conn.execute(
         """
@@ -83,3 +84,6 @@ def _create_gateway_file_delivery_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+
+# 向后兼容:migration 仍通过私有名引用同一份 DDL。
+_create_gateway_file_delivery_schema = create_schema

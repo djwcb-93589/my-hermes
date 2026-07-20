@@ -4,7 +4,15 @@ import sqlite3
 
 from ..database import _table_columns
 
+
 def create_schema(conn: sqlite3.Connection) -> None:
+    """创建 Gateway 基础表与 ownership / lease 辅助表。
+
+    顺序与历史 migration 累积结果保持一致:基础路由 / 队列 / 出站 /
+    最终回答投递表 -> 原始消息归属索引 -> 运行期租约表。fencing triggers
+    因为需要参照 approval / delivery 表的存在,由 ``create_fencing_triggers``
+    单独暴露,在顶层 schema 中按历史顺序延后创建。
+    """
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS gateway_session_routes (
             route_key TEXT PRIMARY KEY,
@@ -85,6 +93,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ON gateway_message_deliveries(session_id, status, assistant_message_id);
     """)
 
+    _create_gateway_source_message_ownership_schema(conn)
+    _create_gateway_runtime_lease_schema(conn)
+
+
 def _create_gateway_source_message_ownership_schema(
     conn: sqlite3.Connection,
 ) -> None:
@@ -128,8 +140,13 @@ def _create_gateway_runtime_lease_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _create_gateway_fencing_triggers(conn: sqlite3.Connection) -> None:
-    """让迁移表与全新表保持相同的 fencing 字段约束。"""
+def create_fencing_triggers(conn: sqlite3.Connection) -> None:
+    """创建运行租约与 Outbox claim 的 fencing triggers。
+
+    历史建表顺序中这一步位于 approval / delivery 表之后,因此单独暴露
+    公开入口,由顶层 schema 按原顺序调用。``_create_gateway_fencing_triggers``
+    保留为同名私有别名,migration 仍可继续引用。
+    """
     lease_columns = _table_columns(conn, "gateway_runtime_lease")
     if "lease_epoch" in lease_columns:
         conn.execute(
@@ -181,3 +198,6 @@ def _create_gateway_fencing_triggers(conn: sqlite3.Connection) -> None:
             """
         )
 
+
+# 向后兼容:migration 仍通过私有名引用同一份 DDL。
+_create_gateway_fencing_triggers = create_fencing_triggers

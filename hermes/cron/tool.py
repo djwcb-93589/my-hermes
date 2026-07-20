@@ -699,7 +699,23 @@ def register(registry):
                     "artifact_policy": {"type": "object"},
                     "capability_spec": {
                         "type": "object",
-                        "description": "Capability constraints. terminal_allowed_executables is required when toolsets includes terminal; shell operators, redirection, background execution, and network access default to false.",
+                        "description": (
+                            "Capability constraints for unattended execution. "
+                            "Defaults below are conservative reminders of the safe "
+                            "baseline; they are not recommendations to copy. Judge "
+                            "each field against what the task actually needs to do "
+                            "and override only the ones the task requires. "
+                            "allow_file_write (default false): set to true when the "
+                            "task must create, modify, or delete files via the file "
+                            "tool; a write action without this stays denied at run "
+                            "time. terminal_allowed_executables is required when "
+                            "toolsets includes terminal. terminal_allow_shell_operators, "
+                            "terminal_allow_redirection, terminal_allow_background, and "
+                            "terminal_allow_network default to false. "
+                            "max_artifact_file_bytes and max_artifact_total_bytes "
+                            "default to 20MB and 50MB. artifact_root is system-managed "
+                            "and cannot be set here."
+                        ),
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },

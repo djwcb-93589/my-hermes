@@ -324,7 +324,7 @@ def _extract_approval_request(
     if (
         not isinstance(request_id, str)
         or not request_id.startswith("approval_")
-        or tool_name not in {"file", "terminal", "gateway_send_file"}
+        or tool_name not in {"file", "terminal", "gateway_send_file", "cron"}
     ):
         return None
     call_name = AgentLoop._tool_call_name(tool_call)

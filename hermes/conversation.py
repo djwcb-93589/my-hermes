@@ -825,6 +825,7 @@ async def run_conversation_async(
                 existing = get_gateway_visible_session_messages(
                     conn,
                     session_id,
+                    exclude_approval_placeholders=resume_from_history,
                 )
                 if not resume_from_history:
                     user_msg = {"role": "user", "content": user_message}
@@ -833,6 +834,7 @@ async def run_conversation_async(
                 existing = await persistence_call(
                     get_gateway_visible_session_messages,
                     session_id,
+                    exclude_approval_placeholders=resume_from_history,
                 )
                 if not resume_from_history:
                     user_msg = {"role": "user", "content": user_message}

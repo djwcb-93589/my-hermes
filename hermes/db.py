@@ -76,11 +76,10 @@ from hermes.persistence.database import (
     GATEWAY_FILE_DELIVERY_STATUSES,
     InvalidFeishuInboxPayloadError,
     InvalidMessageError,
-    LATEST_SCHEMA_VERSION,
     build_feishu_inbox_route_key,
-    init_db,
     transaction,
 )
+from hermes.persistence.schema import LATEST_SCHEMA_VERSION, init_db
 from hermes.persistence.delivery import (
     add_final_message_with_gateway_outbox,
     claim_gateway_file_delivery,
@@ -94,8 +93,16 @@ from hermes.persistence.delivery import (
     mark_gateway_file_delivery_outbox_retry,
     mark_gateway_file_delivery_retry,
     mark_gateway_file_delivery_uploaded,
-    reconcile_gateway_terminal_deliveries,
     reset_gateway_uploading_file_deliveries,
+)
+from hermes.persistence.gateway_delivery import (
+    cancel_gateway_delivery,
+    complete_gateway_delivery,
+    fail_gateway_delivery,
+    mark_gateway_outbox_cancelled,
+    mark_gateway_outbox_delivered,
+    mark_gateway_outbox_failed,
+    reconcile_gateway_terminal_deliveries,
 )
 from hermes.persistence.feishu import (
     claim_feishu_inbox_message,
@@ -122,8 +129,6 @@ from hermes.persistence.gateway import (
     acquire_gateway_runtime_lease,
     check_gateway_runtime_readiness,
     complete_gateway_message,
-    complete_gateway_delivery,
-    cancel_gateway_delivery,
     delete_gateway_messages,
     enqueue_gateway_message,
     enqueue_gateway_outbox,
@@ -142,11 +147,7 @@ from hermes.persistence.gateway import (
     mark_gateway_message_delivery_failed,
     mark_gateway_message_processing,
     mark_gateway_message_reply_pending,
-    fail_gateway_delivery,
-    mark_gateway_outbox_cancelled,
     mark_gateway_outbox_chunk_sent,
-    mark_gateway_outbox_delivered,
-    mark_gateway_outbox_failed,
     mark_gateway_outbox_retry,
     mark_gateway_outbox_sending,
     prune_gateway_terminal_outbox,

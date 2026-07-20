@@ -8,6 +8,7 @@ from .database import (
     DBError, FEISHU_INBOX_STATUSES, InvalidFeishuInboxPayloadError, transaction,
     _cleanup_batch_limit as _shared_cleanup_batch_limit,
     _derive_feishu_inbox_route_key,
+    _immediate_transaction,
 )
 
 def _validate_feishu_inbox_identity(app_id: str, message_id: str) -> None:

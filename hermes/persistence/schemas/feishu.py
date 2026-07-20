@@ -4,6 +4,7 @@ import sqlite3
 
 from ..database import _table_columns
 
+
 def _create_feishu_pending_attachment_schema(
     conn: sqlite3.Connection,
 ) -> None:
@@ -87,8 +88,8 @@ def _create_feishu_inbox_indexes_and_triggers(
             )
             """
         )
-    # 旧表无法通过 ALTER TABLE 补表级 CHECK，触发器让迁移库与新库保持
-    # 相同的状态集合约束；新库上的 CHECK 则提供双重保护。
+    # 旧表无法通过 ALTER TABLE 补表级 CHECK,触发器让迁移库与新库保持
+    # 相同的状态集合约束;新库上的 CHECK 则提供双重保护。
     conn.execute(
         """
         CREATE TRIGGER IF NOT EXISTS trg_feishu_inbox_status_insert
@@ -167,3 +168,8 @@ def _create_feishu_inbox_schema(conn: sqlite3.Connection) -> None:
     )
     _create_feishu_inbox_indexes_and_triggers(conn)
 
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    """按历史建表顺序创建 Feishu Inbox 与 pending attachment 全部对象。"""
+    _create_feishu_inbox_schema(conn)
+    _create_feishu_pending_attachment_schema(conn)

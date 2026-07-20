@@ -162,14 +162,34 @@ get_messages = get_session_messages
 def get_gateway_visible_session_messages(
     conn: sqlite3.Connection,
     session_id: str,
+    *,
+    exclude_approval_placeholders: bool = False,
 ) -> list[dict]:
     """读取 Gateway 用户实际可见的历史，不改变普通 CLI 的读取语义。
 
     只有与投递记录关联的最终 assistant 回答会被检查状态；没有关联的旧记录
     默认按已送达处理，tool-call/continuation 等内部消息也会完整保留。
+
+    ``exclude_approval_placeholders=True`` 时排除审批问题占位消息：这类
+    消息由 Gateway 注入而非 LLM 生成，留在审批恢复历史里会让 LLM 误以为
+    上一轮自己在请求审批，进而重复催促用户回复 /approve。
     """
-    rows = conn.execute(
+    approval_filter = ""
+    if exclude_approval_placeholders:
+        approval_filter = """
+          AND NOT EXISTS (
+              SELECT 1
+              FROM gateway_message_deliveries AS d
+              JOIN gateway_outbox AS o ON o.id = d.delivery_id
+              WHERE d.assistant_message_id = m.id
+                AND (
+                    o.delivery_kind = 'approval_request'
+                    OR o.delivery_kind LIKE 'approval_request:%'
+                )
+          )
         """
+    rows = conn.execute(
+        f"""
         SELECT m.role, m.content, m.tool_calls, m.tool_call_id
         FROM messages AS m
         WHERE m.session_id = ?
@@ -182,6 +202,7 @@ def get_gateway_visible_session_messages(
                     AND delivery.status != 'delivered'
               )
           )
+          {approval_filter}
         ORDER BY m.id
         """,
         (session_id,),

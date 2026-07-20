@@ -22,9 +22,9 @@ from .gateway import (
 
 _GATEWAY_APPROVAL_COLUMNS = (
     "id, route_key, conversation_id, requester_user_id, source_message_id, "
-    "request_message_id, tool_message_id, tool_call_id, tool_name, tool_args_json, "
-    "details_json, agent_state_json, source_event_json, status, grant_scope, "
-    "decision_message_id, result_content, expires_at, created_at, updated_at"
+    "tool_call_id, tool_message_id, tool_name, tool_args_json, summary, "
+    "details_json, status, decision_message_id, result_content, "
+    "source_event_json, agent_state_json, created_at, expires_at, updated_at"
 )
 
 def _normalize_gateway_approval_agent_state(value: dict | None) -> dict:
