@@ -24,6 +24,7 @@ from hermes.cron.job import CronJob, CronRun
 from hermes.cron.artifacts import cron_run_artifact_dir
 from hermes.cron.capability import (
     CronCapabilityGuard,
+    _normalise_path,
     validate_cron_capability_grant,
 )
 from hermes.db import (
@@ -230,8 +231,10 @@ class CronExecutor:
         grant: dict,
     ) -> CronExecutionContext:
         """规范化受控运行上下文，拒绝不存在的工作目录。"""
-        workdir = Path(job.workdir or os.getcwd()).expanduser().resolve()
-        if not workdir.is_dir():
+        # 复用 capability._normalise_path 的 Git Bash -> Windows 路径转换，
+        # 让 LLM 传的 /e/双周报 能被正确解析成 E:\双周报，与 terminal 行为一致。
+        workdir = _normalise_path(job.workdir or os.getcwd())
+        if not Path(workdir).is_dir():
             raise ValueError("Cron workdir does not exist or is not a directory")
         artifact_dir = cron_run_artifact_dir(job.job_id, run.run_id).resolve()
         artifact_dir.mkdir(parents=True, exist_ok=True)

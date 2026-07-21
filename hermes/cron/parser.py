@@ -8,6 +8,7 @@ Supports three forms:
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -24,7 +25,13 @@ def _parse_duration(s: str) -> float:
     unit = s[-1].lower()
     if unit not in _DURATION_UNITS:
         raise ValueError(f"unknown duration unit: {unit!r}")
-    return float(s[:-1]) * _DURATION_UNITS[unit]
+    try:
+        seconds = float(s[:-1]) * _DURATION_UNITS[unit]
+    except ValueError as exc:
+        raise ValueError("duration value is invalid") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("duration must be a positive finite value")
+    return seconds
 
 
 def _parse_cron_field(field_str: str, value_range: tuple[int, int]):

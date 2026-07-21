@@ -53,6 +53,7 @@ from hermes.persistence.cron import (
     pause_cron_one_shot_job,
     prune_cron_terminal_history,
     refresh_cron_delivery_statuses,
+    recover_interrupted_cron_runs,
     resume_cron_job,
     revoke_cron_capability_grants,
     set_cron_job_paused,

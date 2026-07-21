@@ -10,7 +10,10 @@ import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
+
+from hermes.path_utils import git_bash_to_windows_path
 
 from hermes.approval_policy import classify_terminal_command
 from hermes.cron.artifacts import cron_job_artifact_root
@@ -49,12 +52,22 @@ def _digest(value: Any) -> str:
 
 def _normalise_path(value: str | os.PathLike[str]) -> str:
     """将授权路径固定为绝对规范路径，避免后续相对路径绕过。"""
-    return str(Path(value).expanduser().resolve())
+    # 与 terminal/file 共用的 PathAccessPolicy.normalize_path 保持同一套
+    # 路径语义：Windows 上先把 Git Bash 风格的 /e/双周报 转成 E:\双周报，
+    # 再做 expandvars/expanduser/resolve。否则 Path("/e/双周报").resolve()
+    # 会被当成相对当前盘符解析成 D:\e\双周报，与用户实际意图不符。
+    expanded = os.path.expandvars(os.path.expanduser(str(value)))
+    if os.name == "nt":
+        expanded = git_bash_to_windows_path(expanded)
+    return str(Path(expanded).resolve())
 
 
 def _normalise_target(value: Any) -> dict:
     """只保留投递路由所需的非内容字段。"""
-    if not isinstance(value, dict):
+    # 接受任意 Mapping（包括 dict 和 MappingProxyType）；executor 把
+    # delivery_target 包装成 MappingProxyType，但它不是 dict 子类，
+    # 严格 isinstance(value, dict) 会把合法投递目标误判为空。
+    if not isinstance(value, Mapping):
         return {}
     allowed = ("platform", "chat_id", "thread_id", "route_key", "target_id")
     return {key: str(value[key]) for key in allowed if value.get(key) not in (None, "")}

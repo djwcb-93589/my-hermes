@@ -86,6 +86,7 @@ from hermes.db import (
     prune_gateway_terminal_ownership,
     prune_cron_terminal_history,
     reconcile_gateway_terminal_deliveries,
+    recover_interrupted_cron_runs,
     recover_gateway_approvals,
     release_gateway_runtime_lease,
     renew_gateway_runtime_lease,
@@ -2622,6 +2623,21 @@ class GatewayRunner:
         self._runtime_lease_acquired = True
         self._runtime_lease_valid = True
         self._start_runtime_lease_heartbeat()
+
+        self._lifecycle_phase = "cron_run_recovery"
+        try:
+            recovered = await self.persistence.call(
+                recover_interrupted_cron_runs,
+                **self._cron_runtime_fence(),
+            )
+            await self._require_startup_runtime_lease()
+            if recovered:
+                print(f"  [gateway:cron] recovered interrupted runs={recovered}")
+        except Exception:
+            await self._abort_startup_after_lease()
+            self._lifecycle_phase = "startup_failed"
+            self._startup_in_progress = False
+            raise
 
         self._lifecycle_phase = "adapter_initialize"
         for name, adapter in self.adapters.items():

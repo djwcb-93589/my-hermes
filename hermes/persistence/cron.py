@@ -809,6 +809,83 @@ def create_cron_retry_run(
     return run
 
 
+def recover_interrupted_cron_runs(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> int:
+    """收敛失效 lease 遗留的活动运行，避免它们永久占用 overlap。"""
+    fence = _cron_run_fence_values(lease_name, instance_id, lease_epoch)
+    now = time.time()
+    recovered = 0
+    run_columns = ", ".join(
+        f"run.{column.strip()}" for column in _CRON_RUN_COLUMNS.split(",")
+    )
+    with _immediate_transaction(conn):
+        if not gateway_runtime_lease_is_valid(conn, *fence, now=now):
+            raise DBError("Cron recovery lease is no longer valid")
+        rows = conn.execute(
+            f"""
+            SELECT {run_columns}, job.delivery_config_json
+            FROM cron_runs AS run
+            INNER JOIN cron_jobs AS job ON job.job_id=run.job_id
+            WHERE run.status IN ('claimed', 'running')
+              AND run.claim_lease_name=?
+              AND (run.claim_instance_id<>? OR run.claim_epoch<>?)
+            """,
+            fence,
+        ).fetchall()
+        for row in rows:
+            run = _cron_run_row(row[:-1])
+            if run is None:
+                continue
+            delivery_config = _deserialize_cron_json(
+                row[-1], "delivery_config"
+            )
+            policy = str((delivery_config or {}).get("policy", "text")).strip().lower()
+            delivery_status = (
+                "not_requested"
+                if policy in {"silent", "none"}
+                else "preparation_pending"
+            )
+            changed = conn.execute(
+                """
+                UPDATE cron_runs
+                SET status='failed', finished_at=?, error_type=?,
+                    result_summary=?, delivery_status=?, updated_at=?
+                WHERE run_id=? AND status IN ('claimed', 'running')
+                  AND claim_lease_name=? AND claim_instance_id=?
+                  AND claim_epoch=?
+                """,
+                (
+                    now,
+                    "execution_interrupted",
+                    "Cron task was interrupted before its execution result could be recorded.",
+                    delivery_status,
+                    now,
+                    run["run_id"],
+                    run["claim_lease_name"],
+                    run["claim_instance_id"],
+                    run["claim_epoch"],
+                ),
+            ).rowcount
+            if changed != 1:
+                continue
+            conn.execute(
+                """
+                UPDATE cron_jobs
+                SET last_run_at=?, consecutive_failures=consecutive_failures + 1,
+                    updated_at=?
+                WHERE job_id=?
+                """,
+                (now, now, run["job_id"]),
+            )
+            recovered += 1
+    return recovered
+
+
 def list_unclaimed_manual_cron_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict]:
     """读取尚未归属任何 Gateway lease 的手工运行请求。"""
     rows = conn.execute(

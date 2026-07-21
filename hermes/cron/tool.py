@@ -691,7 +691,23 @@ def register(registry):
                         "description": "Required for create. Request only the minimum Cron toolsets required; never include cron.",
                         "items": {"type": "string"},
                     },
-                    "skills": {"type": "array", "items": {"type": "string"}}, "workdir": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Working directory for the Cron run. It also defines "
+                            "the file access boundary: at run time the sub-agent "
+                            "may only read or write paths inside this directory "
+                            "(plus the system-managed artifact root). Any path "
+                            "mentioned in the prompt must fall under this "
+                            "directory; a prompt that references paths outside "
+                            "workdir will be denied by the capability guard even "
+                            "if allow_file_write is true. On Windows, Git Bash "
+                            "forms like /e/path and Windows forms like E:\\path "
+                            "are both accepted and normalized to the same "
+                            "absolute directory."
+                        ),
+                    },
                     "timeout": {"type": "number"}, "max_agent_iterations": {"type": "integer"},
                     "overlap_policy": {"type": "string", "enum": ["skip", "queue", "parallel"]},
                     "misfire_policy": {"type": "string", "enum": ["skip", "run_once", "catch_up"]},
