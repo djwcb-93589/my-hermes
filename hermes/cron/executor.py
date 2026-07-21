@@ -38,6 +38,7 @@ from hermes.db import (
     init_db,
     transition_cron_run,
 )
+from hermes.path_utils import git_bash_to_windows_path
 from hermes.prompt import build_system_prompt
 from hermes.tools.skill import handle_skill_view
 from hermes.tools import (
@@ -94,6 +95,7 @@ def _cron_session_id(job_id: str, run_id: str) -> str:
 def _result_artifacts(messages: list[dict], artifact_dir: str) -> list[dict]:
     """从已有工具结果提取轻量产物描述，不执行投递或复制文件。"""
     artifacts: list[dict] = []
+    artifact_root = Path(artifact_dir).resolve()
     for message in messages:
         if message.get("role") != "tool":
             continue
@@ -101,16 +103,24 @@ def _result_artifacts(messages: list[dict], artifact_dir: str) -> list[dict]:
             payload = json.loads(str(message.get("content", "")))
         except (TypeError, ValueError):
             continue
-        if not isinstance(payload, dict) or not isinstance(payload.get("path"), str):
+        if not isinstance(payload, dict):
             continue
+        # 优先用 abs_path（file 工具返回的 Windows 绝对路径）；没有再退回 path
+        # 并用 git_bash_to_windows_path 把 /d/... 转成 D:\... 否则 Windows 上
+        # Path("/d/...").resolve() 会解析到当前盘符的子目录，relative_to 失败。
+        raw_path = payload.get("abs_path") or payload.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        normalized = git_bash_to_windows_path(raw_path) if os.name == "nt" else raw_path
         try:
-            Path(payload["path"]).resolve().relative_to(Path(artifact_dir).resolve())
+            candidate = Path(normalized).resolve()
+            candidate.relative_to(artifact_root)
         except (OSError, ValueError):
             continue
         artifacts.append({
             "kind": "tool_file_reference",
             "tool_call_id": str(message.get("tool_call_id", "")),
-            "path": payload["path"],
+            "path": str(candidate),
             "description": "A tool result referenced this file; delivery was not requested.",
         })
     return artifacts
