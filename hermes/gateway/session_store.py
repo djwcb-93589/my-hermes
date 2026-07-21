@@ -120,7 +120,11 @@ class SessionStore:
         route_key: str,
         system_prompt: str,
     ) -> SessionContext:
-        """取现有 context 或新建。"""
+        """取现有 context 或新建；已存在时用最新 system_prompt 覆盖。
+
+        system_prompt 里带有 ``Current time`` 等会随时间漂移的环境信息，
+        会话持续期间必须每次刷新，否则 LLM 会基于过时时间做判断。
+        """
         ctx = self._contexts.get(route_key)
         if ctx is None:
             ctx = SessionContext(
@@ -129,6 +133,8 @@ class SessionStore:
                 system_prompt=system_prompt,
             )
             self._contexts[route_key] = ctx
+        else:
+            ctx.system_prompt = system_prompt
         ctx.last_activity = time.time()
         return ctx
 
@@ -137,9 +143,15 @@ class SessionStore:
         route_key: str,
         system_prompt: str,
     ) -> SessionContext:
-        """异步恢复会话映射，不在事件循环线程等待 SQLite。"""
+        """异步恢复会话映射，不在事件循环线程等待 SQLite。
+
+        已存在的 context 同样用最新 system_prompt 覆盖，保证 LLM 看到的
+        ``Current time`` 等环境信息反映本次消息到达时刻，而不是会话
+        第一次创建时的固化值。
+        """
         ctx = self._contexts.get(route_key)
         if ctx is not None:
+            ctx.system_prompt = system_prompt
             ctx.last_activity = time.time()
             return ctx
         lock = self._context_locks.setdefault(route_key, asyncio.Lock())

@@ -25,18 +25,19 @@ from pathlib import Path
 
 from .database import DBError, _apply_pragmas
 from .migrations.approval import _migrate_v13_to_v14
-from .migrations.core import _migrate_v1_to_v2
+from .migrations.core import _migrate_v1_to_v2, _migrate_v26_to_v27
 from .migrations.cron import _migrate_v18_to_v19, _migrate_v19_to_v20, _migrate_v20_to_v21, _migrate_v24_to_v25
 from .migrations.delivery import _migrate_v15_to_v16, _migrate_v16_to_v17, _migrate_v21_to_v22
 from .migrations.feishu import _migrate_v9_to_v10, _migrate_v10_to_v11, _migrate_v17_to_v18
 from .migrations.gateway import _migrate_v2_to_v3, _migrate_v3_to_v4, _migrate_v4_to_v5, _migrate_v5_to_v6, _migrate_v6_to_v7, _migrate_v7_to_v8, _migrate_v8_to_v9, _migrate_v11_to_v12, _migrate_v12_to_v13, _migrate_v14_to_v15
 from .migrations.mixed import _migrate_v22_to_v23, _migrate_v23_to_v24
-from .schemas import approval, core, cron, delivery, feishu, gateway
+from .migrations.tool_execution import _migrate_v25_to_v26
+from .schemas import approval, core, cron, delivery, feishu, gateway, tool_execution
 
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 25
+LATEST_SCHEMA_VERSION = 27
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -85,6 +86,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     gateway.create_fencing_triggers(conn)
     feishu.create_schema(conn)
     cron.create_schema(conn)
+    tool_execution.create_schema(conn)
 
 
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
@@ -408,6 +410,30 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 25
+
+    if current < 26:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v25_to_v26(conn)
+            _set_schema_version(conn, 26)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 26
+
+    if current < 27:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v26_to_v27(conn)
+            _set_schema_version(conn, 27)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 27
 
     return current
 

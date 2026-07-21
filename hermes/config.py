@@ -371,6 +371,28 @@ APPROVAL_REQUEST_TTL_SECONDS = float(
 BASE_URL = os.getenv("OPENAI_BASE_URL") or _config["base_url"]
 API_KEY = os.getenv("OPENAI_API_KEY") or _config["api_key"]
 MODEL = os.getenv("MODEL") or _config["model"]
+
+
+def _positive_int_setting(value, name: str) -> int:
+    """把模型额度配置规范化为正整数。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    if isinstance(value, int):
+        normalized = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+        normalized = int(value.strip())
+    else:
+        raise ValueError(f"{name} must be a positive integer")
+    if normalized <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return normalized
+
+
+MODEL_MAX_OUTPUT_TOKENS = _positive_int_setting(
+    os.getenv("MODEL_MAX_OUTPUT_TOKENS")
+    or _config.get("max_output_tokens", 8192),
+    "max_output_tokens",
+)
 MAX_ITERATIONS = int(
     os.getenv("MAX_ITERATIONS") or _config["limits"]["max_iterations"]
 )
@@ -392,6 +414,11 @@ FALLBACK_API_KEY = (
     os.getenv("FALLBACK_API_KEY")
     or _config["fallback"]["api_key"]
     or API_KEY
+)
+FALLBACK_MAX_OUTPUT_TOKENS = _positive_int_setting(
+    os.getenv("FALLBACK_MAX_OUTPUT_TOKENS")
+    or _config["fallback"].get("max_output_tokens", 8192),
+    "fallback.max_output_tokens",
 )
 
 COMPRESSION_THRESHOLD = _config["compression"]["threshold"]

@@ -118,6 +118,9 @@ class ToolEntry:
     approval_mode: ApprovalMode
     risk_level: ToolRiskLevel
     default_enabled_environments: frozenset[ExecutionEnvironment]
+    retry_safe: bool
+    unknown_on_crash: bool
+    status_check: Callable | None
 
 
 class ToolRegistry:
@@ -139,8 +142,23 @@ class ToolRegistry:
         approval_mode: ApprovalMode | str = ApprovalMode.NONE,
         risk_level: ToolRiskLevel | str = ToolRiskLevel.LOW,
         default_enabled_environments: Iterable[ExecutionEnvironment | str] = (),
+        retry_safe: bool = False,
+        unknown_on_crash: bool | None = None,
+        status_check: Callable | None = None,
     ) -> None:
         """注册一次工具及其跨入口运行策略。"""
+        normalized_retry_safe = bool(retry_safe)
+        normalized_unknown_on_crash = (
+            not normalized_retry_safe
+            if unknown_on_crash is None
+            else bool(unknown_on_crash)
+        )
+        if normalized_retry_safe and normalized_unknown_on_crash:
+            raise ValueError("retry_safe and unknown_on_crash cannot both be enabled")
+        if not normalized_retry_safe and not normalized_unknown_on_crash:
+            raise ValueError("a durable recovery policy must be enabled")
+        if status_check is not None:
+            raise ValueError("status_check tools are not supported until status queries are implemented")
         self._tools[name] = ToolEntry(
             name=name,
             toolset=str(toolset).strip().lower(),
@@ -168,7 +186,14 @@ class ToolRegistry:
                 _normalize_environment(item)
                 for item in default_enabled_environments
             ),
+            retry_safe=normalized_retry_safe,
+            unknown_on_crash=normalized_unknown_on_crash,
+            status_check=status_check,
         )
+
+    def get_entry(self, name: str) -> ToolEntry | None:
+        """返回工具注册元数据，执行包装器据此决定恢复策略。"""
+        return self._tools.get(name)
 
     def resolve(self, policy: ToolPolicy) -> ToolResolution:
         """按环境、toolset 和可信上下文生成统一的会话能力边界。"""

@@ -94,3 +94,60 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE messages_v1_backup")
     conn.execute("DROP TABLE sessions_v1_backup")
 
+
+def _migrate_v26_to_v27(conn: sqlite3.Connection) -> None:
+    """v26 -> v27:持久化思考模型协议字段与脱敏调用诊断。"""
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "reasoning_content" not in columns:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN reasoning_content TEXT"
+        )
+    # 旧记录已经丢失真实推理内容，只能为空；保留字段可满足兼容端协议。
+    conn.execute(
+        """
+        UPDATE messages
+        SET reasoning_content = ''
+        WHERE role = 'assistant'
+          AND tool_calls IS NOT NULL
+          AND reasoning_content IS NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_call_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            iteration INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            model_role TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            finish_reason TEXT,
+            latency_ms INTEGER NOT NULL,
+            has_content INTEGER NOT NULL,
+            content_chars INTEGER NOT NULL,
+            has_reasoning INTEGER NOT NULL,
+            reasoning_chars INTEGER NOT NULL,
+            tool_call_count INTEGER NOT NULL,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            total_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            cached_tokens INTEGER,
+            http_status INTEGER,
+            error_category TEXT,
+            exception_type TEXT,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_model_call_events_session_order
+            ON model_call_events(session_id, id)
+        """
+    )
+

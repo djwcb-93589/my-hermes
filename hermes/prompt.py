@@ -16,6 +16,30 @@ from hermes.tools.memory import (
 from hermes.tools.skill import discover_skills
 
 
+_CRON_ROUTING_GUIDANCE = (
+    "# Scheduled Task Routing\n"
+    "For any request to perform work in the future, after a delay, or on a "
+    "recurring schedule, your first tool call must be cron. Do not call any "
+    "other tool first.\n"
+    "Do not perform or prepare the scheduled task body in the current "
+    "conversation turn. This includes inspecting or discovering its runtime "
+    "files or directories, calculating runtime-dependent dates, and creating, "
+    "reading, modifying, copying, or otherwise staging its outputs.\n"
+    "Put runtime discovery, file-selection criteria, and date calculations in "
+    "the cron prompt so they happen when the job runs. Build the schedule, "
+    "workdir, and least-privilege capabilities directly from the user's "
+    "request when it is safe to do so. Ask a clarifying question only when a "
+    "safe schedule or capability scope cannot be constructed from the "
+    "available information.\n"
+    "For a one-time relative delay, pass a duration schedule directly: use "
+    "`5m`, `2h`, or `1d`. Never convert a relative delay into a five-field "
+    "calendar cron expression, because that expression repeats. Use `every "
+    "5m` or a five-field expression only when the user explicitly requests "
+    "recurrence. A five-field expression requires `recurring: true` in the "
+    "cron arguments."
+)
+
+
 def find_project_context(cwd: str) -> str:
     """Find and load the project configuration file by priority."""
     for name in [".hermes.md", "HERMES.md"]:
@@ -107,6 +131,7 @@ def build_system_prompt(
             "be managed through their dedicated tools, never repaired by "
             "guessing paths in terminal."
         )
+        parts.append(_CRON_ROUTING_GUIDANCE)
     elif not selected_toolsets:
         no_tool_capabilities = (
             "# Capabilities\n"
@@ -149,6 +174,8 @@ def build_system_prompt(
             )
         if tool_lines:
             parts.append("# Tool Use\n" + "\n".join(tool_lines))
+        if "cron" in selected_toolsets:
+            parts.append(_CRON_ROUTING_GUIDANCE)
 
     if include_project_context:
         project = find_project_context(cwd)

@@ -21,7 +21,12 @@ from typing import Callable
 
 from hermes.agent_loop import AgentLoop
 from hermes.backends import cleanup_backend
-from hermes.config import MAX_CHILD_ITERATIONS, MODEL, client as _default_client
+from hermes.config import (
+    MAX_CHILD_ITERATIONS,
+    MODEL,
+    MODEL_MAX_OUTPUT_TOKENS,
+    client as _default_client,
+)
 from hermes.delegate_jobs import get_delegate_job_manager
 from hermes.tools import (
     ExecutionEnvironment,
@@ -259,8 +264,7 @@ def run_delegate_child(
             client=_default_client,
             session_key=child_session_key,
             allowed_tool_names=resolution.allowed_tool_names,
-            # provider-specific 参数留空,需要时由调用方注入
-            model_kwargs=None,
+            model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
             cancel_checker=cancel_checker,
             tool_context=tool_context,
         )

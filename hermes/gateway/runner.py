@@ -5671,6 +5671,12 @@ class GatewayRunner:
         tool_context = {
             "interactive_approval": False,
             "approval_mode": "remote",
+            "durable_tool_execution": {
+                "environment": "gateway",
+                "session_id": conversation_id,
+                "source_message_id": task_event.message_id,
+                "database_path": self.db_path,
+            },
         }
         if "messaging" in enabled_toolsets:
             tool_context.update(self._gateway_tool_context(

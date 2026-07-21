@@ -17,6 +17,8 @@ from hermes.config import (
     MAX_CONTINUATIONS,
     MAX_RETRIES,
     MODEL,
+    FALLBACK_MAX_OUTPUT_TOKENS,
+    MODEL_MAX_OUTPUT_TOKENS,
     client,
 )
 from hermes.conversation import ConversationAgentLoop
@@ -176,18 +178,20 @@ def _terminal_outcome(loop_result, *, timed_out: bool, cancelled: bool, guard: C
             "Cron artifact limits were exceeded. Update the task or request authorization again.",
             "cron_artifact_limit_exceeded",
         )
-    if guard.violation is not None:
-        return (
-            "blocked", "cron_capability_denied",
-            "Cron capability authorization does not permit a requested operation. Update the task or request authorization again.",
-            "cron_capability_denied",
-        )
     if timed_out:
         return "cancelled", "timeout", "Cron task timed out before completion.", "timeout"
     if cancelled or loop_result.status == "cancelled":
         return "cancelled", "cancelled", "Cron task was cancelled before completion.", "cancelled"
     if loop_result.ok:
         return "completed", None, str(loop_result.summary or ""), None
+    # capability 拒绝允许模型换用已授权方案恢复；只有任务最终未完成时，
+    # 才把运行期间记录的拒绝作为阻塞原因。
+    if guard.violation is not None:
+        return (
+            "blocked", "cron_capability_denied",
+            "Cron capability authorization does not permit a requested operation. Update the task or request authorization again.",
+            "cron_capability_denied",
+        )
     return (
         "failed",
         str(loop_result.error_type or loop_result.status or "cron_execution_failed"),
@@ -442,13 +446,22 @@ class CronExecutor:
                 max_retries=MAX_RETRIES,
                 max_continuations=MAX_CONTINUATIONS,
                 compression_threshold=COMPRESSION_THRESHOLD,
-                model_kwargs=None,
+                model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
+                fallback_model_kwargs={
+                    "max_tokens": FALLBACK_MAX_OUTPUT_TOKENS,
+                },
                 cancel_checker=context.cancel_checker,
                 allowed_tool_names=allowed_tool_names,
                 tool_context={
                     "cron_execution_context": context,
                     "cron_capability_guard": guard,
                     "interactive_approval": False,
+                    "durable_tool_execution": {
+                        "environment": "cron",
+                        "session_id": session_id,
+                        "cron_run_id": run.run_id,
+                        "connection": conn,
+                    },
                 },
             )
             run_prompt = (

@@ -19,12 +19,14 @@ from hermes.persistence.approval import (
     recover_gateway_approvals,
 )
 from hermes.persistence.core import (
+    add_model_call_event,
     add_message,
     add_messages,
     create_session,
     ensure_session,
     get_gateway_visible_session_messages,
     get_session_messages,
+    list_model_call_events,
 )
 from hermes.persistence.cron import (
     advance_due_cron_job_without_run,
@@ -81,6 +83,18 @@ from hermes.persistence.database import (
     transaction,
 )
 from hermes.persistence.schema import LATEST_SCHEMA_VERSION, init_db
+from hermes.persistence.tool_execution import (
+    TOOL_EXECUTION_STATUSES,
+    complete_tool_execution,
+    create_tool_execution,
+    fail_tool_execution,
+    get_tool_execution,
+    get_tool_execution_by_call,
+    list_incomplete_tool_executions,
+    mark_tool_execution_unknown,
+    succeed_tool_execution,
+    start_tool_execution,
+)
 from hermes.persistence.delivery import (
     add_final_message_with_gateway_outbox,
     claim_gateway_file_delivery,

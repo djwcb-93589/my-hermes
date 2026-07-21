@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from hermes.approval import build_approval_required, is_remote_approval
 from hermes.approval_policy import approval_grant_identity_matches
 from hermes.config import DB_PATH
 from hermes.cron.capability import (
+    _normalise_path,
     build_capability_scope,
     build_cron_capability_grant,
     capability_change_requires_reauthorization,
@@ -51,6 +55,20 @@ _UPDATE_FIELDS = frozenset({
     "timeout", "max_agent_iterations", "overlap_policy", "misfire_policy",
     "retry_policy", "delivery_policy", "artifact_policy", "capability_spec",
 })
+_PROMPT_QUOTED_PATH_PATTERNS = (
+    re.compile(r'"((?:[A-Za-z]:[\\/]|/[A-Za-z](?:/|$)|\\\\)[^"\r\n]+)"'),
+    re.compile(r"'((?:[A-Za-z]:[\\/]|/[A-Za-z](?:/|$)|\\\\)[^'\r\n]+)'"),
+    re.compile(r"「((?:[A-Za-z]:[\\/]|/[A-Za-z](?:/|$)|\\\\)[^」\r\n]+)」"),
+    re.compile(r"“((?:[A-Za-z]:[\\/]|/[A-Za-z](?:/|$)|\\\\)[^”\r\n]+)”"),
+)
+_PROMPT_BARE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"[A-Za-z]:[\\/][^\s\"'<>|]+"
+    r"|\\\\[^\\/\s\"'<>|]+[\\/][^\s\"'<>|]+"
+    r"|/[A-Za-z](?:/[^\s\"'<>|]+)+"
+    r")"
+)
+_PROMPT_PATH_TRAILING_PUNCTUATION = ".,;:!?，。；：！？、)]}）】》」”"
 
 
 def _fingerprint(payload: dict) -> str:
@@ -80,6 +98,43 @@ def _contains_internal_field(value: Any) -> str | None:
             if nested is not None:
                 return nested
     return None
+
+
+def _prompt_absolute_paths(prompt: str) -> list[str]:
+    """提取任务提示中的 Windows、UNC 和 Git Bash 绝对路径。"""
+    candidates: list[tuple[int, str]] = []
+    quoted_spans: list[tuple[int, int]] = []
+    for pattern in _PROMPT_QUOTED_PATH_PATTERNS:
+        for match in pattern.finditer(prompt):
+            quoted_spans.append(match.span())
+            candidates.append((match.start(), match.group(1).strip()))
+
+    for match in _PROMPT_BARE_PATH_RE.finditer(prompt):
+        if any(start <= match.start() < end for start, end in quoted_spans):
+            continue
+        value = match.group(0).rstrip(_PROMPT_PATH_TRAILING_PUNCTUATION)
+        if value:
+            candidates.append((match.start(), value))
+
+    # 保留首次出现顺序，错误信息优先指向提示中最早的矛盾路径。
+    return list(dict.fromkeys(value for _, value in sorted(candidates)))
+
+
+def _validate_prompt_paths_within_workdir(
+    prompt: str,
+    workdir: object,
+) -> None:
+    """在任务入库前拒绝提示路径超出 workdir 的定义。"""
+    root = _normalise_path(str(workdir or os.getcwd()))
+    for raw_path in _prompt_absolute_paths(prompt):
+        candidate = _normalise_path(raw_path)
+        try:
+            Path(candidate).relative_to(Path(root))
+        except ValueError as exc:
+            raise ValueError(
+                f"prompt absolute path is outside workdir: {raw_path!r}; "
+                f"set workdir to contain every absolute path in prompt"
+            ) from exc
 
 
 def _approval_scope_for_job(job: CronJob) -> tuple[dict, dict]:
@@ -331,6 +386,29 @@ def _validate_system_capability_spec(capability_spec: dict) -> None:
         raise ValueError("capability_spec.artifact_root is system-managed")
 
 
+def _validate_schedule_recurrence(
+    schedule: str,
+    *,
+    one_shot: bool,
+    recurring: object,
+) -> None:
+    """防止把一次性相对延迟误写成会每年重复的日历 Cron。"""
+    normalized = schedule.strip()
+    if normalized.startswith("every "):
+        if recurring not in (None, True):
+            raise ValueError("recurring must be a boolean when supplied")
+        return
+    if one_shot:
+        if recurring is not None:
+            raise ValueError("one-time duration schedules must not set recurring")
+        return
+    if recurring is not True:
+        raise ValueError(
+            "five-field calendar schedules are recurring; pass recurring=true "
+            "or use a one-time duration such as '5m'"
+        )
+
+
 def _approved_candidate_job_id(args: dict, kwargs: dict) -> str | None:
     """仅复用 Gateway 已签发的一次性审批中保存的候选任务身份。"""
     grant = kwargs.get("approval_grant")
@@ -356,6 +434,11 @@ def _new_job(args: dict, **kwargs) -> CronJob:
         raise ValueError("'schedule' and 'prompt' are required")
     timezone = validate_timezone(str(args.get("timezone") or "UTC"))
     next_fire, one_shot = parse_schedule(schedule, timezone_name=timezone)
+    _validate_schedule_recurrence(
+        schedule,
+        one_shot=one_shot,
+        recurring=args.get("recurring"),
+    )
     toolsets = _validated_cron_toolsets(args.get("toolsets"))
     skills = args.get("skills", [])
     if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
@@ -377,7 +460,7 @@ def _new_job(args: dict, **kwargs) -> CronJob:
     gateway_origin = _trusted_origin(kwargs)
     source = "gateway" if gateway_origin else "cli"
     creator_id = str(kwargs.get("creator_id") or (f"cli:{session_key}" if source == "cli" else session_key))
-    return CronJob(
+    job = CronJob(
         job_id=_approved_candidate_job_id(args, kwargs) or uuid.uuid4().hex[:12],
         schedule=schedule.strip(), prompt=prompt.strip(),
         session_key=session_key, created_at=datetime.now().isoformat(), next_fire=next_fire,
@@ -392,6 +475,8 @@ def _new_job(args: dict, **kwargs) -> CronJob:
         delivery_config=_delivery_config(args, existing=None, origin=gateway_origin),
         capability_spec=dict(capability_spec), approval_status="pending",
     )
+    _validate_prompt_paths_within_workdir(job.prompt, job.workdir)
+    return job
 
 
 def _grant_for_job(
@@ -472,7 +557,7 @@ def _history_payload(records: list[dict], limit: int) -> list[dict]:
 
 def _update_changes(args: dict, current: CronJob, kwargs: dict) -> tuple[dict, float | None]:
     """把公开管理参数映射为定义更新，并在改计划时计算新的未来窗口。"""
-    supplied = set(args) - {"action", "job_id", "limit"}
+    supplied = set(args) - {"action", "job_id", "limit", "recurring"}
     unknown = supplied - _UPDATE_FIELDS
     if unknown:
         raise ValueError(f"unsupported update fields: {sorted(unknown)}")
@@ -499,6 +584,11 @@ def _update_changes(args: dict, current: CronJob, kwargs: dict) -> tuple[dict, f
             raise ValueError("schedule must be a non-empty string")
         timezone = str(changes.get("timezone", current.timezone))
         next_run_at, one_shot = parse_schedule(schedule, timezone_name=timezone)
+        _validate_schedule_recurrence(
+            schedule,
+            one_shot=one_shot,
+            recurring=args.get("recurring"),
+        )
         changes["schedule_expr"] = schedule.strip()
         changes["schedule_type"] = "one_shot" if one_shot else ("interval" if schedule.strip().startswith("every ") else "cron")
     elif "timezone" in changes and current.schedule_type == "cron":
@@ -572,6 +662,10 @@ def handle_cron_tool(args, **kwargs):
             candidate_record.update(changes)
             candidate_record["version"] = current.version + 1
             candidate = CronJob.from_record(candidate_record)
+            _validate_prompt_paths_within_workdir(
+                candidate.prompt,
+                candidate.workdir,
+            )
             if "capability_spec" in args:
                 _validate_system_capability_spec(candidate.capability_spec)
             _validate_terminal_capability(candidate.toolsets, candidate.capability_spec)
@@ -684,7 +778,22 @@ def register(registry):
                 "properties": {
                     "action": {"type": "string", "enum": ["create", "list", "get", "update", "pause", "resume", "run", "delete", "history"]},
                     "job_id": {"type": "string"}, "name": {"type": "string"},
-                    "schedule": {"type": "string"}, "timezone": {"type": "string"},
+                    "schedule": {
+                        "type": "string",
+                        "description": (
+                            "One-time delays use a duration such as '5m' or '2h'. "
+                            "Recurring durations use 'every 5m'. Five-field calendar "
+                            "expressions are recurring and require recurring=true."
+                        ),
+                    },
+                    "recurring": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only for an intentional five-field recurring "
+                            "calendar schedule; omit for one-time durations."
+                        ),
+                    },
+                    "timezone": {"type": "string"},
                     "prompt": {"type": "string"},
                     "toolsets": {
                         "type": "array",
@@ -700,9 +809,9 @@ def register(registry):
                             "may only read or write paths inside this directory "
                             "(plus the system-managed artifact root). Any path "
                             "mentioned in the prompt must fall under this "
-                            "directory; a prompt that references paths outside "
-                            "workdir will be denied by the capability guard even "
-                            "if allow_file_write is true. On Windows, Git Bash "
+                            "directory; create and update reject a prompt that "
+                            "references an absolute path outside workdir, even if "
+                            "allow_file_write is true. On Windows, Git Bash "
                             "forms like /e/path and Windows forms like E:\\path "
                             "are both accepted and normalized to the same "
                             "absolute directory."

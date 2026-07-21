@@ -34,8 +34,11 @@ from hermes.config import (
     MAX_CONTINUATIONS,
     COMPRESSION_THRESHOLD,
     CONTINUE_MESSAGE,
+    FALLBACK_MAX_OUTPUT_TOKENS,
+    MODEL_MAX_OUTPUT_TOKENS,
 )
 from hermes.db import (
+    add_model_call_event,
     add_messages,
     get_gateway_visible_session_messages,
     get_session_messages,
@@ -242,6 +245,7 @@ class ConversationAgentLoop(AgentLoop):
         max_continuations: int,
         compression_threshold: int,
         model_kwargs: dict | None = None,
+        fallback_model_kwargs: dict | None = None,
         cancel_checker=None,
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
@@ -267,6 +271,11 @@ class ConversationAgentLoop(AgentLoop):
         self._existing_messages = existing_messages
         self._retry_count = 0
         self._continuation_count = 0
+        self._fallback_model_kwargs = dict(
+            model_kwargs
+            if fallback_model_kwargs is None
+            else fallback_model_kwargs
+        )
         # fallback 只能从 primary 切换一次。已经切到 fallback 后再失败,
         # 不再二次切换、不重置 retry_count,直接 abort 避免 max_iterations 拖延。
         self._using_fallback = False
@@ -345,6 +354,7 @@ class ConversationAgentLoop(AgentLoop):
         if fallback_client:
             self.client = fallback_client
             self.model = fallback_model
+            self.model_kwargs = dict(self._fallback_model_kwargs)
             self._using_fallback = True
             # 切到 fallback 后重置 retry_count 一次,让 fallback 有重试机会。
             # 后续 fallback 自己失败时不再重置(上面的 _using_fallback 守卫)。
@@ -353,6 +363,13 @@ class ConversationAgentLoop(AgentLoop):
         return "abort"
 
     # --- 普通 assistant msg 追加后:add_messages + 重置 retry_count ---
+
+    def on_model_call_event(self, event: dict) -> None:
+        """尽力记录脱敏诊断，诊断库写失败不影响正常会话。"""
+        try:
+            add_model_call_event(self.conn, self.db_session_id, event)
+        except Exception:
+            pass
 
     def on_assistant_message(self, msg_dict: dict, response) -> None:
         add_messages(self.conn, self.db_session_id, [msg_dict])
@@ -363,6 +380,14 @@ class ConversationAgentLoop(AgentLoop):
 
     def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
         if finish_reason == "length" and self._continuation_count < self.max_continuations:
+            # 完全空响应无法续写；reasoning_content 则是可回传的截断状态。
+            last = messages[-1] if messages else {}
+            if (
+                not last.get("content")
+                and not last.get("tool_calls")
+                and not last.get("reasoning_content")
+            ):
+                return False
             self._continuation_count += 1
             return True
         return False
@@ -429,6 +454,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         max_continuations: int,
         compression_threshold: int,
         model_kwargs: dict | None = None,
+        fallback_model_kwargs: dict | None = None,
         cancel_checker=None,
         final_message_callback=None,
         persistence_call=None,
@@ -461,6 +487,11 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self._retry_count = restored_state["retry_count"]
         self._continuation_count = restored_state["continuation_count"]
         self._using_fallback = restored_state["using_fallback"]
+        self._fallback_model_kwargs = dict(
+            model_kwargs
+            if fallback_model_kwargs is None
+            else fallback_model_kwargs
+        )
         # 空集合是 Gateway 的硬边界：伪造 tool call 也不能触达 registry。
         self.allowed_tool_names = (
             None
@@ -480,6 +511,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
                 raise RuntimeError("approval resume fallback is unavailable")
             self.client = fallback_client
             self.model = active_model or fallback_model
+            self.model_kwargs = dict(self._fallback_model_kwargs)
             self._fallback_client = fallback_client
         elif active_model:
             self.model = active_model
@@ -538,6 +570,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         if fallback_client:
             self.client = fallback_client
             self.model = fallback_model
+            self.model_kwargs = dict(self._fallback_model_kwargs)
             self._fallback_client = fallback_client
             self._using_fallback = True
             self._retry_count = 0
@@ -561,6 +594,17 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         if self.persistence_call is not None:
             return await self.persistence_call(operation, *args)
         return operation(self.conn, *args)
+
+    async def on_model_call_event(self, event: dict) -> None:
+        """尽力记录脱敏诊断，诊断库写失败不影响正常会话。"""
+        try:
+            await self._persist(
+                add_model_call_event,
+                self.db_session_id,
+                event,
+            )
+        except Exception:
+            pass
 
     async def on_assistant_message(self, msg_dict: dict, response) -> None:
         await self._persist(add_messages, self.db_session_id, [msg_dict])
@@ -593,6 +637,14 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
 
     def should_continue(self, finish_reason: str, messages: list[dict]) -> bool:
         if finish_reason == "length" and self._continuation_count < self.max_continuations:
+            # 同步版本同样只拒绝没有任何可回传状态的完全空响应。
+            last = messages[-1] if messages else {}
+            if (
+                not last.get("content")
+                and not last.get("tool_calls")
+                and not last.get("reasoning_content")
+            ):
+                return False
             self._continuation_count += 1
             return True
         return False
@@ -769,10 +821,10 @@ def run_conversation(
         max_retries=MAX_RETRIES,
         max_continuations=MAX_CONTINUATIONS,
         compression_threshold=COMPRESSION_THRESHOLD,
-        # ponytail: 当前项目 client.chat.completions.create 只传基础三参数
-        # (model/messages/tools)。若后续切到 GLM 5.2 / deepseek v4 等需要
-        # extra_body / temperature 的 provider,在这里透传即可,无需改 AgentLoop。
-        model_kwargs=None,
+        model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
+        fallback_model_kwargs={
+            "max_tokens": FALLBACK_MAX_OUTPUT_TOKENS,
+        },
         cancel_checker=cancel_checker,
         allowed_tool_names=allowed_tool_names,
         tool_context=tool_context,
@@ -878,7 +930,10 @@ async def run_conversation_async(
                 max_retries=MAX_RETRIES,
                 max_continuations=MAX_CONTINUATIONS,
                 compression_threshold=COMPRESSION_THRESHOLD,
-                model_kwargs=None,
+                model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
+                fallback_model_kwargs={
+                    "max_tokens": FALLBACK_MAX_OUTPUT_TOKENS,
+                },
                 cancel_checker=cancel_checker,
                 final_message_callback=final_message_callback,
                 persistence_call=persistence_call,

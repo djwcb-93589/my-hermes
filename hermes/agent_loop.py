@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Callable
@@ -348,13 +349,30 @@ def _extract_approval_request(
     }
 
 
-def build_assistant_msg_dict(assistant_msg) -> dict:
+def build_assistant_msg_dict(
+    assistant_msg,
+    *,
+    preserve_reasoning: bool = False,
+) -> dict:
     """把 SDK 的 assistant message 对象转成可序列化 dict。"""
     msg_dict: dict = {
         "role": "assistant",
         "content": assistant_msg.content or "",
     }
+    reasoning_content = getattr(
+        assistant_msg,
+        "reasoning_content",
+        None,
+    )
+    if preserve_reasoning and reasoning_content is not None:
+        # 仅为截断续写保存协议状态，普通最终回复不额外持久化隐藏推理。
+        msg_dict["reasoning_content"] = str(reasoning_content)
     if assistant_msg.tool_calls:
+        # 思考模型要求后续工具轮完整回传该字段；普通模型缺少该字段时
+        # 补空串，使同一份历史也能被要求该协议字段的 fallback 接受。
+        msg_dict["reasoning_content"] = (
+            "" if reasoning_content is None else str(reasoning_content)
+        )
         msg_dict["tool_calls"] = [
             {
                 "id": tc.id,
@@ -367,6 +385,128 @@ def build_assistant_msg_dict(assistant_msg) -> dict:
             for tc in assistant_msg.tool_calls
         ]
     return msg_dict
+
+
+def _object_value(obj, name: str, default=None):
+    """兼容 SDK 对象与普通 dict 的只读字段访问。"""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _optional_int(value) -> int | None:
+    """把 usage / HTTP 状态中的整数安全规范化。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _content_char_count(value) -> int:
+    """只统计正文长度，不复制或持久化正文。"""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def _model_error_category(exc) -> tuple[int | None, str]:
+    """从状态码和异常类型生成不包含响应正文的稳定错误分类。"""
+    status = _optional_int(getattr(exc, "status_code", None))
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = _optional_int(getattr(response, "status_code", None))
+
+    # 这里只用异常文本做内存内分类，事件中不保存原文或响应 body。
+    error_text = str(exc).lower()
+    exception_name = type(exc).__name__.lower()
+    if status == 400 and "context" in error_text:
+        return status, "context_overflow"
+    if status == 400:
+        return status, "bad_request"
+    if status in (401, 403):
+        return status, "auth"
+    if status == 404:
+        return status, "model_not_found"
+    if status == 408 or "timeout" in exception_name or "timed out" in error_text:
+        return status, "timeout"
+    if status == 429:
+        return status, "rate_limit"
+    if status is not None and status >= 500:
+        return status, "server_error"
+    if "connection" in exception_name or "connection" in error_text:
+        return status, "network_error"
+    if status is not None:
+        return status, f"http_{status}"
+    return None, "unknown"
+
+
+def _model_call_event(
+    *,
+    iteration: int,
+    model: str,
+    model_role: str,
+    latency_ms: int,
+    outcome: str,
+    response=None,
+    assistant_msg=None,
+    finish_reason=None,
+    error=None,
+) -> dict:
+    """构造不含 prompt、回答、推理正文和异常正文的模型调用诊断。"""
+    content = _object_value(assistant_msg, "content")
+    reasoning = _object_value(assistant_msg, "reasoning_content")
+    tool_calls = _object_value(assistant_msg, "tool_calls") or []
+    usage = _object_value(response, "usage")
+    completion_details = _object_value(usage, "completion_tokens_details")
+    prompt_details = _object_value(usage, "prompt_tokens_details")
+
+    http_status = None
+    error_category = None
+    exception_type = None
+    if error is not None:
+        http_status, error_category = _model_error_category(error)
+        exception_type = type(error).__name__
+    elif outcome != "success":
+        error_category = outcome
+
+    return {
+        "iteration": iteration,
+        "model": str(model),
+        "model_role": model_role,
+        "outcome": outcome,
+        "finish_reason": (
+            None if finish_reason is None else str(finish_reason)
+        ),
+        "latency_ms": max(0, int(latency_ms)),
+        "has_content": bool(content),
+        "content_chars": _content_char_count(content),
+        "has_reasoning": bool(reasoning),
+        "reasoning_chars": _content_char_count(reasoning),
+        "tool_call_count": len(tool_calls),
+        "prompt_tokens": _optional_int(_object_value(usage, "prompt_tokens")),
+        "completion_tokens": _optional_int(
+            _object_value(usage, "completion_tokens")
+        ),
+        "total_tokens": _optional_int(_object_value(usage, "total_tokens")),
+        "reasoning_tokens": _optional_int(
+            _object_value(completion_details, "reasoning_tokens")
+            or _object_value(usage, "reasoning_tokens")
+        ),
+        "cached_tokens": _optional_int(
+            _object_value(prompt_details, "cached_tokens")
+            or _object_value(usage, "cached_tokens")
+        ),
+        "http_status": http_status,
+        "error_category": error_category,
+        "exception_type": exception_type,
+    }
 
 
 def dispatch_tool_call(
@@ -410,11 +550,32 @@ def dispatch_tool_call(
 
     try:
         dispatch_context = dict(tool_context or {})
+        durable_context = dispatch_context.pop("durable_tool_execution", None)
         # 普通 AgentLoop 不得把内部审批许可透传给工具。
         dispatch_context.pop("allow_sensitive", None)
         dispatch_context.pop("approval_grant", None)
         dispatch_context["session_key"] = session_key
-        output = registry.dispatch(tool_name, tool_args, **dispatch_context)
+        if durable_context is None:
+            output = registry.dispatch(tool_name, tool_args, **dispatch_context)
+        else:
+            from hermes.durable_tool_dispatcher import (
+                DurableToolDispatcher,
+                DurableToolExecutionContext,
+            )
+
+            context = DurableToolExecutionContext.from_value(durable_context)
+            if context is None:
+                output = registry.dispatch(tool_name, tool_args, **dispatch_context)
+            else:
+                output = DurableToolDispatcher(
+                    registry,
+                    context,
+                ).dispatch(
+                    tool_name,
+                    tool_args,
+                    tool_call_id=tool_call.id,
+                    **dispatch_context,
+                )
     except Exception as exc:
         short = _short_error(exc)
         return (
@@ -657,9 +818,22 @@ class AgentLoop:
                 return self._cancel_result(messages)
 
             # 模型调用 —— 走 handle_model_error 决定后续动作
+            call_model = str(self.model)
+            call_model_role = self._model_role()
+            call_started = time.perf_counter()
             try:
                 response = self.call_model(messages)
             except Exception as exc:
+                self._emit_model_call_event(
+                    _model_call_event(
+                        iteration=self.iterations,
+                        model=call_model,
+                        model_role=call_model_role,
+                        latency_ms=(time.perf_counter() - call_started) * 1000,
+                        outcome="error",
+                        error=exc,
+                    )
+                )
                 decision = self.handle_model_error(exc, messages)
                 if decision == "retry":
                     continue
@@ -669,15 +843,85 @@ class AgentLoop:
                 # "raise" 或任何未知返回值都重新抛,但被顶层兜底 catch
                 raise
 
+            assistant_msg = response.choices[0].message
+            finish_reason = response.choices[0].finish_reason
+            has_output = bool(assistant_msg.content or assistant_msg.tool_calls)
+            outcome = "success"
+            if not has_output:
+                outcome = (
+                    "output_length_exhausted"
+                    if finish_reason == "length"
+                    else "empty_model_response"
+                )
+            self._emit_model_call_event(
+                _model_call_event(
+                    iteration=self.iterations,
+                    model=call_model,
+                    model_role=call_model_role,
+                    latency_ms=(time.perf_counter() - call_started) * 1000,
+                    outcome=outcome,
+                    response=response,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                )
+            )
+
             # 模型请求期间可能收到 /stop 或后续消息。响应返回后必须
             # 再检查一次,避免把已经过时的内容写入历史或继续发送。
             if self._is_cancelled():
                 return self._cancel_result(messages)
 
-            assistant_msg = response.choices[0].message
-            finish_reason = response.choices[0].finish_reason
+            # reasoning-only 与完全空响应都不是合法 assistant 输出，必须在
+            # append 前处理，避免污染同轮重试或 fallback 的请求历史。
+            if not has_output:
+                reasoning_content = getattr(
+                    assistant_msg,
+                    "reasoning_content",
+                    None,
+                )
+                if finish_reason == "length" and reasoning_content:
+                    continuation_msg = build_assistant_msg_dict(
+                        assistant_msg,
+                        preserve_reasoning=True,
+                    )
+                    messages.append(continuation_msg)
+                    if self.should_continue(finish_reason, messages):
+                        try:
+                            self.on_assistant_message(
+                                continuation_msg,
+                                response,
+                            )
+                        except Exception as exc:
+                            return self._persistence_error_result(
+                                messages,
+                                repr(exc),
+                            )
+                        cont_msg = self.continuation_message()
+                        messages.append(cont_msg)
+                        try:
+                            self.on_continuation_message(cont_msg)
+                        except Exception as exc:
+                            return self._persistence_error_result(
+                                messages,
+                                repr(exc),
+                            )
+                        continue
+                    messages.pop()
+                decision = self.handle_model_error(
+                    RuntimeError("model returned empty content with no tool_calls"),
+                    messages,
+                )
+                if decision == "retry":
+                    continue
+                return self._model_error_result(
+                    messages,
+                    "model returned empty content with no tool_calls",
+                )
 
-            msg_dict = build_assistant_msg_dict(assistant_msg)
+            msg_dict = build_assistant_msg_dict(
+                assistant_msg,
+                preserve_reasoning=finish_reason == "length",
+            )
             messages.append(msg_dict)
 
             if assistant_msg.tool_calls:
@@ -717,7 +961,6 @@ class AgentLoop:
                     return self._persistence_error_result(messages, repr(exc))
                 continue
 
-            # 模型不再调工具 → 任务完成
             try:
                 self.on_final_assistant_message(msg_dict, response)
             except Exception as exc:
@@ -880,6 +1123,21 @@ class AgentLoop:
             tools=self.tools if self.tools else None,
             **self.model_kwargs,
         )
+
+    def _model_role(self) -> str:
+        """诊断中只区分主模型与 fallback，不记录供应商凭证或地址。"""
+        return "fallback" if bool(getattr(self, "_using_fallback", False)) else "primary"
+
+    def _emit_model_call_event(self, event: dict) -> None:
+        """诊断是 best effort，记录失败不得改变 AgentLoop 结果。"""
+        try:
+            self.on_model_call_event(event)
+        except Exception:
+            pass
+
+    def on_model_call_event(self, event: dict) -> None:
+        """模型调用诊断 hook；默认不持久化。"""
+        pass
 
     def handle_model_error(self, exc, messages) -> str:
         """模型调用异常时调用。返回:
@@ -1051,11 +1309,24 @@ class AsyncAgentLoop(AgentLoop):
             if self._is_cancelled():
                 return self._cancel_result(messages)
 
+            call_model = str(self.model)
+            call_model_role = self._model_role()
+            call_started = time.perf_counter()
             try:
                 response = await self.call_model(messages)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                await self._emit_model_call_event_async(
+                    _model_call_event(
+                        iteration=self.iterations,
+                        model=call_model,
+                        model_role=call_model_role,
+                        latency_ms=(time.perf_counter() - call_started) * 1000,
+                        outcome="error",
+                        error=exc,
+                    )
+                )
                 decision = await self.handle_model_error(exc, messages)
                 if decision == "retry":
                     continue
@@ -1063,14 +1334,87 @@ class AsyncAgentLoop(AgentLoop):
                     return self._model_error_result(messages, repr(exc))
                 raise
 
+            assistant_msg = response.choices[0].message
+            finish_reason = response.choices[0].finish_reason
+            has_output = bool(assistant_msg.content or assistant_msg.tool_calls)
+            outcome = "success"
+            if not has_output:
+                outcome = (
+                    "output_length_exhausted"
+                    if finish_reason == "length"
+                    else "empty_model_response"
+                )
+            await self._emit_model_call_event_async(
+                _model_call_event(
+                    iteration=self.iterations,
+                    model=call_model,
+                    model_role=call_model_role,
+                    latency_ms=(time.perf_counter() - call_started) * 1000,
+                    outcome=outcome,
+                    response=response,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                )
+            )
+
             # 保留协作式取消检查,处理未通过 Task.cancel() 触发的旧调用方。
             if self._is_cancelled():
                 return self._cancel_result(messages)
 
-            assistant_msg = response.choices[0].message
-            finish_reason = response.choices[0].finish_reason
+            # reasoning-only 与完全空响应都不能进入下一次模型请求的历史。
+            if not has_output:
+                reasoning_content = getattr(
+                    assistant_msg,
+                    "reasoning_content",
+                    None,
+                )
+                if finish_reason == "length" and reasoning_content:
+                    continuation_msg = build_assistant_msg_dict(
+                        assistant_msg,
+                        preserve_reasoning=True,
+                    )
+                    messages.append(continuation_msg)
+                    if self.should_continue(finish_reason, messages):
+                        try:
+                            await self.on_assistant_message(
+                                continuation_msg,
+                                response,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            return self._persistence_error_result(
+                                messages,
+                                repr(exc),
+                            )
+                        cont_msg = self.continuation_message()
+                        messages.append(cont_msg)
+                        try:
+                            await self.on_continuation_message(cont_msg)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            return self._persistence_error_result(
+                                messages,
+                                repr(exc),
+                            )
+                        continue
+                    messages.pop()
+                decision = await self.handle_model_error(
+                    RuntimeError("model returned empty content with no tool_calls"),
+                    messages,
+                )
+                if decision == "retry":
+                    continue
+                return self._model_error_result(
+                    messages,
+                    "model returned empty content with no tool_calls",
+                )
 
-            msg_dict = build_assistant_msg_dict(assistant_msg)
+            msg_dict = build_assistant_msg_dict(
+                assistant_msg,
+                preserve_reasoning=finish_reason == "length",
+            )
             messages.append(msg_dict)
 
             if assistant_msg.tool_calls:
@@ -1243,6 +1587,19 @@ class AsyncAgentLoop(AgentLoop):
             tools=self.tools if self.tools else None,
             **self.model_kwargs,
         )
+
+    async def _emit_model_call_event_async(self, event: dict) -> None:
+        """异步诊断同样 best effort，不得让记录失败中断会话。"""
+        try:
+            await self.on_model_call_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def on_model_call_event(self, event: dict) -> None:
+        """异步模型调用诊断 hook；默认不持久化。"""
+        pass
 
     async def handle_model_error(self, exc, messages) -> str:
         """模型调用异常时调用。默认重新抛出。"""

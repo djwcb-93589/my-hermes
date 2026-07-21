@@ -15,7 +15,18 @@ from hermes.config import (
 
 def estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate: character count / 4."""
-    return sum(len(str(msg.get("content", ""))) for msg in messages) // 4
+    return sum(_message_text_chars(msg) for msg in messages) // 4
+
+
+def _message_text_chars(message: dict) -> int:
+    """统计会进入模型上下文的正文与推理协议字段字符数。"""
+    content = message.get("content")
+    reasoning_content = message.get("reasoning_content")
+    return (
+        len(str(content)) if content is not None else 0
+    ) + (
+        len(str(reasoning_content)) if reasoning_content is not None else 0
+    )
 
 
 def compress(messages: list[dict]) -> list[dict]:
@@ -35,7 +46,7 @@ def compress(messages: list[dict]) -> list[dict]:
     tail_tokens = 0
 
     for index in range(len(messages) - 1, head_end - 1, -1):
-        msg_tokens = len(str(messages[index].get("content", ""))) // 4
+        msg_tokens = _message_text_chars(messages[index]) // 4
         if tail_tokens + msg_tokens > TAIL_TOKEN_BUDGET:
             break
         tail_tokens += msg_tokens
@@ -91,7 +102,7 @@ async def compress_async(
     tail_tokens = 0
 
     for index in range(len(messages) - 1, head_end - 1, -1):
-        msg_tokens = len(str(messages[index].get("content", ""))) // 4
+        msg_tokens = _message_text_chars(messages[index]) // 4
         if tail_tokens + msg_tokens > TAIL_TOKEN_BUDGET:
             break
         tail_tokens += msg_tokens

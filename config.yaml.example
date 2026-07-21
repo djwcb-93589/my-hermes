@@ -2,6 +2,8 @@
 
 # 主模型名称，填写 OpenAI 兼容服务支持的模型标识。
 model: gpt-5
+# 主模型单次响应允许使用的最大 completion token 数。
+max_output_tokens: 8192
 # 主模型 API 的 OpenAI 兼容基础地址。
 base_url: https://api.openai.com/v1
 # 主模型 API 密钥；建议使用环境变量引用，避免明文提交。
@@ -11,6 +13,8 @@ api_key: ${OPENAI_API_KEY}
 fallback:
   # 回退模型名称；空字符串表示不单独指定。
   model: ""
+  # 回退模型使用独立额度，避免继承主模型可能更高的供应商上限。
+  max_output_tokens: 8192
   # 回退模型 API 地址；空字符串表示沿用主模型地址。
   base_url: ""
   # 回退模型 API 密钥；空字符串表示沿用主模型密钥。

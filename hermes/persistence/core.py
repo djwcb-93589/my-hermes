@@ -70,6 +70,20 @@ def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> int
     tool_calls_json = _serialize_tool_calls(msg.get("tool_calls"))
 
     tool_call_id = msg.get("tool_call_id")
+    reasoning_content = msg.get("reasoning_content")
+    if role == "assistant" and tool_calls_json and reasoning_content is None:
+        # 思考模型要求后续请求原样带回该字段；普通模型的工具调用用空串兼容。
+        reasoning_content = ""
+    if reasoning_content is not None and not isinstance(
+        reasoning_content,
+        str,
+    ):
+        try:
+            reasoning_content = str(reasoning_content)
+        except Exception as exc:
+            raise InvalidMessageError(
+                f"reasoning_content cannot be coerced to str: {exc}"
+            ) from exc
     # tool 角色必须带 tool_call_id,否则上下文里无法关联到原 tool_call
     if role == "tool" and not tool_call_id:
         raise InvalidMessageError("tool message missing tool_call_id")
@@ -78,8 +92,9 @@ def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> int
         cursor = conn.execute(
             """
             INSERT INTO messages
-                (session_id, role, content, tool_calls, tool_call_id, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (session_id, role, content, tool_calls, tool_call_id,
+                 reasoning_content, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -87,6 +102,7 @@ def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> int
                 content,
                 tool_calls_json,
                 tool_call_id,
+                reasoning_content,
                 time.time(),
             ),
         )
@@ -135,7 +151,7 @@ def get_session_messages(
     """
     rows = conn.execute(
         """
-        SELECT role, content, tool_calls, tool_call_id
+        SELECT role, content, tool_calls, tool_call_id, reasoning_content
         FROM messages
         WHERE session_id = ?
         ORDER BY id
@@ -144,7 +160,7 @@ def get_session_messages(
     ).fetchall()
 
     messages: list[dict] = []
-    for role, content, tool_calls_json, tool_call_id in rows:
+    for role, content, tool_calls_json, tool_call_id, reasoning_content in rows:
         msg: dict = {"role": role, "content": content or ""}
         # tool_calls 反序列化(集中处理)
         calls = _deserialize_tool_calls(tool_calls_json)
@@ -152,6 +168,8 @@ def get_session_messages(
             msg["tool_calls"] = calls
         if tool_call_id:
             msg["tool_call_id"] = tool_call_id
+        if reasoning_content is not None or (role == "assistant" and calls):
+            msg["reasoning_content"] = reasoning_content or ""
         messages.append(msg)
     return messages
 
@@ -190,7 +208,8 @@ def get_gateway_visible_session_messages(
         """
     rows = conn.execute(
         f"""
-        SELECT m.role, m.content, m.tool_calls, m.tool_call_id
+        SELECT m.role, m.content, m.tool_calls, m.tool_call_id,
+               m.reasoning_content
         FROM messages AS m
         WHERE m.session_id = ?
           AND (
@@ -209,13 +228,59 @@ def get_gateway_visible_session_messages(
     ).fetchall()
 
     messages: list[dict] = []
-    for role, content, tool_calls_json, tool_call_id in rows:
+    for role, content, tool_calls_json, tool_call_id, reasoning_content in rows:
         msg: dict = {"role": role, "content": content or ""}
         calls = _deserialize_tool_calls(tool_calls_json)
         if calls:
             msg["tool_calls"] = calls
         if tool_call_id:
             msg["tool_call_id"] = tool_call_id
+        if reasoning_content is not None or (role == "assistant" and calls):
+            msg["reasoning_content"] = reasoning_content or ""
         messages.append(msg)
     return messages
+
+
+def add_model_call_event(
+    conn: sqlite3.Connection,
+    session_id: str,
+    event: dict,
+) -> None:
+    """写入不含提示词、回答和推理正文的模型调用诊断。"""
+    fields = (
+        "iteration", "model", "model_role", "outcome", "finish_reason",
+        "latency_ms", "has_content", "content_chars", "has_reasoning",
+        "reasoning_chars", "tool_call_count", "prompt_tokens",
+        "completion_tokens", "total_tokens", "reasoning_tokens",
+        "cached_tokens", "http_status", "error_category",
+        "exception_type",
+    )
+    values = [event.get(field) for field in fields]
+    conn.execute(
+        f"""
+        INSERT INTO model_call_events
+            (session_id, {', '.join(fields)}, created_at)
+        VALUES ({', '.join('?' for _ in range(len(fields) + 2))})
+        """,
+        (session_id, *values, time.time()),
+    )
+    conn.commit()
+
+
+def list_model_call_events(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> list[dict]:
+    """按调用顺序返回脱敏模型诊断记录。"""
+    rows = conn.execute(
+        "SELECT * FROM model_call_events WHERE session_id=? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    columns = [
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(model_call_events)"
+        ).fetchall()
+    ]
+    return [dict(zip(columns, row)) for row in rows]
 
