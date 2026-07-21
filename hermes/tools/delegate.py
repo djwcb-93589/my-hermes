@@ -37,6 +37,7 @@ from hermes.tools import (
 
 
 _DEFAULT_TOOLSETS = ["terminal", "file"]
+_ALLOWED_TOOLSETS = frozenset({"terminal", "file", "skill_read"})
 
 DELEGATE_SYSTEM_PROMPT = """
 You are a temporary delegated subagent in my-hermes.
@@ -133,8 +134,9 @@ def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str |
             error="toolsets must be a list of strings",
         )
 
-    allowed_toolsets = registry.toolsets_for_environment(
-        ExecutionEnvironment.DELEGATE
+    allowed_toolsets = (
+        registry.toolsets_for_environment(ExecutionEnvironment.DELEGATE)
+        & _ALLOWED_TOOLSETS
     )
     # 严格校验:出现未知 / 不允许的项直接拒绝,不静默过滤。
     invalid = [t for t in requested if t not in allowed_toolsets]
@@ -511,7 +513,7 @@ def register(registry):
                         "items": {"type": "string"},
                         "description": (
                             "Allowed child toolsets. Each item must be one "
-                            "of {terminal, file, skill}. Unknown or "
+                            "of {terminal, file, skill_read}. Unknown or "
                             "disallowed values (memory / delegate / cron) "
                             "cause invalid_args. Default "
                             "['terminal', 'file']."

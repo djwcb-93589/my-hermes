@@ -64,11 +64,11 @@ def test_commands_outside_readonly_boundary_still_require_approval(command):
 @pytest.mark.parametrize(
     ("command", "expected_decision", "expected_source"),
     [
-        ("ls -lt .", ALLOW, "static_allowlist"),
-        ("tail -f gateway.log", ASK, "approval_policy"),
+        ("ls -lt .", ALLOW, "remote_blacklist_default_allow"),
+        ("tail -f gateway.log", ALLOW, "remote_blacklist_default_allow"),
     ],
 )
-def test_remote_gateway_uses_static_allowlist(
+def test_remote_gateway_uses_blacklist_default_allow(
     command,
     expected_decision,
     expected_source,

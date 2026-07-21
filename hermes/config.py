@@ -29,6 +29,14 @@ DEFAULT_CONFIG = {
             "denied_executables": [],
             "protected_paths": [],
             "denied_file_rules": [],
+            "approval_command_patterns": [
+                r"\b(?:rm|rmdir|del|erase|remove-item)\b",
+                r"\b(?:chmod|chown|chgrp|setfacl|icacls|takeown)\b",
+                r"\b(?:git\s+push|curl|wget|scp|sftp|ssh|ftp)\b",
+                r"\b(?:docker|kubectl|terraform|ansible)\b",
+            ],
+            "approval_file_rules": [],
+            "remote_default_allow": True,
             "sensitive_file_patterns": [
                 r"(^|/)\.env(\..*)?$",
                 r"\.(key|pem|pfx|p12)$",
@@ -113,12 +121,21 @@ def _validate_filesystem_security_config(config: dict) -> None:
         "denied_executables",
         "protected_paths",
         "denied_file_rules",
+        "approval_command_patterns",
+        "approval_file_rules",
         "sensitive_file_patterns",
     ):
         value = approval.get(field, defaults[field])
         if not isinstance(value, list):
             raise ValueError(f"security.approval.{field} must be a list")
         approval[field] = list(value)
+
+    for index, rule in enumerate(approval["approval_file_rules"]):
+        if not isinstance(rule, dict):
+            raise ValueError(
+                "security.approval.approval_file_rules entries must be "
+                f"mappings (invalid item at index {index})"
+            )
 
     for index, pattern in enumerate(approval["sensitive_file_patterns"]):
         if not isinstance(pattern, str) or not pattern.strip():
@@ -150,6 +167,16 @@ def _validate_filesystem_security_config(config: dict) -> None:
     intelligent["enabled"] = enabled
     approval["intelligent_approval"] = intelligent
 
+    remote_default_allow = approval.get(
+        "remote_default_allow",
+        defaults["remote_default_allow"],
+    )
+    if not isinstance(remote_default_allow, bool):
+        raise ValueError(
+            "security.approval.remote_default_allow must be a boolean"
+        )
+    approval["remote_default_allow"] = remote_default_allow
+
     raw_ttl_seconds = approval.get(
         "request_ttl_seconds",
         defaults["request_ttl_seconds"],
@@ -174,6 +201,9 @@ def _validate_filesystem_security_config(config: dict) -> None:
         denied_executables=approval["denied_executables"],
         protected_paths=approval["protected_paths"],
         denied_file_rules=approval["denied_file_rules"],
+        approval_command_patterns=approval["approval_command_patterns"],
+        approval_file_rules=approval["approval_file_rules"],
+        remote_default_allow=remote_default_allow,
         intelligent_approval_enabled=enabled,
         cwd=os.getcwd(),
     )
@@ -358,6 +388,9 @@ APPROVAL_SECURITY_POLICY = ApprovalSecurityPolicy(
     denied_executables=_approval_cfg["denied_executables"],
     protected_paths=_approval_cfg["protected_paths"],
     denied_file_rules=_approval_cfg["denied_file_rules"],
+    approval_command_patterns=_approval_cfg["approval_command_patterns"],
+    approval_file_rules=_approval_cfg["approval_file_rules"],
+    remote_default_allow=_approval_cfg["remote_default_allow"],
     hardline_protected_paths=_hardline_protected_paths(),
     intelligent_approval_enabled=(
         _approval_cfg["intelligent_approval"]["enabled"]

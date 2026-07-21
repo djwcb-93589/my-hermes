@@ -500,7 +500,11 @@ def _grant_for_job(
 def _requires_gateway_authorization(job: CronJob) -> bool:
     """判断创建或敏感更新是否携带无人值守高风险能力。"""
     scope = build_capability_scope(job)
-    return bool("terminal" in scope["toolsets"] or scope["allow_file_write"] or scope["allow_external_communication"])
+    return bool(
+        not job.one_shot
+        or "terminal" in scope["toolsets"]
+        or scope["allow_external_communication"]
+    )
 
 
 def _approved(args: dict, kwargs: dict, expected_fingerprint: str) -> bool:
@@ -619,7 +623,11 @@ def handle_cron_tool(args, **kwargs):
                 args, job.session_key, "create", canonical_scope
             )
             approved = _approved(args, kwargs, approval_fingerprint)
-            if is_remote_approval(kwargs) and not approved:
+            if (
+                is_remote_approval(kwargs)
+                and _requires_gateway_authorization(job)
+                and not approved
+            ):
                 return _cron_approval_response(
                     args, job, action="create", canonical_scope=canonical_scope
                 )
@@ -675,11 +683,20 @@ def handle_cron_tool(args, **kwargs):
                 args, current.session_key, "update", canonical_scope
             )
             approved = _approved(args, kwargs, approval_fingerprint)
-            if sensitive and is_remote_approval(kwargs) and not approved:
+            if (
+                sensitive
+                and _requires_gateway_authorization(candidate)
+                and is_remote_approval(kwargs)
+                and not approved
+            ):
                 return _cron_approval_response(
                     args, candidate, action="update", canonical_scope=canonical_scope
                 )
-            if sensitive and not is_remote_approval(kwargs):
+            if (
+                sensitive
+                and _requires_gateway_authorization(candidate)
+                and not is_remote_approval(kwargs)
+            ):
                 return _json({"ok": False, "error_type": "approval_required", "error": "Capability-expanding Cron updates require Gateway remote authorization."})
             updated = store.update(job_id, changes)
             if next_run_at is not None:

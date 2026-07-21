@@ -124,6 +124,9 @@ class ApprovalSecurityPolicy:
     _protected_paths: tuple[str, ...]
     _hardline_protected_paths: tuple[str, ...]
     _denied_file_rules: tuple[FileDenyRule, ...]
+    _approval_command_patterns: tuple[re.Pattern[str], ...]
+    _approval_file_rules: tuple[FileDenyRule, ...]
+    remote_default_allow: bool
     intelligent_approval_enabled: bool
 
     def __init__(
@@ -133,7 +136,10 @@ class ApprovalSecurityPolicy:
         denied_executables: Sequence[str] = (),
         protected_paths: Sequence[str] = (),
         denied_file_rules: Sequence[Mapping] = (),
+        approval_command_patterns: Sequence[str] = (),
+        approval_file_rules: Sequence[Mapping] = (),
         hardline_protected_paths: Sequence[str] = (),
+        remote_default_allow: bool = True,
         intelligent_approval_enabled: bool = False,
         cwd: str | None = None,
     ) -> None:
@@ -178,40 +184,74 @@ class ApprovalSecurityPolicy:
             field_name="hardline protected paths",
         )
 
-        normalized_file_rules: list[FileDenyRule] = []
-        for index, rule in enumerate(denied_file_rules):
-            if not isinstance(rule, Mapping):
+        def compile_file_rules(
+            rules: Sequence[Mapping],
+            *,
+            field_name: str,
+        ) -> tuple[FileDenyRule, ...]:
+            normalized_rules: list[FileDenyRule] = []
+            for index, rule in enumerate(rules):
+                if not isinstance(rule, Mapping):
+                    raise ValueError(
+                        f"{field_name} entries must be mappings "
+                        f"(invalid item at index {index})"
+                    )
+                actions = rule.get("actions")
+                path_under = rule.get("path_under")
+                if (
+                    not isinstance(actions, (list, tuple))
+                    or not actions
+                    or any(
+                        not isinstance(action, str)
+                        or action not in _FILE_PATH_ACTIONS
+                        for action in actions
+                    )
+                ):
+                    raise ValueError(
+                        f"{field_name} actions must be a non-empty File "
+                        f"action list (invalid item at index {index})"
+                    )
+                if not isinstance(path_under, str) or not path_under.strip():
+                    raise ValueError(
+                        f"{field_name} path_under must be a non-empty "
+                        f"string (invalid item at index {index})"
+                    )
+                normalized_rules.append(FileDenyRule(
+                    actions=frozenset(actions),
+                    path_under=normalizer.normalize_path(
+                        path_under,
+                        cwd=base_cwd,
+                    ),
+                ))
+            return tuple(normalized_rules)
+
+        normalized_file_rules = compile_file_rules(
+            denied_file_rules,
+            field_name="security.approval.denied_file_rules",
+        )
+        approval_file_rules_normalized = compile_file_rules(
+            approval_file_rules,
+            field_name="security.approval.approval_file_rules",
+        )
+        approval_patterns: list[re.Pattern[str]] = []
+        for index, pattern in enumerate(approval_command_patterns):
+            if not isinstance(pattern, str) or not pattern.strip():
                 raise ValueError(
-                    "security.approval.denied_file_rules entries must be "
-                    f"mappings (invalid item at index {index})"
+                    "security.approval.approval_command_patterns entries must "
+                    f"be non-empty strings (invalid item at index {index})"
                 )
-            actions = rule.get("actions")
-            path_under = rule.get("path_under")
-            if (
-                not isinstance(actions, (list, tuple))
-                or not actions
-                or any(
-                    not isinstance(action, str)
-                    or action not in _FILE_PATH_ACTIONS
-                    for action in actions
-                )
-            ):
+            try:
+                approval_patterns.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
                 raise ValueError(
-                    "security.approval.denied_file_rules actions must be a "
-                    f"non-empty File action list (invalid item at index {index})"
-                )
-            if not isinstance(path_under, str) or not path_under.strip():
-                raise ValueError(
-                    "security.approval.denied_file_rules path_under must be a "
-                    f"non-empty string (invalid item at index {index})"
-                )
-            normalized_file_rules.append(FileDenyRule(
-                actions=frozenset(actions),
-                path_under=normalizer.normalize_path(
-                    path_under,
-                    cwd=base_cwd,
-                ),
-            ))
+                    "security.approval.approval_command_patterns contains an "
+                    f"invalid regex at index {index}"
+                ) from exc
+
+        if not isinstance(remote_default_allow, bool):
+            raise ValueError(
+                "security.approval.remote_default_allow must be a boolean"
+            )
 
         if not isinstance(intelligent_approval_enabled, bool):
             raise ValueError(
@@ -236,7 +276,22 @@ class ApprovalSecurityPolicy:
         object.__setattr__(
             self,
             "_denied_file_rules",
-            tuple(normalized_file_rules),
+            normalized_file_rules,
+        )
+        object.__setattr__(
+            self,
+            "_approval_command_patterns",
+            tuple(approval_patterns),
+        )
+        object.__setattr__(
+            self,
+            "_approval_file_rules",
+            approval_file_rules_normalized,
+        )
+        object.__setattr__(
+            self,
+            "remote_default_allow",
+            remote_default_allow,
         )
         object.__setattr__(
             self,
@@ -381,6 +436,28 @@ class ApprovalSecurityPolicy:
                     decision_source="user_deny_rule",
                 )
         return None
+
+    def requires_terminal_approval(self, command: str) -> bool:
+        """返回命中远程审批黑名单的常规 Terminal 操作。"""
+        return any(
+            pattern.search(command)
+            for pattern in self._approval_command_patterns
+        )
+
+    def requires_file_approval(
+        self,
+        *,
+        action: str,
+        normalized_path: str | None,
+    ) -> bool:
+        """返回命中远程审批黑名单的常规 File 操作。"""
+        if normalized_path is None:
+            return False
+        return any(
+            action in rule.actions
+            and _path_is_under(normalized_path, rule.path_under)
+            for rule in self._approval_file_rules
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3476,21 +3553,24 @@ def assess_terminal_operation(
         decision_source = "session_grant"
     elif (
         remote_approval
+        and active_security_policy.remote_default_allow
         and backend_risk.automatic_allowance
-        and command_classification.automatically_allowed
+        and not active_security_policy.requires_terminal_approval(
+            normalized_command
+        )
     ):
         decision = ALLOW
-        reason = command_classification.reason
+        reason = "terminal operation is outside the remote approval blacklist"
         error_type = None
         error = None
         fatal = False
-        decision_source = "static_allowlist"
+        decision_source = "remote_blacklist_default_allow"
     elif remote_approval:
         decision = ASK
         reason = (
             backend_risk.reason
             if backend_risk.risk_floor == HIGH
-            else command_classification.reason
+            else "terminal operation matches the remote approval blacklist"
         )
         error_type = None
         error = None
@@ -3638,7 +3718,21 @@ def assess_file_operation(
         error = None
         fatal = False
         decision_source = "session_grant"
-    elif remote_approval and action in _FILE_WRITE_ACTIONS:
+    elif (
+        remote_approval
+        and active_security_policy.remote_default_allow
+        and not active_security_policy.requires_file_approval(
+            action=action,
+            normalized_path=normalized_path,
+        )
+    ):
+        decision = ALLOW
+        reason = "file operation is outside the remote approval blacklist"
+        error_type = None
+        error = None
+        fatal = False
+        decision_source = "remote_blacklist_default_allow"
+    elif remote_approval:
         decision = ASK
         reason = "File 写入或修改操作需要显式审批"
         error_type = None

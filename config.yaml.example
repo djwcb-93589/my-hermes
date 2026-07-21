@@ -74,6 +74,15 @@ security:
     # append、replace、list 或 stat，path_under 同时覆盖目录本身和全部子路径。
     # 示例：[{actions: [write, append, replace], path_under: 'D:\\published'}]
     denied_file_rules: []
+    # Gateway 默认放行；仅命中审批黑名单时请求远程确认。
+    remote_default_allow: true
+    # 需要审批的 Terminal 命令正则。硬拒绝请使用 denied_command_patterns。
+    approval_command_patterns:
+      - '\\b(?:rm|rmdir|del|erase|remove-item)\\b'
+      - '\\b(?:chmod|chown|chgrp|setfacl|icacls|takeown)\\b'
+      - '\\b(?:git\\s+push|curl|wget|scp|sftp|ssh|ftp)\\b'
+    # 需要审批的 File action/path 组合规则，格式同 denied_file_rules。
+    approval_file_rules: []
     # File 敏感文件拒绝正则；命中后读写均按 critical 直接拒绝。
     # 默认值与原内置列表一致，可按需增加、删除或替换。
     sensitive_file_patterns:
@@ -235,7 +244,7 @@ gateway:
         - terminal
         - file
         - memory
-        - skill
+        - skill_read
         - delegate
         - messaging
       # 飞书应用 App ID。

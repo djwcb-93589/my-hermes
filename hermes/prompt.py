@@ -104,7 +104,7 @@ def build_system_prompt(
 
     skill_enabled = (
         selected_toolsets is None
-        or "skill" in selected_toolsets
+        or bool({"skill_read", "skill_manage"} & set(selected_toolsets))
     )
     if skill_enabled:
         skills = discover_skills()
@@ -160,10 +160,12 @@ def build_system_prompt(
             tool_lines.append(
                 "Use the memory tool for persistent memory changes."
             )
-        if "skill" in selected_toolsets:
+        if "skill_read" in selected_toolsets:
             tool_lines.append(
-                "Use the skill tool for explicitly available skills."
+                "Use the skill tools to inspect explicitly available skills."
             )
+        if "skill_manage" in selected_toolsets:
+            tool_lines.append("Skill management is available through skill_manage.")
         if "delegate" in selected_toolsets:
             tool_lines.append(
                 "Delegation is available only through the delegate tools."

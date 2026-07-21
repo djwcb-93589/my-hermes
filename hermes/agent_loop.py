@@ -1178,6 +1178,9 @@ class AgentLoop:
         合法 tool message,再由 batch hook 原子持久化。
         """
         tool_context = dict(self.tool_context)
+        allowed_tool_names = getattr(self, "allowed_tool_names", None)
+        if allowed_tool_names is not None:
+            tool_context["allowed_tool_names"] = allowed_tool_names
         if (
             self.cancel_checker is not None
             and self._tool_call_name(tool_call) == "terminal"
@@ -1627,6 +1630,9 @@ class AsyncAgentLoop(AgentLoop):
     ) -> tuple[str, str | None, str | None]:
         """在线程池运行现有同步工具,避免阻塞 Gateway 事件循环。"""
         tool_context = dict(self.tool_context)
+        allowed_tool_names = getattr(self, "allowed_tool_names", None)
+        if allowed_tool_names is not None:
+            tool_context["allowed_tool_names"] = allowed_tool_names
         if (
             self.cancel_checker is not None
             and self._tool_call_name(tool_call) == "terminal"

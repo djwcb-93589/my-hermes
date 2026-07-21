@@ -257,6 +257,16 @@ class ToolRegistry:
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        allowed_tool_names = kwargs.get("allowed_tool_names")
+        if (
+            allowed_tool_names is not None
+            and name not in frozenset(str(item) for item in allowed_tool_names)
+        ):
+            return json.dumps({
+                "ok": False,
+                "error_type": "tool_not_authorized",
+                "error": "tool is outside the current execution boundary",
+            }, ensure_ascii=False)
         guard = kwargs.get("cron_capability_guard")
         if guard is not None:
             denial = guard.authorize_tool(name)

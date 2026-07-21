@@ -514,7 +514,7 @@ def register(registry):
     """注册 skill_view / skills_list / skill_manage 三个工具。"""
     registry.register(
         name="skill_view",
-        toolset="skill",
+        toolset="skill_read",
         schema={
             "name": "skill_view",
             "description": (
@@ -543,7 +543,7 @@ def register(registry):
     )
     registry.register(
         name="skills_list",
-        toolset="skill",
+        toolset="skill_read",
         schema={
             "name": "skills_list",
             "description": (
@@ -561,7 +561,7 @@ def register(registry):
     )
     registry.register(
         name="skill_manage",
-        toolset="skill",
+        toolset="skill_manage",
         schema={
             "name": "skill_manage",
             "description": (

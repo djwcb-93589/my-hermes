@@ -205,6 +205,7 @@ def _dispatch_conversation_tool_call(loop, tool_call):
         dispatch_context.pop("allow_sensitive", None)
         dispatch_context.pop("approval_grant", None)
         dispatch_context["session_key"] = loop.session_key
+        dispatch_context["allowed_tool_names"] = allowed_tool_names
         if loop.cancel_checker is not None and tool_name == "terminal":
             dispatch_context["cancel_checker"] = loop.cancel_checker
         output = loop.registry.dispatch(

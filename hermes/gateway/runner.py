@@ -4348,6 +4348,7 @@ class GatewayRunner:
                 "interactive_approval": False,
                 "approval_mode": "remote",
                 "approval_grant": approval_grant,
+                "allowed_tool_names": {request["tool_name"]},
             }
             if request["tool_name"] in {"gateway_send_file", "cron"}:
                 source_event = self._deserialize_event(

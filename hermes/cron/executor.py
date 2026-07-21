@@ -117,6 +117,11 @@ def _result_artifacts(messages: list[dict], artifact_dir: str) -> list[dict]:
             candidate.relative_to(artifact_root)
         except (OSError, ValueError):
             continue
+        # 排除 artifact 目录本身：子代理常 list/stat 这个目录，tool result 的
+        # path 会等于 artifact_root，relative_to 通过但它是目录不是文件，投递
+        # 阶段 capture_file 会失败。只收严格在 artifact_root 之下的路径。
+        if candidate == artifact_root:
+            continue
         artifacts.append({
             "kind": "tool_file_reference",
             "tool_call_id": str(message.get("tool_call_id", "")),
@@ -438,7 +443,7 @@ class CronExecutor:
                     context.workdir,
                     enabled_toolsets=sorted(
                         toolset for toolset in resolution.toolsets
-                        if toolset != "skill"
+                        if toolset != "skill_read"
                     ),
                 ) + (
                     "\n\n# Cron Execution Context\n"
