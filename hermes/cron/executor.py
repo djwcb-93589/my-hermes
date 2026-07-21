@@ -434,7 +434,11 @@ class CronExecutor:
                     "\n\n# Cron Execution Context\n"
                     "This is an unattended task. Follow the trusted execution context; "
                     "do not create, modify, or delete Cron tasks.\n"
-                    f"Artifact directory: {context.artifact_dir}\n\n"
+                    f"Artifact directory: {context.artifact_dir}\n"
+                    "If this task must deliver files to the conversation, write them "
+                    "under the artifact directory; Gateway will send them as "
+                    "attachments when the run finishes (requires "
+                    "delivery_policy=\"text_and_files\").\n\n"
                     + ("# Preloaded Skills\n" + preloaded_skills if preloaded_skills else "")
                 ),
                 registry=registry,
@@ -466,7 +470,7 @@ class CronExecutor:
             )
             run_prompt = (
                 f"{job.prompt}\n\n"
-                "For files intended as Cron artifacts, write them only to: "
+                "Files to deliver to the conversation must be written under: "
                 f"{context.artifact_dir}"
             )
             loop_result = loop.run(run_prompt)

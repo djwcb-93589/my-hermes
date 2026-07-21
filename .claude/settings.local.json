@@ -15,7 +15,9 @@
       "Bash(python _db_check.py)",
       "Bash(python _err_check.py)",
       "Bash(python _err2_check.py)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(mkdir -p \"C:/Users/iie/.claude/plans/\")",
+      "Read(//c/Users/iie/.claude/**)"
     ]
   }
 }

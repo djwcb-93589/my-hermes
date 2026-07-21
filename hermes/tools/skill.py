@@ -598,9 +598,9 @@ def register(registry):
             },
         },
         handler=handle_skill_manage,
-        execution_environments=("cli", "gateway"),
-        unattended_allowed=False,
+        execution_environments=("cli", "gateway", "cron"),
+        unattended_allowed=True,
         approval_mode="none",
         risk_level="medium",
-        default_enabled_environments=("cli",),
+        default_enabled_environments=("cli", "cron"),
     )

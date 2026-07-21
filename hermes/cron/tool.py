@@ -771,7 +771,11 @@ def register(registry):
                 "uses only file; do not request terminal unless command execution is "
                 "needed, and do not request delegate unless a child agent is needed. "
                 "Cron terminal also requires a narrow terminal_allowed_executables "
-                "allowlist in capability_spec."
+                "allowlist in capability_spec. To deliver files to the conversation, "
+                "set delivery_policy to \"text_and_files\" and "
+                "capability_spec.allow_file_write to true; the sub-agent writes "
+                "files to the artifact directory (shown in its system prompt) and "
+                "Gateway delivers them as attachments when the run finishes."
             ),
             "parameters": {
                 "type": "object",
@@ -820,7 +824,20 @@ def register(registry):
                     "timeout": {"type": "number"}, "max_agent_iterations": {"type": "integer"},
                     "overlap_policy": {"type": "string", "enum": ["skip", "queue", "parallel"]},
                     "misfire_policy": {"type": "string", "enum": ["skip", "run_once", "catch_up"]},
-                    "retry_policy": {"type": "object"}, "delivery_policy": {"oneOf": [{"type": "string"}, {"type": "object"}]},
+                    "retry_policy": {"type": "object"},
+                    "delivery_policy": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": (
+                            "Controls what Gateway sends to the conversation after "
+                            "the run. String values: \"text\" (default, send only "
+                            "the final text summary), \"text_and_files\" (send the "
+                            "summary plus any files the sub-agent wrote to the "
+                            "artifact directory as attachments), \"failure_only\" "
+                            "(send only when the run fails), \"silent\" (send "
+                            "nothing). Use \"text_and_files\" when the task must "
+                            "deliver files."
+                        ),
+                    },
                     "artifact_policy": {"type": "object"},
                     "capability_spec": {
                         "type": "object",
@@ -833,7 +850,10 @@ def register(registry):
                             "allow_file_write (default false): set to true when the "
                             "task must create, modify, or delete files via the file "
                             "tool; a write action without this stays denied at run "
-                            "time. terminal_allowed_executables is required when "
+                            "time. Set this true together with "
+                            "delivery_policy=\"text_and_files\" when the task must "
+                            "deliver files to the conversation. "
+                            "terminal_allowed_executables is required when "
                             "toolsets includes terminal. terminal_allow_shell_operators, "
                             "terminal_allow_redirection, terminal_allow_background, and "
                             "terminal_allow_network default to false. "
