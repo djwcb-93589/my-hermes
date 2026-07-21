@@ -5011,6 +5011,11 @@ class GatewayRunner:
                 if event.source.platform not in self.adapters:
                     await self._reply(event, content)
                     return
+                # 先持久化入站事件再创建 Outbox,保证重启恢复时
+                # Outbox 的 source_message_id 能在 gateway_messages
+                # 表中找到对应记录,去重窗口与审计关联不会断裂。
+                if not await self._persist_event_async(route_key, event):
+                    return
                 await self._start_durable_reply_async(
                     route_key,
                     event,
@@ -5127,6 +5132,9 @@ class GatewayRunner:
         cancel_reason = None
         event_completed = False
         abandoned = False
+        # 防止 try 块中已成功调用 finish_processing 后,finally 块
+        # 再次以 "cancelled" 调用,导致 adapter 收到重复状态通知。
+        processing_finished = False
         agent_result = _GatewayAgentResult(None)
         try:
             if agent_task is None:
@@ -5254,12 +5262,15 @@ class GatewayRunner:
                 ):
                     ctx.delivery_id = delivery_id
                 if agent_result.failed:
-                    await self._finish_processing_best_effort(
-                        delivery_event,
-                        "failed",
-                        ctx=ctx,
-                        generation=generation,
-                    )
+                    if not processing_finished:
+                        processing_finished = (
+                            await self._finish_processing_best_effort(
+                                delivery_event,
+                                "failed",
+                                ctx=ctx,
+                                generation=generation,
+                            )
+                        )
                     print(
                         "  [gateway:audit] event=agent_final_failure "
                         f"{safe_route_digest(route_key)} "
@@ -5303,12 +5314,15 @@ class GatewayRunner:
                         f"  [gateway] {route_key}: error outbox lookup failed "
                         f"({type(lookup_exc).__name__})"
                     )
-                    await self._finish_processing_best_effort(
-                        event,
-                        "failed",
-                        ctx=ctx,
-                        generation=generation,
-                    )
+                    if not processing_finished:
+                        processing_finished = (
+                            await self._finish_processing_best_effort(
+                                event,
+                                "failed",
+                                ctx=ctx,
+                                generation=generation,
+                            )
+                        )
                 else:
                     if existing_error_outbox is None:
                         failure = self._safe_exception_result(exc)
@@ -5332,12 +5346,15 @@ class GatewayRunner:
                                 ) is None
                             ):
                                 ctx.delivery_id = delivery_id
-                            await self._finish_processing_best_effort(
-                                delivery_event,
-                                "failed",
-                                ctx=ctx,
-                                generation=generation,
-                            )
+                            if not processing_finished:
+                                processing_finished = (
+                                    await self._finish_processing_best_effort(
+                                        delivery_event,
+                                        "failed",
+                                        ctx=ctx,
+                                        generation=generation,
+                                    )
+                                )
                             delivered = await self._deliver_outbox(
                                 route_key,
                                 delivery_event,
@@ -5364,12 +5381,15 @@ class GatewayRunner:
                                 f"  [gateway] {route_key}: error reply failed "
                                 f"({type(send_exc).__name__})"
                             )
-                            await self._finish_processing_best_effort(
-                                event,
-                                "failed",
-                                ctx=ctx,
-                                generation=generation,
-                            )
+                            if not processing_finished:
+                                processing_finished = (
+                                    await self._finish_processing_best_effort(
+                                        event,
+                                        "failed",
+                                        ctx=ctx,
+                                        generation=generation,
+                                    )
+                                )
         finally:
             cancel_reason = cancel_reason or self._task_cancel_reason(
                 ctx,
@@ -5430,6 +5450,7 @@ class GatewayRunner:
                     owns_worker
                     and abandoned
                     and cancel_reason != "shutdown"
+                    and not processing_finished
                 ):
                     await self._finish_processing_best_effort(
                         delivery_event,

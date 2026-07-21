@@ -621,15 +621,6 @@ async def upload_feishu_file(
                     ),
                     timeout=timeout_seconds,
                 )
-            if _upload_stream_changed(
-                file_obj,
-                opened_stat,
-                state,
-                expected_size_bytes=expected_size_bytes,
-                expected_sha256=expected_sha256,
-                require_complete=True,
-            ):
-                return _upload_failure("file_changed", retryable=False)
 
             try:
                 status_code = int(response.status_code)
@@ -653,6 +644,9 @@ async def upload_feishu_file(
             except (TypeError, ValueError):
                 normalized_code = None
             if 200 <= status_code < 300 and normalized_code == 0:
+                # 平台已确认接受文件。即使文件在传输过程中被外部修改,
+                # file_key 仍然有效,不应因 stream_changed 复核而丢失,
+                # 否则平台侧会留下孤儿文件且本地无 file_key 可投递。
                 response_data = data.get("data")
                 file_key = (
                     response_data.get("file_key")
@@ -668,6 +662,17 @@ async def upload_feishu_file(
                     status="uploaded",
                     platform_file_key=file_key,
                 )
+
+            # 平台未接受:优先用 stream_changed 解释失败原因,便于上层分类。
+            if _upload_stream_changed(
+                file_obj,
+                opened_stat,
+                state,
+                expected_size_bytes=expected_size_bytes,
+                expected_sha256=expected_sha256,
+                require_complete=False,
+            ):
+                return _upload_failure("file_changed", retryable=False)
 
             error, retryable, refresh_required = classify_error(
                 status_code,

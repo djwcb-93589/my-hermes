@@ -540,11 +540,22 @@ def reset_feishu_inbox_processing(
     app_id: str,
     *,
     now: float | None = None,
+    stale_threshold_seconds: float = 300.0,
 ) -> int:
-    """启动时把异常退出遗留的 processing 收敛为立即可恢复状态。"""
+    """启动时把异常退出遗留的 processing 收敛为立即可恢复状态。
+
+    只重置 ``updated_at`` 早于 ``stale_threshold_seconds`` 的记录,避免
+    多实例下误改其它实例正在正常处理的记录。正常 shutdown 走
+    release_feishu_inbox_processing_message 立即释放,不经过这里。
+    """
     if not isinstance(app_id, str) or not app_id:
         raise DBError("Feishu Inbox app_id must not be empty")
+    if stale_threshold_seconds < 0:
+        raise DBError(
+            "Feishu Inbox stale_threshold_seconds must not be negative"
+        )
     timestamp = time.time() if now is None else float(now)
+    stale_cutoff = timestamp - float(stale_threshold_seconds)
     with transaction(conn):
         cursor = conn.execute(
             """
@@ -553,8 +564,9 @@ def reset_feishu_inbox_processing(
                 completed_at=NULL,
                 last_error='gateway_restart:processing_recovered'
             WHERE app_id=? AND status='processing'
+              AND updated_at < ?
             """,
-            (timestamp, timestamp, app_id),
+            (timestamp, timestamp, app_id, stale_cutoff),
         )
     return cursor.rowcount
 
