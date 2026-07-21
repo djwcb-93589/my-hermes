@@ -10,6 +10,8 @@ import uuid
 from typing import Any
 
 from .database import DBError, transaction
+from .core import _insert_message
+from .gateway import gateway_runtime_lease_is_valid
 
 
 TOOL_EXECUTION_STATUSES = frozenset({
@@ -59,7 +61,8 @@ def _tool_execution_row(row) -> dict | None:
         return None
     fields = (
         "execution_id", "environment", "session_id", "source_message_id",
-        "cron_run_id", "tool_call_id", "tool_name", "arguments_json",
+        "cron_run_id", "gateway_lease_name", "gateway_instance_id",
+        "gateway_lease_epoch", "tool_call_id", "tool_name", "arguments_json",
         "arguments_fingerprint", "recovery_policy", "status", "result_json",
         "external_operation_id", "attempt_count", "created_at", "updated_at",
     )
@@ -73,7 +76,8 @@ def _tool_execution_row(row) -> dict | None:
 
 _TOOL_EXECUTION_COLUMNS = (
     "execution_id, environment, session_id, source_message_id, cron_run_id, "
-    "tool_call_id, tool_name, arguments_json, arguments_fingerprint, "
+    "gateway_lease_name, gateway_instance_id, gateway_lease_epoch, tool_call_id, "
+    "tool_name, arguments_json, arguments_fingerprint, "
     "recovery_policy, status, result_json, external_operation_id, attempt_count, "
     "created_at, updated_at"
 )
@@ -90,6 +94,9 @@ def create_tool_execution(
     session_id: str | None = None,
     source_message_id: str | None = None,
     cron_run_id: str | None = None,
+    gateway_lease_name: str | None = None,
+    gateway_instance_id: str | None = None,
+    gateway_lease_epoch: int | None = None,
     execution_id: str | None = None,
 ) -> dict:
     """创建或按环境与 tool_call_id 返回同一条 prepared Journal 记录。"""
@@ -97,6 +104,10 @@ def create_tool_execution(
     normalized_call_id = _require_nonempty_string(tool_call_id, "tool_call_id")
     normalized_name = _require_nonempty_string(tool_name, "tool_name")
     normalized_policy = _require_nonempty_string(recovery_policy, "recovery_policy")
+    if normalized_policy not in {
+        "retry_safe", "unknown_on_crash", "status_check",
+    }:
+        raise DBError("tool execution recovery_policy is invalid")
     arguments_json = _serialize_json(arguments, "arguments")
     fingerprint = _arguments_fingerprint(arguments_json)
     now = time.time()
@@ -128,14 +139,16 @@ def create_tool_execution(
                 """
                 INSERT INTO tool_executions (
                     execution_id, environment, session_id, source_message_id,
-                    cron_run_id, tool_call_id, tool_name, arguments_json,
+                    cron_run_id, gateway_lease_name, gateway_instance_id,
+                    gateway_lease_epoch, tool_call_id, tool_name, arguments_json,
                     arguments_fingerprint, recovery_policy, status, result_json,
                     external_operation_id, attempt_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, 0, ?, ?)
                 """,
                 (
                     record_id, normalized_environment, session_id, source_message_id,
-                    cron_run_id, normalized_call_id, normalized_name, arguments_json,
+                    cron_run_id, gateway_lease_name, gateway_instance_id,
+                    gateway_lease_epoch, normalized_call_id, normalized_name, arguments_json,
                     fingerprint, normalized_policy, now, now,
                 ),
             )
@@ -303,6 +316,178 @@ def mark_tool_execution_unknown(
         if changed != 1:
             raise DBError(f"tool execution cannot become unknown from status {record['status']!r}")
         return get_tool_execution(conn, execution_id)  # type: ignore[return-value]
+
+
+def retry_tool_execution(
+    conn: sqlite3.Connection,
+    execution_id: str,
+) -> dict:
+    """以原 execution_id 重新准备仅允许安全重试的中断调用。"""
+    now = time.time()
+    with transaction(conn):
+        changed = conn.execute(
+            """
+            UPDATE tool_executions
+            SET status='prepared', result_json=NULL, updated_at=?
+            WHERE execution_id=? AND status IN ('prepared', 'running', 'unknown')
+            """,
+            (now, execution_id),
+        ).rowcount
+        record = get_tool_execution(conn, execution_id)
+        if record is None:
+            raise DBError("tool execution not found")
+        if changed != 1:
+            raise DBError(f"tool execution cannot retry from status {record['status']!r}")
+        return get_tool_execution(conn, execution_id)  # type: ignore[return-value]
+
+
+def list_gateway_incomplete_tool_executions(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    limit: int = 100,
+) -> list[dict]:
+    """仅返回当前有效 Gateway runtime lease 所属的未确定执行。"""
+    if not gateway_runtime_lease_is_valid(
+        conn, lease_name, instance_id, lease_epoch,
+    ):
+        raise DBError("gateway tool recovery lease is not valid")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise DBError("tool execution incomplete query limit must be positive")
+    rows = conn.execute(
+        f"""
+        SELECT {_TOOL_EXECUTION_COLUMNS}
+        FROM tool_executions
+        WHERE environment='gateway'
+          AND gateway_lease_name=?
+          AND status IN ('prepared', 'running', 'unknown')
+        ORDER BY updated_at, execution_id
+        LIMIT ?
+        """,
+        (lease_name, limit),
+    ).fetchall()
+    return [record for row in rows if (record := _tool_execution_row(row)) is not None]
+
+
+def list_cron_incomplete_tool_executions(
+    conn: sqlite3.Connection,
+    cron_run_id: str,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+    limit: int = 100,
+) -> list[dict]:
+    """仅返回当前有效 claim fence 所属 Cron Run 的未确定执行。"""
+    if not gateway_runtime_lease_is_valid(
+        conn, lease_name, instance_id, lease_epoch,
+    ):
+        raise DBError("cron tool recovery lease is not valid")
+    run = conn.execute(
+        """
+        SELECT 1 FROM cron_runs
+        WHERE run_id=? AND claim_lease_name=? AND claim_instance_id=?
+          AND claim_epoch=?
+        """,
+        (cron_run_id, lease_name, instance_id, lease_epoch),
+    ).fetchone()
+    if run is None:
+        raise DBError("cron tool recovery claim is not valid")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise DBError("tool execution incomplete query limit must be positive")
+    rows = conn.execute(
+        f"""
+        SELECT {_TOOL_EXECUTION_COLUMNS}
+        FROM tool_executions
+        WHERE environment='cron' AND cron_run_id=?
+          AND status IN ('prepared', 'running', 'unknown')
+        ORDER BY updated_at, execution_id
+        LIMIT ?
+        """,
+        (cron_run_id, limit),
+    ).fetchall()
+    return [record for row in rows if (record := _tool_execution_row(row)) is not None]
+
+
+def save_recovered_tool_execution_result(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    *,
+    status: str,
+    output: str,
+) -> dict:
+    """保存恢复结论，并在缺失时补入模型可见的 tool result。"""
+    if status not in {"succeeded", "failed", "unknown"}:
+        raise DBError("tool execution recovery status is invalid")
+    now = time.time()
+    with transaction(conn):
+        record = get_tool_execution(conn, execution_id)
+        if record is None:
+            raise DBError("tool execution not found")
+        if record["status"] in {"prepared", "running", "unknown"}:
+            conn.execute(
+                """
+                UPDATE tool_executions
+                SET status=?, result_json=?, updated_at=?
+                WHERE execution_id=? AND status IN ('prepared', 'running', 'unknown')
+                """,
+                (status, _serialize_json({"output": output}, "result"), now, execution_id),
+            )
+        elif record["status"] != status:
+            raise DBError("tool execution recovery conflicts with terminal status")
+
+        session_id = record.get("session_id")
+        if session_id:
+            assistant_rows = conn.execute(
+                """
+                SELECT 1
+                FROM messages
+                WHERE session_id=? AND role='assistant' AND tool_calls IS NOT NULL
+                  AND tool_calls LIKE ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (session_id, f'%"id": "{record["tool_call_id"]}"%'),
+            ).fetchone()
+            if assistant_rows is None:
+                _insert_message(
+                    conn,
+                    session_id,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": record["tool_call_id"],
+                            "type": "function",
+                            "function": {
+                                "name": record["tool_name"],
+                                "arguments": _serialize_json(
+                                    record["arguments"], "arguments"
+                                ),
+                            },
+                        }],
+                    },
+                )
+            exists = conn.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE session_id=? AND role='tool' AND tool_call_id=?
+                LIMIT 1
+                """,
+                (session_id, record["tool_call_id"]),
+            ).fetchone()
+            if exists is None:
+                _insert_message(
+                    conn,
+                    session_id,
+                    {
+                        "role": "tool",
+                        "tool_call_id": record["tool_call_id"],
+                        "content": output,
+                    },
+                )
+    return get_tool_execution(conn, execution_id)  # type: ignore[return-value]
 
 
 def list_incomplete_tool_executions(

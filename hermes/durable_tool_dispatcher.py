@@ -14,11 +14,13 @@ from hermes.persistence.tool_execution import (
     create_tool_execution,
     fail_tool_execution,
     mark_tool_execution_unknown,
+    retry_tool_execution,
+    save_recovered_tool_execution_result,
     start_tool_execution,
 )
 
 
-def _tool_output_failed(output: str) -> bool:
+def tool_output_failed(output: str) -> bool:
     """仅按公共 Tool Result 约定判断 handler 是否已明确返回失败。"""
     if output.lstrip().lower().startswith("(error:"):
         return True
@@ -42,6 +44,9 @@ class DurableToolExecutionContext:
     session_id: str | None = None
     source_message_id: str | None = None
     cron_run_id: str | None = None
+    gateway_lease_name: str | None = None
+    gateway_instance_id: str | None = None
+    gateway_lease_epoch: int | None = None
     connection: sqlite3.Connection | None = None
     database_path: str | None = None
 
@@ -58,6 +63,9 @@ class DurableToolExecutionContext:
             session_id=value.get("session_id"),
             source_message_id=value.get("source_message_id"),
             cron_run_id=value.get("cron_run_id"),
+            gateway_lease_name=value.get("gateway_lease_name"),
+            gateway_instance_id=value.get("gateway_instance_id"),
+            gateway_lease_epoch=value.get("gateway_lease_epoch"),
             connection=value.get("connection"),
             database_path=value.get("database_path"),
         )
@@ -80,9 +88,8 @@ class DurableToolDispatcher:
         if entry is None:
             return self.registry.dispatch(name, args, **kwargs)
         if entry.status_check is not None:
-            raise RuntimeError("tool status_check execution is not implemented")
-
-        if entry.retry_safe:
+            recovery_policy = "status_check"
+        elif entry.retry_safe:
             recovery_policy = "retry_safe"
         elif entry.unknown_on_crash:
             recovery_policy = "unknown_on_crash"
@@ -94,6 +101,9 @@ class DurableToolDispatcher:
             session_id=self.context.session_id,
             source_message_id=self.context.source_message_id,
             cron_run_id=self.context.cron_run_id,
+            gateway_lease_name=self.context.gateway_lease_name,
+            gateway_instance_id=self.context.gateway_instance_id,
+            gateway_lease_epoch=self.context.gateway_lease_epoch,
             tool_call_id=tool_call_id,
             tool_name=name,
             arguments=args,
@@ -109,7 +119,7 @@ class DurableToolDispatcher:
 
         result = {"output": output}
         try:
-            if _tool_output_failed(output):
+            if tool_output_failed(output):
                 self._call(fail_tool_execution, execution_id, result)
             else:
                 self._call(complete_tool_execution, execution_id, result)
@@ -117,6 +127,18 @@ class DurableToolDispatcher:
             self._mark_unknown_best_effort(execution_id)
             raise
         return output
+
+    def retry_record(self, record: dict, **kwargs) -> str:
+        """用保存的参数和原 execution_id 执行已声明可安全重试的调用。"""
+        self._call(retry_tool_execution, record["execution_id"])
+        retry_kwargs = dict(kwargs)
+        retry_kwargs.setdefault("session_key", record.get("session_id"))
+        return self.dispatch(
+            str(record["tool_name"]),
+            record["arguments"],
+            tool_call_id=str(record["tool_call_id"]),
+            **retry_kwargs,
+        )
 
     def _mark_unknown_best_effort(self, execution_id: str) -> None:
         try:

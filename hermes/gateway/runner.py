@@ -74,6 +74,7 @@ from hermes.db import (
     init_db,
     list_gateway_conversations,
     list_cron_delivery_preparation_candidates,
+    list_gateway_incomplete_tool_executions,
     mark_gateway_message_delivery_failed,
     mark_gateway_message_processing,
     mark_gateway_file_delivery_outbox_retry,
@@ -86,6 +87,7 @@ from hermes.db import (
     prune_gateway_terminal_ownership,
     prune_cron_terminal_history,
     reconcile_gateway_terminal_deliveries,
+    claim_interrupted_cron_runs_for_tool_recovery,
     recover_interrupted_cron_runs,
     recover_gateway_approvals,
     release_gateway_runtime_lease,
@@ -112,8 +114,14 @@ from hermes.gateway.observability import (
 from hermes.gateway.persistence import GatewayPersistence
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
-from hermes.cron.job import CronJob
+from hermes.cron.executor import CronExecutor
+from hermes.cron.job import CronJob, CronRun
 from hermes.gateway.session_store import SessionStore
+from hermes.durable_tool_dispatcher import (
+    DurableToolDispatcher,
+    DurableToolExecutionContext,
+)
+from hermes.tool_execution_recovery import ToolExecutionRecoveryService
 from hermes.gateway.types import (
     MessageEvent,
     MessageType,
@@ -1339,6 +1347,22 @@ class GatewayRunner:
             "instance_id": self._runtime_instance_id,
             "lease_epoch": self._runtime_lease_epoch,
         }
+
+    def _require_sync_recovery_runtime_lease(self) -> None:
+        """在同步工具恢复前再次确认当前实例仍持有有效 runtime lease。"""
+        if not self._runtime_lease_valid or self._runtime_lease_epoch is None:
+            raise RuntimeError("gateway runtime lease is no longer valid")
+        conn = init_db(self.db_path)
+        try:
+            if not gateway_runtime_lease_is_valid(
+                conn,
+                self._runtime_lease_name,
+                self._runtime_instance_id,
+                self._runtime_lease_epoch,
+            ):
+                raise RuntimeError("gateway runtime lease is no longer valid")
+        finally:
+            conn.close()
 
     def _cron_runtime_fence(self) -> dict | None:
         """只有持有且本地仍有效的 Gateway lease 才能领取 Cron。"""
@@ -2624,8 +2648,59 @@ class GatewayRunner:
         self._runtime_lease_valid = True
         self._start_runtime_lease_heartbeat()
 
+        self._lifecycle_phase = "gateway_tool_execution_recovery"
+        try:
+            fence = self._runtime_fence_kwargs()
+            records = await self.persistence.call(
+                list_gateway_incomplete_tool_executions,
+                **fence,
+            )
+            if records:
+                recovery_context = DurableToolExecutionContext(
+                    environment="gateway",
+                    connection=init_db(self.db_path),
+                    gateway_lease_name=self._runtime_lease_name,
+                    gateway_instance_id=self._runtime_instance_id,
+                    gateway_lease_epoch=self._runtime_lease_epoch,
+                )
+                try:
+                    ToolExecutionRecoveryService(
+                        registry,
+                        DurableToolDispatcher(registry, recovery_context),
+                        before_recover=self._require_sync_recovery_runtime_lease,
+                        interactive_approval=False,
+                        approval_mode="remote",
+                    ).recover(records)
+                finally:
+                    recovery_context.connection.close()
+            await self._require_startup_runtime_lease()
+        except Exception:
+            await self._abort_startup_after_lease()
+            self._lifecycle_phase = "startup_failed"
+            self._startup_in_progress = False
+            raise
+
         self._lifecycle_phase = "cron_run_recovery"
         try:
+            self._lifecycle_phase = "cron_tool_execution_recovery"
+            interrupted = await self.persistence.call(
+                claim_interrupted_cron_runs_for_tool_recovery,
+                **self._cron_runtime_fence(),
+            )
+            for item in interrupted:
+                await self._require_startup_runtime_lease()
+                await asyncio.to_thread(
+                    CronExecutor(
+                        self.db_path,
+                        **self._cron_runtime_fence(),
+                    ).execute,
+                    CronJob.from_record(item["job"]),
+                    CronRun.from_record(item["run"]),
+                    recovery_only=True,
+                )
+                await self._require_startup_runtime_lease()
+
+            self._lifecycle_phase = "cron_run_recovery"
             recovered = await self.persistence.call(
                 recover_interrupted_cron_runs,
                 **self._cron_runtime_fence(),
@@ -5698,6 +5773,9 @@ class GatewayRunner:
                 "session_id": conversation_id,
                 "source_message_id": task_event.message_id,
                 "database_path": self.db_path,
+                "gateway_lease_name": self._runtime_lease_name,
+                "gateway_instance_id": self._runtime_instance_id,
+                "gateway_lease_epoch": self._runtime_lease_epoch,
             },
         }
         if "messaging" in enabled_toolsets:

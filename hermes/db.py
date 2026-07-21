@@ -31,6 +31,7 @@ from hermes.persistence.core import (
 from hermes.persistence.cron import (
     advance_due_cron_job_without_run,
     claim_cron_delivery_preparation,
+    claim_interrupted_cron_runs_for_tool_recovery,
     claim_due_cron_job_run,
     claim_manual_cron_run,
     create_cron_capability_grant,
@@ -91,7 +92,11 @@ from hermes.persistence.tool_execution import (
     get_tool_execution,
     get_tool_execution_by_call,
     list_incomplete_tool_executions,
+    list_gateway_incomplete_tool_executions,
+    list_cron_incomplete_tool_executions,
     mark_tool_execution_unknown,
+    retry_tool_execution,
+    save_recovered_tool_execution_result,
     succeed_tool_execution,
     start_tool_execution,
 )

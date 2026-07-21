@@ -157,8 +157,8 @@ class ToolRegistry:
             raise ValueError("retry_safe and unknown_on_crash cannot both be enabled")
         if not normalized_retry_safe and not normalized_unknown_on_crash:
             raise ValueError("a durable recovery policy must be enabled")
-        if status_check is not None:
-            raise ValueError("status_check tools are not supported until status queries are implemented")
+        if status_check is not None and not callable(status_check):
+            raise ValueError("status_check must be callable")
         self._tools[name] = ToolEntry(
             name=name,
             toolset=str(toolset).strip().lower(),

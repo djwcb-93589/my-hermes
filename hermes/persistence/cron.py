@@ -886,6 +886,68 @@ def recover_interrupted_cron_runs(
     return recovered
 
 
+def claim_interrupted_cron_runs_for_tool_recovery(
+    conn: sqlite3.Connection,
+    *,
+    lease_name: str,
+    instance_id: str,
+    lease_epoch: int,
+) -> list[dict]:
+    """将有未确定 Journal 的中断 Run 接管给当前 lease，供恢复服务使用。"""
+    fence = _cron_run_fence_values(lease_name, instance_id, lease_epoch)
+    now = time.time()
+    recovered: list[dict] = []
+    run_columns = ", ".join(
+        f"run.{column.strip()}" for column in _CRON_RUN_COLUMNS.split(",")
+    )
+    with _immediate_transaction(conn):
+        if not gateway_runtime_lease_is_valid(conn, *fence, now=now):
+            raise DBError("Cron tool recovery lease is no longer valid")
+        rows = conn.execute(
+            f"""
+            SELECT {run_columns}, job.delivery_config_json
+            FROM cron_runs AS run
+            INNER JOIN cron_jobs AS job ON job.job_id=run.job_id
+            WHERE run.status IN ('claimed', 'running')
+              AND run.claim_lease_name=?
+              AND (run.claim_instance_id<>? OR run.claim_epoch<>?)
+              AND EXISTS (
+                  SELECT 1 FROM tool_executions AS execution
+                  WHERE execution.environment='cron'
+                    AND execution.cron_run_id=run.run_id
+                    AND execution.status IN ('prepared', 'running', 'unknown')
+              )
+            """,
+            fence,
+        ).fetchall()
+        for row in rows:
+            run = _cron_run_row(row[:-1])
+            if run is None:
+                continue
+            changed = conn.execute(
+                """
+                UPDATE cron_runs
+                SET claim_lease_name=?, claim_instance_id=?, claim_epoch=?,
+                    updated_at=?
+                WHERE run_id=? AND status IN ('claimed', 'running')
+                  AND claim_lease_name=? AND claim_instance_id=?
+                  AND claim_epoch=?
+                """,
+                (
+                    fence[0], fence[1], fence[2], now,
+                    run["run_id"], run["claim_lease_name"],
+                    run["claim_instance_id"], run["claim_epoch"],
+                ),
+            ).rowcount
+            if changed != 1:
+                continue
+            job = get_cron_job(conn, run["job_id"])
+            current = get_cron_run(conn, run["run_id"])
+            if job is not None and current is not None:
+                recovered.append({"job": job, "run": current})
+    return recovered
+
+
 def list_unclaimed_manual_cron_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict]:
     """读取尚未归属任何 Gateway lease 的手工运行请求。"""
     rows = conn.execute(

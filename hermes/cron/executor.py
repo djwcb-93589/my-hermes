@@ -35,11 +35,17 @@ from hermes.db import (
     ensure_session,
     get_cron_run,
     get_active_cron_capability_grant,
+    list_cron_incomplete_tool_executions,
     init_db,
     transition_cron_run,
 )
 from hermes.path_utils import git_bash_to_windows_path
 from hermes.prompt import build_system_prompt
+from hermes.durable_tool_dispatcher import (
+    DurableToolDispatcher,
+    DurableToolExecutionContext,
+)
+from hermes.tool_execution_recovery import ToolExecutionRecoveryService
 from hermes.tools.skill import handle_skill_view
 from hermes.tools import (
     ExecutionEnvironment,
@@ -314,7 +320,13 @@ class CronExecutor:
             **self._lease_fence,
         )
 
-    def execute(self, job: CronJob, run: CronRun) -> CronExecutionResult:
+    def execute(
+        self,
+        job: CronJob,
+        run: CronRun,
+        *,
+        recovery_only: bool = False,
+    ) -> CronExecutionResult:
         """执行已领取运行；调用方负责领取，执行器负责运行到终态。"""
         session_id = _cron_session_id(job.job_id, run.run_id)
         conn = init_db(self._db_path)
@@ -323,7 +335,9 @@ class CronExecutor:
             stored_run = get_cron_run(conn, run.run_id)
             if stored_run is None or stored_run["job_id"] != job.job_id:
                 raise DBError("Cron run does not belong to the supplied job")
-            if stored_run["status"] != "claimed":
+            if stored_run["status"] != "claimed" and not (
+                recovery_only and stored_run["status"] == "running"
+            ):
                 raise DBError("Cron executor requires a claimed run")
             if self._lease_fence and (
                 stored_run["claim_lease_name"] != self._lease_fence["lease_name"]
@@ -406,6 +420,51 @@ class CronExecutor:
                 context,
                 toolsets=tuple(sorted(resolution.toolsets)),
             )
+            backend = get_backend(session_id)
+            backend_created = True
+            backend.cwd = context.workdir
+            if self._lease_fence:
+                recovery_context = DurableToolExecutionContext(
+                    environment="cron",
+                    session_id=session_id,
+                    cron_run_id=run.run_id,
+                    connection=conn,
+                )
+                records = list_cron_incomplete_tool_executions(
+                    conn,
+                    run.run_id,
+                    **self._lease_fence,
+                )
+                ToolExecutionRecoveryService(
+                    registry,
+                    DurableToolDispatcher(registry, recovery_context),
+                    before_recover=lambda: list_cron_incomplete_tool_executions(
+                        conn,
+                        run.run_id,
+                        limit=1,
+                        **self._lease_fence,
+                    ),
+                    cron_execution_context=context,
+                    cron_capability_guard=guard,
+                    interactive_approval=False,
+                ).recover(records)
+            if recovery_only:
+                summary = (
+                    "Cron task was interrupted. Its incomplete tool calls were "
+                    "recovered according to their registered safety policy."
+                )
+                self._write_terminal_result(
+                    conn,
+                    run.run_id,
+                    status="failed",
+                    summary=summary,
+                    error_type="execution_interrupted",
+                    delivery_status=delivery_preparation_status(job, "failed"),
+                )
+                return CronExecutionResult(
+                    job.job_id, run.run_id, session_id, "failed", summary,
+                    0, (), (), "execution_interrupted", summary,
+                )
             self._write_terminal_result(
                 conn,
                 run.run_id,
@@ -413,9 +472,6 @@ class CronExecutor:
                 summary="",
                 error_type=None,
             )
-            backend = get_backend(session_id)
-            backend_created = True
-            backend.cwd = context.workdir
 
             ensure_session(conn, session_id, source="cron")
             add_messages(conn, session_id, [{"role": "user", "content": job.prompt}])

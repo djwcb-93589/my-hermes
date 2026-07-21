@@ -208,10 +208,28 @@ def _dispatch_conversation_tool_call(loop, tool_call):
         dispatch_context["allowed_tool_names"] = allowed_tool_names
         if loop.cancel_checker is not None and tool_name == "terminal":
             dispatch_context["cancel_checker"] = loop.cancel_checker
-        output = loop.registry.dispatch(
-            tool_name, tool_args,
-            **dispatch_context,
-        )
+        durable_context = dispatch_context.pop("durable_tool_execution", None)
+        if durable_context is None:
+            output = loop.registry.dispatch(
+                tool_name, tool_args,
+                **dispatch_context,
+            )
+        else:
+            # 持久化包装只接收运行范围，工具 handler 的调用契约保持不变。
+            from hermes.durable_tool_dispatcher import (
+                DurableToolDispatcher,
+                DurableToolExecutionContext,
+            )
+
+            context = DurableToolExecutionContext.from_value(durable_context)
+            if context is None:
+                raise RuntimeError("durable tool execution context is invalid")
+            output = DurableToolDispatcher(loop.registry, context).dispatch(
+                tool_name,
+                tool_args,
+                tool_call_id=str(tool_call.id),
+                **dispatch_context,
+            )
     except Exception as exc:
         short = _sanitize_error_message(exc, max_len=200)
         return (

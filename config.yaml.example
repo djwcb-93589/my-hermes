@@ -77,10 +77,12 @@ security:
     # Gateway 默认放行；仅命中审批黑名单时请求远程确认。
     remote_default_allow: true
     # 需要审批的 Terminal 命令正则。硬拒绝请使用 denied_command_patterns。
+    # 注意：YAML 单引号不处理反斜杠转义，'\\b' 会变成字面 "\\b" 而不是单词边界。
+    # 含转义的正则必须用双引号，让 YAML 把 "\\b" 解析成 "\b"。
     approval_command_patterns:
-      - '\\b(?:rm|rmdir|del|erase|remove-item)\\b'
-      - '\\b(?:chmod|chown|chgrp|setfacl|icacls|takeown)\\b'
-      - '\\b(?:git\\s+push|curl|wget|scp|sftp|ssh|ftp)\\b'
+      - "\\b(?:rm|rmdir|del|erase|remove-item)\\b"
+      - "\\b(?:chmod|chown|chgrp|setfacl|icacls|takeown)\\b"
+      - "\\b(?:git\\s+push|curl|wget|scp|sftp|ssh|ftp)\\b"
     # 需要审批的 File action/path 组合规则，格式同 denied_file_rules。
     approval_file_rules: []
     # File 敏感文件拒绝正则；命中后读写均按 critical 直接拒绝。

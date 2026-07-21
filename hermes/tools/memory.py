@@ -62,6 +62,51 @@ def _current_chars(file_path: Path) -> int:
     return len(file_path.read_text(encoding="utf-8"))
 
 
+def render_memory_section(
+    *,
+    include_long: bool = True,
+    include_user: bool = True,
+) -> str | None:
+    """渲染长期记忆和用户档案为 system prompt 段落。
+
+    返回拼好的纯文本段落;两类记忆都为空时返回 None。
+    调用方不感知文件路径、分隔符和字符限额,这些细节由本模块独占。
+    """
+    sections: list[str] = []
+    if include_long:
+        section = _render_single_section(
+            MEMORY_FILE, "# Memory", MEMORY_CHAR_LIMIT
+        )
+        if section is not None:
+            sections.append(section)
+    if include_user:
+        section = _render_single_section(
+            USER_FILE, "# User Profile", USER_CHAR_LIMIT
+        )
+        if section is not None:
+            sections.append(section)
+    if not sections:
+        return None
+    return "\n\n".join(sections)
+
+
+def _render_single_section(
+    file_path: Path,
+    header: str,
+    char_limit: int,
+) -> str | None:
+    """渲染单个记忆文件为带标题的段落;空文件返回 None。"""
+    entries = load_memory(file_path)
+    if not entries:
+        return None
+    used = _current_chars(file_path)
+    return (
+        f"{header} ({len(entries)} entries, "
+        f"{used}/{char_limit} chars)\n"
+        f"{render_entries(entries)}"
+    )
+
+
 def _atomic_write_text(file_path: Path, text: str) -> None:
     """同目录写临时文件 → flush/fsync → os.replace 原子替换。
 

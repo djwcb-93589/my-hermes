@@ -5,14 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from hermes.config import HERMES_HOME, MEMORY_CHAR_LIMIT, USER_CHAR_LIMIT
-from hermes.tools.memory import (
-    load_memory,
-    render_entries,
-    _current_chars,
-    MEMORY_FILE,
-    USER_FILE,
-)
+from hermes.config import HERMES_HOME
+from hermes.tools.memory import render_memory_section
 from hermes.tools.skill import discover_skills
 
 
@@ -38,6 +32,18 @@ _CRON_ROUTING_GUIDANCE = (
     "recurrence. A five-field expression requires `recurring: true` in the "
     "cron arguments."
 )
+
+
+def _script_workspace_guidance() -> str:
+    """给可使用本地工具的会话提供统一的临时脚本落盘位置。"""
+    workspace = HERMES_HOME / "scripts"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return (
+        "# Generated Scripts\n"
+        f"When creating helper scripts, write them only under `{workspace}` "
+        "using an absolute path. Run the same absolute path, and do not "
+        "create generated scripts in the project working directory."
+    )
 
 
 def find_project_context(cwd: str) -> str:
@@ -82,25 +88,13 @@ def build_system_prompt(
     else:
         parts.append("You are a helpful assistant.")
 
-    if include_memory:
-        memory_entries = load_memory(MEMORY_FILE)
-        if memory_entries:
-            used = _current_chars(MEMORY_FILE)
-            header = (
-                f"# Memory ({len(memory_entries)} entries, "
-                f"{used}/{MEMORY_CHAR_LIMIT} chars)"
-            )
-            parts.append(header + "\n" + render_entries(memory_entries))
-
-    if include_user_profile:
-        user_entries = load_memory(USER_FILE)
-        if user_entries:
-            used = _current_chars(USER_FILE)
-            header = (
-                f"# User Profile ({len(user_entries)} entries, "
-                f"{used}/{USER_CHAR_LIMIT} chars)"
-            )
-            parts.append(header + "\n" + render_entries(user_entries))
+    if include_memory or include_user_profile:
+        memory_section = render_memory_section(
+            include_long=include_memory,
+            include_user=include_user_profile,
+        )
+        if memory_section is not None:
+            parts.append(memory_section)
 
     skill_enabled = (
         selected_toolsets is None
@@ -131,6 +125,7 @@ def build_system_prompt(
             "be managed through their dedicated tools, never repaired by "
             "guessing paths in terminal."
         )
+        parts.append(_script_workspace_guidance())
         parts.append(_CRON_ROUTING_GUIDANCE)
     elif not selected_toolsets:
         no_tool_capabilities = (
@@ -176,6 +171,8 @@ def build_system_prompt(
             )
         if tool_lines:
             parts.append("# Tool Use\n" + "\n".join(tool_lines))
+        if {"file", "terminal"} & selected_toolsets:
+            parts.append(_script_workspace_guidance())
         if "cron" in selected_toolsets:
             parts.append(_CRON_ROUTING_GUIDANCE)
 
