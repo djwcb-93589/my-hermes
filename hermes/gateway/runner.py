@@ -33,7 +33,6 @@ from hermes.config import (
     PATH_ACCESS_POLICY,
 )
 from hermes.db import (
-    acquire_gateway_runtime_lease,
     add_final_message_with_gateway_outbox,
     add_messages,
     cancel_gateway_delivery,
@@ -71,7 +70,6 @@ from hermes.db import (
     get_gateway_queued_messages,
     get_recoverable_gateway_outbox,
     get_recoverable_gateway_file_deliveries,
-    init_db,
     list_gateway_conversations,
     list_cron_delivery_preparation_candidates,
     list_gateway_incomplete_tool_executions,
@@ -90,8 +88,6 @@ from hermes.db import (
     claim_interrupted_cron_runs_for_tool_recovery,
     recover_interrupted_cron_runs,
     recover_gateway_approvals,
-    release_gateway_runtime_lease,
-    renew_gateway_runtime_lease,
     refresh_cron_delivery_statuses,
     reset_gateway_processing_messages,
     reset_gateway_sending_outbox,
@@ -112,6 +108,7 @@ from hermes.gateway.observability import (
     safe_route_digest,
 )
 from hermes.gateway.persistence import GatewayPersistence
+from hermes.gateway.runtime_lease import GatewayRuntimeLease
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
 from hermes.cron.executor import CronExecutor
@@ -756,6 +753,13 @@ class GatewayRunner:
         max_pending = gateway_cfg.get("max_pending_messages", 20)
         max_concurrent = gateway_cfg.get("max_concurrent_llm_requests", 4)
         self.persistence = GatewayPersistence(db_path)
+        self._runtime_lease = GatewayRuntimeLease(
+            self.persistence,
+            lease_name=_GATEWAY_RUNTIME_LEASE_NAME,
+            ttl_seconds=self.runtime_lease_ttl_seconds,
+            heartbeat_seconds=self.runtime_lease_heartbeat_seconds,
+            on_lost=self._on_runtime_lease_lost,
+        )
         self.sessions = SessionStore(
             idle_timeout=idle_timeout,
             db_path=db_path,
@@ -828,12 +832,6 @@ class GatewayRunner:
         self._startup_in_progress = False
         self._accepting_external_messages = True
         self._lifecycle_phase = "created"
-        self._runtime_lease_name = _GATEWAY_RUNTIME_LEASE_NAME
-        self._runtime_instance_id = str(uuid.uuid4())
-        self._runtime_lease_acquired = False
-        self._runtime_lease_valid = False
-        self._runtime_lease_epoch: int | None = None
-        self._lease_heartbeat_task: asyncio.Task | None = None
         self._session_cleanup_task: asyncio.Task | None = None
         self._retention_cleanup_task: asyncio.Task | None = None
         self._file_delivery_dispatcher_task: asyncio.Task | None = None
@@ -857,6 +855,26 @@ class GatewayRunner:
         self._stop_lock = asyncio.Lock()
         # 异步模型客户端按需创建,Gateway 停止时统一关闭。
         self._async_client = None
+
+    @property
+    def _runtime_lease_name(self) -> str:
+        return self._runtime_lease.name
+
+    @property
+    def _runtime_instance_id(self) -> str:
+        return self._runtime_lease.instance_id
+
+    @property
+    def _runtime_lease_epoch(self) -> int | None:
+        return self._runtime_lease.epoch
+
+    @property
+    def _runtime_lease_acquired(self) -> bool:
+        return self._runtime_lease.acquired
+
+    @property
+    def _runtime_lease_valid(self) -> bool:
+        return self._runtime_lease.valid
 
     @staticmethod
     def _gateway_context_policy_name(source: SessionSource) -> str:
@@ -1265,14 +1283,10 @@ class GatewayRunner:
 
     def _reconcile_terminal_deliveries(self) -> int:
         """在 Gateway 恢复前一次性收敛旧终态记录。"""
-        conn = init_db(self.db_path)
-        try:
-            return reconcile_gateway_terminal_deliveries(
-                conn,
-                **self._runtime_fence_kwargs(),
-            )
-        finally:
-            conn.close()
+        return self.persistence.call_sync(
+            reconcile_gateway_terminal_deliveries,
+            **self._runtime_fence_kwargs(),
+        )
 
     async def _reconcile_terminal_deliveries_async(self) -> int:
         return await self.persistence.call(
@@ -1280,103 +1294,69 @@ class GatewayRunner:
             **self._runtime_fence_kwargs(),
         )
 
-    def _acquire_runtime_lease(self) -> dict | None:
-        """在独立连接中争用当前数据库的 Gateway 单实例租约。"""
-        conn = init_db(self.db_path)
-        try:
-            return acquire_gateway_runtime_lease(
-                conn,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self.runtime_lease_ttl_seconds,
-            )
-        finally:
-            conn.close()
-
-    def _renew_runtime_lease(self) -> bool:
-        """仅为当前实例持有的运行租约续期。"""
-        if self._runtime_lease_epoch is None:
-            return False
-        conn = init_db(self.db_path)
-        try:
-            return renew_gateway_runtime_lease(
-                conn,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self._runtime_lease_epoch,
-                self.runtime_lease_ttl_seconds,
-            )
-        finally:
-            conn.close()
-
-    def _release_runtime_lease(self) -> bool:
-        """释放当前实例的租约；实例不匹配时不会删除其他持有者。"""
-        if self._runtime_lease_epoch is None:
-            return False
-        conn = init_db(self.db_path)
-        try:
-            return release_gateway_runtime_lease(
-                conn,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self._runtime_lease_epoch,
-            )
-        finally:
-            conn.close()
-
     def _pending_outbox_route_keys(self) -> set[str]:
         """读取仍由持久 Outbox 管理、不能清理内存会话的 route。"""
-        conn = init_db(self.db_path)
-        try:
-            return get_gateway_routes_with_pending_outbox(conn)
-        finally:
-            conn.close()
+        return self.persistence.call_sync(
+            get_gateway_routes_with_pending_outbox,
+        )
 
     def _runtime_lease_blocks_delivery(self) -> bool:
         """嵌入式私有调用保持兼容；正式启动后失租必须阻止投递。"""
-        return self._runtime_lease_acquired and not self._runtime_lease_valid
+        return self._runtime_lease.blocks_delivery()
 
     def _runtime_fence_kwargs(self) -> dict:
         """正式运行携带 fencing；未调用 start 的嵌入式路径保持兼容。"""
-        if not self._runtime_lease_acquired:
-            return {}
-        if self._runtime_lease_epoch is None:
-            raise RuntimeError("gateway runtime lease epoch is unavailable")
-        return {
-            "lease_name": self._runtime_lease_name,
-            "instance_id": self._runtime_instance_id,
-            "lease_epoch": self._runtime_lease_epoch,
-        }
+        return self._runtime_lease.fence()
 
     def _require_sync_recovery_runtime_lease(self) -> None:
         """在同步工具恢复前再次确认当前实例仍持有有效 runtime lease。"""
         if not self._runtime_lease_valid or self._runtime_lease_epoch is None:
             raise RuntimeError("gateway runtime lease is no longer valid")
-        conn = init_db(self.db_path)
-        try:
-            if not gateway_runtime_lease_is_valid(
-                conn,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self._runtime_lease_epoch,
+        if not self.persistence.call_sync(
+            gateway_runtime_lease_is_valid,
+            self._runtime_lease_name,
+            self._runtime_instance_id,
+            self._runtime_lease_epoch,
+        ):
+            raise RuntimeError("gateway runtime lease is no longer valid")
+
+    def _recover_gateway_tool_executions(
+        self,
+        connection,
+        records: list[dict],
+    ) -> None:
+        """在持久化边界提供的连接内恢复未完成的 Gateway 工具调用。"""
+        def require_runtime_lease() -> None:
+            if (
+                not self._runtime_lease_valid
+                or self._runtime_lease_epoch is None
+                or not gateway_runtime_lease_is_valid(
+                    connection,
+                    self._runtime_lease_name,
+                    self._runtime_instance_id,
+                    self._runtime_lease_epoch,
+                )
             ):
                 raise RuntimeError("gateway runtime lease is no longer valid")
-        finally:
-            conn.close()
+
+        context = DurableToolExecutionContext(
+            environment="gateway",
+            connection=connection,
+            gateway_lease_name=self._runtime_lease_name,
+            gateway_instance_id=self._runtime_instance_id,
+            gateway_lease_epoch=self._runtime_lease_epoch,
+        )
+        ToolExecutionRecoveryService(
+            registry,
+            DurableToolDispatcher(registry, context),
+            before_recover=require_runtime_lease,
+            interactive_approval=False,
+            approval_mode="remote",
+        ).recover(records)
 
     def _cron_runtime_fence(self) -> dict | None:
         """只有持有且本地仍有效的 Gateway lease 才能领取 Cron。"""
-        if (
-            not self._runtime_lease_acquired
-            or not self._runtime_lease_valid
-            or self._runtime_lease_epoch is None
-        ):
-            return None
-        return {
-            "lease_name": self._runtime_lease_name,
-            "instance_id": self._runtime_instance_id,
-            "lease_epoch": self._runtime_lease_epoch,
-        }
+        return self._runtime_lease.valid_fence()
 
     def _gateway_tool_context(
         self,
@@ -1412,26 +1392,22 @@ class GatewayRunner:
             return True, True
         if self._runtime_lease_epoch is None:
             return False, False
-        conn = init_db(self.db_path)
-        try:
-            claim_valid = gateway_outbox_claim_is_valid(
-                conn,
-                outbox_id,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self._runtime_lease_epoch,
-            )
-            if claim_valid:
-                return True, True
-            lease_valid = gateway_runtime_lease_is_valid(
-                conn,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self._runtime_lease_epoch,
-            )
-            return lease_valid, False
-        finally:
-            conn.close()
+        claim_valid = self.persistence.call_sync(
+            gateway_outbox_claim_is_valid,
+            outbox_id,
+            self._runtime_lease_name,
+            self._runtime_instance_id,
+            self._runtime_lease_epoch,
+        )
+        if claim_valid:
+            return True, True
+        lease_valid = self.persistence.call_sync(
+            gateway_runtime_lease_is_valid,
+            self._runtime_lease_name,
+            self._runtime_instance_id,
+            self._runtime_lease_epoch,
+        )
+        return lease_valid, False
 
     async def _database_delivery_fence_state_async(
         self,
@@ -1484,10 +1460,11 @@ class GatewayRunner:
         return claim_valid
 
     def _handle_runtime_lease_loss(self, error_type: str | None) -> None:
+        """将外部发现的失租事件交给 lease 所有者做一次性状态转换。"""
+        self._runtime_lease.lose(error_type)
+
+    def _on_runtime_lease_lost(self, error_type: str | None) -> None:
         """先撤销运行资格，再调度不会自等待的统一安全停止。"""
-        if not self._runtime_lease_valid:
-            return
-        self._runtime_lease_valid = False
         self._accepting_external_messages = False
         self._lifecycle_phase = "lease_lost"
         if error_type:
@@ -1517,33 +1494,6 @@ class GatewayRunner:
                 self.stop(),
                 name="gateway-lease-loss-shutdown",
             )
-
-    async def _runtime_lease_heartbeat_loop(self) -> None:
-        """周期续租；任何续租异常或所有权丢失都进入安全停止。"""
-        try:
-            while self._runtime_lease_valid:
-                await asyncio.sleep(self.runtime_lease_heartbeat_seconds)
-                if not self._runtime_lease_valid:
-                    return
-                try:
-                    if self._runtime_lease_epoch is None:
-                        renewed = False
-                    else:
-                        renewed = await self.persistence.call(
-                            renew_gateway_runtime_lease,
-                            self._runtime_lease_name,
-                            self._runtime_instance_id,
-                            self._runtime_lease_epoch,
-                            self.runtime_lease_ttl_seconds,
-                        )
-                except Exception as exc:
-                    self._handle_runtime_lease_loss(type(exc).__name__)
-                    return
-                if not renewed:
-                    self._handle_runtime_lease_loss(None)
-                    return
-        except asyncio.CancelledError:
-            raise
 
     async def _session_cleanup_loop(self) -> None:
         """周期清理没有运行、排队或持久投递负担的空闲会话。"""
@@ -1719,13 +1669,7 @@ class GatewayRunner:
 
     def _start_runtime_lease_heartbeat(self) -> None:
         """获取 lease 后立即启动 heartbeat，覆盖整个初始化与恢复阶段。"""
-        task = self._lease_heartbeat_task
-        if task is not None and not task.done():
-            return
-        self._lease_heartbeat_task = asyncio.create_task(
-            self._runtime_lease_heartbeat_loop(),
-            name="gateway-runtime-lease-heartbeat",
-        )
+        self._runtime_lease.start_heartbeat()
 
     def _start_session_cleanup(self) -> None:
         """只有进入 running 后才启动会话空闲清理。"""
@@ -2519,10 +2463,10 @@ class GatewayRunner:
     async def _cancel_background_tasks(self) -> None:
         """取消并回收长期后台任务，避免事件循环退出时残留 Task。"""
         current = asyncio.current_task()
+        await self._runtime_lease.stop_heartbeat()
         tasks = [
             task
             for task in (
-                self._lease_heartbeat_task,
                 self._session_cleanup_task,
                 self._retention_cleanup_task,
                 self._file_delivery_dispatcher_task,
@@ -2536,8 +2480,6 @@ class GatewayRunner:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if self._lease_heartbeat_task is not current:
-            self._lease_heartbeat_task = None
         if self._session_cleanup_task is not current:
             self._session_cleanup_task = None
         if self._retention_cleanup_task is not current:
@@ -2566,7 +2508,7 @@ class GatewayRunner:
     async def _abort_startup_after_lease(self) -> None:
         """启动恢复失败时停止已创建资源并尽早交还租约。"""
         self._accepting_external_messages = False
-        self._runtime_lease_valid = False
+        self._runtime_lease.revoke()
         await self._cancel_background_tasks()
         active_tasks = self.sessions.cancel_all(reason="shutdown")
         if active_tasks:
@@ -2582,21 +2524,12 @@ class GatewayRunner:
                 )
         if self._runtime_lease_acquired:
             try:
-                if self._runtime_lease_epoch is not None:
-                    await self.persistence.call(
-                        release_gateway_runtime_lease,
-                        self._runtime_lease_name,
-                        self._runtime_instance_id,
-                        self._runtime_lease_epoch,
-                    )
+                await self._runtime_lease.release()
             except Exception as exc:
                 print(
                     "  [gateway] runtime lease release failed: "
                     f"{type(exc).__name__}"
                 )
-            finally:
-                self._runtime_lease_acquired = False
-                self._runtime_lease_epoch = None
 
     async def tick_cron(self) -> None:
         """供受控手工入口复用同一 lease、claim 与无重入边界。"""
@@ -2617,12 +2550,7 @@ class GatewayRunner:
 
         self._lifecycle_phase = "acquire_runtime_lease"
         try:
-            acquired = await self.persistence.call(
-                acquire_gateway_runtime_lease,
-                self._runtime_lease_name,
-                self._runtime_instance_id,
-                self.runtime_lease_ttl_seconds,
-            )
+            acquired = await self._runtime_lease.acquire()
         except Exception as exc:
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
@@ -2641,11 +2569,6 @@ class GatewayRunner:
             raise RuntimeError(
                 "another active Gateway instance holds the runtime lease"
             )
-        if str(acquired["instance_id"]) != self._runtime_instance_id:
-            raise RuntimeError("gateway runtime lease identity mismatch")
-        self._runtime_lease_epoch = int(acquired["lease_epoch"])
-        self._runtime_lease_acquired = True
-        self._runtime_lease_valid = True
         self._start_runtime_lease_heartbeat()
 
         self._lifecycle_phase = "gateway_tool_execution_recovery"
@@ -2656,23 +2579,10 @@ class GatewayRunner:
                 **fence,
             )
             if records:
-                recovery_context = DurableToolExecutionContext(
-                    environment="gateway",
-                    connection=init_db(self.db_path),
-                    gateway_lease_name=self._runtime_lease_name,
-                    gateway_instance_id=self._runtime_instance_id,
-                    gateway_lease_epoch=self._runtime_lease_epoch,
+                await self.persistence.call(
+                    self._recover_gateway_tool_executions,
+                    records,
                 )
-                try:
-                    ToolExecutionRecoveryService(
-                        registry,
-                        DurableToolDispatcher(registry, recovery_context),
-                        before_recover=self._require_sync_recovery_runtime_lease,
-                        interactive_approval=False,
-                        approval_mode="remote",
-                    ).recover(records)
-                finally:
-                    recovery_context.connection.close()
             await self._require_startup_runtime_lease()
         except Exception:
             await self._abort_startup_after_lease()
@@ -2823,7 +2733,7 @@ class GatewayRunner:
                 return
             self._lifecycle_phase = "stopping"
             self._accepting_external_messages = False
-            self._runtime_lease_valid = False
+            self._runtime_lease.revoke()
             self._cron_scheduler.revoke()
 
             # 先同步关闭所有外部入站资格，不能在等待 worker 时继续落库。
@@ -2877,21 +2787,12 @@ class GatewayRunner:
 
             if self._runtime_lease_acquired:
                 try:
-                    if self._runtime_lease_epoch is not None:
-                        await self.persistence.call(
-                            release_gateway_runtime_lease,
-                            self._runtime_lease_name,
-                            self._runtime_instance_id,
-                            self._runtime_lease_epoch,
-                        )
+                    await self._runtime_lease.release()
                 except Exception as exc:
                     print(
                         "  [gateway] runtime lease release failed: "
                         f"{type(exc).__name__}"
                     )
-                finally:
-                    self._runtime_lease_acquired = False
-                    self._runtime_lease_epoch = None
 
             if self._async_client is not None:
                 try:
@@ -2916,15 +2817,11 @@ class GatewayRunner:
     def _message_persistence_state(self, event: MessageEvent) -> dict | None:
         """以数据库为准查询平台消息是否已被 Gateway 接受。"""
         route_key = build_session_key(event.source, self.agent_name)
-        conn = init_db(self.db_path)
-        try:
-            persisted = get_gateway_message_persistence_state(
-                conn,
-                route_key,
-                event.message_id,
-            )
-        finally:
-            conn.close()
+        persisted = self.persistence.call_sync(
+            get_gateway_message_persistence_state,
+            route_key,
+            event.message_id,
+        )
         if persisted is not None:
             return persisted
         return self._startup_message_states.get((route_key, event.message_id))
@@ -3033,16 +2930,12 @@ class GatewayRunner:
 
     def _persist_event(self, route_key: str, event: MessageEvent) -> bool:
         """消息进入内存 busy / pending 前先持久化。"""
-        conn = init_db(self.db_path)
-        try:
-            accepted = enqueue_gateway_message(
-                conn,
-                route_key,
-                event.message_id,
-                self._serialize_event(event),
-            )
-        finally:
-            conn.close()
+        accepted = self.persistence.call_sync(
+            enqueue_gateway_message,
+            route_key,
+            event.message_id,
+            self._serialize_event(event),
+        )
         if not accepted:
             return False
         self._accepted_messages.add((route_key, event.message_id))
@@ -3065,13 +2958,11 @@ class GatewayRunner:
         return True
 
     def _mark_event_processing(self, route_key: str, event: MessageEvent) -> None:
-        conn = init_db(self.db_path)
-        try:
-            mark_gateway_message_processing(
-                conn, route_key, event.message_id,
-            )
-        finally:
-            conn.close()
+        self.persistence.call_sync(
+            mark_gateway_message_processing,
+            route_key,
+            event.message_id,
+        )
 
     async def _mark_event_processing_async(
         self,
@@ -3087,13 +2978,11 @@ class GatewayRunner:
     def _complete_event(self, route_key: str, event: MessageEvent) -> bool:
         """处理结束后删除恢复记录;失败时保留到下次重启。"""
         try:
-            conn = init_db(self.db_path)
-            try:
-                complete_gateway_message(
-                    conn, route_key, event.message_id,
-                )
-            finally:
-                conn.close()
+            self.persistence.call_sync(
+                complete_gateway_message,
+                route_key,
+                event.message_id,
+            )
         except Exception as exc:
             print(
                 f"  [gateway] {route_key}: queue completion failed "
@@ -3161,15 +3050,11 @@ class GatewayRunner:
         }
 
     def _enqueue_outbox(self, outbox: dict) -> str:
-        conn = init_db(self.db_path)
-        try:
-            return enqueue_gateway_outbox(
-                conn,
-                outbox,
-                **self._runtime_fence_kwargs(),
-            )
-        finally:
-            conn.close()
+        return self.persistence.call_sync(
+            enqueue_gateway_outbox,
+            outbox,
+            **self._runtime_fence_kwargs(),
+        )
 
     async def _enqueue_outbox_async(self, outbox: dict) -> str:
         return await self.persistence.call(
@@ -3179,11 +3064,7 @@ class GatewayRunner:
         )
 
     def _load_outbox(self, outbox_id: str) -> dict | None:
-        conn = init_db(self.db_path)
-        try:
-            return get_gateway_outbox(conn, outbox_id)
-        finally:
-            conn.close()
+        return self.persistence.call_sync(get_gateway_outbox, outbox_id)
 
     async def _load_outbox_async(self, outbox_id: str) -> dict | None:
         return await self.persistence.call(get_gateway_outbox, outbox_id)
@@ -3195,11 +3076,10 @@ class GatewayRunner:
         route_key: str | None = None,
         source_message_id: str | None = None,
     ) -> bool:
-        conn = init_db(self.db_path)
-        try:
+        def operation(conn) -> tuple[bool, str | None, str | None]:
             outbox = get_gateway_outbox(conn, outbox_id)
             if outbox is None:
-                return False
+                return False, None, None
             expected_route = route_key or str(outbox["route_key"])
             expected_source = source_message_id or str(
                 outbox["source_message_id"]
@@ -3221,9 +3101,13 @@ class GatewayRunner:
                         "delivered",
                     }
                 )
-        finally:
-            conn.close()
+            return cancelled, expected_route, expected_source
+
+        cancelled, expected_route, expected_source = self.persistence.call_sync(
+            operation,
+        )
         if cancelled:
+            assert expected_route is not None and expected_source is not None
             self._accepted_messages.discard((expected_route, expected_source))
         return cancelled
 
@@ -3268,8 +3152,7 @@ class GatewayRunner:
         route_key: str,
         event: MessageEvent,
     ) -> bool:
-        conn = init_db(self.db_path)
-        try:
+        def operation(conn) -> bool:
             completed = complete_gateway_delivery(
                 conn,
                 outbox_id,
@@ -3284,8 +3167,9 @@ class GatewayRunner:
                 )
                 if not completed and self._runtime_lease_acquired:
                     self._outbox_send_fence_is_valid(outbox_id)
-        finally:
-            conn.close()
+            return completed
+
+        completed = self.persistence.call_sync(operation)
         if completed:
             self._accepted_messages.discard((route_key, event.message_id))
         return completed
@@ -3320,19 +3204,15 @@ class GatewayRunner:
         error: str,
         error_code: str | None,
     ) -> bool:
-        conn = init_db(self.db_path)
-        try:
-            return fail_gateway_delivery(
-                conn,
-                outbox_id,
-                route_key,
-                event.message_id,
-                error,
-                error_code,
-                **self._runtime_fence_kwargs(),
-            )
-        finally:
-            conn.close()
+        return self.persistence.call_sync(
+            fail_gateway_delivery,
+            outbox_id,
+            route_key,
+            event.message_id,
+            error,
+            error_code,
+            **self._runtime_fence_kwargs(),
+        )
 
     async def _fail_outbox_async(
         self,
@@ -3464,15 +3344,11 @@ class GatewayRunner:
         event: MessageEvent | None,
     ) -> None:
         """兼容无 Outbox 的嵌入式回复，只保留入站失败审计。"""
-        conn = init_db(self.db_path)
-        try:
-            mark_gateway_message_delivery_failed(
-                conn,
-                route_key,
-                event.message_id,
-            )
-        finally:
-            conn.close()
+        self.persistence.call_sync(
+            mark_gateway_message_delivery_failed,
+            route_key,
+            event.message_id,
+        )
 
     async def _mark_delivery_failed_without_outbox_async(
         self,
@@ -3978,11 +3854,11 @@ class GatewayRunner:
     def _drop_events(self, route_key: str, events: list[MessageEvent]) -> None:
         """持久化删除被 /new 明确取消的旧 pending。"""
         message_ids = [event.message_id for event in events]
-        conn = init_db(self.db_path)
-        try:
-            delete_gateway_messages(conn, route_key, message_ids)
-        finally:
-            conn.close()
+        self.persistence.call_sync(
+            delete_gateway_messages,
+            route_key,
+            message_ids,
+        )
         for message_id in message_ids:
             self._accepted_messages.discard((route_key, message_id))
 

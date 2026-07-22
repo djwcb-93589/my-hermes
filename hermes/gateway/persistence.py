@@ -78,6 +78,22 @@ class GatewayPersistence:
         # 调用协程取消时不取消已经进入线程的提交；shutdown 会统一 drain。
         return await asyncio.shield(future)
 
+    def call_sync(
+        self,
+        operation: Callable[..., Any],
+        *args,
+        **kwargs,
+    ) -> Any:
+        """为同步兼容路径执行数据库操作，并统一管理连接生命周期。"""
+        if self._closing or self._closed:
+            raise RuntimeError("Gateway persistence is closing")
+        return self._run_with_connection(
+            self.db_path,
+            operation,
+            args,
+            kwargs,
+        )
+
     async def close(self) -> None:
         """停止接收新操作，等待已提交操作完成后关闭线程池。"""
         async with self._close_lock:
@@ -96,4 +112,3 @@ class GatewayPersistence:
                 cancel_futures=False,
             )
             self._closed = True
-

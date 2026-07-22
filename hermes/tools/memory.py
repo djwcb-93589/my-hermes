@@ -244,51 +244,49 @@ def _do_write(
                 **_capacity(file_path, char_limit)}
 
 
-def handle_memory(args, **kwargs):
-    """memory 工具入口。按 action 分发。"""
-    action = args.get("action", "")
-    target = args.get("target", "memory")
-    # 统一清理空白,避免"写进去但 read 时被 parse_entries 滤掉"
-    content = (args.get("content") or "").strip()
-    old_text = (args.get("old_text") or "").strip()
+def _resolve_target(target: str) -> tuple[Path | None, int | None, str | None]:
+    """把 target 名称解析成 (file_path, char_limit, error)。
 
+    target 非法时返回 (None, None, error)；合法时返回 (path, limit, None)。
+    """
     if target not in ("memory", "user"):
-        return _json({"ok": False, "error_type": "invalid_target",
-                      "error": f"target must be 'memory' or 'user', got {target!r}"})
+        return None, None, f"target must be 'memory' or 'user', got {target!r}"
+    if target == "user":
+        return USER_FILE, USER_CHAR_LIMIT, None
+    return MEMORY_FILE, MEMORY_CHAR_LIMIT, None
 
-    file_path = USER_FILE if target == "user" else MEMORY_FILE
-    char_limit = USER_CHAR_LIMIT if target == "user" else MEMORY_CHAR_LIMIT
 
-    # read：只读,不强制加锁(写入走原子替换,读旧/新版本都可接受)
-    if action == "read":
-        entries = load_memory(file_path)
-        return _json({
-            "ok": True, "target": target, "entries": entries,
-            "entry_count": len(entries), **_capacity(file_path, char_limit),
-        })
+def _build_mutate(
+    action: str,
+    content: str,
+    old_text: str,
+    target: str,
+    file_path: Path,
+    char_limit: int,
+):
+    """校验参数并构造 mutate 闭包。
 
-    if action not in ("add", "remove", "replace"):
-        return _json({"ok": False, "error_type": "unknown_action",
-                      "error": f"unknown action: {action!r}"})
-
-    # 写操作前置校验：分隔符 + 安全扫描（这些不依赖文件状态,放锁外做）
+    返回 (mutate, error_dict)。error_dict 非空表示校验失败,调用方应
+    直接返回 error_dict;为 None 时 mutate 可用,交给 _do_write 执行。
+    复用同一套校验:分隔符拦截、安全扫描、必填字段、重复检测规则。
+    """
+    # 写操作前置校验:分隔符 + 安全扫描(这些不依赖文件状态,放锁外做)
     if "§" in content or "§" in old_text:
-        return _json({"ok": False, "target": target, "error_type": "invalid_content",
+        return None, {"ok": False, "target": target, "error_type": "invalid_content",
                       "error": "content must not contain the § separator",
-                      **_capacity(file_path, char_limit)})
+                      **_capacity(file_path, char_limit)}
 
     for text in (content, old_text):
         ok, reason = _security_scan(text)
         if not ok:
-            return _json({"ok": False, "target": target, "error_type": "blocked_content",
-                          "error": reason, **_capacity(file_path, char_limit)})
+            return None, {"ok": False, "target": target, "error_type": "blocked_content",
+                          "error": reason, **_capacity(file_path, char_limit)}
 
-    # 按 action 校验必填字段,然后定义 mutate 闭包
     if action == "add":
         if not content:
-            return _json({"ok": False, "target": target, "error_type": "invalid_args",
+            return None, {"ok": False, "target": target, "error_type": "invalid_args",
                           "error": "content is required for add",
-                          **_capacity(file_path, char_limit)})
+                          **_capacity(file_path, char_limit)}
 
         def mutate(entries):
             if _is_duplicate(entries, content):
@@ -298,9 +296,9 @@ def handle_memory(args, **kwargs):
 
     elif action == "remove":
         if not content:
-            return _json({"ok": False, "target": target, "error_type": "invalid_args",
+            return None, {"ok": False, "target": target, "error_type": "invalid_args",
                           "error": "content (substring to match) is required for remove",
-                          **_capacity(file_path, char_limit)})
+                          **_capacity(file_path, char_limit)}
 
         def mutate(entries):
             matches = _find_matches(entries, content)
@@ -320,13 +318,13 @@ def handle_memory(args, **kwargs):
 
     else:  # replace
         if not content:
-            return _json({"ok": False, "target": target, "error_type": "invalid_args",
+            return None, {"ok": False, "target": target, "error_type": "invalid_args",
                           "error": "content (new text) is required for replace",
-                          **_capacity(file_path, char_limit)})
+                          **_capacity(file_path, char_limit)}
         if not old_text:
-            return _json({"ok": False, "target": target, "error_type": "invalid_args",
+            return None, {"ok": False, "target": target, "error_type": "invalid_args",
                           "error": "old_text is required for replace",
-                          **_capacity(file_path, char_limit)})
+                          **_capacity(file_path, char_limit)}
 
         def mutate(entries):
             matches = _find_matches(entries, old_text)
@@ -349,6 +347,98 @@ def handle_memory(args, **kwargs):
             new_entries[idx] = content
             return new_entries, {"action": "replace"}
 
+    return mutate, None
+
+
+def read_memory_entries(target: str = "memory") -> dict:
+    """程序级读取接口。返回结构化字典,不是 JSON 字符串。
+
+    供需要直接读取记忆的外部模块使用。与 handle_memory 的 read 动作
+    共用同一套读逻辑,但返回字典,调用方不需要 json.loads。
+    """
+    file_path, char_limit, error = _resolve_target(target)
+    if file_path is None:
+        return {"ok": False, "error_type": "invalid_target", "error": error}
+    entries = load_memory(file_path)
+    return {
+        "ok": True, "target": target, "entries": entries,
+        "entry_count": len(entries), **_capacity(file_path, char_limit),
+    }
+
+
+def mutate_memory_entries(
+    action: str,
+    *,
+    target: str = "memory",
+    content: str = "",
+    old_text: str = "",
+) -> dict:
+    """程序级写入接口。返回结构化字典,不是 JSON 字符串。
+
+    与 handle_memory 的写动作共用同一套校验、锁和原子写逻辑,但返回
+    字典,供程序内部调用(如会话结束自动压缩、外部脚本批量写入)。
+    调用方不需要 json.loads,也不需要自己拼文件锁和原语。
+
+    参数语义与 handle_memory 完全一致:
+      - action: "add" / "remove" / "replace"
+      - target: "memory" / "user"
+      - content: add 的新文本 / remove 的子串 / replace 的新文本
+      - old_text: 仅 replace 需要,定位被替换的条目
+
+    返回字典键名与 handle_memory 的 JSON 一致:成功时含 ok/target/
+    entry_count/action/size 等;失败时 ok=False 且 error_type 说明原因。
+    """
+    file_path, char_limit, error = _resolve_target(target)
+    if file_path is None:
+        return {"ok": False, "error_type": "invalid_target", "error": error}
+
+    if action not in ("add", "remove", "replace"):
+        return {"ok": False, "target": target, "error_type": "unknown_action",
+                "error": f"unknown action: {action!r}",
+                **_capacity(file_path, char_limit)}
+
+    normalized_content = (content or "").strip()
+    normalized_old_text = (old_text or "").strip()
+
+    mutate, error_dict = _build_mutate(
+        action, normalized_content, normalized_old_text,
+        target, file_path, char_limit,
+    )
+    if error_dict is not None:
+        return error_dict
+    return _do_write(file_path, char_limit, mutate, target)
+
+
+def handle_memory(args, **kwargs):
+    """memory 工具入口。按 action 分发。"""
+    action = args.get("action", "")
+    target = args.get("target", "memory")
+
+    file_path, char_limit, error = _resolve_target(target)
+    if file_path is None:
+        return _json({"ok": False, "error_type": "invalid_target",
+                      "error": error})
+
+    # read：只读,不强制加锁(写入走原子替换,读旧/新版本都可接受)
+    if action == "read":
+        entries = load_memory(file_path)
+        return _json({
+            "ok": True, "target": target, "entries": entries,
+            "entry_count": len(entries), **_capacity(file_path, char_limit),
+        })
+
+    if action not in ("add", "remove", "replace"):
+        return _json({"ok": False, "error_type": "unknown_action",
+                      "error": f"unknown action: {action!r}"})
+
+    content = (args.get("content") or "").strip()
+    old_text = (args.get("old_text") or "").strip()
+
+    mutate, error_dict = _build_mutate(
+        action, content, old_text, target, file_path, char_limit,
+    )
+    if error_dict is not None:
+        return _json(error_dict)
     return _json(_do_write(file_path, char_limit, mutate, target))
 
 
