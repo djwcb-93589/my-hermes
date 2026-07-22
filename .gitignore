@@ -22,4 +22,9 @@ SOUL.md
 memories/
 数据脱敏和安全边界笔记.md
 *.md
+!README.md
 !开发说明/*.md
+cache
+!README.md
+!memories
+!SOUL.md
