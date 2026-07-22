@@ -46,7 +46,7 @@ from hermes.durable_tool_dispatcher import (
     DurableToolExecutionContext,
 )
 from hermes.tool_execution_recovery import ToolExecutionRecoveryService
-from hermes.tools.skill import handle_skill_view
+from hermes.tools.skill import load_skill_body
 from hermes.tools import (
     ExecutionEnvironment,
     ToolPolicy,
@@ -167,14 +167,7 @@ def _load_cron_skills(job: CronJob) -> str:
         return ""
     sections: list[str] = []
     for name in job.skills:
-        response = handle_skill_view(
-            {"name": name},
-            interactive_approval=False,
-        )
-        try:
-            payload = json.loads(response)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Cron skill could not be loaded") from exc
+        payload = load_skill_body(name)
         if not payload.get("ok") or not isinstance(payload.get("body"), str):
             raise ValueError("Cron skill is unavailable")
         sections.append(f"## Preloaded Skill: {payload.get('name', name)}\n{payload['body']}")

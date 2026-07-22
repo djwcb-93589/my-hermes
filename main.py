@@ -2,7 +2,7 @@
 Hermes 入口。
 
 默认模式：交互式 CLI REPL —— input → run_conversation → output。
-其它模式经 argv 分发：--gateway、--simulate、--test。
+其它模式经 argv 分发：--gateway、--simulate。
 """
 
 from __future__ import annotations

@@ -8,13 +8,11 @@ memory 工具：长期记忆存储（MEMORY.md / USER.md）。
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
 import re
-import time
 from pathlib import Path
 
+from hermes._io_utils import LockTimeout, atomic_write_text, file_lock
 from hermes.config import (
     HERMES_HOME,
     MEMORY_CHAR_LIMIT,
@@ -27,9 +25,8 @@ MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 USER_FILE = MEMORY_DIR / "USER.md"
 ENTRY_SEP = "\n\n§\n\n"
 
-# 文件锁参数：拿不到锁时轮询,超过 _LOCK_TIMEOUT 秒抛 _LockTimeout。
+# 文件锁等待超时时间（秒）。memory 的写入路径较短,5 秒足够。
 _LOCK_TIMEOUT = 5.0
-_LOCK_POLL = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -107,26 +104,6 @@ def _render_single_section(
     )
 
 
-def _atomic_write_text(file_path: Path, text: str) -> None:
-    """同目录写临时文件 → flush/fsync → os.replace 原子替换。
-
-    异常时清理临时文件并重新抛出,旧文件不受影响。
-    """
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, file_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-
-
 def _try_save(
     file_path: Path,
     entries: list[str],
@@ -144,54 +121,8 @@ def _try_save(
             "error": "write would exceed char limit; file unchanged",
         }
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(file_path, text)
+    atomic_write_text(file_path, text)
     return True, {"size": len(text)}
-
-
-# ---------------------------------------------------------------------------
-# 文件锁（标准库 O_CREAT | O_EXCL 实现,跨进程互斥）
-# ---------------------------------------------------------------------------
-
-class _LockTimeout(Exception):
-    """文件锁等待超时。"""
-
-
-def _lock_path_for(file_path: Path) -> Path:
-    """锁文件与目标文件同目录,加 ``.lock`` 后缀。"""
-    return file_path.with_suffix(file_path.suffix + ".lock")
-
-
-def _acquire_lock(lock_path: Path, timeout: float = _LOCK_TIMEOUT) -> int:
-    """``O_CREAT | O_EXCL`` 抢锁,返回 fd。超时抛 _LockTimeout。"""
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise _LockTimeout()
-            time.sleep(_LOCK_POLL)
-
-
-def _release_lock(lock_path: Path, fd: int) -> None:
-    try:
-        os.close(fd)
-    finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@contextlib.contextmanager
-def _file_lock(file_path: Path, timeout: float = _LOCK_TIMEOUT):
-    """简单的跨进程文件锁上下文。"""
-    lock_path = _lock_path_for(file_path)
-    fd = _acquire_lock(lock_path, timeout)
-    try:
-        yield
-    finally:
-        _release_lock(lock_path, fd)
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +220,7 @@ def _do_write(
                 **_capacity(file_path, char_limit)}
 
     try:
-        with _file_lock(file_path):
+        with file_lock(file_path):
             entries = load_memory(file_path)
             new_entries, info = mutate(entries)
             if new_entries is None:
@@ -307,7 +238,7 @@ def _do_write(
             return {"ok": True, "target": target,
                     "entry_count": len(new_entries), **info, **save_info,
                     **_capacity(file_path, char_limit)}
-    except _LockTimeout:
+    except LockTimeout:
         return {"ok": False, "target": target, "error_type": "lock_timeout",
                 "error": "could not acquire memory file lock in time",
                 **_capacity(file_path, char_limit)}

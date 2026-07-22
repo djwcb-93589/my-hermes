@@ -6,23 +6,18 @@ Skill 名称、SHA-256 内容摘要和信任时间，不保存正文或凭证。
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
-import os
 import re
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from hermes._io_utils import atomic_write_text, file_lock
 from hermes.config import HERMES_HOME
 
 
 TRUSTED_SKILLS_FILE = HERMES_HOME / "trusted_skills.json"
-
-_LOCK_TIMEOUT = 5.0
-_LOCK_POLL = 0.05
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
@@ -370,45 +365,6 @@ def compute_skill_content_hash(text: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-class _LockTimeout(Exception):
-    """信任记录文件锁等待超时。"""
-
-
-def _lock_path_for(file_path: Path) -> Path:
-    return file_path.with_suffix(file_path.suffix + ".lock")
-
-
-def _acquire_lock(lock_path: Path, timeout: float = _LOCK_TIMEOUT) -> int:
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise _LockTimeout()
-            time.sleep(_LOCK_POLL)
-
-
-def _release_lock(lock_path: Path, fd: int) -> None:
-    try:
-        os.close(fd)
-    finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@contextlib.contextmanager
-def _file_lock(file_path: Path, timeout: float = _LOCK_TIMEOUT):
-    lock_path = _lock_path_for(file_path)
-    fd = _acquire_lock(lock_path, timeout)
-    try:
-        yield
-    finally:
-        _release_lock(lock_path, fd)
-
-
 def _load_trust_records(file_path: Path | None = None) -> dict[str, dict]:
     file_path = file_path or TRUSTED_SKILLS_FILE
     if not file_path.exists():
@@ -423,21 +379,9 @@ def _load_trust_records(file_path: Path | None = None) -> dict[str, dict]:
 
 
 def _atomic_write_records(file_path: Path, records: dict[str, dict]) -> None:
-    """同目录写临时文件并原子替换，失败时保留旧信任记录。"""
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    """序列化为 JSON 后走公共原子写入,失败时保留旧信任记录。"""
     payload = json.dumps(records, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, file_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write_text(file_path, payload)
 
 
 def get_skill_trust_state(name: str, content: str) -> SkillTrustState:
@@ -465,7 +409,7 @@ def trust_skill_content(name: str, content: str) -> dict[str, str]:
         "trusted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     TRUSTED_SKILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with _file_lock(TRUSTED_SKILLS_FILE):
+    with file_lock(TRUSTED_SKILLS_FILE):
         records = _load_trust_records()
         records[name] = record
         _atomic_write_records(TRUSTED_SKILLS_FILE, records)

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from hermes.config import HERMES_HOME
 from hermes.tools.memory import render_memory_section
-from hermes.tools.skill import discover_skills
+from hermes.tools.skill import render_skills_section
 
 
 _CRON_ROUTING_GUIDANCE = (
@@ -101,13 +101,9 @@ def build_system_prompt(
         or bool({"skill_read", "skill_manage"} & set(selected_toolsets))
     )
     if skill_enabled:
-        skills = discover_skills()
-        if skills:
-            lines = [
-                f"- **{skill['name']}**: {skill['description']}"
-                for skill in skills
-            ]
-            parts.append("# Available Skills\n" + "\n".join(lines))
+        skills_section = render_skills_section()
+        if skills_section is not None:
+            parts.append(skills_section)
 
     if selected_toolsets is None:
         # None 保持 CLI 原有完整工具提示。

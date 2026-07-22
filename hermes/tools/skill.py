@@ -8,17 +8,16 @@ Markdown body。所有写操作走"文件锁 + 原子替换"完整事务;所有�
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import asdict
 import json
 import os
 import re
 import shutil
-import time
 from pathlib import Path
 
 import yaml
 
+from hermes._io_utils import LockTimeout, atomic_write_text, file_lock
 from hermes.config import HERMES_HOME
 from hermes.skill_security import get_skill_trust_state, scan_skill_content
 
@@ -159,62 +158,6 @@ def _render_skill(
 # 原子写入 + 文件锁(同 memory.py 实现思路)
 # ---------------------------------------------------------------------------
 
-class _LockTimeout(Exception):
-    """文件锁等待超时。"""
-
-
-def _lock_path_for(file_path: Path) -> Path:
-    return file_path.with_suffix(file_path.suffix + ".lock")
-
-
-def _acquire_lock(lock_path: Path, timeout: float = _LOCK_TIMEOUT) -> int:
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise _LockTimeout()
-            time.sleep(_LOCK_POLL)
-
-
-def _release_lock(lock_path: Path, fd: int) -> None:
-    try:
-        os.close(fd)
-    finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@contextlib.contextmanager
-def _file_lock(file_path: Path, timeout: float = _LOCK_TIMEOUT):
-    lock_path = _lock_path_for(file_path)
-    fd = _acquire_lock(lock_path, timeout)
-    try:
-        yield
-    finally:
-        _release_lock(lock_path, fd)
-
-
-def _atomic_write_text(file_path: Path, text: str) -> None:
-    """同目录 tmp + fsync + os.replace,异常时清理 tmp 且不破坏旧文件。"""
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, file_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-
-
 # ---------------------------------------------------------------------------
 # JSON 返回 helper
 # ---------------------------------------------------------------------------
@@ -275,21 +218,39 @@ def discover_skills() -> list[dict]:
     return out
 
 
-def handle_skill_view(args, **kwargs):
-    """按 name 加载完整正文，并返回风险报告与当前内容版本的信任状态。"""
-    name = args.get("name", "")
+def _load_skill_payload(name: str) -> dict:
+    """加载单个 skill 的完整内容,返回结构化字典。
+
+    供本模块的工具入口和对外接口 ``load_skill_body`` 共用。返回的字典
+    使用与工具结果一致的键名(ok/error_type/name/body/...),但调用方
+    可以直接当作数据结构使用,不需要再 JSON 解析。
+
+    成功时返回 {"ok": True, "name": ..., "body": ..., ...};
+    失败时返回 {"ok": False, "error_type": ..., "error": ..., ...}。
+    """
     skill_dir, reason = _resolve_skill_dir(name)
     if skill_dir is None:
-        return _err("invalid_name", reason)
+        return {"ok": False, "error_type": "invalid_name", "error": reason}
 
     skill_file = skill_dir / "SKILL.md"
     if not skill_file.exists():
-        return _err("not_found", f"skill {name!r} does not exist", name=name)
+        return {
+            "ok": False,
+            "error_type": "not_found",
+            "error": f"skill {name!r} does not exist",
+            "name": name,
+        }
 
     text = skill_file.read_text(encoding="utf-8")
     metadata, body, error = _parse_frontmatter_safe(text)
     if error:
-        return _err("parse_error", error, name=name, relative_path=f"skills/{name}")
+        return {
+            "ok": False,
+            "error_type": "parse_error",
+            "error": error,
+            "name": name,
+            "relative_path": f"skills/{name}",
+        }
 
     risk_report = scan_skill_content(body)
     risk = {
@@ -297,17 +258,74 @@ def handle_skill_view(args, **kwargs):
         "findings": [asdict(finding) for finding in risk_report.findings],
     }
     trust_state = get_skill_trust_state(name, text)
-    common = {
+    return {
+        "ok": True,
         "name": metadata.get("name", name),
         "relative_path": f"skills/{name}",
         "risk": risk,
         "trusted": trust_state.trusted,
         "trust_stale": trust_state.trust_stale,
+        "description": metadata.get("description", ""),
+        "version": metadata.get("version"),
+        "platforms": metadata.get("platforms"),
+        "metadata": metadata.get("metadata"),
+        "body": body,
+    }
+
+
+def load_skill_body(name: str) -> dict:
+    """加载单个 skill 的完整内容,返回结构化数据。
+
+    供需要 skill 正文的外部模块(如 cron 预加载)使用,不走工具 handler
+    的 JSON 返回格式。调用方直接拿字典,不需要再 json.loads。
+
+    返回的字典键名与工具结果一致:成功时含 ok/name/body/description 等;
+    失败时 ok=False 且 error_type 说明原因。本函数不做风险等级拦截--
+    需要按风险等级决定是否使用 skill 的调用方,应自行读取 ``risk`` 字段。
+    """
+    return _load_skill_payload(name)
+
+
+def render_skills_section() -> str | None:
+    """渲染可用 skill 列表为 system prompt 段落。
+
+    返回拼好的纯文本段落;无 skill 时返回 None。调用方不感知字段名、
+    渲染格式、风险等级显示策略,这些细节由本模块独占。
+    """
+    skills = discover_skills()
+    if not skills:
+        return None
+    lines = [
+        f"- **{skill['name']}**: {skill['description']}"
+        for skill in skills
+    ]
+    return "# Available Skills\n" + "\n".join(lines)
+
+
+def handle_skill_view(args, **kwargs):
+    """按 name 加载完整正文，并返回风险报告与当前内容版本的信任状态。"""
+    name = args.get("name", "")
+    payload = _load_skill_payload(name)
+    if not payload.get("ok"):
+        # _err 期望关键字参数,这里把 payload 里的字段透传
+        return _err(
+            payload.get("error_type", "unknown"),
+            payload.get("error", "skill load failed"),
+            **{k: v for k, v in payload.items() if k not in ("ok", "error_type", "error")},
+        )
+
+    risk_report_level = payload["risk"]["level"]
+    common = {
+        "name": payload["name"],
+        "relative_path": payload["relative_path"],
+        "risk": payload["risk"],
+        "trusted": payload["trusted"],
+        "trust_stale": payload["trust_stale"],
     }
 
     # Gateway 等无人值守调用没有可靠的交互确认能力；CLI 仍完整展示正文。
     if kwargs.get("interactive_approval") is False:
-        if risk_report.risk_level == "high":
+        if risk_report_level == "high":
             return _err(
                 "safety_blocked",
                 "high-risk skill is blocked in unattended mode",
@@ -315,7 +333,7 @@ def handle_skill_view(args, **kwargs):
                 requires_confirmation=True,
                 **common,
             )
-        if risk_report.risk_level == "medium" and not trust_state.trusted:
+        if risk_report_level == "medium" and not payload["trusted"]:
             return _err(
                 "permission_denied",
                 "untrusted medium-risk skill requires interactive confirmation",
@@ -325,11 +343,11 @@ def handle_skill_view(args, **kwargs):
             )
 
     return _ok(
-        description=metadata.get("description", ""),
-        version=metadata.get("version"),
-        platforms=metadata.get("platforms"),
-        metadata=metadata.get("metadata"),
-        body=body,
+        description=payload["description"],
+        version=payload["version"],
+        platforms=payload["platforms"],
+        metadata=payload["metadata"],
+        body=payload["body"],
         **common,
     )
 
@@ -381,12 +399,12 @@ def _do_create(name: str, args: dict) -> str:
         # 锁文件需要父目录存在,先建目录(mkdir 本身幂等,即使没拿到锁也无害)
         SKILLS_DIR.mkdir(parents=True, exist_ok=True)
         skill_dir.mkdir(parents=True, exist_ok=True)
-        with _file_lock(skill_file):
+        with file_lock(skill_file):
             # 锁内二次检查,防并发 create
             if skill_file.exists():
                 return _err("exists", f"skill {name!r} was created concurrently", name=name)
-            _atomic_write_text(skill_file, content)
-    except _LockTimeout:
+            atomic_write_text(skill_file, content)
+    except LockTimeout:
         return _err("lock_timeout", "could not acquire skill file lock")
     except OSError as exc:
         return _err("io_error", str(exc))
@@ -404,7 +422,7 @@ def _do_edit(name: str, args: dict) -> str:
         return _err("not_found", f"skill {name!r} does not exist", name=name)
 
     try:
-        with _file_lock(skill_file):
+        with file_lock(skill_file):
             text = skill_file.read_text(encoding="utf-8")
             metadata, old_body, error = _parse_frontmatter_safe(text)
             if error:
@@ -433,8 +451,8 @@ def _do_edit(name: str, args: dict) -> str:
                 name, new_body, description=new_description,
                 version=new_version, platforms=new_platforms, metadata=new_metadata,
             )
-            _atomic_write_text(skill_file, content)
-    except _LockTimeout:
+            atomic_write_text(skill_file, content)
+    except LockTimeout:
         return _err("lock_timeout", "could not acquire skill file lock")
     except OSError as exc:
         return _err("io_error", str(exc))
@@ -485,7 +503,7 @@ def _do_patch(name: str, args: dict) -> str:
         return _err("invalid_args", "new_text must differ from old_text")
 
     try:
-        with _file_lock(skill_file):
+        with file_lock(skill_file):
             text = skill_file.read_text(encoding="utf-8")
             count = text.count(old_text)
             if count == 0:
@@ -497,8 +515,8 @@ def _do_patch(name: str, args: dict) -> str:
                     name=name, match_count=count,
                 )
             new_content = text.replace(old_text, new_text, 1)
-            _atomic_write_text(skill_file, new_content)
-    except _LockTimeout:
+            atomic_write_text(skill_file, new_content)
+    except LockTimeout:
         return _err("lock_timeout", "could not acquire skill file lock")
     except OSError as exc:
         return _err("io_error", str(exc))

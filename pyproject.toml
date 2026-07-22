@@ -15,8 +15,3 @@ dependencies = [
     "httpx>=0.28,<1",
     "tzdata>=2026.3",
 ]
-
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]
