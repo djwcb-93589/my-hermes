@@ -788,9 +788,20 @@ class BrowserSession:
             previous_url = self._page.url
             try:
                 previous_position = self._position_marker_locked()
-            except Exception:
-                # 导航切换期间 history.state 可能短暂不可读；这不妨碍等待本身。
-                previous_position = None
+            except Exception as exc:
+                if self._is_permanent_browser_error(exc):
+                    return _err(
+                        "wait_failed",
+                        f"开始等待时页面不可用: {exc}",
+                    )
+                if self._is_transient_wait_error(exc):
+                    # 导航切换期间 history.state 可能短暂不可读；这不妨碍等待本身。
+                    previous_position = None
+                else:
+                    return _err(
+                        "wait_failed",
+                        f"开始等待时读取页面位置失败: {exc}",
+                    )
         except Exception as exc:
             return _err("wait_failed", f"开始等待时页面不可用: {exc}")
         # 条件等待期间 DOM、URL 都可能已变化；开始等待即废弃旧观察结果。
@@ -812,6 +823,8 @@ class BrowserSession:
             except Exception as exc:
                 if self._is_permanent_browser_error(exc):
                     return _err("wait_failed", f"等待{description}时页面不可用: {exc}")
+                if not self._is_transient_wait_error(exc):
+                    return _err("wait_failed", f"等待{description}时发生未知错误: {exc}")
                 # 导航和框架重绘会暂时销毁执行上下文或 locator；视为本轮未命中。
 
             remaining_ms = int((deadline - monotonic()) * 1000)
@@ -835,6 +848,8 @@ class BrowserSession:
             except Exception as exc:
                 if self._is_permanent_browser_error(exc):
                     return _err("wait_failed", f"等待{description}时页面不可用: {exc}")
+                if not self._is_transient_wait_error(exc):
+                    return _err("wait_failed", f"等待{description}时发生未知错误: {exc}")
                 # 有些导航窗口拒绝任何 page 调用；短暂退让后再次检查条件。
                 sleep(min(0.05, max(0.0, remaining_ms / 1000)))
 
@@ -878,6 +893,35 @@ class BrowserSession:
         )
         return any(marker in message for marker in permanent_markers)
 
+    def _is_transient_wait_error(self, exc: Exception) -> bool:
+        """仅识别导航或重绘窗口内已知、可恢复的 Playwright 错误。"""
+        message = str(exc).lower()
+        transient_markers = (
+            "execution context was destroyed",
+            "execution context is not available",
+            "most likely because of a navigation",
+            "cannot find context with specified id",
+            "frame was detached",
+            "frame has been detached",
+            "frame is detached",
+            "frame was navigated",
+            "frame is navigating",
+            "element is not attached to the dom",
+            "element is not attached",
+            "node is detached",
+            "no node with given id found",
+            "could not find node with given id",
+        )
+        return any(marker in message for marker in transient_markers)
+
+    def _is_networkidle_probe_timeout(self, exc: Exception) -> bool:
+        """识别本模块主动发起的短 networkidle 探测超时。"""
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        except ImportError:
+            return False
+        return isinstance(exc, PlaywrightTimeoutError)
+
     def _is_backend_node_visible_locked(self, backend_id: int) -> bool:
         """通过 backendDOMNodeId 检查元素仍连接在页面中且可见。"""
         client = self._context.new_cdp_session(self._page)
@@ -895,12 +939,18 @@ class BrowserSession:
                         "returnByValue": True,
                     },
                 )
-            except Exception:
-                # 元素被框架重绘而脱离 DOM 时，不是浏览器故障，只代表条件未满足。
-                return False
+            except Exception as exc:
+                if self._is_transient_wait_error(exc):
+                    # 元素被框架重绘而脱离 DOM 时，本轮尚不能确认可见。
+                    return False
+                raise
             return result.get("result", {}).get("value") is True
         finally:
-            client.detach()
+            try:
+                client.detach()
+            except Exception as exc:
+                if not self._is_transient_wait_error(exc):
+                    raise
 
     def _is_load_state_ready_locked(self, state: str) -> bool:
         """以非阻塞短探测检查加载状态，避免一次调用占满总超时。"""
@@ -913,8 +963,10 @@ class BrowserSession:
             # 也不会让取消信号被一次长等待拖住。
             self._page.wait_for_load_state("networkidle", timeout=50)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            if self._is_networkidle_probe_timeout(exc) or self._is_transient_wait_error(exc):
+                return False
+            raise
 
     def _finish_wait_locked(
         self,
@@ -923,11 +975,24 @@ class BrowserSession:
         previous_url: str,
         previous_position: str | None,
     ) -> str:
-        """等待专用收尾：直接取快照，不再引入动作后的额外等待。"""
-        try:
-            snapshot, new_snapshot_id = self._snapshot_locked()
-        except Exception as exc:
-            return _err("wait_failed", f"等待结束时获取当前快照失败: {exc}")
+        """等待专用收尾：短暂重试快照，不引入动作后的秒级等待。"""
+        snapshot: str | None = None
+        new_snapshot_id: str | None = None
+        for attempt in range(3):
+            try:
+                snapshot, new_snapshot_id = self._snapshot_locked()
+                break
+            except Exception as exc:
+                if self._is_permanent_browser_error(exc):
+                    return _err("wait_failed", f"等待结束时页面不可用: {exc}")
+                if not self._is_transient_wait_error(exc):
+                    return _err("wait_failed", f"等待结束时获取快照失败: {exc}")
+                if attempt == 2:
+                    return _err("wait_failed", f"等待结束时页面仍在切换: {exc}")
+                # 最多两次短暂退让，总额外等待约 80ms。
+                sleep(0.04)
+        if snapshot is None or new_snapshot_id is None:
+            return _err("wait_failed", "等待结束时未能取得当前快照")
         try:
             self._record_navigation_locked(previous_url, previous_position)
         except Exception:
@@ -1153,9 +1218,11 @@ class BrowserSession:
             previous_position = self._position_marker_locked()
             # JS 可能改 DOM,先失效旧观察结果。
             self._invalidate_snapshot_locked()
-            # 用包装函数执行:try-catch 捕获 JS 异常,JSON.stringify 兜底
-            # 非可序列化返回值。returnByValue 让 CDP 把结果序列化传回。
-            wrapped = _JS_CONSOLE_WRAPPER.format(escaped_expr=_js_escape(expression))
+            # 页面侧先序列化并截断，避免超大结果完整穿过 CDP 传到 Python。
+            wrapped = _JS_CONSOLE_WRAPPER.format(
+                escaped_expr=_js_escape(expression),
+                max_chars=max_chars,
+            )
             try:
                 call_result = self._page.evaluate(wrapped)
             except Exception as exc:
@@ -1170,13 +1237,14 @@ class BrowserSession:
                     f"JS 抛出异常: {call_result.get('error')}",
                 )
             js_result = call_result.get("result", "<unserializable>")
-            # JS 侧序列化失败的返回值也兜底成这个字符串。
-            if call_result.get("unserializable"):
-                js_result = "<unserializable>"
-            js_result, truncated, original_length = _truncate_console_result(
-                js_result,
-                max_chars,
-            )
+            truncated = call_result.get("truncated")
+            original_length = call_result.get("original_length")
+            if not isinstance(truncated, bool) or (
+                isinstance(original_length, bool)
+                or not isinstance(original_length, int)
+                or original_length < 0
+            ):
+                return _err("console_failed", "页面返回了无效的结果长度信息")
             try:
                 snapshot, new_snapshot_id = self._observe_after_action_locked(
                     previous_url,
@@ -1349,16 +1417,15 @@ _JS_IS_VISIBLE = """function() {
     return rect.width > 0 && rect.height > 0;
 }"""
 
-# console():包装用户表达式,捕获 JS 异常,JSON.stringify 兜底非可序列化返回值。
+# console():在页面侧执行、序列化并限制结果大小，避免完整大对象跨 CDP 返回。
 # 用户表达式作为字符串注入,在函数体内 eval 执行(保留其作用域语义)。
-# 返回 {ok, result, unserializable, error} 结构供 Python 解析。
+# 返回的小结果保持原类型；超限结果返回截断后的序列化文本。
 _JS_CONSOLE_WRAPPER = """(() => {{
     try {{
         var value = eval({escaped_expr});
-        var hasValue = true;
-        // 函数/undefined 不能 JSON.stringify 成有意义的结果。
-        if (typeof value === 'function' || value === undefined) {{
-            return {{ok: true, result: String(value), unserializable: false, error: null}};
+        // 函数、undefined 和 Symbol 先转成可说明的文本，避免 JSON.stringify 丢值。
+        if (typeof value === 'function' || value === undefined || typeof value === 'symbol') {{
+            value = String(value);
         }}
         try {{
             var serialized = JSON.stringify(value, (key, val) => {{
@@ -1369,14 +1436,45 @@ _JS_CONSOLE_WRAPPER = """(() => {{
                 return val;
             }});
             if (serialized === undefined) {{
-                return {{ok: true, result: '<unserializable>', unserializable: true, error: null}};
+                serialized = JSON.stringify('<unserializable>');
             }}
-            return {{ok: true, result: JSON.parse(serialized), unserializable: false, error: null}};
+            var originalLength = serialized.length;
+            var maxChars = {max_chars};
+            if (originalLength > maxChars) {{
+                var prefix = maxChars === 1 ? '' : serialized.slice(0, maxChars - 1);
+                return {{
+                    ok: true,
+                    result: prefix + '…',
+                    truncated: true,
+                    original_length: originalLength,
+                    error: null
+                }};
+            }}
+            return {{
+                ok: true,
+                result: JSON.parse(serialized),
+                truncated: false,
+                original_length: originalLength,
+                error: null
+            }};
         }} catch (_) {{
-            return {{ok: true, result: '<unserializable>', unserializable: true, error: null}};
+            var fallback = JSON.stringify('<unserializable>');
+            return {{
+                ok: true,
+                result: '<unserializable>',
+                truncated: false,
+                original_length: fallback.length,
+                error: null
+            }};
         }}
     }} catch (e) {{
-        return {{ok: false, result: null, unserializable: false, error: String(e && e.message || e)}};
+        return {{
+            ok: false,
+            result: null,
+            truncated: false,
+            original_length: 0,
+            error: String(e && e.message || e)
+        }};
     }}
 }})()"""
 
@@ -1384,23 +1482,6 @@ _JS_CONSOLE_WRAPPER = """(() => {{
 def _js_escape(text: str) -> str:
     """把 Python 字符串转成 JS 字符串字面量(含引号)。"""
     return json.dumps(text, ensure_ascii=False)
-
-
-def _truncate_console_result(result: Any, max_chars: int) -> tuple[Any, bool, int]:
-    """按 JSON 序列化长度限制 console 结果，并保证外层返回仍可编码。"""
-    try:
-        serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError):
-        serialized = json.dumps("<unserializable>", ensure_ascii=False)
-        result = "<unserializable>"
-    original_length = len(serialized)
-    if original_length <= max_chars:
-        return result, False, original_length
-    if max_chars == 1:
-        return "…", True, original_length
-    # 截断的是 JSON 表示文本，而不是半个 Python 对象；外层会再次 JSON 编码，
-    # 因此调用方永远能收到合法 JSON，不会被残缺对象破坏解析。
-    return serialized[: max_chars - 1] + "…", True, original_length
 
 
 def _normalize_url(url: str) -> str:

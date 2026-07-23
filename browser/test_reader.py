@@ -5,15 +5,24 @@ browser 模块独立测试(无 pytest)。
 
     uv run python -m browser.test_reader
 
+绝大多数用例跑在本地 fixture 网站(browser/_fixtures),不依赖外网 --
+避免网络波动假失败、真实页面结构变化导致 ref 测试失效。fixture 提供
+cookie/表单/延迟/下载/iframe/弹窗等真实 HTTP 语义,覆盖已实现的全部功能。
+真实网站只保留 1 个冒烟用例,外网不可达时 skip 不 fail。
+
+需要 HTTP 语义的用例(cookie 持久、表单提交、慢加载、延迟出现、iframe、
+弹窗)走 fixture;极简单页(单元素、stale ref、参数校验)仍用 data: URL,
+各取所长。
+
 测试覆盖:
 1. navigate 返回的快照含 link、heading 和 snapshot_id
 2. ref 只出现在交互角色行上
-3. 连续两次 navigate 后 cookie 仍存在(长驻 context 的核心价值)
+3. cookie-set 写入后跨 navigate 保持(context 持久化)
 4. 跨页 navigate 后 ref 从 e1 重新编号,且 snapshot 反映新页面内容
 5. session close 后再调 snapshot 抛 RuntimeError(资源已释放)
-6. click 触发导航后返回新快照(页内锚点跳转)
-7. type 在 Wikipedia 搜索框填入文字,快照反映输入值
-8. press Enter 提交搜索,URL 变成搜索结果页
+6. click 链接触发跳转,返回新快照
+7. type 在搜索框填入文字,快照反映输入值
+8. press Enter 提交表单,URL 带查询参数
 9. select 在带下拉框的页面选项
 10. 旧 snapshot_id 不能再次操作页面
 11. contenteditable 元素可以输入文字
@@ -21,22 +30,31 @@ browser 模块独立测试(无 pytest)。
 13. 裸域名会补全为 HTTPS URL
 14. back/forward 在两页之间来回切换
 15. 无历史时 back 返回 no_history 错误,页面状态恢复
-16. reload 后 URL 不变但 snapshot_id 刷新
-17. scroll 不改 URL 但 snapshot_id 刷新
-18. scroll 非法 direction 返回 invalid_args
-19. scroll 零/负 amount 返回 invalid_args
-20. get_text 整页返回连贯 innerText(子标签文本拼好)
-21. get_text(ref) 返回元素 textContent,含后代、不含 box 外文本
-22. get_text 纯读取:不失效旧 snapshot_id,ref 仍可操作
-23. get_text 超长文本截断 + truncated 标记
-24. get_text 拒绝 stale snapshot_id
-25. console 返回序列化的结构化结果
-26. console 返回复杂对象(dict/list)
-27. console 不可序列化返回值(循环引用)兜底成 '<unserializable>'
-28. console JS 抛异常返回 console_failed 错误
-29. console 改 DOM 后旧 ref 失效(stale_snapshot)
-30. console 拒绝 stale snapshot_id
-31. console 空表达式返回 invalid_args
+16. 同文档片段历史 back/forward 正常(不误报 no_history)
+17. 同 URL 的 pushState 历史可回退
+18. reload 后 URL 不变但 snapshot_id 刷新
+19. scroll 不改 URL 但 snapshot_id 刷新
+20. scroll 非法 direction 返回 invalid_args
+21. scroll 零/负 amount 返回 invalid_args
+22. get_text 整页返回连贯 innerText(子标签文本拼好)
+23. get_text(ref) 返回元素 textContent,含后代、不含 box 外文本
+24. get_text 纯读取:不失效旧 snapshot_id,ref 仍可操作
+25. get_text 超长文本截断 + truncated 标记
+26. get_text 拒绝 stale snapshot_id
+27. console 返回序列化的结构化结果
+28. console 返回复杂对象(dict/list)
+29. console 不可序列化返回值(循环引用)兜底成 '<unserializable>'
+30. console JS 抛异常返回 console_failed 错误
+31. console 改 DOM 后旧 ref 失效(stale_snapshot)
+32. console 拒绝 stale snapshot_id
+33. console 空表达式返回 invalid_args
+34-39. wait_for_url/text/ref/load_state 成功 + 超时 + 取消 + stale 拒绝
+40. 真实 Wikipedia 冒烟(外网不可达时 skip)
+41. iframe 页父页元素可操作
+42. alert 弹窗不阻塞,副作用生效
+43. 慢加载页 wait_for_load_state 等到就绪
+44. 延迟出现文本 wait_for_text 成功(非超时)
+45. 延迟出现元素 wait_for_ref 成功
 
 playwright 或浏览器未装时整组 skip,不报 error。
 """
@@ -61,6 +79,37 @@ except ImportError:
     print("  uv add playwright")
     print("  uv run playwright install chromium  # 走系统 Chrome 时不需要")
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# 本地 fixture 网站:提供 cookie/表单/延迟/下载等 HTTP 语义,测试不依赖外网。
+# 由 _run_all 启停,测试通过 _fixture_url("/path") 拿 URL。
+# ---------------------------------------------------------------------------
+
+from browser._fixtures import FixtureSite, start_fixture_server  # noqa: E402
+
+_FIXTURE: FixtureSite | None = None
+
+
+def _fixture_url(path: str = "/") -> str:
+    """拼出 fixture 站点的完整 URL。未启动时给清晰错误。"""
+    if _FIXTURE is None:
+        raise RuntimeError("fixture 服务器未启动;应在 _run_all 中启动")
+    return _FIXTURE.base_url + path
+
+
+def _skip_if_no_network() -> bool:
+    """冒烟用例:探测外网可达性,不可达时打印 skip 并返回 True。
+
+    返回 True 表示调用方应跳过(不 fail)。只在真实网站冒烟测试里用。
+    """
+    import urllib.request
+    try:
+        urllib.request.urlopen("https://en.wikipedia.org", timeout=5)
+    except Exception as exc:
+        print(f"  [skip] 外网不可达,跳过真实网站冒烟: {exc.__class__.__name__}")
+        return True
+    return False
 
 
 def _check_browser_installed() -> bool:
@@ -152,9 +201,7 @@ def test_navigate_returns_snapshot_with_link_and_heading() -> None:
     """navigate 返回的快照应含至少一个 link 和一个 heading。"""
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        snap, _ = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
+        snap, _ = _observation(s.navigate(_fixture_url("/")))
     assert snap, "快照为空"
     # 去缩进后比较 role。
     roles = {line.lstrip().split(" ", 1)[0] for line in snap.splitlines() if line.strip()}
@@ -166,9 +213,7 @@ def test_refs_only_on_interactive_roles() -> None:
     """所有 [ref=eN] 必须出现在 INTERACTIVE_ROLES 的行上。"""
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        snap, _ = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
+        snap, _ = _observation(s.navigate(_fixture_url("/")))
     ref_lines = _extract_ref_lines(snap)
     assert ref_lines, "快照里没有任何 ref"
     for line in ref_lines:
@@ -179,42 +224,41 @@ def test_refs_only_on_interactive_roles() -> None:
 
 
 def test_cookie_persists_across_navigates() -> None:
-    """同一 session 连续 navigate 后 cookie 应保持。"""
+    """同一 session 访问 cookie-set 后,cookie 在后续 navigate 仍保持。
+
+    用 fixture 的 /cookie-set 写入固定 cookie,再 navigate 到别的页面,
+    cookies() 仍应含该 cookie -- 证明 context 持久化。
+    """
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
+        s.navigate(_fixture_url("/cookie-set"))
         cookies_after_first = s.cookies()
-        assert cookies_after_first, "第一次 navigate 后没有 cookie"
-
-        s.navigate("https://en.wikipedia.org/wiki/Rust_(programming_language)")
-        cookies_after_second = s.cookies()
-        assert cookies_after_second, "第二次 navigate 后没有 cookie"
-
-        # 至少有一个同名 cookie 跨两次 navigate 仍在 -- 证明 context 持久化。
+        assert cookies_after_first, "cookie-set 后没有 cookie"
+        # 应含 fixture 写入的 cookie。
         names_first = {c["name"] for c in cookies_after_first}
+        assert "fixture_session" in names_first, (
+            f"cookie-set 后没有 fixture_session: {sorted(names_first)}"
+        )
+
+        # navigate 到另一页面,cookie 应仍在。
+        s.navigate(_fixture_url("/"))
+        cookies_after_second = s.cookies()
         names_second = {c["name"] for c in cookies_after_second}
-        common = names_first & names_second
-        assert common, (
-            f"两次 navigate 没有同名 cookie;first={sorted(names_first)[:5]} "
-            f"second={sorted(names_second)[:5]}"
+        assert "fixture_session" in names_second, (
+            f"第二次 navigate 后 fixture_session 丢失: {sorted(names_second)}"
         )
 
 
 def test_refs_reset_across_pages() -> None:
     """跨页 navigate 后 ref 从 e1 重新编号,且 snapshot 反映新页面内容。
 
-    不断言"e1 行内容不同" -- Wikipedia 全站共享"Jump to content"链接,
-    两个页面的 e1 都会是它。改成断言两页 ref 行集合不同(两篇文章内容不同),
-    这能抓住"navigate 后 snapshot 返回旧页面缓存"的 bug。
+    用 fixture 两篇不同文章(alpha/beta)验证。断言两页 ref 行集合不同,
+    能抓住"navigate 后 snapshot 返回旧页面缓存"的 bug。
     """
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        snap_a, _ = _observation(s.navigate(
-            "https://en.wikipedia.org/wiki/Python_(programming_language)"
-        ))
-        snap_b, _ = _observation(s.navigate(
-            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
-        ))
+        snap_a, _ = _observation(s.navigate(_fixture_url("/article?name=alpha")))
+        snap_b, _ = _observation(s.navigate(_fixture_url("/article?name=beta")))
 
     ref_lines_a = _extract_ref_lines(snap_a)
     ref_lines_b = _extract_ref_lines(snap_b)
@@ -258,82 +302,77 @@ def test_session_closed_raises_on_snapshot() -> None:
 
 
 def test_click_triggers_navigation_and_returns_new_snapshot() -> None:
-    """click "Jump to content" 应触发页内锚点跳转,返回新快照。
+    """click 首页的"文章 Alpha"链接应跳转到 article 页,返回新快照。
 
-    Wikipedia 每个页面顶部都有 "Jump to content" 链接,点击后 URL 加 #bodyContent。
-    验证:click 返回 ok=True,且 page.url 变化。
+    用 fixture 首页的导航链接验证:click 后 URL 变化到 /article,且返回新快照。
     """
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        snap, snapshot_id = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
-        ref = _find_ref_for_role(snap, "link", "Jump to content")
-        assert ref, "快照里找不到 'Jump to content' 链接"
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        ref = _find_ref_for_role(snap, "link", "文章 Alpha")
+        assert ref, "首页快照里找不到 '文章 Alpha' 链接"
         url_before = s._page.url
         result_json = s.click(ref, snapshot_id)
         result = _parse_result(result_json)
         assert result.get("ok") is True, f"click 失败: {result}"
         url_after = s._page.url
-        # URL 应变化(加 #bodyContent 锚点)。
+        # URL 应变化(跳到 /article?name=alpha)。
         assert url_after != url_before, (
             f"click 后 URL 没变: before={url_before} after={url_after}"
         )
+        assert "article" in url_after, f"click 后应跳到 article 页: {url_after}"
         # 返回的 snapshot 字段非空。
         assert result.get("snapshot"), "click 返回的 snapshot 为空"
         assert result.get("snapshot_id"), "click 返回的 snapshot_id 为空"
 
 
 def test_type_fills_search_box() -> None:
-    """type 在 Wikipedia 搜索框填入文字,新快照应反映输入值。"""
+    """type 在搜索框填入文字,新快照应反映输入值。"""
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        snap, snapshot_id = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
-        # Wikipedia 搜索框 role 是 searchbox,name 含 "Search"。
-        ref = _find_ref_for_role(snap, "searchbox", "Search")
-        assert ref, "快照里找不到搜索框(searchbox, name~Search)"
-        result_json = s.type(ref, "python programming", snapshot_id, clear=True)
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/search")))
+        # fixture 搜索框 aria-label="搜索框"。
+        ref = _find_ref_for_role(snap, "textbox", "搜索框")
+        assert ref, "快照里找不到搜索框(textbox, name~搜索框)"
+        result_json = s.type(ref, "alpha", snapshot_id, clear=True)
         result = _parse_result(result_json)
         assert result.get("ok") is True, f"type 失败: {result}"
-        # 新快照里应能看到 value='python programming'。
+        # 新快照里应能看到输入的文字。
         new_snap = result.get("snapshot", "")
-        assert "python programming" in new_snap, (
+        assert "alpha" in new_snap, (
             "新快照里找不到输入的文字,可能 value 没写进去"
         )
 
 
 def test_press_enter_submits_search() -> None:
-    """先 type 填搜索框,再 press Enter,URL 应变成搜索结果页。"""
+    """先 type 填搜索框,再 press Enter,URL 应变成搜索结果页。
+
+    fixture /search 是 GET 表单,Enter 提交后 URL 带 ?q=alpha。
+    """
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        snap, snapshot_id = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
-        ref = _find_ref_for_role(snap, "searchbox", "Search")
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/search")))
+        ref = _find_ref_for_role(snap, "textbox", "搜索框")
         assert ref, "快照里找不到搜索框"
-        typed = _parse_result(s.type(ref, "python programming", snapshot_id, clear=True))
+        typed = _parse_result(s.type(ref, "alpha", snapshot_id, clear=True))
         assert typed.get("ok") is True, f"type 失败: {typed}"
         url_before = s._page.url
         result_json = s.press("Enter", typed["snapshot_id"])
         result = _parse_result(result_json)
         assert result.get("ok") is True, f"press 失败: {result}"
         url_after = s._page.url
-        # Enter 提交搜索,URL 应变化(跳到 /w/index.php?search=... 或 /wiki/Python)。
+        # Enter 提交搜索,URL 应变化并带查询参数。
         assert url_after != url_before, (
             f"press Enter 后 URL 没变: before={url_before} after={url_after}"
         )
+        assert "q=alpha" in url_after, f"提交后 URL 应含 q=alpha: {url_after}"
 
 
 def test_select_on_dropdown() -> None:
-    """select 在 Wikipedia 设置页的语言下拉框选项。
+    """select 在 data: URL 内联的 <select> 上选项。
 
-    Wikipedia Special:Preferences 有大量 <select>。但那需要登录 --
-    改用 example.com 的简单 HTML fixture 不现实(需要起 HTTP 服务器)。
-    这里用 Wikipedia 首页的语言选择链接页 /wiki/Wikipedia:Contents,
-    用一个已知含 select 的页面:Wikimedia 的 SiteMatrix 不行...
-    退而求其次:用 data: URL 内联一个含 <select> 的 HTML,保证测试稳定。
+    select 不需要 HTTP 语义,用 data: URL 内联 HTML 最简单稳定。
+    验证:select 成功,新快照里 combobox 反映选中值。
     """
     from browser.session import BrowserSession
     html = """<!DOCTYPE html><html><body>
@@ -464,12 +503,12 @@ def test_normalize_url_adds_https_for_bare_domain() -> None:
 def test_back_forward_navigation() -> None:
     """navigate A -> navigate B -> back 应回到 A,forward 应再到 B。
 
-    用两篇不同 Wikipedia 文章验证 URL 来回切换。这是 back/forward 最核心
+    用 fixture 两篇不同文章验证 URL 来回切换。这是 back/forward 最核心
     的契约。
     """
     from browser.session import BrowserSession
-    url_a = "https://en.wikipedia.org/wiki/Python_(programming_language)"
-    url_b = "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+    url_a = _fixture_url("/article?name=alpha")
+    url_b = _fixture_url("/article?name=beta")
     with BrowserSession() as s:
         s.navigate(url_a)
         _, snapshot_id_b = _observation(s.navigate(url_b))
@@ -522,11 +561,14 @@ def test_back_without_history_returns_no_history_error() -> None:
 
 
 def test_back_forward_handles_same_document_history() -> None:
-    """仅 URL 片段变化的历史也应正常 back/forward，而非误报 no_history。"""
+    """仅 URL 片段变化的历史也应正常 back/forward，而非误报 no_history。
+
+    用 fixture 长页面的锚点跳转验证:#top -> #p100 是同文档历史项。
+    """
     from browser.session import BrowserSession
 
-    base_url = "https://example.com/"
-    fragment_url = "https://example.com/#two"
+    base_url = _fixture_url("/long")
+    fragment_url = _fixture_url("/long#p100")
     with BrowserSession() as s:
         s.navigate(base_url)
         _, fragment_snapshot_id = _observation(s.navigate(fragment_url))
@@ -573,9 +615,7 @@ def test_reload_refreshes_page() -> None:
     """reload 后 URL 不变,但 snapshot_id 应变化(新观察结果)。"""
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        _, snapshot_id_before = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
+        _, snapshot_id_before = _observation(s.navigate(_fixture_url("/")))
         url_before = s._page.url
         result = _parse_result(s.reload(snapshot_id_before))
         assert result.get("ok") is True, f"reload 失败: {result}"
@@ -593,14 +633,12 @@ def test_reload_refreshes_page() -> None:
 def test_scroll_changes_snapshot_id() -> None:
     """scroll 不改 URL,但应产生新的 snapshot_id(页面状态变化)。
 
-    用 Wikipedia 长文章页验证 -- 滚动后懒加载内容可能变化,至少
-    snapshot_id 必须刷新,否则后续 ref 操作会基于旧观察结果。
+    用 fixture 长页面验证 -- 滚动后可见内容变化,至少 snapshot_id 必须刷新,
+    否则后续 ref 操作会基于旧观察结果。
     """
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        _, snapshot_id_before = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
-        )
+        _, snapshot_id_before = _observation(s.navigate(_fixture_url("/long")))
         url_before = s._page.url
         result = _parse_result(s.scroll("down", snapshot_id_before, 800))
         assert result.get("ok") is True, f"scroll 失败: {result}"
@@ -992,6 +1030,126 @@ def test_wait_rejects_stale_snapshot() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 真实网站冒烟用例:验证真实网页兼容性,外网不可达时 skip 不 fail。
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_real_wikipedia_navigate() -> None:
+    """冒烟:navigate 真实 Wikipedia,断言含 link+heading。外网不可达则 skip。"""
+    from browser.session import BrowserSession
+    if _skip_if_no_network():
+        return
+    with BrowserSession() as s:
+        snap, _ = _observation(
+            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
+        )
+    assert snap, "真实 Wikipedia 快照为空"
+    roles = {line.lstrip().split(" ", 1)[0] for line in snap.splitlines() if line.strip()}
+    assert "link" in roles, f"真实 Wikipedia 缺 link: {sorted(roles)[:10]}"
+    assert "heading" in roles, f"真实 Wikipedia 缺 heading: {sorted(roles)[:10]}"
+
+
+# ---------------------------------------------------------------------------
+# fixture 边界测试:iframe / 弹窗 / 慢加载 / 延迟出现 -- 之前外网无法稳定测。
+# ---------------------------------------------------------------------------
+
+
+def test_iframe_parent_page_navigable() -> None:
+    """含 iframe 的页面本身可正常 navigate 和操作父页元素。
+
+    iframe 内的内容未必进主可访问性树,但父页元素必须正常。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/iframe")))
+        # 父页按钮应能找到并操作。
+        ref = _find_ref_for_role(snap, "button", "父页按钮")
+        assert ref, "iframe 页缺少父页按钮 ref"
+        result = _parse_result(s.click(ref, snapshot_id))
+        assert result.get("ok") is True, f"点击父页按钮失败: {result}"
+        # iframe 应存在于 DOM。
+        iframe_count = s._page.evaluate('document.querySelectorAll("iframe").length')
+        assert iframe_count == 1, f"应含 1 个 iframe,实际 {iframe_count}"
+
+
+def test_dialog_alert_does_not_block() -> None:
+    """点击触发 alert 的按钮不应卡死,alert 被 Playwright 自动 dismiss。
+
+    验证:click 成功返回新快照,且 alert 副作用(改元素文本)生效。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        # alert 需要先注册 dialog handler,否则 Playwright 默认 dismiss 但
+        # 可能报错。session 未暴露 handler,这里靠 click 的 JS 路径:alert
+        # 触发后 Playwright 自动 accept,onclick 继续执行改文本。
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/dialog")))
+        ref = _find_ref_for_role(snap, "button", "触发弹窗")
+        assert ref, "弹窗页缺少触发按钮 ref"
+        result = _parse_result(s.click(ref, snapshot_id))
+        assert result.get("ok") is True, f"触发 alert 的 click 失败: {result}"
+        # alert 后的副作用:文本应变成"点击后"。
+        after = s._page.evaluate('document.getElementById("after-alert").textContent')
+        assert "点击后" in after, f"alert 副作用未生效,实际: {after!r}"
+
+
+def test_wait_for_load_state_on_slow_page() -> None:
+    """慢加载页面(服务器延迟)wait_for_load_state 应等到就绪。
+
+    fixture /slow?delay=800 延迟 800ms 响应。navigate 已等 load,
+    wait_for_load_state 应立即成功。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/slow?delay=800")))
+        result = _parse_result(
+            s.wait_for_load_state("load", snapshot_id, timeout_ms=3000)
+        )
+        assert result.get("ok") is True, f"慢加载页 wait_for_load_state 失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_for_text_succeeds_on_delayed_content() -> None:
+    """页面延迟插入文本时,wait_for_text 应等到文本出现而非超时。
+
+    fixture /appear?delay=400 加载后 400ms 插入"延迟目标已出现"。
+    wait_for_text 超时设 2000ms,应在文本出现后成功。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/appear?delay=400")))
+        result = _parse_result(
+            s.wait_for_text("延迟目标已出现", snapshot_id, timeout_ms=2000)
+        )
+        assert result.get("ok") is True, f"延迟文本等待失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_for_ref_succeeds_on_delayed_element() -> None:
+    """页面延迟插入按钮时,wait_for_ref 应等到它出现。
+
+    fixture /appear?delay=400 加载后 400ms 插入"延迟按钮"。
+    但 wait_for_ref 基于快照里的 backendDOMNodeId -- 延迟插入的元素不在
+    初始快照里,没有 ref。所以这个测试改为:先 wait_for_text 等文本出现,
+    拿到新快照里的按钮 ref,再 wait_for_ref 应立即成功。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/appear?delay=400")))
+        # 等延迟文本出现,拿到含延迟按钮的新快照。
+        waited = _parse_result(
+            s.wait_for_text("延迟目标已出现", snapshot_id, timeout_ms=2000)
+        )
+        assert waited.get("ok") is True, f"等待延迟文本失败: {waited}"
+        new_snap = waited["snapshot"]
+        new_sid = waited["snapshot_id"]
+        ref = _find_ref_for_role(new_snap, "button", "延迟按钮")
+        assert ref, "延迟按钮出现后的快照里找不到它"
+        # 此时按钮已可见,wait_for_ref 应立即成功。
+        result = _parse_result(s.wait_for_ref(ref, new_sid, timeout_ms=1000))
+        assert result.get("ok") is True, f"wait_for_ref 失败: {result}"
+
+
+# ---------------------------------------------------------------------------
 # 简单测试运行器:依次跑,统计 pass/fail,失败打印 traceback。
 # ---------------------------------------------------------------------------
 
@@ -1082,23 +1240,42 @@ _TESTS: list[tuple[str, Any]] = [
      test_wait_cancelled_returns_current_observation),
     ("test_wait_rejects_stale_snapshot",
      test_wait_rejects_stale_snapshot),
+    ("test_smoke_real_wikipedia_navigate",
+     test_smoke_real_wikipedia_navigate),
+    ("test_iframe_parent_page_navigable",
+     test_iframe_parent_page_navigable),
+    ("test_dialog_alert_does_not_block",
+     test_dialog_alert_does_not_block),
+    ("test_wait_for_load_state_on_slow_page",
+     test_wait_for_load_state_on_slow_page),
+    ("test_wait_for_text_succeeds_on_delayed_content",
+     test_wait_for_text_succeeds_on_delayed_content),
+    ("test_wait_for_ref_succeeds_on_delayed_element",
+     test_wait_for_ref_succeeds_on_delayed_element),
 ]
 
 
 def _run_all() -> int:
+    global _FIXTURE
     if not _check_browser_installed():
         return 0
+    # 启动本地 fixture 服务器,所有 fixture 测试通过它拿 URL。
+    _FIXTURE = start_fixture_server()
     passed = 0
     failed = 0
-    for name, fn in _TESTS:
-        try:
-            fn()
-            print(f"  [PASS] {name}")
-            passed += 1
-        except Exception:
-            print(f"  [FAIL] {name}")
-            traceback.print_exc()
-            failed += 1
+    try:
+        for name, fn in _TESTS:
+            try:
+                fn()
+                print(f"  [PASS] {name}")
+                passed += 1
+            except Exception:
+                print(f"  [FAIL] {name}")
+                traceback.print_exc()
+                failed += 1
+    finally:
+        _FIXTURE.stop()
+        _FIXTURE = None
     print(f"\n结果: {passed} passed, {failed} failed, 共 {len(_TESTS)} 个")
     return 0 if failed == 0 else 1
 
