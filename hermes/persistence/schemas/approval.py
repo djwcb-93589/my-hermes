@@ -16,12 +16,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             tool_call_id TEXT NOT NULL,
             tool_message_id INTEGER NOT NULL UNIQUE,
             tool_name TEXT NOT NULL CHECK (
-                tool_name IN (
-                    'file', 'terminal', 'gateway_send_file', 'cron',
-                    'media_analyze', 'browser_analyze_page',
-                    'browser_upload_files', 'browser_console',
-                    'browser_delete_artifact', 'browser_cleanup_artifacts'
-                )
+                length(tool_name) BETWEEN 1 AND 128
             ),
             tool_args_json TEXT NOT NULL,
             summary TEXT NOT NULL,

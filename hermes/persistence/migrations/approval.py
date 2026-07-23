@@ -120,3 +120,37 @@ def _migrate_v29_to_v30(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE gateway_approval_requests_v29")
     _create_gateway_approval_schema(conn)
     _create_gateway_file_delivery_schema(conn)
+
+
+def _migrate_v30_to_v31(conn: sqlite3.Connection) -> None:
+    """移除审批工具名称枚举，保留现有审批记录及其关联状态。"""
+    deliveries = _stash_gateway_file_deliveries(conn, "v30")
+    conn.execute(
+        "ALTER TABLE gateway_approval_requests "
+        "RENAME TO gateway_approval_requests_v30"
+    )
+    _create_gateway_approval_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO gateway_approval_requests (
+            id, route_key, conversation_id, requester_user_id,
+            source_message_id, tool_call_id, tool_message_id, tool_name,
+            tool_args_json, summary, details_json, status,
+            decision_message_id, grant_scope, result_content,
+            source_event_json, agent_state_json, created_at, expires_at,
+            updated_at, execution_started
+        )
+        SELECT
+            id, route_key, conversation_id, requester_user_id,
+            source_message_id, tool_call_id, tool_message_id, tool_name,
+            tool_args_json, summary, details_json, status,
+            decision_message_id, grant_scope, result_content,
+            source_event_json, agent_state_json, created_at, expires_at,
+            updated_at, execution_started
+        FROM gateway_approval_requests_v30
+        """
+    )
+    _restore_gateway_file_deliveries(conn, deliveries)
+    conn.execute("DROP TABLE gateway_approval_requests_v30")
+    _create_gateway_approval_schema(conn)
+    _create_gateway_file_delivery_schema(conn)

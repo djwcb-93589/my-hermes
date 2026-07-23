@@ -128,6 +128,7 @@ from hermes.gateway.types import (
 from hermes.prompt import build_system_prompt
 from hermes.redaction import redact_explicit_secrets
 from hermes.tools import (
+    ApprovalMode,
     ExecutionEnvironment,
     ToolPolicy,
     register_all,
@@ -231,6 +232,80 @@ def _bind_approval_request_metadata(
         "fingerprint": fingerprint,
     })
     return normalized
+
+
+def _gateway_approval_request_is_allowed(
+    request: dict,
+    result_messages: object,
+    tool_policy: ToolPolicy,
+) -> bool:
+    """确认待审批结果来自当前 Gateway 允许的已注册工具调用。"""
+    tool_name = request.get("tool_name")
+    tool_call_id = request.get("tool_call_id")
+    arguments = request.get("arguments")
+    request_id = request.get("id")
+    if (
+        not isinstance(tool_name, str)
+        or not isinstance(tool_call_id, str)
+        or not isinstance(arguments, dict)
+        or not isinstance(request_id, str)
+        or not isinstance(result_messages, list)
+    ):
+        return False
+
+    entry = registry.get_entry(tool_name)
+    if (
+        entry is None
+        or tool_name not in registry.resolve(tool_policy).allowed_tool_names
+        or entry.approval_mode == ApprovalMode.NONE
+    ):
+        return False
+
+    matching_calls = 0
+    matching_results = 0
+    for message in result_messages:
+        if not isinstance(message, dict):
+            return False
+        if message.get("role") == "assistant":
+            tool_calls = message.get("tool_calls")
+            if tool_calls is None:
+                continue
+            if not isinstance(tool_calls, list):
+                return False
+            for call in tool_calls:
+                if not isinstance(call, dict) or call.get("id") != tool_call_id:
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    return False
+                try:
+                    call_arguments = json.loads(function.get("arguments"))
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    function.get("name") != tool_name
+                    or call_arguments != arguments
+                ):
+                    return False
+                matching_calls += 1
+        elif (
+            message.get("role") == "tool"
+            and message.get("tool_call_id") == tool_call_id
+        ):
+            try:
+                payload = json.loads(message.get("content"))
+                result_request = payload["approval_request"]
+            except (KeyError, TypeError, ValueError):
+                return False
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(result_request, dict)
+                or result_request.get("id") != request_id
+                or result_request.get("tool_name") != tool_name
+            ):
+                return False
+            matching_results += 1
+    return matching_calls == 1 and matching_results == 1
 
 
 def _format_approval_question(request: dict) -> str:
@@ -5352,6 +5427,16 @@ class GatewayRunner:
         if result.get("status") == "awaiting_approval":
             request = result.get("approval_request")
             if not isinstance(request, dict):
+                return _GatewayAgentResult(
+                    _SAFE_INTERNAL_REPLY,
+                    failed=True,
+                    failure_type="invalid_approval_request",
+                )
+            if not _gateway_approval_request_is_allowed(
+                request,
+                result.get("messages"),
+                tool_policy,
+            ):
                 return _GatewayAgentResult(
                     _SAFE_INTERNAL_REPLY,
                     failed=True,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import time
 import uuid
@@ -27,6 +28,8 @@ _GATEWAY_APPROVAL_COLUMNS = (
     "source_event_json, agent_state_json, created_at, expires_at, updated_at, "
     "grant_scope, execution_started"
 )
+
+_TOOL_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,127}")
 
 def _normalize_gateway_approval_agent_state(value: dict | None) -> dict:
     """校验并收敛可持久化的最小 AgentLoop 状态。"""
@@ -289,7 +292,7 @@ def create_gateway_approval_with_outbox(
     """原子写入审批请求、审批问题及其 Outbox。"""
     outbox = dict(outbox)
     request_id = str(request.get("id", ""))
-    tool_name = str(request.get("tool_name", ""))
+    tool_name = request.get("tool_name")
     tool_call_id = str(request.get("tool_call_id", ""))
     tool_args = request.get("arguments")
     details = request.get("details", {})
@@ -298,18 +301,7 @@ def create_gateway_approval_with_outbox(
     normalized_requester_user_id = str(requester_user_id or "").strip()
     if not request_id.startswith("approval_"):
         raise DBError("invalid gateway approval request id")
-    if tool_name not in {
-        "file",
-        "terminal",
-        "gateway_send_file",
-        "cron",
-        "media_analyze",
-        "browser_analyze_page",
-        "browser_upload_files",
-        "browser_console",
-        "browser_delete_artifact",
-        "browser_cleanup_artifacts",
-    }:
+    if not isinstance(tool_name, str) or _TOOL_NAME_RE.fullmatch(tool_name) is None:
         raise DBError("invalid gateway approval tool")
     if not tool_call_id or not isinstance(tool_args, dict):
         raise DBError("invalid gateway approval tool call")
