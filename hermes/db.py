@@ -5,6 +5,7 @@
 """
 
 from hermes.persistence.approval import (
+    begin_gateway_approval_execution,
     cancel_pending_gateway_approvals,
     cancel_pending_gateway_approvals_for_session,
     claim_gateway_approval,
