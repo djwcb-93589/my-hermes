@@ -25,6 +25,11 @@ agent 通过 accessibility tree 看网页,通过元素引用(@e1、@e2)操作网
 from __future__ import annotations
 
 from browser.accessibility import INTERACTIVE_ROLES, format_snapshot
+from browser.multimodal import (
+    DoubaoMultimodalProvider,
+    MultimodalAnalyzer,
+    MultimodalError,
+)
 from browser.session import (
     BrowserSession,
     close_all_sessions,
@@ -34,7 +39,10 @@ from browser.session import (
 
 __all__ = [
     "BrowserSession",
+    "DoubaoMultimodalProvider",
     "INTERACTIVE_ROLES",
+    "MultimodalAnalyzer",
+    "MultimodalError",
     "close_all_sessions",
     "close_session",
     "format_snapshot",

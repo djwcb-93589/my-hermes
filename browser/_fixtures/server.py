@@ -79,6 +79,14 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             self._send_html(pages.same_url_state_page())
         elif path == "/iframe":
             self._send_html(pages.iframe_page())
+        elif path == "/controls":
+            self._send_html(pages.controls_page())
+        elif path == "/drag":
+            self._send_html(pages.drag_page())
+        elif path == "/popup":
+            self._send_html(pages.popup_page())
+        elif path == "/upload":
+            self._send_html(pages.upload_page())
         elif path == "/dialog":
             self._send_html(pages.dialog_page())
         elif path == "/download":
@@ -96,6 +104,11 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             # 响应不慢,但页面 JS 延迟插入内容。
             delay_ms = _parse_int(query.get("delay"), default=300)
             self._send_html(pages.appear_page(delay_ms))
+        elif path == "/slow-render":
+            # AJAX 延迟渲染:domcontentloaded/load 时内容不全,JS 延迟注入。
+            # 测 click/press 触发导航后能否拿到完整 AJAX 页面。
+            delay_ms = _parse_int(query.get("delay"), default=500)
+            self._send_html(pages.slow_render_page(delay_ms))
         else:
             self._send_html(pages.not_found_page(self.path), status=404)
 

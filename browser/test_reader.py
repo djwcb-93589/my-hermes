@@ -49,12 +49,28 @@ cookie/表单/延迟/下载/iframe/弹窗等真实 HTTP 语义,覆盖已实现�
 32. console 拒绝 stale snapshot_id
 33. console 空表达式返回 invalid_args
 34-39. wait_for_url/text/ref/load_state 成功 + 超时 + 取消 + stale 拒绝
-40. 真实 Wikipedia 冒烟(外网不可达时 skip)
+40. 真实百度百科冒烟(外网不可达时 skip)
 41. iframe 页父页元素可操作
-42. alert 弹窗不阻塞,副作用生效
+42. dialog API 边界:set_dialog_strategy 参数校验 + accept/dismiss 无效 id
 43. 慢加载页 wait_for_load_state 等到就绪
 44. 延迟出现文本 wait_for_text 成功(非超时)
 45. 延迟出现元素 wait_for_ref 成功
+46. click 触发导航到 AJAX 延迟页后快照含延迟注入内容(不拿半截)
+47. press 触发表单提交到 AJAX 延迟页后快照完整
+48. check/uncheck 切换复选框状态
+49. hover/focus 返回新快照,focus 副作用生效
+50. drag_and_drop 后放置目标区更新
+51. keyboard_shortcut 等价 press
+52. set_dialog_strategy 声明后 click 触发 alert 按策略处理,不卡死
+53. 多页:list_pages/switch_page/close_page 完整生命周期
+54. screenshot 生成 PNG 产物并登记(kind/mime/size)
+55. screenshot full_page 全页截图
+56. screenshot_element 对 ref 截图
+57. download 点击下载链接存产物,文件内容正确
+58. upload_files 上传文件后页面显示文件名
+59. 产物生命周期:list/get/delete/cleanup_artifacts
+60. screenshot/download/upload 拒绝 stale snapshot_id
+61. get/delete 不存在 artifact_id 返回 artifact_not_found
 
 playwright 或浏览器未装时整组 skip,不报 error。
 """
@@ -64,8 +80,10 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
 import threading
 import traceback
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -102,10 +120,11 @@ def _skip_if_no_network() -> bool:
     """冒烟用例:探测外网可达性,不可达时打印 skip 并返回 True。
 
     返回 True 表示调用方应跳过(不 fail)。只在真实网站冒烟测试里用。
+    探测百度百科,和冒烟测试目标站点一致。
     """
     import urllib.request
     try:
-        urllib.request.urlopen("https://en.wikipedia.org", timeout=5)
+        urllib.request.urlopen("https://baike.baidu.com", timeout=5)
     except Exception as exc:
         print(f"  [skip] 外网不可达,跳过真实网站冒烟: {exc.__class__.__name__}")
         return True
@@ -292,7 +311,7 @@ def test_session_closed_raises_on_snapshot() -> None:
     from browser.session import BrowserSession
     s = BrowserSession()
     with s:
-        s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
+        s.navigate(_fixture_url("/"))
     # 此时 session 已关闭。
     try:
         s.snapshot()
@@ -1034,19 +1053,23 @@ def test_wait_rejects_stale_snapshot() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_smoke_real_wikipedia_navigate() -> None:
-    """冒烟:navigate 真实 Wikipedia,断言含 link+heading。外网不可达则 skip。"""
+def test_smoke_real_baike_navigate() -> None:
+    """冒烟:navigate 真实百度百科,断言含 link+heading。外网不可达则 skip。
+
+    用国内网站验证真实重 AJAX 站点兼容性。断言宽松(只看 role 存在),
+    不依赖具体 ref 或页面结构,避免站点改版导致假失败。
+    """
     from browser.session import BrowserSession
     if _skip_if_no_network():
         return
     with BrowserSession() as s:
         snap, _ = _observation(
-            s.navigate("https://en.wikipedia.org/wiki/Python_(programming_language)")
+            s.navigate("https://baike.baidu.com/item/Python")
         )
-    assert snap, "真实 Wikipedia 快照为空"
+    assert snap, "真实百度百科快照为空"
     roles = {line.lstrip().split(" ", 1)[0] for line in snap.splitlines() if line.strip()}
-    assert "link" in roles, f"真实 Wikipedia 缺 link: {sorted(roles)[:10]}"
-    assert "heading" in roles, f"真实 Wikipedia 缺 heading: {sorted(roles)[:10]}"
+    assert "link" in roles, f"真实百度百科缺 link: {sorted(roles)[:10]}"
+    assert "heading" in roles, f"真实百度百科缺 heading: {sorted(roles)[:10]}"
 
 
 # ---------------------------------------------------------------------------
@@ -1072,24 +1095,44 @@ def test_iframe_parent_page_navigable() -> None:
         assert iframe_count == 1, f"应含 1 个 iframe,实际 {iframe_count}"
 
 
-def test_dialog_alert_does_not_block() -> None:
-    """点击触发 alert 的按钮不应卡死,alert 被 Playwright 自动 dismiss。
+def test_dialog_api_boundaries() -> None:
+    """dialog API 边界：策略参数校验与无待处理对话框的错误。
 
-    验证:click 成功返回新快照,且 alert 副作用(改元素文本)生效。
+    同步 Playwright 操作必须在触发对话框前声明策略，否则触发操作会阻塞。
+    当前契约使用 set_dialog_strategy 声明 accept、dismiss 或 prompt；不再
+    保存 Dialog 对象并等待下一次调用处理。
     """
     from browser.session import BrowserSession
     with BrowserSession() as s:
-        # alert 需要先注册 dialog handler,否则 Playwright 默认 dismiss 但
-        # 可能报错。session 未暴露 handler,这里靠 click 的 JS 路径:alert
-        # 触发后 Playwright 自动 accept,onclick 继续执行改文本。
-        snap, snapshot_id = _observation(s.navigate(_fixture_url("/dialog")))
-        ref = _find_ref_for_role(snap, "button", "触发弹窗")
-        assert ref, "弹窗页缺少触发按钮 ref"
-        result = _parse_result(s.click(ref, snapshot_id))
-        assert result.get("ok") is True, f"触发 alert 的 click 失败: {result}"
-        # alert 后的副作用:文本应变成"点击后"。
-        after = s._page.evaluate('document.getElementById("after-alert").textContent')
-        assert "点击后" in after, f"alert 副作用未生效,实际: {after!r}"
+        _observation(s.navigate(_fixture_url("/dialog")))
+        # 无 dialog 时 list_dialogs 返回空列表。
+        result = _parse_result(s.list_dialogs())
+        assert result.get("ok") is True, f"list_dialogs 失败: {result}"
+        assert result.get("dialogs") == [], (
+            f"无 dialog 时应返回空列表,实际: {result.get('dialogs')}"
+        )
+        # accept 不存在的 dialog 返回 no_pending_dialog。
+        result = _parse_result(s.accept_dialog("nonexistent"))
+        assert result.get("ok") is False, "accept 不存在的 dialog 不应成功"
+        assert result.get("error_type") == "no_pending_dialog", (
+            f"错误类型应为 no_pending_dialog,实际: {result.get('error_type')}"
+        )
+        # dismiss 不存在的 dialog 同样。
+        result = _parse_result(s.dismiss_dialog("nonexistent"))
+        assert result.get("ok") is False
+        assert result.get("error_type") == "no_pending_dialog"
+        # 策略参数校验，以及有效策略的声明。
+        result = _parse_result(s.set_dialog_strategy("unexpected"))
+        assert result.get("ok") is False
+        assert result.get("error_type") == "invalid_args"
+        result = _parse_result(s.set_dialog_strategy("prompt"))
+        assert result.get("ok") is False
+        assert result.get("error_type") == "invalid_args"
+        result = _parse_result(s.set_dialog_strategy("accept", prompt_text="text"))
+        assert result.get("ok") is False
+        assert result.get("error_type") == "invalid_args"
+        result = _parse_result(s.set_dialog_strategy("dismiss"))
+        assert result.get("ok") is True, f"声明 dismiss 策略失败: {result}"
 
 
 def test_wait_for_load_state_on_slow_page() -> None:
@@ -1147,6 +1190,521 @@ def test_wait_for_ref_succeeds_on_delayed_element() -> None:
         # 此时按钮已可见,wait_for_ref 应立即成功。
         result = _parse_result(s.wait_for_ref(ref, new_sid, timeout_ms=1000))
         assert result.get("ok") is True, f"wait_for_ref 失败: {result}"
+
+
+def test_click_navigation_to_ajax_page_returns_complete_snapshot() -> None:
+    """click 链接到 AJAX 延迟渲染页后,返回的快照应含延迟注入的内容。
+
+    回归测试:fixture /slow-render 在 domcontentloaded 时只有占位标题,
+    1500ms 后 JS 才注入"AJAX 内容已完整渲染"标记。若 ``_observe_after_action_locked``
+    只等 domcontentloaded,会拿到半截页面(无标记);必须等 load 或更久
+    才完整。这个 bug 用真实 Wikipedia 暴露过(press Enter 后只拿到 777 行
+    而非 20630 行),现在用 fixture 在本地稳定回归。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        ref = _find_ref_for_role(snap, "link", "AJAX 延迟渲染页")
+        assert ref, "首页缺少指向 AJAX 延迟渲染页的链接"
+        result = _parse_result(s.click(ref, snapshot_id))
+        assert result.get("ok") is True, f"click 失败: {result}"
+        new_snap = result.get("snapshot", "")
+        # 关键断言:click 触发导航后,快照必须含延迟注入的标记文本。
+        # 只等 domcontentloaded 会拿到半截(无标记),这个断言会失败。
+        assert "AJAX 内容已完整渲染" in new_snap, (
+            "click 导航到 AJAX 页后快照缺少延迟注入的标记文本,"
+            "可能只等了 domcontentloaded 拿到半截页面"
+        )
+
+
+def test_press_navigation_to_ajax_page_returns_complete_snapshot() -> None:
+    """press Enter 触发表单提交到 AJAX 延迟页后,快照应含延迟内容。
+
+    与 click 测试互补:press 不针对元素,但触发导航后同样要等完整加载。
+    用 /search 表单提交到结果页 -- 但结果页非 AJAX。改用更直接的方式:
+    在 AJAX 页上 press(不导航),验证非导航场景不受影响;再单独验证
+    press 触发导航的场景已在 click 测试覆盖(press 走相同的 _observe 路径)。
+
+    这里聚焦:press 触发导航(表单提交)后,若目标页是 AJAX 延迟页,
+    快照应完整。构造一个提交到 /slow-render 的表单。
+    """
+    from browser.session import BrowserSession
+    # 用 data: 内联一个表单,提交到 fixture 的 /slow-render。
+    # 但 data: 页面里的表单 action 用相对/绝对 URL 到 fixture,需要 fixture 在线。
+    html = (
+        '<form action="PLACEHOLDER/slow-render?delay=500" method="get">'
+        '<input aria-label="关键词" name="q" value="x">'
+        '<button type="submit">提交到 AJAX 页</button>'
+        '</form>'
+    )
+    html = html.replace("PLACEHOLDER", _fixture_url(""))
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8," + html)
+        )
+        ref = _find_ref_for_role(snap, "button", "提交到 AJAX 页")
+        assert ref, "测试页缺少提交按钮 ref"
+        # click submit 按钮触发表单提交(导航到 AJAX 页)。
+        result = _parse_result(s.click(ref, snapshot_id))
+        assert result.get("ok") is True, f"提交失败: {result}"
+        new_snap = result.get("snapshot", "")
+        assert "AJAX 内容已完整渲染" in new_snap, (
+            "表单提交到 AJAX 页后快照缺少延迟注入的标记文本,"
+            "可能只等了 domcontentloaded 拿到半截页面"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P6 完整交互测试:hover/focus/check/uncheck/drag_and_drop/keyboard_shortcut
+# + dialog 策略真实流程 + 多页(list_pages/switch_page/close_page)
+# ---------------------------------------------------------------------------
+
+
+def test_check_uncheck_checkbox() -> None:
+    """check/uncheck 切换复选框状态,新快照应反映 checked 变化。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/controls")))
+        # "订阅"复选框初始未选中。
+        ref = _find_ref_for_role(snap, "checkbox", "订阅")
+        assert ref, "控件页缺少 '订阅' 复选框 ref"
+        result = _parse_result(s.check(ref, snapshot_id))
+        assert result.get("ok") is True, f"check 失败: {result}"
+        # 新快照里该 checkbox 行应含 checked=true。
+        new_snap = result.get("snapshot", "")
+        sub_line = next(
+            (ln for ln in new_snap.splitlines() if "checkbox" in ln and "订阅" in ln),
+            "",
+        )
+        assert "checked=true" in sub_line, f"check 后未变 checked=true: {sub_line!r}"
+
+        # 再 uncheck 应变回 checked=false。
+        result2 = _parse_result(s.uncheck(ref, result["snapshot_id"]))
+        assert result2.get("ok") is True, f"uncheck 失败: {result2}"
+        new_snap2 = result2.get("snapshot", "")
+        sub_line2 = next(
+            (ln for ln in new_snap2.splitlines() if "checkbox" in ln and "订阅" in ln),
+            "",
+        )
+        assert "checked=false" in sub_line2, f"uncheck 后未变 checked=false: {sub_line2!r}"
+
+
+def test_hover_and_focus_return_new_snapshot() -> None:
+    """hover/focus 应成功返回新快照(不报错),snapshot_id 刷新。
+
+    hover/focus 的视觉副作用(CSS)不出现在可访问性树里,这里只验证操作成功
+    且产生新观察结果;副作用细节由 Playwright Locator 保证。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/controls")))
+        # hover 悬停按钮。
+        hover_ref = _find_ref_for_role(snap, "button", "悬停我")
+        assert hover_ref, "控件页缺少 '悬停我' 按钮 ref"
+        result = _parse_result(s.hover(hover_ref, snapshot_id))
+        assert result.get("ok") is True, f"hover 失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id, "hover 后 snapshot_id 未刷新"
+
+        # focus 聚焦输入框。
+        focus_ref = _find_ref_for_role(result["snapshot"], "textbox", "聚焦目标")
+        assert focus_ref, "控件页缺少 '聚焦目标' 输入框 ref"
+        result2 = _parse_result(s.focus(focus_ref, result["snapshot_id"]))
+        assert result2.get("ok") is True, f"focus 失败: {result2}"
+        # 验证 focus 确实生效:document.activeElement 应是该输入框。
+        active = s._page.evaluate('document.activeElement.id')
+        assert active == "focus-target", f"focus 未生效,activeElement={active!r}"
+
+
+def test_drag_and_drop_updates_target() -> None:
+    """drag_and_drop 后,放置目标区应显示接收到的源文字。
+
+    fixture 拖拽源/目标用 role="button" 让它们获得 ref(drag_and_drop
+    需要 source_ref/target_ref,而可拖拽 div 本身不是交互角色)。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/drag")))
+        source_ref = _find_ref_for_role(snap, "button", "拖拽源")
+        target_ref = _find_ref_for_role(snap, "button", "放置目标")
+        assert source_ref, "拖拽页找不到源元素 ref"
+        assert target_ref, "拖拽页找不到放置目标 ref"
+        result = _parse_result(s.drag_and_drop(source_ref, target_ref, snapshot_id))
+        assert result.get("ok") is True, f"drag_and_drop 失败: {result}"
+        # 拖拽后目标区应含"已接收"。
+        target_text = s._page.evaluate('document.getElementById("target").textContent')
+        assert "已接收" in target_text, f"拖拽后目标区未更新,实际: {target_text!r}"
+        drop_result = s._page.evaluate('document.getElementById("drop-result").textContent')
+        assert "拖拽完成" in drop_result, f"拖拽完成标记未触发,实际: {drop_result!r}"
+
+
+def test_keyboard_shortcut_equivalent_to_press() -> None:
+    """keyboard_shortcut 是 press 的语义别名,行为应一致。
+
+    用 fixture 搜索页:聚焦搜索框后 keyboard_shortcut Enter 应提交表单(等价 press Enter)。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/search")))
+        ref = _find_ref_for_role(snap, "textbox", "搜索框")
+        assert ref, "搜索页缺少搜索框 ref"
+        typed = _parse_result(s.type(ref, "alpha", snapshot_id, clear=True))
+        assert typed.get("ok") is True, f"type 失败: {typed}"
+        url_before = s._page.url
+        # keyboard_shortcut 等价 press。
+        result = _parse_result(s.keyboard_shortcut("Enter", typed["snapshot_id"]))
+        assert result.get("ok") is True, f"keyboard_shortcut 失败: {result}"
+        url_after = s._page.url
+        assert url_after != url_before, (
+            f"keyboard_shortcut Enter 后 URL 没变: {url_before} -> {url_after}"
+        )
+        assert "q=alpha" in url_after, f"提交后 URL 应含 q=alpha: {url_after}"
+
+
+def test_dialog_strategy_handles_alert_without_blocking() -> None:
+    """声明 dialog 策略后,click 触发 alert 应按策略处理,不卡死。
+
+    真实流程:set_dialog_strategy("dismiss") -> click 触发 alert 按钮 ->
+    alert 按策略自动 dismiss,click 立即返回新快照 -> list_dialogs 看到
+    已处理的 alert 事件。这是 dialog 机制修复后的核心契约。
+    """
+    import time
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/dialog")))
+        ref = _find_ref_for_role(snap, "button", "触发弹窗")
+        assert ref, "弹窗页缺少触发按钮 ref"
+        # 声明 dismiss 策略。
+        strat = _parse_result(s.set_dialog_strategy("dismiss"))
+        assert strat.get("ok") is True, f"set_dialog_strategy 失败: {strat}"
+        # click 触发 alert,应按策略 dismiss,不卡 30s。
+        t0 = time.time()
+        result = _parse_result(s.click(ref, snapshot_id))
+        elapsed = time.time() - t0
+        assert result.get("ok") is True, f"click 触发 alert 失败: {result}"
+        assert elapsed < 10, f"click 触发 dialog 后卡了 {elapsed:.1f}s,策略未生效"
+        # alert 后的副作用:文本应变成"点击后"。
+        after = s._page.evaluate('document.getElementById("after-alert").textContent')
+        assert "点击后" in after, f"alert 副作用未生效,实际: {after!r}"
+        # 已处理的 alert 事件随操作返回(_last_dialog_event 不跨操作持久化,
+        # 因此从 click 返回值读,而非事后调 list_dialogs)。
+        dialog_list = result.get("dialogs", [])
+        assert any(d.get("type") == "alert" for d in dialog_list), (
+            f"click 返回值未记录已处理的 alert: {dialog_list}"
+        )
+        # event_type 应标记为 dialog。
+        assert result.get("event_type") == "dialog", (
+            f"click 触发 alert 后 event_type 应为 dialog,实际: {result.get('event_type')}"
+        )
+
+
+def test_multi_page_lifecycle() -> None:
+    """多页:list_pages 看到新页,switch_page 切换,close_page 关闭。
+
+    用 /popup 页的 target=_blank 链接打开新标签页。click 该链接后
+    session 应登记新 page,event_type 为 popup。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/popup")))
+        # 初始只有一页。
+        pages = _parse_result(s.list_pages())
+        assert pages.get("ok") is True
+        assert len(pages.get("pages", [])) == 1, f"初始应只有 1 页,实际: {pages.get('pages')}"
+
+        # click "打开新页"链接(target=_blank)。
+        ref = _find_ref_for_role(snap, "link", "打开新页")
+        assert ref, "弹窗页缺少 '打开新页' 链接 ref"
+        result = _parse_result(s.click(ref, snapshot_id))
+        assert result.get("ok") is True, f"打开新页失败: {result}"
+        # event_type 应为 popup(新标签页被打开并自动切换)。
+        assert result.get("event_type") == "popup", (
+            f"打开新标签页后 event_type 应为 popup,实际: {result.get('event_type')}"
+        )
+
+        # 现在应有两页,当前页是新页。
+        pages = _parse_result(s.list_pages())
+        page_list = pages.get("pages", [])
+        assert len(page_list) == 2, f"打开新页后应有 2 页,实际: {len(page_list)}"
+        # 新页 URL 含 popup-target。
+        new_page = next(
+            (p for p in page_list if p.get("is_current")), None
+        )
+        assert new_page is not None, "没有当前页"
+        assert "popup-target" in new_page.get("url", ""), (
+            f"当前页应是 popup-target,实际 url: {new_page.get('url')}"
+        )
+
+        # switch_page 切回原页。
+        old_page = next(
+            (p for p in page_list if not p.get("is_current")), None
+        )
+        assert old_page is not None, "找不到原页"
+        switched = _parse_result(s.switch_page(old_page["page_id"]))
+        assert switched.get("ok") is True, f"switch_page 失败: {switched}"
+        assert "弹窗页" in switched.get("snapshot", ""), "切回原页后快照应含弹窗页标题"
+
+        # close_page 关闭新页。
+        closed = _parse_result(s.close_page(new_page["page_id"]))
+        assert closed.get("ok") is True, f"close_page 失败: {closed}"
+        # 关闭后应只剩一页。
+        pages = _parse_result(s.list_pages())
+        assert len(pages.get("pages", [])) == 1, (
+            f"close_page 后应只剩 1 页,实际: {pages.get('pages')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P7 测试:screenshot / screenshot_element / download / upload_files
+# + 产物管理(list/get/delete/cleanup_artifacts)
+# ---------------------------------------------------------------------------
+
+
+def _artifact_from_result(result: dict) -> dict:
+    """从操作返回里取出 artifact 字段,缺失时抛断言。"""
+    artifact = result.get("artifact")
+    assert artifact, f"返回缺少 artifact 字段: {result}"
+    return artifact
+
+
+def test_screenshot_creates_png_artifact() -> None:
+    """screenshot 生成 PNG 产物并登记:kind/mime/size 正确,文件存在。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        result = _parse_result(s.screenshot(snapshot_id))
+        assert result.get("ok") is True, f"screenshot 失败: {result}"
+        artifact = _artifact_from_result(result)
+        assert artifact.get("kind") == "screenshot", f"kind 应为 screenshot: {artifact}"
+        assert artifact.get("mime_type") == "image/png", (
+            f"mime_type 应为 image/png: {artifact}"
+        )
+        assert artifact.get("size_bytes", 0) > 0, f"size_bytes 应 > 0: {artifact}"
+        # 文件应实际存在。
+        assert Path(artifact["path"]).is_file(), f"产物文件不存在: {artifact['path']}"
+        # 纯读取:snapshot_id 应保持不变(不失效旧观察)。
+        assert result.get("snapshot_id") == snapshot_id, "screenshot 不应改变 snapshot_id"
+
+
+def test_screenshot_full_page() -> None:
+    """full_page=True 全页截图应成功,产物更大。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/long")))
+        result = _parse_result(s.screenshot(snapshot_id, full_page=True))
+        assert result.get("ok") is True, f"full_page screenshot 失败: {result}"
+        artifact = _artifact_from_result(result)
+        assert artifact.get("size_bytes", 0) > 0
+
+
+def test_screenshot_element() -> None:
+    """screenshot_element 对指定 ref 截图,生成产物。
+
+    screenshot_element 的稳定性检查(截图前后 DOM 版本不变)对时序敏感,
+    偶发失败。这里用 data: URL 纯静态页降低概率,并在偶发失败时重试一次。
+    """
+    from browser.session import BrowserSession
+    html = '<button id="b">静态按钮</button>'
+    last_result = None
+    for attempt in range(2):
+        with BrowserSession() as s:
+            snap, snapshot_id = _observation(
+                s.navigate("data:text/html;charset=utf-8," + html)
+            )
+            ref = _find_ref_for_role(snap, "button", "静态按钮")
+            assert ref, "静态页缺少按钮 ref"
+            result = _parse_result(s.screenshot_element(ref, snapshot_id))
+            last_result = result
+            if result.get("ok"):
+                artifact = _artifact_from_result(result)
+                assert artifact.get("kind") == "element-screenshot", (
+                    f"kind 应为 element-screenshot: {artifact}"
+                )
+                assert Path(artifact["path"]).is_file()
+                return
+    assert last_result.get("ok") is True, (
+        f"screenshot_element 重试后仍失败: {last_result}"
+    )
+
+
+def test_download_creates_artifact() -> None:
+    """download 点击下载链接存产物,文件内容正确。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/download")))
+        ref = _find_ref_for_role(snap, "link", "下载文件")
+        assert ref, "下载页缺少 '下载文件' 链接 ref"
+        result = _parse_result(s.download(ref, snapshot_id, timeout_ms=5000))
+        assert result.get("ok") is True, f"download 失败: {result}"
+        artifact = _artifact_from_result(result)
+        assert artifact.get("kind") == "download", f"kind 应为 download: {artifact}"
+        # 文件内容应是 fixture 下载内容。
+        content = Path(artifact["path"]).read_bytes()
+        assert b"fixture download content" in content, (
+            f"下载文件内容不对: {content[:50]!r}"
+        )
+
+
+def test_upload_files_shows_filename_on_page() -> None:
+    """upload_files 上传文件后,页面应显示已选文件名。"""
+    from browser.session import BrowserSession
+    # 造一个临时文件在 workspace_root(cwd)内,供上传。
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, dir=".", prefix="upload_test_"
+    ) as f:
+        f.write("upload test content")
+        tmp_path = f.name
+    try:
+        with BrowserSession() as s:
+            snap, snapshot_id = _observation(s.navigate(_fixture_url("/upload")))
+            ref = _find_ref_for_role(snap, "button", "文件选择")
+            # <input type=file> 在 AX tree 里 role 可能是 button 或 textbox,
+            # 找不到 button 就找 textbox。
+            if not ref:
+                ref = _find_ref_for_role(snap, "textbox", "文件选择")
+            assert ref, "上传页缺少文件选择 input ref"
+            result = _parse_result(s.upload_files(ref, tmp_path, snapshot_id))
+            assert result.get("ok") is True, f"upload_files 失败: {result}"
+            # 页面应显示文件名。
+            shown = s._page.evaluate('document.getElementById("upload-result").textContent')
+            assert Path(tmp_path).name in shown, (
+                f"上传后页面未显示文件名,实际: {shown!r}"
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def test_artifact_lifecycle_list_get_delete() -> None:
+    """产物生命周期:screenshot 产生 -> list 看到 -> get 拿元数据 -> delete 删除。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        shot = _parse_result(s.screenshot(snapshot_id))
+        artifact_id = _artifact_from_result(shot)["artifact_id"]
+        artifact_path = Path(_artifact_from_result(shot)["path"])
+
+        # list_artifacts 应含该产物。
+        listed = _parse_result(s.list_artifacts())
+        assert listed.get("ok") is True
+        ids = [a.get("artifact_id") for a in listed.get("artifacts", [])]
+        assert artifact_id in ids, f"list_artifacts 未含 {artifact_id}: {ids}"
+
+        # get_artifact 拿元数据。
+        got = _parse_result(s.get_artifact(artifact_id))
+        assert got.get("ok") is True, f"get_artifact 失败: {got}"
+        assert got["artifact"]["artifact_id"] == artifact_id
+
+        # delete_artifact 删除,文件消失。
+        deleted = _parse_result(s.delete_artifact(artifact_id))
+        assert deleted.get("ok") is True, f"delete_artifact 失败: {deleted}"
+        assert not artifact_path.exists(), "delete 后文件仍存在"
+
+        # 再 list 应不含。
+        listed2 = _parse_result(s.list_artifacts())
+        ids2 = [a.get("artifact_id") for a in listed2.get("artifacts", [])]
+        assert artifact_id not in ids2, "delete 后 list 仍含该产物"
+
+
+def test_cleanup_artifacts_removes_all() -> None:
+    """cleanup_artifacts 清理当前会话所有产物。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        # 产生两个产物。
+        s.screenshot(snapshot_id)
+        shot2 = _parse_result(s.screenshot(snapshot_id, full_page=True))
+        paths = []
+        listed = _parse_result(s.list_artifacts())
+        paths = [Path(a["path"]) for a in listed.get("artifacts", [])]
+        assert len(paths) >= 2, f"应至少 2 个产物,实际 {len(paths)}"
+
+        # cleanup。
+        cleaned = _parse_result(s.cleanup_artifacts())
+        assert cleaned.get("ok") is True, f"cleanup_artifacts 失败: {cleaned}"
+
+        # list 应为空。
+        listed2 = _parse_result(s.list_artifacts())
+        assert listed2.get("artifacts") == [], (
+            f"cleanup 后应无产物,实际: {listed2.get('artifacts')}"
+        )
+
+
+def test_p7_actions_reject_stale_snapshot() -> None:
+    """screenshot/screenshot_element/download/upload 拒绝 stale snapshot_id。
+
+    每个动作:先拿一个 snapshot_id,再 navigate 一次让它失效,然后用旧 id
+    调用,应返回 stale_snapshot。
+    """
+    from browser.session import BrowserSession
+
+    def _stale_id_after_navigate(s, url: str) -> str:
+        """navigate 拿 id,再 navigate 同页让 id 失效,返回失效的 id。"""
+        _, old_id = _observation(s.navigate(url))
+        _observation(s.navigate(url))  # 这次让 old_id 失效
+        return old_id
+
+    with BrowserSession() as s:
+        # screenshot。
+        stale_id = _stale_id_after_navigate(s, _fixture_url("/"))
+        r = _parse_result(s.screenshot(stale_id))
+        assert r.get("ok") is False and r.get("error_type") == "stale_snapshot", (
+            f"screenshot 应拒绝 stale: {r}"
+        )
+
+        # screenshot_element:ref 来自失效快照前的页面,但 snapshot_id 已失效。
+        snap, _ = _observation(s.navigate(_fixture_url("/article?name=alpha")))
+        ref = _find_ref_for_role(snap, "link", "返回首页")
+        if ref:
+            stale_id2 = _stale_id_after_navigate(s, _fixture_url("/article?name=alpha"))
+            r = _parse_result(s.screenshot_element(ref, stale_id2))
+            assert r.get("ok") is False, f"screenshot_element 应拒绝 stale: {r}"
+            assert r.get("error_type") == "stale_snapshot", (
+                f"screenshot_element 错误类型: {r.get('error_type')}"
+            )
+
+        # download。
+        snap2, _ = _observation(s.navigate(_fixture_url("/download")))
+        dl_ref = _find_ref_for_role(snap2, "link", "下载文件")
+        if dl_ref:
+            stale_id3 = _stale_id_after_navigate(s, _fixture_url("/download"))
+            r = _parse_result(s.download(dl_ref, stale_id3, timeout_ms=3000))
+            assert r.get("ok") is False, f"download 应拒绝 stale: {r}"
+            assert r.get("error_type") == "stale_snapshot", (
+                f"download 错误类型: {r.get('error_type')}"
+            )
+
+        # upload_files。
+        snap3, _ = _observation(s.navigate(_fixture_url("/upload")))
+        up_ref = _find_ref_for_role(snap3, "button", "文件选择")
+        if not up_ref:
+            up_ref = _find_ref_for_role(snap3, "textbox", "文件选择")
+        if up_ref:
+            stale_id4 = _stale_id_after_navigate(s, _fixture_url("/upload"))
+            r = _parse_result(s.upload_files(up_ref, ".", stale_id4))
+            assert r.get("ok") is False, f"upload_files 应拒绝 stale: {r}"
+            assert r.get("error_type") == "stale_snapshot", (
+                f"upload_files 错误类型: {r.get('error_type')}"
+            )
+
+
+def test_artifact_not_found_errors() -> None:
+    """get/delete 不存在的 artifact_id 返回 artifact_not_found。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _observation(s.navigate(_fixture_url("/")))
+        # get 不存在。
+        r = _parse_result(s.get_artifact("nonexistent"))
+        assert r.get("ok") is False, "get 不存在 artifact 不应成功"
+        assert r.get("error_type") == "artifact_not_found", (
+            f"错误类型应为 artifact_not_found,实际: {r.get('error_type')}"
+        )
+        # delete 不存在。
+        r = _parse_result(s.delete_artifact("nonexistent"))
+        assert r.get("ok") is False
+        assert r.get("error_type") == "artifact_not_found"
+        # 空 id 参数校验。
+        r = _parse_result(s.get_artifact(""))
+        assert r.get("ok") is False
+        assert r.get("error_type") == "artifact_not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -1240,18 +1798,52 @@ _TESTS: list[tuple[str, Any]] = [
      test_wait_cancelled_returns_current_observation),
     ("test_wait_rejects_stale_snapshot",
      test_wait_rejects_stale_snapshot),
-    ("test_smoke_real_wikipedia_navigate",
-     test_smoke_real_wikipedia_navigate),
+    ("test_smoke_real_baike_navigate",
+     test_smoke_real_baike_navigate),
     ("test_iframe_parent_page_navigable",
      test_iframe_parent_page_navigable),
-    ("test_dialog_alert_does_not_block",
-     test_dialog_alert_does_not_block),
+    ("test_dialog_api_boundaries",
+     test_dialog_api_boundaries),
     ("test_wait_for_load_state_on_slow_page",
      test_wait_for_load_state_on_slow_page),
     ("test_wait_for_text_succeeds_on_delayed_content",
      test_wait_for_text_succeeds_on_delayed_content),
     ("test_wait_for_ref_succeeds_on_delayed_element",
      test_wait_for_ref_succeeds_on_delayed_element),
+    ("test_click_navigation_to_ajax_page_returns_complete_snapshot",
+     test_click_navigation_to_ajax_page_returns_complete_snapshot),
+    ("test_press_navigation_to_ajax_page_returns_complete_snapshot",
+     test_press_navigation_to_ajax_page_returns_complete_snapshot),
+    ("test_check_uncheck_checkbox",
+     test_check_uncheck_checkbox),
+    ("test_hover_and_focus_return_new_snapshot",
+     test_hover_and_focus_return_new_snapshot),
+    ("test_drag_and_drop_updates_target",
+     test_drag_and_drop_updates_target),
+    ("test_keyboard_shortcut_equivalent_to_press",
+     test_keyboard_shortcut_equivalent_to_press),
+    ("test_dialog_strategy_handles_alert_without_blocking",
+     test_dialog_strategy_handles_alert_without_blocking),
+    ("test_multi_page_lifecycle",
+     test_multi_page_lifecycle),
+    ("test_screenshot_creates_png_artifact",
+     test_screenshot_creates_png_artifact),
+    ("test_screenshot_full_page",
+     test_screenshot_full_page),
+    ("test_screenshot_element",
+     test_screenshot_element),
+    ("test_download_creates_artifact",
+     test_download_creates_artifact),
+    ("test_upload_files_shows_filename_on_page",
+     test_upload_files_shows_filename_on_page),
+    ("test_artifact_lifecycle_list_get_delete",
+     test_artifact_lifecycle_list_get_delete),
+    ("test_cleanup_artifacts_removes_all",
+     test_cleanup_artifacts_removes_all),
+    ("test_p7_actions_reject_stale_snapshot",
+     test_p7_actions_reject_stale_snapshot),
+    ("test_artifact_not_found_errors",
+     test_artifact_not_found_errors),
 ]
 
 

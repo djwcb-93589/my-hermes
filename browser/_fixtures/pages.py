@@ -38,6 +38,7 @@ def home_page() -> str:
       <a href="/article?name=beta">文章 Beta</a>
       <a href="/form">表单页</a>
       <a href="/long">长页面</a>
+      <a href="/slow-render?delay=500">AJAX 延迟渲染页</a>
     </nav>
   </header>
   <main>
@@ -329,6 +330,158 @@ def appear_page(delay_ms: int) -> str:
       document.body.appendChild(btn);
     }}, {delay_ms});
   </script>
+</body>
+</html>"""
+
+
+def slow_render_page(delay_ms: int = 500) -> str:
+    """AJAX 延迟渲染页:模拟 Wikipedia 等重 AJAX 站点。
+
+    ``domcontentloaded``/``load`` 触发时页面只有占位标题;``delay_ms`` 毫秒后
+    JS 才注入大量内容(若干段落 + 一个稳定标记文本
+    ``AJAX 内容已完整渲染``)。AJAX 内容在 load 事件之后异步注入,所以
+    等待策略不能只靠 load,还要给 AJAX 留时间。
+
+    用于回归测试:click/press 触发导航到本页后,返回的快照必须含标记文本,
+    否则说明 ``_observe_after_action_locked`` 等待不够,拿到了半截 AJAX 页面。
+    ``delay_ms`` 默认 500ms,接近真实 AJAX 量级:旧策略(domcontentloaded +
+    200ms)拿不到(delay 500ms 还没触发);新策略(load + 500ms)能拿到
+    (500ms 延迟 + 500ms 等待覆盖)。
+    """
+    # 注入 20 段内容,让"半截"和"完整"差异明显(行数差距大)。
+    # 用反引号字符串在 JS 侧拼接,避免在 Python 侧处理转义。
+    paragraphs_js = "+".join(
+        f"'<p>AJAX 段落 {i}:这是延迟渲染的第 {i} 段内容。</p>'"
+        for i in range(1, 21)
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>AJAX 延迟渲染页</title></head>
+<body>
+  <h1>AJAX 延迟渲染页(占位)</h1>
+  <div id="content"></div>
+  <script>
+    setTimeout(function() {{
+      var div = document.getElementById('content');
+      div.innerHTML = '<h2>AJAX 内容已完整渲染</h2>' +
+        {paragraphs_js} +
+        '<p id="render-marker">标记:AJAX 渲染完成</p>';
+    }}, {delay_ms});
+  </script>
+</body>
+</html>"""
+
+
+def controls_page() -> str:
+    """控件页:复选框、单选、可 hover/focus 的元素。
+
+    覆盖 P6 的 check/uncheck/hover/focus。复选框带 aria-label,ref 稳定。
+    hover/focus 有可见副作用(hover 改文本,focus 改样式),便于断言。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>控件页</title>
+<style>
+  #hover-target:hover + #hover-result { display: block; }
+  #hover-result { display: none; }
+  #focus-target:focus { background-color: yellow; }
+</style>
+</head>
+<body>
+  <h1>控件页</h1>
+  <fieldset>
+    <legend>选项</legend>
+    <label><input type="checkbox" aria-label="订阅" id="sub">订阅</label>
+    <label><input type="checkbox" aria-label="同意条款" id="agree" checked>同意条款</label>
+    <label><input type="radio" aria-label="方案一" name="plan" value="a">方案一</label>
+    <label><input type="radio" aria-label="方案二" name="plan" value="b">方案二</label>
+  </fieldset>
+  <div>
+    <button id="hover-target" type="button">悬停我</button>
+    <p id="hover-result">悬停生效</p>
+  </div>
+  <div>
+    <input type="text" aria-label="聚焦目标" id="focus-target">
+  </div>
+  <a href="/">返回首页</a>
+</body>
+</html>"""
+
+
+def drag_page() -> str:
+    """拖拽页:可拖拽源 + 放置目标,拖拽后目标区显示源文字。
+
+    覆盖 P6 的 drag_and_drop。用原生 draggable + drop 事件实现,
+    Playwright 的 drag_to 会触发 dragstart/dragover/drop。
+    源/目标加 role="button" 让它们进入交互角色、获得 ref(drag_and_drop
+    需要 source_ref/target_ref,而可拖拽 div 本身不是交互角色)。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>拖拽页</title></head>
+<body>
+  <h1>拖拽页</h1>
+  <div id="source" role="button" tabindex="0" draggable="true" aria-label="拖拽源">源元素</div>
+  <div id="target" role="button" tabindex="0" aria-label="放置目标" style="width:200px;height:100px;border:2px dashed #999;margin-top:10px;padding:10px;">放置区</div>
+  <p id="drop-result">未拖拽</p>
+  <script>
+    var src = document.getElementById('source');
+    var tgt = document.getElementById('target');
+    var result = document.getElementById('drop-result');
+    src.addEventListener('dragstart', function(e) {
+      e.dataTransfer.setData('text/plain', src.textContent);
+    });
+    tgt.addEventListener('dragover', function(e) { e.preventDefault(); });
+    tgt.addEventListener('drop', function(e) {
+      e.preventDefault();
+      var data = e.dataTransfer.getData('text/plain');
+      tgt.textContent = '已接收: ' + data;
+      result.textContent = '拖拽完成';
+    });
+  </script>
+  <a href="/">返回首页</a>
+</body>
+</html>"""
+
+
+def popup_page() -> str:
+    """弹窗页:链接用 target=_blank 打开新标签页。
+
+    覆盖 P6 的 list_pages/switch_page/close_page。点击"打开新页"链接
+    会打开 /article?name=popup-target 的新标签页,session 应登记新 page。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>弹窗页</title></head>
+<body>
+  <h1>弹窗页</h1>
+  <a href="/article?name=popup-target" target="_blank" rel="noopener">打开新页</a>
+  <a href="/">返回首页</a>
+</body>
+</html>"""
+
+
+def upload_page() -> str:
+    """上传页:含 multiple 的 file input,change 事件显示已选文件名。
+
+    覆盖 P7 的 upload_files。上传成功后 #upload-result 显示文件名列表,
+    便于断言。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>上传页</title></head>
+<body>
+  <h1>上传页</h1>
+  <input type="file" id="file-input" aria-label="文件选择" multiple>
+  <p id="upload-result">未选择文件</p>
+  <script>
+    document.getElementById('file-input').addEventListener('change', function(e) {
+      var names = Array.from(e.target.files).map(function(f) { return f.name; });
+      document.getElementById('upload-result').textContent =
+        names.length ? '已选择: ' + names.join(', ') : '未选择文件';
+    });
+  </script>
+  <a href="/">返回首页</a>
 </body>
 </html>"""
 
