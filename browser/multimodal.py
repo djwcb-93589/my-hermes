@@ -19,9 +19,10 @@ import httpx
 
 _DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _DEFAULT_TIMEOUT_MS = 60_000
-_DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _DEFAULT_MAX_AUDIO_BYTES = 25 * 1024 * 1024
 _DEFAULT_MAX_TOTAL_BYTES = 40 * 1024 * 1024
+_DEFAULT_MAX_MEDIA_FILES = 20
 
 _IMAGE_FORMATS: dict[str, tuple[str, str]] = {
     ".png": ("image", "image/png"),
@@ -29,16 +30,13 @@ _IMAGE_FORMATS: dict[str, tuple[str, str]] = {
     ".jpeg": ("image", "image/jpeg"),
     ".webp": ("image", "image/webp"),
 }
-# Responses API 的 input_audio 使用短格式名称。这里只允许常见、无需本地转码
-# 的容器；实际模型是否启用音频输入仍由调用方配置的方舟模型决定。
-_AUDIO_FORMATS: dict[str, tuple[str, str, str]] = {
-    ".mp3": ("audio", "audio/mpeg", "mp3"),
-    ".wav": ("audio", "audio/wav", "wav"),
-    ".m4a": ("audio", "audio/mp4", "m4a"),
-    ".aac": ("audio", "audio/aac", "aac"),
-    ".ogg": ("audio", "audio/ogg", "ogg"),
-    ".flac": ("audio", "audio/flac", "flac"),
-    ".webm": ("audio", "audio/webm", "webm"),
+# 只允许当前 Responses API 明确采用 data URL 传入的常见音频格式；不做本地
+# 转码，也不把其他容器假定为模型可理解的音频。
+_AUDIO_FORMATS: dict[str, tuple[str, str]] = {
+    ".mp3": ("audio", "audio/mpeg"),
+    ".wav": ("audio", "audio/wav"),
+    ".aac": ("audio", "audio/aac"),
+    ".m4a": ("audio", "audio/m4a"),
 }
 
 
@@ -68,7 +66,6 @@ class ValidatedMedia:
     source: MediaSource
     media_type: str
     mime_type: str
-    audio_format: str | None
     size_bytes: int
 
     def public_payload(self) -> dict[str, Any]:
@@ -126,6 +123,7 @@ class DoubaoMultimodalProvider:
         max_image_bytes: int | None = None,
         max_audio_bytes: int | None = None,
         max_total_bytes: int | None = None,
+        max_media_files: int | None = None,
     ) -> None:
         self._api_key = api_key if api_key is not None else os.getenv("ARK_API_KEY")
         self._base_url = (base_url if base_url is not None else os.getenv("ARK_BASE_URL", _DEFAULT_ARK_BASE_URL)).rstrip("/")
@@ -154,6 +152,14 @@ class DoubaoMultimodalProvider:
             else _environment_positive_int("DOUBAO_MAX_TOTAL_MEDIA_BYTES", _DEFAULT_MAX_TOTAL_BYTES),
             name="max_total_bytes",
         )
+        self._max_media_files = _positive_int(
+            max_media_files
+            if max_media_files is not None
+            else _environment_positive_int(
+                "DOUBAO_MAX_MEDIA_FILES", _DEFAULT_MAX_MEDIA_FILES
+            ),
+            name="max_media_files",
+        )
 
     def _require_configuration(self) -> None:
         if not isinstance(self._api_key, str) or not self._api_key.strip():
@@ -170,18 +176,28 @@ class DoubaoMultimodalProvider:
         expected_type: str | None = None,
     ) -> list[ValidatedMedia]:
         """按文件名扩展名、真实文件大小和总大小验证媒体输入。"""
+        try:
+            source_list = list(sources)
+        except TypeError as exc:
+            raise MultimodalError("invalid_media_path", "媒体来源必须是可迭代集合") from exc
+        if not source_list:
+            raise MultimodalError("invalid_media_path", "至少需要一个媒体文件")
+        if len(source_list) > self._max_media_files:
+            raise MultimodalError(
+                "too_many_media_files",
+                f"单次最多允许 {self._max_media_files} 个媒体文件",
+            )
         validated: list[ValidatedMedia] = []
         total_size = 0
-        for source in sources:
+        for source in source_list:
             suffix = source.path.suffix.lower()
             image_info = _IMAGE_FORMATS.get(suffix)
             audio_info = _AUDIO_FORMATS.get(suffix)
             if image_info is not None:
                 media_type, mime_type = image_info
-                audio_format = None
                 limit = self._max_image_bytes
             elif audio_info is not None:
-                media_type, mime_type, audio_format = audio_info
+                media_type, mime_type = audio_info
                 limit = self._max_audio_bytes
             else:
                 raise MultimodalError(
@@ -199,7 +215,11 @@ class DoubaoMultimodalProvider:
                 raise MultimodalError("media_not_found", f"媒体文件不存在: {source.filename}") from exc
             except OSError as exc:
                 raise MultimodalError("invalid_media_path", f"无法读取媒体文件信息: {source.filename}") from exc
-            if size_bytes < 0 or size_bytes > limit:
+            if size_bytes <= 0:
+                raise MultimodalError(
+                    "invalid_media_path", f"媒体文件不能为空: {source.filename}"
+                )
+            if size_bytes >= limit:
                 raise MultimodalError(
                     "media_too_large",
                     f"{source.filename} 超出 {media_type} 单文件大小限制",
@@ -208,10 +228,8 @@ class DoubaoMultimodalProvider:
             if total_size > self._max_total_bytes:
                 raise MultimodalError("media_too_large", "媒体总大小超出请求限制")
             validated.append(
-                ValidatedMedia(source, media_type, mime_type, audio_format, size_bytes)
+                ValidatedMedia(source, media_type, mime_type, size_bytes)
             )
-        if not validated:
-            raise MultimodalError("invalid_media_path", "至少需要一个媒体文件")
         return validated
 
     def analyze(
@@ -257,6 +275,7 @@ class DoubaoMultimodalProvider:
             raise MultimodalError("invalid_model_response", "模型返回的不是有效 JSON") from exc
         if not isinstance(response_payload, dict):
             raise MultimodalError("invalid_model_response", "模型返回结构无效")
+        self._validate_response_status(response_payload)
         analysis = self._extract_output_text(response_payload)
         response_model = response_payload.get("model")
         model = response_model if isinstance(response_model, str) and response_model else self._model
@@ -286,6 +305,10 @@ class DoubaoMultimodalProvider:
                 raise MultimodalError("media_not_found", f"媒体文件不存在: {item.source.filename}") from exc
             except OSError as exc:
                 raise MultimodalError("invalid_media_path", f"无法读取媒体文件: {item.source.filename}") from exc
+            if not raw_data:
+                raise MultimodalError(
+                    "invalid_media_path", f"媒体文件不能为空: {item.source.filename}"
+                )
             if len(raw_data) != item.size_bytes:
                 raise MultimodalError("media_too_large", f"媒体文件在读取时发生变化: {item.source.filename}")
             encoded = base64.b64encode(raw_data).decode("ascii")
@@ -301,10 +324,35 @@ class DoubaoMultimodalProvider:
                 content.append(
                     {
                         "type": "input_audio",
-                        "input_audio": {"data": encoded, "format": item.audio_format},
+                        "audio_url": f"data:{item.mime_type};base64,{encoded}",
                     }
                 )
-        return {"model": self._model, "input": [{"role": "user", "content": content}]}
+        return {
+            "model": self._model,
+            "input": [{"role": "user", "content": content}],
+            "store": False,
+        }
+
+    @staticmethod
+    def _validate_response_status(payload: dict[str, Any]) -> None:
+        """拒绝失败或不完整响应，绝不把其中的部分文字当作分析结果。"""
+        error = payload.get("error")
+        if (isinstance(error, str) and error.strip()) or (
+            not isinstance(error, str) and bool(error)
+        ):
+            raise MultimodalError("model_request_failed", "多模态模型返回了错误状态")
+        status = payload.get("status")
+        if status is None:
+            return
+        if not isinstance(status, str):
+            raise MultimodalError("invalid_model_response", "模型响应状态格式无效")
+        if status == "completed":
+            return
+        if status == "incomplete":
+            raise MultimodalError("model_request_failed", "多模态模型输出不完整")
+        if status == "failed":
+            raise MultimodalError("model_request_failed", "多模态模型执行失败")
+        raise MultimodalError("model_request_failed", f"多模态模型未完成: {status}")
 
     @staticmethod
     def _extract_output_text(payload: dict[str, Any]) -> str:
@@ -325,10 +373,10 @@ class DoubaoMultimodalProvider:
                         and isinstance(part.get("text"), str)
                     ):
                         texts.append(part["text"])
-        output_text = payload.get("output_text")
-        if isinstance(output_text, str):
-            texts.append(output_text)
         result = "\n".join(text for text in texts if text)
+        if not result:
+            output_text = payload.get("output_text")
+            result = output_text if isinstance(output_text, str) else ""
         if not result:
             raise MultimodalError("invalid_model_response", "模型响应中没有最终分析文本")
         return result
