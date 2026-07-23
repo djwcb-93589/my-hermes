@@ -169,6 +169,14 @@ class DoubaoMultimodalProvider:
         if not self._base_url.startswith(("https://", "http://")):
             raise MultimodalError("multimodal_not_configured", "ARK_BASE_URL 必须是 HTTP(S) 地址")
 
+    def configuration(self) -> dict[str, str]:
+        """返回已验证的安全模型标识，不暴露密钥或服务地址。"""
+        self._require_configuration()
+        return {
+            "provider": self.provider_name,
+            "model": self._model.strip(),
+        }
+
     def validate_media(
         self,
         sources: Iterable[MediaSource],
@@ -399,6 +407,10 @@ class MultimodalAnalyzer:
 
     def __init__(self, provider: DoubaoMultimodalProvider | None = None) -> None:
         self._provider = provider or DoubaoMultimodalProvider()
+
+    def configuration(self) -> dict[str, str]:
+        """提供当前实际会使用的供应商和模型，供上层建立审批绑定。"""
+        return self._provider.configuration()
 
     def analyze(
         self,

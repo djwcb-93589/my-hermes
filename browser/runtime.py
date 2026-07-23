@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import queue
 import threading
@@ -51,20 +52,31 @@ class BrowserWorker:
         on_failure: Callable[[str, "BrowserWorker"], None] | None = None,
     ) -> None:
         self.session_key = session_key
-        self._workspace_root = workspace_root
-        self._artifact_dir = artifact_dir
+        self._workspace_root = (
+            Path(workspace_root).resolve()
+            if workspace_root is not None
+            else Path.cwd().resolve()
+        )
+        self._artifact_dir = (
+            Path(artifact_dir).resolve()
+            if artifact_dir is not None
+            else self._workspace_root / ".browser_artifacts"
+        )
         self._headless = headless
         self._channel = channel
         self._on_failure = on_failure
         self._queue: queue.Queue[_WorkItem | None] = queue.Queue()
         self._ready = threading.Event()
         self._closed = threading.Event()
+        self._state_lock = threading.Lock()
+        self._busy = False
+        self._queued = 0
         self._failed = False
         self._failure_message = ""
         self._last_used = monotonic()
         self._thread = threading.Thread(
             target=self._run,
-            name=f"browser-worker-{session_key[:24]}",
+            name=f"browser-worker-{self._session_digest(session_key)}",
             daemon=True,
         )
         self._thread.start()
@@ -80,6 +92,30 @@ class BrowserWorker:
         """worker 启动或工作线程已永久失效时为真。"""
         return self._failed
 
+    @property
+    def workspace_root(self) -> Path:
+        """返回创建后固定不变的工作区配置，仅供 Manager 校验复用。"""
+        return Path(self._workspace_root).resolve()
+
+    @property
+    def artifact_dir(self) -> Path:
+        """返回创建后固定不变的会话产物目录，仅供 Manager 校验复用。"""
+        return Path(self._artifact_dir).resolve()
+
+    @staticmethod
+    def _session_digest(session_key: str) -> str:
+        """生成不泄露原始会话标识的稳定短摘要。"""
+        return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:20]
+
+    def is_idle(self, *, now: float, idle_timeout_seconds: float) -> bool:
+        """仅在没有执行或排队请求且超过时限时允许 Manager 回收。"""
+        with self._state_lock:
+            return (
+                not self._busy
+                and self._queued == 0
+                and now - self._last_used >= idle_timeout_seconds
+            )
+
     def call(
         self,
         method: str,
@@ -90,14 +126,16 @@ class BrowserWorker:
         """串行执行 BrowserSession 公开方法，不把 Playwright 交给线程池。"""
         if not isinstance(method, str) or not method or method.startswith("_"):
             return _error("invalid_args", "browser method is invalid")
-        if self._closed.is_set() or self._failed:
-            return _error(
-                "browser_worker_unavailable",
-                self._failure_message or "browser worker is closed",
-            )
         future: Future[str] = Future()
-        self._last_used = monotonic()
-        self._queue.put(_WorkItem(method, args, dict(kwargs), future))
+        with self._state_lock:
+            if self._closed.is_set() or self._failed:
+                return _error(
+                    "browser_worker_unavailable",
+                    self._failure_message or "browser worker is closed",
+                )
+            self._queued += 1
+            self._last_used = monotonic()
+            self._queue.put(_WorkItem(method, args, dict(kwargs), future))
         try:
             return future.result(timeout=timeout)
         except TimeoutError:
@@ -107,12 +145,26 @@ class BrowserWorker:
 
     def close(self) -> None:
         """请求线程完成已有任务后关闭浏览器；重复调用安全。"""
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        self._queue.put(None)
+        with self._state_lock:
+            if not self._closed.is_set():
+                self._closed.set()
+                self._queue.put(None)
         if threading.get_ident() != self._thread.ident:
             self._thread.join(timeout=10)
+
+    def close_if_idle(self, *, now: float, idle_timeout_seconds: float) -> bool:
+        """原子地确认空闲并封闭 worker，防止回收与新请求竞争。"""
+        with self._state_lock:
+            if (
+                self._closed.is_set()
+                or self._busy
+                or self._queued != 0
+                or now - self._last_used < idle_timeout_seconds
+            ):
+                return False
+            self._closed.set()
+            self._queue.put(None)
+            return True
 
     def _run(self) -> None:
         """只在固定线程创建、调用和释放同步 Playwright 对象。"""
@@ -136,7 +188,13 @@ class BrowserWorker:
                 item = self._queue.get()
                 if item is None:
                     break
+                with self._state_lock:
+                    self._queued = max(0, self._queued - 1)
+                    self._busy = True
                 if item.future.cancelled():
+                    with self._state_lock:
+                        self._busy = False
+                        self._last_used = monotonic()
                     continue
                 try:
                     target = getattr(session, item.method, None)
@@ -153,7 +211,9 @@ class BrowserWorker:
                     )
                 if not item.future.done():
                     item.future.set_result(result)
-                self._last_used = monotonic()
+                with self._state_lock:
+                    self._busy = False
+                    self._last_used = monotonic()
         except BaseException as exc:
             self._failed = True
             self._failure_message = f"browser worker crashed: {exc.__class__.__name__}"
@@ -197,8 +257,12 @@ class BrowserManager:
         channel: str | None = "chrome",
     ) -> None:
         self._idle_timeout_seconds = max(0.0, float(idle_timeout_seconds))
-        self._workspace_root = workspace_root
-        self._artifact_dir = artifact_dir
+        self._workspace_root = (
+            Path(workspace_root).resolve() if workspace_root is not None else None
+        )
+        self._artifact_dir = (
+            Path(artifact_dir).resolve() if artifact_dir is not None else None
+        )
         self._headless = headless
         self._channel = channel
         self._workers: dict[str, BrowserWorker] = {}
@@ -211,22 +275,36 @@ class BrowserManager:
         )
         self._reaper.start()
 
-    def get_worker(self, session_key: str) -> BrowserWorker:
+    def get_worker(
+        self,
+        session_key: str,
+        *,
+        workspace_root: str | Path | None = None,
+    ) -> BrowserWorker:
         """同一会话并发请求只创建一个 worker，不允许模型提供 session_key。"""
         normalized_key = str(session_key or "").strip()
         if not normalized_key:
             raise ValueError("browser session_key is required")
+        resolved_workspace = self._resolve_workspace_root(workspace_root)
+        resolved_artifact_dir = self._session_artifact_dir(
+            normalized_key, resolved_workspace
+        )
         with self._lock:
             self._cleanup_idle_locked()
             worker = self._workers.get(normalized_key)
             if worker is not None and not worker.failed:
+                if (
+                    worker.workspace_root != resolved_workspace
+                    or worker.artifact_dir != resolved_artifact_dir
+                ):
+                    raise ValueError("browser workspace configuration conflicts with the existing session")
                 return worker
             if worker is not None:
                 self._workers.pop(normalized_key, None)
             worker = BrowserWorker(
                 normalized_key,
-                workspace_root=self._workspace_root,
-                artifact_dir=self._artifact_dir,
+                workspace_root=resolved_workspace,
+                artifact_dir=resolved_artifact_dir,
                 headless=self._headless,
                 channel=self._channel,
                 on_failure=self._remove_failed_worker,
@@ -268,12 +346,19 @@ class BrowserManager:
         if self._idle_timeout_seconds <= 0:
             return 0
         now = monotonic()
-        stale = [
-            key
-            for key, worker in self._workers.items()
-            if worker.failed or now - worker.last_used >= self._idle_timeout_seconds
-        ]
-        workers = [self._workers.pop(key) for key in stale]
+        stale: list[str] = []
+        workers: list[BrowserWorker] = []
+        for key, worker in self._workers.items():
+            if worker.failed:
+                stale.append(key)
+                workers.append(worker)
+            elif worker.close_if_idle(
+                now=now, idle_timeout_seconds=self._idle_timeout_seconds
+            ):
+                stale.append(key)
+                workers.append(worker)
+        for key in stale:
+            self._workers.pop(key, None)
         # 不能持有 Manager 锁等待线程退出；close 的 join 在锁外完成。
         if workers:
             threading.Thread(
@@ -282,6 +367,27 @@ class BrowserManager:
                 daemon=True,
             ).start()
         return len(workers)
+
+    def _resolve_workspace_root(
+        self,
+        workspace_root: str | Path | None,
+    ) -> Path:
+        raw = workspace_root if workspace_root is not None else self._workspace_root
+        if raw is None:
+            return Path.cwd().resolve()
+        resolved = Path(raw).resolve()
+        if not resolved.is_dir():
+            raise ValueError("browser workspace_root must be an existing directory")
+        return resolved
+
+    def _session_artifact_dir(
+        self,
+        session_key: str,
+        workspace_root: Path,
+    ) -> Path:
+        """按会话摘要隔离产物，不把原始 session_key 写入路径。"""
+        root = self._artifact_dir or workspace_root / ".browser_artifacts"
+        return root / BrowserWorker._session_digest(session_key)
 
     def _remove_failed_worker(self, session_key: str, worker: BrowserWorker) -> None:
         with self._lock:

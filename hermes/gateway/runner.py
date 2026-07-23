@@ -1493,10 +1493,10 @@ class GatewayRunner:
                         self.sessions.cleanup_idle_conversations(protected)
                     )
                     if removed_conversations:
-                        from hermes.backends import cleanup_backend
+                        from hermes.session_resources import cleanup_session_resources
                         for conversation_id in removed_conversations:
                             await asyncio.to_thread(
-                                cleanup_backend,
+                                cleanup_session_resources,
                                 conversation_id,
                             )
                     removed = len(removed_conversations)
@@ -2774,8 +2774,8 @@ class GatewayRunner:
                     )
                 finally:
                     self._async_client = None
-            from hermes.backends import cleanup_all_backends
-            cleanup_all_backends()
+            from hermes.session_resources import cleanup_all_session_resources
+            cleanup_all_session_resources()
             self._receiving_adapters.clear()
             self._inbox_restored_adapters.clear()
             self._startup_in_progress = False
@@ -4484,9 +4484,9 @@ class GatewayRunner:
             ctx = await self.sessions.new_conversation_async(
                 route_key, self._build_gateway_prompt(event.source),
             )
-            from hermes.backends import cleanup_backend
+            from hermes.session_resources import cleanup_session_resources
             await asyncio.to_thread(
-                cleanup_backend,
+                cleanup_session_resources,
                 previous_conversation_id,
             )
             if event.source.platform not in self.adapters:

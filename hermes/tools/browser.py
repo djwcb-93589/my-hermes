@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -85,13 +84,29 @@ def _worker(kwargs: dict[str, Any]):
     if not isinstance(session_key, str) or not session_key.strip():
         return None, _error("browser_session_unavailable", "browser requires a trusted session context")
     try:
-        return default_browser_manager.get_worker(session_key), None
-    except (RuntimeError, ValueError) as exc:
+        backend = _trusted_backend(kwargs)
+        workspace_root = _backend_workspace_root(backend)
+        return default_browser_manager.get_worker(
+            session_key, workspace_root=workspace_root
+        ), None
+    except Exception as exc:
         return None, _error("browser_worker_unavailable", f"browser worker is unavailable: {exc.__class__.__name__}")
 
 
 def _call(worker: Any, method: str, *args: Any, **kwargs: Any) -> str:
     return worker.call(method, *args, **kwargs)
+
+
+def _multimodal_configuration(worker: Any) -> tuple[dict[str, str] | None, str | None]:
+    """从固定浏览器线程读取实际模型配置，避免工具层猜测默认模型。"""
+    payload = _parse(_call(worker, "multimodal_configuration"))
+    if not payload.get("ok"):
+        return None, _public_result(_result(payload))
+    provider = payload.get("provider")
+    model = payload.get("model")
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        return None, _error("multimodal_not_configured", "browser multimodal configuration is invalid")
+    return {"provider": provider, "model": model}, None
 
 
 def _current_page(worker: Any) -> dict[str, Any]:
@@ -145,13 +160,16 @@ def _artifact_snapshot(artifact: dict[str, Any], *, snapshot_id: str | None = No
     return state
 
 
-def _workspace_file_snapshot(value: Any) -> dict[str, Any] | None:
+def _workspace_file_snapshot(
+    value: Any,
+    workspace_root: Path,
+) -> dict[str, Any] | None:
     if not isinstance(value, str) or not value or Path(value).is_absolute():
         return None
     raw = Path(value)
     if ".." in raw.parts:
         return None
-    root = Path.cwd().resolve()
+    root = workspace_root.resolve()
     try:
         resolved = (root / raw).resolve(strict=True)
         if root != resolved and root not in resolved.parents:
@@ -161,13 +179,30 @@ def _workspace_file_snapshot(value: Any) -> dict[str, Any] | None:
     return _file_state(resolved)
 
 
-def _approval_options(kwargs: dict[str, Any]) -> dict[str, Any]:
+def _trusted_backend(kwargs: dict[str, Any]) -> Any:
+    """只从工具运行上下文取得当前会话的 backend。"""
     backend = kwargs.get("backend")
-    if backend is None:
-        try:
-            backend = get_backend(session_key=kwargs["session_key"])
-        except Exception:
-            backend = None
+    if backend is not None:
+        return backend
+    return get_backend(session_key=kwargs["session_key"])
+
+
+def _backend_workspace_root(backend: Any) -> Path:
+    """把可信 backend 的当前工作目录收敛为可供本地浏览器使用的目录。"""
+    raw_cwd = getattr(backend, "cwd", None)
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+        raise ValueError("backend workspace is unavailable")
+    root = Path(raw_cwd).resolve()
+    if not root.is_dir():
+        raise ValueError("backend workspace is not available on this host")
+    return root
+
+
+def _approval_options(kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        backend = _trusted_backend(kwargs)
+    except Exception:
+        backend = None
     return {
         "remote_approval": is_remote_approval(kwargs),
         "approval_grant": kwargs.get("approval_grant"),
@@ -175,6 +210,25 @@ def _approval_options(kwargs: dict[str, Any]) -> dict[str, Any]:
         "backend_context": {"backend_type": getattr(backend, "backend_type", "browser")},
         "intelligent_advisor": getattr(backend, "intelligent_approval_advisor", None),
     }
+
+
+def _allow_high_risk_execution(
+    assessment: Any,
+    pending: str | None,
+    approval_grant: object,
+    approved_context: dict | None,
+    current_context: dict,
+) -> str | None:
+    """区分待批准、过期 grant 与智能审批当场放行三种结果。"""
+    if pending is not None:
+        return pending
+    if approval_grant is not None:
+        if approved_context != current_context:
+            return _error("approval_stale", "approved browser operation changed; request approval again")
+        return None
+    if assessment.decision.value == "allow":
+        return None
+    return _error("approval_stale", "browser approval could not be validated")
 
 
 def _handle_simple(method: str, allowed: set[str], required: set[str]) -> Callable[[Any], str]:
@@ -193,8 +247,14 @@ def handle_browser_upload_files(args: Any, **kwargs: Any) -> str:
     validated = _validate(args, {"ref", "paths", "snapshot_id"}, {"ref", "paths", "snapshot_id"})
     if isinstance(validated, str):
         return validated
+    try:
+        workspace_root = _backend_workspace_root(_trusted_backend(kwargs))
+    except Exception:
+        return _error("browser_workspace_unavailable", "browser workspace is unavailable")
     raw_paths = validated["paths"] if isinstance(validated["paths"], list) else [validated["paths"]]
-    snapshots = [_workspace_file_snapshot(path) for path in raw_paths]
+    snapshots = [
+        _workspace_file_snapshot(path, workspace_root) for path in raw_paths
+    ]
     if not raw_paths or any(item is None for item in snapshots):
         return _error("invalid_path", "upload paths must be existing regular files inside the workspace")
     worker, error = _worker(kwargs)
@@ -212,14 +272,15 @@ def handle_browser_upload_files(args: Any, **kwargs: Any) -> str:
         risk_level=HIGH, **_approval_options(kwargs),
     )
     pending = build_assessment_response(assessment, "Upload selected local files to the current webpage.")
-    if pending is not None:
-        return pending
     approved = approved_browser_operation_context_candidate(
         kwargs.get("approval_grant"), "browser_upload_files", validated,
         session_key=kwargs["session_key"],
     )
-    if approved != context:
-        return _error("approval_stale", "approved upload context changed; request approval again")
+    decision_error = _allow_high_risk_execution(
+        assessment, pending, kwargs.get("approval_grant"), approved, context
+    )
+    if decision_error is not None:
+        return decision_error
     return _public_result(_call(worker, "upload_files", **validated))
 
 
@@ -236,11 +297,12 @@ def handle_browser_console(args: Any, **kwargs: Any) -> str:
         source_context=context, risk_level=HIGH, **_approval_options(kwargs),
     )
     pending = build_assessment_response(assessment, "Run JavaScript in the current webpage.")
-    if pending is not None:
-        return pending
     approved = approved_browser_operation_context_candidate(kwargs.get("approval_grant"), "browser_console", validated, session_key=kwargs["session_key"])
-    if approved != context:
-        return _error("approval_stale", "approved console context changed; request approval again")
+    decision_error = _allow_high_risk_execution(
+        assessment, pending, kwargs.get("approval_grant"), approved, context
+    )
+    if decision_error is not None:
+        return decision_error
     return _public_result(_call(worker, "console", **validated))
 
 
@@ -269,11 +331,12 @@ def _handle_artifact_change(tool_name: str, method: str, args: Any, kwargs: dict
         risk_level=_HIGH_RISK_OPERATIONS[tool_name], **_approval_options(kwargs),
     )
     pending = build_assessment_response(assessment, "Delete browser session artifact files.")
-    if pending is not None:
-        return pending
     approved = approved_browser_operation_context_candidate(kwargs.get("approval_grant"), tool_name, validated, session_key=kwargs["session_key"])
-    if approved != context:
-        return _error("approval_stale", "approved artifact state changed; request approval again")
+    decision_error = _allow_high_risk_execution(
+        assessment, pending, kwargs.get("approval_grant"), approved, context
+    )
+    if decision_error is not None:
+        return decision_error
     return _public_result(_call(worker, method, **validated))
 
 
@@ -284,39 +347,104 @@ def handle_browser_analyze_page(args: Any, **kwargs: Any) -> str:
     worker, error = _worker(kwargs)
     if error is not None:
         return error
+    configuration, configuration_error = _multimodal_configuration(worker)
+    if configuration_error is not None:
+        return configuration_error
+    assert configuration is not None
     grant = kwargs.get("approval_grant")
     approved = approved_browser_media_snapshots_candidate(grant, validated, session_key=kwargs["session_key"])
-    if approved is None:
-        screenshot_args = {"snapshot_id": validated["snapshot_id"], "full_page": validated.get("full_page", False)}
+    approved_context = approved_browser_operation_context_candidate(
+        grant,
+        "browser_analyze_page",
+        validated,
+        session_key=kwargs["session_key"],
+    )
+    artifact: dict[str, Any] | None = None
+    snapshot: dict[str, Any] | None = None
+    context: dict[str, Any]
+    if grant is not None:
+        if approved is None or approved_context is None or len(approved) != 1:
+            return _error("approval_stale", "approved screenshot identity is invalid")
+        snapshot = approved[0]
+        artifact_response = _parse(_call(worker, "get_artifact", snapshot["artifact_id"]))
+        candidate = artifact_response.get("artifact")
+        if not isinstance(candidate, dict):
+            return _error("approval_stale", "approved screenshot no longer exists")
+        current = _artifact_snapshot(
+            candidate,
+            snapshot_id=snapshot.get("snapshot_id"),
+        )
+        if current != snapshot:
+            return _error("approval_stale", "approved screenshot state changed; request approval again")
+        artifact = candidate
+        context = {
+            "page_id": artifact.get("page_id"),
+            "url": artifact.get("source_url"),
+            "snapshot_id": snapshot.get("snapshot_id"),
+            "artifact_id": snapshot["artifact_id"],
+            "filename": snapshot["filename"],
+            "size_bytes": snapshot["size_bytes"],
+            "full_page": validated.get("full_page", False),
+        }
+    else:
+        screenshot_args = {
+            "snapshot_id": validated["snapshot_id"],
+            "full_page": validated.get("full_page", False),
+        }
         screenshot = _parse(_call(worker, "screenshot", **screenshot_args))
         if not screenshot.get("ok"):
             return _public_result(_result(screenshot))
-        artifact = screenshot.get("artifact")
-        snapshot = _artifact_snapshot(artifact, snapshot_id=validated["snapshot_id"]) if isinstance(artifact, dict) else None
+        candidate = screenshot.get("artifact")
+        snapshot = (
+            _artifact_snapshot(candidate, snapshot_id=validated["snapshot_id"])
+            if isinstance(candidate, dict)
+            else None
+        )
         if snapshot is None:
             return _error("approval_snapshot_unavailable", "could not capture browser screenshot state for approval")
+        artifact = candidate
         context = {
-            "page_id": screenshot.get("page_id"), "url": screenshot.get("url"),
-            "snapshot_id": validated["snapshot_id"], "artifact_id": snapshot["artifact_id"],
-            "filename": snapshot["filename"], "size_bytes": snapshot["size_bytes"],
+            "page_id": screenshot.get("page_id"),
+            "url": screenshot.get("url"),
+            "snapshot_id": validated["snapshot_id"],
+            "artifact_id": snapshot["artifact_id"],
+            "filename": snapshot["filename"],
+            "size_bytes": snapshot["size_bytes"],
             "full_page": screenshot_args["full_page"],
         }
-        assessment = assess_external_media_analysis(
-            "browser_analyze_page", validated, session_key=kwargs["session_key"],
-            media_snapshots=[snapshot], provider="doubao_ark",
-            model=str(os.environ.get("DOUBAO_MULTIMODAL_MODEL", "doubao-seed-2-0-pro-260215")),
-            source_context=context, **_approval_options(kwargs),
+    assessment = assess_external_media_analysis(
+        "browser_analyze_page",
+        validated,
+        session_key=kwargs["session_key"],
+        media_snapshots=[snapshot],
+        provider=configuration["provider"],
+        model=configuration["model"],
+        source_context=context,
+        **_approval_options(kwargs),
+    )
+    pending = build_assessment_response(
+        assessment,
+        "Send the current page screenshot to the configured external model.",
+    )
+    decision_error = _allow_high_risk_execution(
+        assessment,
+        pending,
+        grant,
+        approved_context,
+        context,
+    )
+    if decision_error is not None:
+        return decision_error
+    assert artifact is not None and snapshot is not None
+    result = _parse(
+        _call(
+            worker,
+            "analyze_image",
+            snapshot["artifact_id"],
+            validated["prompt"],
+            timeout_ms=validated.get("timeout_ms"),
         )
-        return build_assessment_response(assessment, "Send the current page screenshot to the configured external model.") or _error("approval_stale", "browser analysis approval could not be validated")
-    if len(approved) != 1:
-        return _error("approval_stale", "approved screenshot identity is invalid")
-    snapshot = approved[0]
-    artifact_response = _parse(_call(worker, "get_artifact", snapshot["artifact_id"]))
-    artifact = artifact_response.get("artifact")
-    current = _artifact_snapshot(artifact, snapshot_id=snapshot.get("snapshot_id")) if isinstance(artifact, dict) else None
-    if current != snapshot:
-        return _error("approval_stale", "approved screenshot state changed; request approval again")
-    result = _parse(_call(worker, "analyze_image", snapshot["artifact_id"], validated["prompt"], timeout_ms=validated.get("timeout_ms")))
+    )
     result["artifact"] = _public(artifact)
     result["snapshot_id"] = snapshot.get("snapshot_id")
     return _result(_public(result))
@@ -343,7 +471,7 @@ _TIMEOUT = {"type": "integer", "minimum": 1}
 def register(registry) -> None:
     """注册默认关闭、显式启用 browser toolset 后才可见的浏览器工具。"""
     operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool]] = [
-        ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), True),
+        ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False),
         ("browser_snapshot", "snapshot", "Read the current page and create a snapshot whose refs are valid only for that page.", {}, [], _handle_simple("snapshot", set(), set()), True),
         ("browser_click", "click", "Click a ref from snapshot_id. Use the returned new snapshot_id afterwards.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("click", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), False),
         ("browser_type", "type", "Enter text into an editable ref and return a new snapshot_id.", {"ref": _REF, "text": _STRING, "snapshot_id": _SNAPSHOT, "clear": {"type": "boolean", "default": True}, "mode": {"type": "string", "enum": ["fill", "type"]}, "delay_ms": {"type": "integer", "minimum": 0}}, ["ref", "text", "snapshot_id"], _handle_simple("type", {"ref", "text", "snapshot_id", "clear", "mode", "delay_ms"}, {"ref", "text", "snapshot_id"}), False),
@@ -369,14 +497,14 @@ def register(registry) -> None:
         ("browser_list_pages", "list_pages", "List browser tabs/pages without changing a snapshot.", {}, [], _handle_simple("list_pages", set(), set()), True),
         ("browser_switch_page", "switch_page", "Switch to a registered page and return its new snapshot_id.", {"page_id": _STRING}, ["page_id"], _handle_simple("switch_page", {"page_id"}, {"page_id"}), False),
         ("browser_close_page", "close_page", "Close a registered page and return a new current-page snapshot when available.", {"page_id": _STRING}, ["page_id"], _handle_simple("close_page", {"page_id"}, {"page_id"}), False),
-        ("browser_screenshot", "screenshot", "Save a page PNG artifact without changing snapshot_id.", {"snapshot_id": _SNAPSHOT, "full_page": {"type": "boolean", "default": False}}, ["snapshot_id"], _handle_simple("screenshot", {"snapshot_id", "full_page"}, {"snapshot_id"}), True),
-        ("browser_screenshot_element", "screenshot_element", "Save a visible element PNG artifact without scrolling or changing snapshot_id.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("screenshot_element", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), True),
+        ("browser_screenshot", "screenshot", "Save a page PNG artifact without changing snapshot_id.", {"snapshot_id": _SNAPSHOT, "full_page": {"type": "boolean", "default": False}}, ["snapshot_id"], _handle_simple("screenshot", {"snapshot_id", "full_page"}, {"snapshot_id"}), False),
+        ("browser_screenshot_element", "screenshot_element", "Save a visible element PNG artifact without scrolling or changing snapshot_id.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("screenshot_element", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), False),
         ("browser_download", "download", "Click a download ref and save only to the browser artifact directory; it returns a new snapshot_id.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT, "event_timeout_ms": _TIMEOUT, "completion_timeout_ms": _TIMEOUT}, ["ref", "snapshot_id"], _handle_simple("download", {"ref", "snapshot_id", "timeout_ms", "event_timeout_ms", "completion_timeout_ms"}, {"ref", "snapshot_id"}), False),
         ("browser_list_artifacts", "list_artifacts", "List safe metadata for browser artifacts.", {}, [], _handle_simple("list_artifacts", set(), set()), True),
         ("browser_get_artifact", "get_artifact", "Get safe metadata for one browser artifact.", {"artifact_id": _STRING}, ["artifact_id"], _handle_simple("get_artifact", {"artifact_id"}, {"artifact_id"}), True),
     ])
     for name, method, description, props, required, handler, retry_safe in operations:
-        registry.register(name=name, toolset="browser", schema=_schema(name, description, props, required), handler=handler, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="none", risk_level="low", default_enabled_environments=(), retry_safe=retry_safe, unknown_on_crash=not retry_safe)
+        registry.register(name=name, toolset="browser", schema=_schema(name, description, props, required), handler=handler, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="none", risk_level="low" if retry_safe else "medium", default_enabled_environments=(), retry_safe=retry_safe, unknown_on_crash=not retry_safe)
     registry.register(name="browser_upload_files", toolset="browser", schema=_schema("browser_upload_files", "Upload workspace files to a file-input ref after one-time approval.", {"ref": _REF, "paths": {"oneOf": [_STRING, {"type": "array", "minItems": 1, "items": _STRING}]}, "snapshot_id": _SNAPSHOT}, ["ref", "paths", "snapshot_id"]), handler=handle_browser_upload_files, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
     registry.register(name="browser_console", toolset="browser", schema=_schema("browser_console", "Run JavaScript in the current page after one-time approval; it may change page state.", {"expression": _STRING, "snapshot_id": _SNAPSHOT, "max_chars": {"type": "integer", "minimum": 1}}, ["expression", "snapshot_id"]), handler=handle_browser_console, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
     registry.register(name="browser_delete_artifact", toolset="browser", schema=_schema("browser_delete_artifact", "Delete one browser artifact after one-time approval.", {"artifact_id": _STRING}, ["artifact_id"]), handler=handle_browser_delete_artifact, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="medium", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)

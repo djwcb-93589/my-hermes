@@ -14,7 +14,7 @@ import sys
 from hermes.config import DB_PATH, MODEL, BASE_URL, HERMES_HOME
 from hermes.conversation import run_conversation
 from hermes.db import init_db, create_session
-from hermes.backends import cleanup_all_backends
+from hermes.session_resources import cleanup_all_session_resources
 from hermes.prompt import build_system_prompt
 from hermes.tools import register_all
 
@@ -45,7 +45,7 @@ def cli_loop():
             print(f"\nAssistant: {result['final_response']}\n")
     finally:
         conn.close()
-        cleanup_all_backends()
+        cleanup_all_session_resources()
 
 
 def main():

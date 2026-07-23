@@ -1546,6 +1546,21 @@ class BrowserSession:
             self._multimodal_analyzer = MultimodalAnalyzer()
         return self._multimodal_analyzer
 
+    def multimodal_configuration(self) -> str:
+        """返回当前会话实际多模态配置的安全标识，不创建页面产物。"""
+        with self._lock:
+            self._assert_owner_thread()
+            try:
+                configuration = self._analyzer_locked().configuration()
+            except MultimodalError as exc:
+                return _err(exc.error_type, exc.message)
+            except Exception as exc:
+                return _err(
+                    "multimodal_not_configured",
+                    f"多模态配置读取失败: {exc.__class__.__name__}",
+                )
+            return json.dumps({"ok": True, **configuration}, ensure_ascii=False)
+
     def _artifact_media_source_locked(self, artifact: _Artifact) -> MediaSource | str:
         """再次确认登记产物仍是专用目录内未链接的普通文件。"""
         try:
