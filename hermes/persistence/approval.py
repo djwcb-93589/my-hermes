@@ -304,6 +304,11 @@ def create_gateway_approval_with_outbox(
         "gateway_send_file",
         "cron",
         "media_analyze",
+        "browser_analyze_page",
+        "browser_upload_files",
+        "browser_console",
+        "browser_delete_artifact",
+        "browser_cleanup_artifacts",
     }:
         raise DBError("invalid gateway approval tool")
     if not tool_call_id or not isinstance(tool_args, dict):

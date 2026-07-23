@@ -322,10 +322,14 @@ def _extract_approval_request(
 
     request_id = request.get("id")
     tool_name = request.get("tool_name")
+    # 审批结果由已获授权的工具处理器生成；这里不维护工具名白名单，
+    # 以便新的受控工具复用同一条 CLI / Gateway 恢复链路。具体操作身份
+    # 仍在持久化前由审批指纹和绑定校验复核。
     if (
         not isinstance(request_id, str)
         or not request_id.startswith("approval_")
-        or tool_name not in {"file", "terminal", "gateway_send_file", "cron"}
+        or not isinstance(tool_name, str)
+        or not tool_name
     ):
         return None
     call_name = AgentLoop._tool_call_name(tool_call)

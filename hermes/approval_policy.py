@@ -509,6 +509,7 @@ class TrustedApprovalGrant:
     cwd: str | None = None
     file_snapshot: dict | None = None
     media_snapshots: tuple[dict, ...] | None = None
+    browser_context: dict | None = None
     session_rule: TerminalSessionGrantRule | FileSessionGrantRule | None = None
     _issuer: object = field(repr=False, compare=False, default=None)
 
@@ -1601,6 +1602,11 @@ def issue_trusted_approval_grant(
         "gateway_send_file",
         "cron",
         "media_analyze",
+        "browser_analyze_page",
+        "browser_upload_files",
+        "browser_console",
+        "browser_delete_artifact",
+        "browser_cleanup_artifacts",
     }:
         raise ValueError("unsupported approval grant tool")
     if not isinstance(arguments, dict) or not isinstance(details, dict):
@@ -1764,6 +1770,68 @@ def issue_trusted_approval_grant(
             fingerprint=fingerprint,
             session_key=session_key,
             media_snapshots=media_snapshots,
+            _issuer=_TRUSTED_GRANT_ISSUER,
+        )
+
+    if tool_name == "browser_analyze_page":
+        if normalized_scope != "once":
+            raise ValueError("browser page analysis only supports once scope")
+        snapshots = _normalize_browser_media_snapshots(details.get("media_snapshots"))
+        context = _normalize_browser_context(details.get("browser_context"))
+        provider = details.get("provider")
+        model = details.get("model")
+        if provider != "doubao_ark" or not isinstance(model, str):
+            raise ValueError("browser page analysis details are invalid")
+        expected = _canonical_fingerprint(_browser_media_fingerprint_payload(
+            tool_name,
+            arguments,
+            snapshots,
+            session_key=session_key,
+            provider=provider,
+            model=model,
+            source_context=context,
+            backend_context=details.get("backend_risk"),
+        ))
+        if fingerprint != expected:
+            raise ValueError("browser page analysis fingerprint is invalid")
+        return TrustedApprovalGrant(
+            scope=normalized_scope,
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            fingerprint=fingerprint,
+            session_key=session_key,
+            media_snapshots=snapshots,
+            browser_context=context,
+            _issuer=_TRUSTED_GRANT_ISSUER,
+        )
+
+    if tool_name in {
+        "browser_upload_files",
+        "browser_console",
+        "browser_delete_artifact",
+        "browser_cleanup_artifacts",
+    }:
+        if normalized_scope != "once":
+            raise ValueError("browser operation approval only supports once scope")
+        context = _normalize_browser_context(details.get("browser_context"))
+        expected = _canonical_fingerprint(_browser_operation_fingerprint_payload(
+            tool_name,
+            arguments,
+            session_key=session_key,
+            source_context=context,
+            backend_context=details.get("backend_risk"),
+        ))
+        if fingerprint != expected:
+            raise ValueError("browser operation fingerprint is invalid")
+        return TrustedApprovalGrant(
+            scope=normalized_scope,
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            fingerprint=fingerprint,
+            session_key=session_key,
+            browser_context=context,
             _issuer=_TRUSTED_GRANT_ISSUER,
         )
 
@@ -3059,6 +3127,122 @@ def _normalize_media_analysis_snapshots(value: object) -> tuple[dict, ...]:
     return tuple(snapshots)
 
 
+def _normalize_browser_media_snapshots(value: object) -> tuple[dict, ...]:
+    """规范化浏览器产物的安全文件状态，不把本地绝对路径写入审批记录。"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("browser media snapshots must be a non-empty sequence")
+    normalized: list[dict] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("browser media snapshot must be an object")
+        artifact_id = item.get("artifact_id")
+        filename = item.get("filename")
+        sha256 = item.get("sha256")
+        if (
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or not isinstance(filename, str)
+            or not filename
+            or not isinstance(sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        ):
+            raise ValueError("browser media snapshot identity is invalid")
+        try:
+            size_bytes = int(item.get("size_bytes"))
+            mtime_ns = int(item.get("mtime_ns"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("browser media snapshot state is invalid") from exc
+        if (
+            isinstance(item.get("size_bytes"), bool)
+            or isinstance(item.get("mtime_ns"), bool)
+            or size_bytes <= 0
+            or mtime_ns < 0
+        ):
+            raise ValueError("browser media snapshot state is invalid")
+        snapshot = {
+            "artifact_id": artifact_id,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "mtime_ns": mtime_ns,
+            "sha256": sha256,
+        }
+        for field_name in ("page_id", "snapshot_id", "source_url"):
+            field_value = item.get(field_name)
+            if field_value is not None:
+                if not isinstance(field_value, str):
+                    raise ValueError("browser media snapshot metadata is invalid")
+                snapshot[field_name] = field_value
+        normalized.append(snapshot)
+    return tuple(normalized)
+
+
+def _normalize_browser_context(value: object) -> dict:
+    """只允许审批记录持久化 JSON 安全且不含本地路径的浏览器上下文。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("browser approval context must be an object")
+    forbidden = {
+        "path",
+        "abs_path",
+        "artifact_dir",
+        "workspace_root",
+        "parent_abs_path",
+    }
+    if any(key in value for key in forbidden):
+        raise ValueError("browser approval context must not contain local paths")
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        normalized = json.loads(serialized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("browser approval context is invalid") from exc
+    if not isinstance(normalized, dict):
+        raise ValueError("browser approval context must be an object")
+    return normalized
+
+
+def _browser_media_fingerprint_payload(
+    tool_name: str,
+    arguments: dict,
+    media_snapshots: Sequence[dict],
+    *,
+    session_key: str,
+    provider: str,
+    model: str,
+    source_context: Mapping,
+    backend_context: Mapping | None,
+) -> dict:
+    """生成浏览器产物外发分析的一次性审批指纹。"""
+    return {
+        "version": 1,
+        "tool_name": tool_name,
+        "arguments": dict(arguments),
+        "session_key": session_key,
+        "media_snapshots": list(_normalize_browser_media_snapshots(media_snapshots)),
+        "provider": provider,
+        "model": model,
+        "browser_context": _normalize_browser_context(source_context),
+        "backend_risk": _backend_fingerprint_payload(backend_context),
+    }
+
+
+def _browser_operation_fingerprint_payload(
+    tool_name: str,
+    arguments: dict,
+    *,
+    session_key: str,
+    source_context: Mapping,
+    backend_context: Mapping | None,
+) -> dict:
+    """生成浏览器高风险本地操作的一次性审批指纹。"""
+    return {
+        "version": 1,
+        "tool_name": tool_name,
+        "arguments": dict(arguments),
+        "session_key": session_key,
+        "browser_context": _normalize_browser_context(source_context),
+        "backend_risk": _backend_fingerprint_payload(backend_context),
+    }
+
+
 def approved_media_snapshots_candidate(
     approval_grant: object,
     arguments: dict,
@@ -3474,6 +3658,249 @@ def assess_media_analysis(
     )
 
 
+def assess_external_media_analysis(
+    tool_name: str,
+    arguments: dict,
+    *,
+    session_key: str,
+    media_snapshots: Sequence[dict],
+    provider: str,
+    model: str,
+    source_context: Mapping,
+    remote_approval: bool,
+    approval_grant: object = None,
+    security_policy: ApprovalSecurityPolicy | None = None,
+    backend_context: Mapping | None = None,
+    intelligent_advisor: IntelligentApprovalAdvisor | None = None,
+) -> ApprovalAssessment:
+    """评估浏览器产物外发给模型服务的高风险一次性操作。"""
+    if tool_name != "browser_analyze_page":
+        raise ValueError("external media analysis tool is invalid")
+    normalized_session_key = normalize_approval_session_key(session_key)
+    normalized_arguments = dict(arguments)
+    normalized_provider = str(provider or "").strip()
+    normalized_model = str(model or "").strip()
+    if normalized_provider != "doubao_ark" or not normalized_model:
+        raise ValueError("external media analysis provider is invalid")
+    snapshots = _normalize_browser_media_snapshots(media_snapshots)
+    context = _normalize_browser_context(source_context)
+    safe_backend_context = _backend_fingerprint_payload(backend_context)
+    fingerprint = _canonical_fingerprint(_browser_media_fingerprint_payload(
+        tool_name,
+        normalized_arguments,
+        snapshots,
+        session_key=normalized_session_key,
+        provider=normalized_provider,
+        model=normalized_model,
+        source_context=context,
+        backend_context=safe_backend_context,
+    ))
+    grant_matches = (
+        approval_grant_identity_matches(approval_grant, tool_name, arguments)
+        and approval_grant.scope == "once"
+        and approval_grant.session_key == normalized_session_key
+        and approval_grant.fingerprint == fingerprint
+        and approval_grant.media_snapshots == snapshots
+        and approval_grant.browser_context == context
+    )
+    if grant_matches:
+        decision, reason, error_type, error, decision_source = (
+            ALLOW,
+            "approved browser media analysis matches the current artifact",
+            None,
+            None,
+            "once_grant",
+        )
+    elif approval_grant is not None:
+        decision, reason, error_type, error, decision_source = (
+            DENY,
+            "browser media analysis approval grant no longer matches this request",
+            "approval_stale",
+            "approved browser artifact state changed; request approval again",
+            "grant_validation",
+        )
+    else:
+        decision, reason, error_type, error, decision_source = (
+            ASK,
+            "external page analysis sends a browser screenshot to a third-party model service",
+            None,
+            None,
+            "remote_approval" if remote_approval else "interactive_approval",
+        )
+    details = {
+        "operation_type": "browser.external_analysis",
+        "browser_context": context,
+        "media_snapshots": list(snapshots),
+        "provider": normalized_provider,
+        "model": normalized_model,
+        "prompt": normalized_arguments.get("prompt"),
+        "session_key_fingerprint": _identifier_fingerprint(normalized_session_key),
+        "reason": reason,
+        "fingerprint": fingerprint,
+        "risk_level": HIGH.value,
+        "allowed_grant_scopes": ["once"],
+        "backend_risk": safe_backend_context,
+        "decision_source": decision_source,
+    }
+    assessment = ApprovalAssessment(
+        tool_name=tool_name,
+        decision=decision,
+        risk_level=HIGH,
+        fingerprint=fingerprint,
+        reason=reason,
+        normalized_arguments=normalized_arguments,
+        details=details,
+        session_key=normalized_session_key,
+        error_type=error_type,
+        error=error,
+        fatal=False,
+    )
+    return apply_intelligent_approval(
+        assessment,
+        security_policy=security_policy or DEFAULT_APPROVAL_SECURITY_POLICY,
+        advisor=intelligent_advisor,
+    )
+
+
+def assess_browser_operation(
+    tool_name: str,
+    arguments: dict,
+    *,
+    session_key: str,
+    source_context: Mapping,
+    risk_level: ApprovalRiskLevel,
+    remote_approval: bool,
+    approval_grant: object = None,
+    security_policy: ApprovalSecurityPolicy | None = None,
+    backend_context: Mapping | None = None,
+    intelligent_advisor: IntelligentApprovalAdvisor | None = None,
+) -> ApprovalAssessment:
+    """评估上传、控制台和产物删除等浏览器高风险一次性操作。"""
+    if tool_name not in {
+        "browser_upload_files",
+        "browser_console",
+        "browser_delete_artifact",
+        "browser_cleanup_artifacts",
+    }:
+        raise ValueError("browser approval tool is invalid")
+    if risk_level not in {MEDIUM, HIGH}:
+        raise ValueError("browser approval risk level is invalid")
+    normalized_session_key = normalize_approval_session_key(session_key)
+    normalized_arguments = dict(arguments)
+    context = _normalize_browser_context(source_context)
+    safe_backend_context = _backend_fingerprint_payload(backend_context)
+    fingerprint = _canonical_fingerprint(_browser_operation_fingerprint_payload(
+        tool_name,
+        normalized_arguments,
+        session_key=normalized_session_key,
+        source_context=context,
+        backend_context=safe_backend_context,
+    ))
+    grant_matches = (
+        approval_grant_identity_matches(approval_grant, tool_name, arguments)
+        and approval_grant.scope == "once"
+        and approval_grant.session_key == normalized_session_key
+        and approval_grant.fingerprint == fingerprint
+        and approval_grant.browser_context == context
+    )
+    if grant_matches:
+        decision, reason, error_type, error, decision_source = (
+            ALLOW,
+            "approved browser operation matches the current request",
+            None,
+            None,
+            "once_grant",
+        )
+    elif approval_grant is not None:
+        decision, reason, error_type, error, decision_source = (
+            DENY,
+            "browser operation approval grant no longer matches this request",
+            "approval_stale",
+            "browser operation changed; request approval again",
+            "grant_validation",
+        )
+    else:
+        decision, reason, error_type, error, decision_source = (
+            ASK,
+            "browser operation requires an explicit one-time approval",
+            None,
+            None,
+            "remote_approval" if remote_approval else "interactive_approval",
+        )
+    details = {
+        "operation_type": "browser.high_risk_operation",
+        "browser_context": context,
+        "session_key_fingerprint": _identifier_fingerprint(normalized_session_key),
+        "reason": reason,
+        "fingerprint": fingerprint,
+        "risk_level": risk_level.value,
+        "allowed_grant_scopes": ["once"],
+        "backend_risk": safe_backend_context,
+        "decision_source": decision_source,
+    }
+    assessment = ApprovalAssessment(
+        tool_name=tool_name,
+        decision=decision,
+        risk_level=risk_level,
+        fingerprint=fingerprint,
+        reason=reason,
+        normalized_arguments=normalized_arguments,
+        details=details,
+        session_key=normalized_session_key,
+        error_type=error_type,
+        error=error,
+        fatal=False,
+    )
+    return apply_intelligent_approval(
+        assessment,
+        security_policy=security_policy or DEFAULT_APPROVAL_SECURITY_POLICY,
+        advisor=intelligent_advisor,
+    )
+
+
+def approved_browser_media_snapshots_candidate(
+    approval_grant: object,
+    arguments: dict,
+    *,
+    session_key: str,
+) -> tuple[dict, ...] | None:
+    """读取仅绑定本次页面分析的可信浏览器产物快照。"""
+    try:
+        normalized_session_key = normalize_approval_session_key(session_key)
+        if (
+            not approval_grant_identity_matches(
+                approval_grant, "browser_analyze_page", arguments
+            )
+            or approval_grant.scope != "once"
+            or approval_grant.session_key != normalized_session_key
+        ):
+            return None
+        return _normalize_browser_media_snapshots(approval_grant.media_snapshots)
+    except (AttributeError, ValueError):
+        return None
+
+
+def approved_browser_operation_context_candidate(
+    approval_grant: object,
+    tool_name: str,
+    arguments: dict,
+    *,
+    session_key: str,
+) -> dict | None:
+    """读取仅绑定本次浏览器高风险操作的可信上下文。"""
+    try:
+        normalized_session_key = normalize_approval_session_key(session_key)
+        if (
+            not approval_grant_identity_matches(approval_grant, tool_name, arguments)
+            or approval_grant.scope != "once"
+            or approval_grant.session_key != normalized_session_key
+        ):
+            return None
+        return _normalize_browser_context(approval_grant.browser_context)
+    except (AttributeError, ValueError):
+        return None
+
+
 def approval_request_binding_matches(
     tool_name: str,
     arguments: dict,
@@ -3487,8 +3914,13 @@ def approval_request_binding_matches(
     risk_level = details.get("risk_level")
     if risk_level not in {level.value for level in ApprovalRiskLevel}:
         return False
-    if details.get("allowed_grant_scopes") != list(
-        allowed_grant_scopes(risk_level)
+    detail_scopes = details.get("allowed_grant_scopes")
+    permitted_scopes = allowed_grant_scopes(risk_level)
+    if (
+        not isinstance(detail_scopes, list)
+        or not detail_scopes
+        or len(detail_scopes) != len(set(detail_scopes))
+        or any(scope not in permitted_scopes for scope in detail_scopes)
     ):
         return False
     backend_risk = details.get("backend_risk")
@@ -3546,6 +3978,66 @@ def approval_request_binding_matches(
             session_key=normalized_session_key,
             provider=provider,
             model=model,
+            backend_context=backend_risk,
+        ))
+        return fingerprint == expected
+
+    if tool_name == "browser_analyze_page":
+        try:
+            normalized_session_key = normalize_approval_session_key(session_key)
+            snapshots = _normalize_browser_media_snapshots(
+                details.get("media_snapshots")
+            )
+            context = _normalize_browser_context(details.get("browser_context"))
+        except ValueError:
+            return False
+        provider = details.get("provider")
+        model = details.get("model")
+        if (
+            details.get("operation_type") != "browser.external_analysis"
+            or details.get("allowed_grant_scopes") != ["once"]
+            or details.get("session_key_fingerprint")
+            != _identifier_fingerprint(normalized_session_key)
+            or provider != "doubao_ark"
+            or not isinstance(model, str)
+            or details.get("prompt") != arguments.get("prompt")
+        ):
+            return False
+        expected = _canonical_fingerprint(_browser_media_fingerprint_payload(
+            tool_name,
+            arguments,
+            snapshots,
+            session_key=normalized_session_key,
+            provider=provider,
+            model=model,
+            source_context=context,
+            backend_context=backend_risk,
+        ))
+        return fingerprint == expected
+
+    if tool_name in {
+        "browser_upload_files",
+        "browser_console",
+        "browser_delete_artifact",
+        "browser_cleanup_artifacts",
+    }:
+        try:
+            normalized_session_key = normalize_approval_session_key(session_key)
+            context = _normalize_browser_context(details.get("browser_context"))
+        except ValueError:
+            return False
+        if (
+            details.get("operation_type") != "browser.high_risk_operation"
+            or details.get("allowed_grant_scopes") != ["once"]
+            or details.get("session_key_fingerprint")
+            != _identifier_fingerprint(normalized_session_key)
+        ):
+            return False
+        expected = _canonical_fingerprint(_browser_operation_fingerprint_payload(
+            tool_name,
+            arguments,
+            session_key=normalized_session_key,
+            source_context=context,
             backend_context=backend_risk,
         ))
         return fingerprint == expected

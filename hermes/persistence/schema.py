@@ -24,7 +24,7 @@ import sqlite3
 from pathlib import Path
 
 from .database import DBError, _apply_pragmas
-from .migrations.approval import _migrate_v13_to_v14, _migrate_v28_to_v29
+from .migrations.approval import _migrate_v13_to_v14, _migrate_v28_to_v29, _migrate_v29_to_v30
 from .migrations.core import _migrate_v1_to_v2, _migrate_v26_to_v27
 from .migrations.cron import _migrate_v18_to_v19, _migrate_v19_to_v20, _migrate_v20_to_v21, _migrate_v24_to_v25
 from .migrations.delivery import _migrate_v15_to_v16, _migrate_v16_to_v17, _migrate_v21_to_v22
@@ -37,7 +37,7 @@ from .schemas import approval, core, cron, delivery, feishu, gateway, tool_execu
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 29
+LATEST_SCHEMA_VERSION = 30
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -107,6 +107,7 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     迁移到 SQLite 的任务定义与运行记录表,v19 -> v20 增加每任务
     AgentLoop 轮数上限,v20 -> v21 为 Gateway Cron 增加 fenced claim。
     旧数据不满足新约束时拒绝迁移。
+    v29 -> v30 扩展 Gateway 审批可持久化的浏览器高风险工具。
     """
     if current < 1:
         # 极少见:有 schema_version 表但版本 < 1,补基础表
@@ -458,6 +459,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 29
+
+    if current < 30:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v29_to_v30(conn)
+            _set_schema_version(conn, 30)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 30
 
     return current
 

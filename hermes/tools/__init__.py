@@ -306,6 +306,7 @@ def register_all() -> None:
     from hermes.tools.delegate import register as _delegate
     from hermes.tools.gateway_send_file import register as _gateway_send_file
     from hermes.tools.media import register as _media
+    from hermes.tools.browser import register as _browser
     from hermes.cron.tool import register as _cron
 
     _terminal(registry)
@@ -315,4 +316,5 @@ def register_all() -> None:
     _delegate(registry)
     _gateway_send_file(registry)
     _media(registry)
+    _browser(registry)
     _cron(registry)
