@@ -24,6 +24,11 @@
 - ``analyze_image`` / ``analyze_audio`` -- 限定单一媒体类型的简化入口
 - ``analyze_page(snapshot_id, prompt)`` -- 截图当前页面后交给配置好的多模态模型
 
+自主浏览与结构化提取(P9):
+- ``find_in_page`` / ``extract_links`` / ``extract_tables`` / ``extract_forms``
+  / ``extract_metadata`` -- 使用现有快照只读提取页面内容
+- ``collect_paginated`` -- 在页面、结果、文本和时间预算内跟随明确的下一页控件
+
 导航(P2,操作后自动返回新快照):
 - ``back(snapshot_id)`` -- 回退到上一页
 - ``forward(snapshot_id)`` -- 前进到下一页
@@ -183,6 +188,8 @@ class BrowserSession:
         self.artifact_dir = self._resolve_artifact_dir(artifact_dir)
         self._artifacts: dict[str, _Artifact] = {}
         self._artifact_counter = 0
+        # P9 提取器只读取当前页面；延迟创建以避免普通浏览会话加载无关逻辑。
+        self._page_extractor: Any | None = None
         # 多模态服务不参与页面状态管理。未显式提供时延迟按环境变量创建，
         # 避免未配置 ARK 时影响只使用浏览器能力的会话。
         self._multimodal_analyzer = multimodal_analyzer
@@ -923,7 +930,15 @@ class BrowserSession:
                 lambda: self._navigate_locked(url)
             )
 
-    def _navigate_locked(self, url: str) -> str:
+    def _navigate_locked(
+        self,
+        url: str,
+        *,
+        navigation_timeout_ms: int | None = None,
+        settle_navigation: bool = True,
+        post_navigation_wait_ms: int = 500,
+        event_collection_timeout_ms: int = 250,
+    ) -> str:
         """执行导航并返回统一观察结果；调用方已完成页面可用性检查。"""
         previous_url = self._page.url
         previous_position = self._position_marker_locked()
@@ -931,9 +946,13 @@ class BrowserSession:
         before_pages = set(self._pages)
         self._invalidate_snapshot_locked()
         try:
-            self._page.goto(_normalize_url(url), wait_until="load")
+            goto_kwargs: dict[str, Any] = {"wait_until": "load"}
+            if navigation_timeout_ms is not None:
+                goto_kwargs["timeout"] = navigation_timeout_ms
+            self._page.goto(_normalize_url(url), **goto_kwargs)
             # 给 AJAX 一点喘息时间;不用 networkidle --对长轮询站点会一直等。
-            self._page.wait_for_timeout(500)
+            if post_navigation_wait_ms > 0:
+                self._page.wait_for_timeout(post_navigation_wait_ms)
             return self._finalize_interaction_locked(
                 previous_url,
                 previous_position,
@@ -941,6 +960,8 @@ class BrowserSession:
                 False,
                 before_pages,
                 previous_marker,
+                settle_navigation=settle_navigation,
+                event_collection_timeout_ms=event_collection_timeout_ms,
             )
         except Exception as exc:
             return self._interaction_failure_with_observation_locked(
@@ -949,6 +970,8 @@ class BrowserSession:
                 previous_url,
                 previous_marker,
                 before_pages,
+                settle_navigation=settle_navigation,
+                event_collection_timeout_ms=event_collection_timeout_ms,
             )
 
     def snapshot(self) -> str:
@@ -1073,6 +1096,282 @@ class BrowserSession:
                 {"ok": not failures, "deleted_artifact_ids": deleted, "failures": failures},
                 ensure_ascii=False,
             )
+
+    # --- 自主浏览与结构化提取(P9) ---
+
+    def _page_extractor_locked(self) -> Any:
+        """延迟创建独立提取器，避免把页面解析细节堆入会话类。"""
+        if self._page_extractor is None:
+            from browser.extractor import PageExtractor
+
+            self._page_extractor = PageExtractor(self)
+        return self._page_extractor
+
+    def _p9_refs_for_selector_locked(self, selector: str) -> dict[int, str]:
+        """为只读提取结果补充现有快照中可确定的 ref，不写入临时属性。"""
+        if not isinstance(selector, str) or not selector:
+            return {}
+        refs: dict[int, str] = {}
+        client = self._context.new_cdp_session(self._page)
+        try:
+            for ref, backend_id in self._ref_to_backend_id.items():
+                try:
+                    resolved = client.send(
+                        "DOM.resolveNode", {"backendNodeId": backend_id}
+                    )
+                    object_id = resolved.get("object", {}).get("objectId")
+                    if not object_id:
+                        continue
+                    result = client.send(
+                        "Runtime.callFunctionOn",
+                        {
+                            "objectId": object_id,
+                            "functionDeclaration": """function(selector) {
+                                return Array.prototype.indexOf.call(
+                                    document.querySelectorAll(selector), this
+                                );
+                            }""",
+                            "arguments": [{"value": selector}],
+                            "returnByValue": True,
+                        },
+                    )
+                    index = result.get("result", {}).get("value")
+                    if isinstance(index, int) and index >= 0 and index not in refs:
+                        refs[index] = ref
+                except Exception as exc:
+                    if self._is_permanent_browser_error(exc):
+                        raise
+                    # 某个 ref 在读取期间被框架重绘时，只是不再能为该项补 ref。
+                    if self._is_transient_wait_error(exc):
+                        continue
+                    raise
+        finally:
+            try:
+                client.detach()
+            except Exception:
+                pass
+        return refs
+
+    def _p9_navigate_locked(self, url: str, timeout_ms: int) -> str:
+        """分页专用 URL 跟随，复用导航、对话框和快照收尾规则。"""
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+        ):
+            return _err("invalid_args", "分页导航 timeout_ms 必须是正整数")
+        return self._execute_with_dialog_policy_locked(
+            lambda: self._navigate_locked(
+                url,
+                navigation_timeout_ms=timeout_ms,
+                settle_navigation=False,
+                post_navigation_wait_ms=min(200, timeout_ms),
+                event_collection_timeout_ms=min(250, timeout_ms),
+            )
+        )
+
+    def _p9_click_next_button_locked(self, index: int, timeout_ms: int) -> str:
+        """只点击提取器识别出的明确下一页按钮，不接受任意页面选择器。"""
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            return _err("invalid_args", "下一页按钮索引无效")
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+        ):
+            return _err("invalid_args", "分页点击 timeout_ms 必须是正整数")
+
+        def click_next() -> str:
+            before_pages = set(self._pages)
+            previous_url = self._page.url
+            previous_position = self._position_marker_locked()
+            previous_marker = self._dom_marker_locked()
+            self._invalidate_snapshot_locked()
+            try:
+                self._page.locator('button, [role="button"]').nth(index).click(
+                    timeout=timeout_ms
+                )
+            except Exception as exc:
+                return self._finalize_interaction_locked(
+                    previous_url,
+                    None,
+                    "collect_paginated_next",
+                    False,
+                    before_pages,
+                    previous_marker,
+                    error_type=self._classify_interaction_error(exc),
+                    error=f"collect_paginated_next 失败: {exc}",
+                    record_navigation=False,
+                    settle_navigation=False,
+                    event_collection_timeout_ms=min(250, timeout_ms),
+                )
+            return self._finalize_interaction_locked(
+                previous_url,
+                previous_position,
+                "collect_paginated_next",
+                False,
+                before_pages,
+                previous_marker,
+                settle_navigation=False,
+                event_collection_timeout_ms=min(250, timeout_ms),
+            )
+
+        return self._execute_with_dialog_policy_locked(click_next)
+
+    def _p9_read_result_locked(
+        self,
+        snapshot_id: str,
+        operation: Callable[[Any], dict[str, Any]],
+    ) -> str:
+        """为纯读取 P9 接口共享页面可用性和快照校验，不换发快照。"""
+        self._require_started_locked()
+        no_page_error = self._require_current_page_locked()
+        if no_page_error is not None:
+            return no_page_error
+        stale_error = self._validate_snapshot_locked(snapshot_id)
+        if stale_error is not None:
+            return stale_error
+        try:
+            payload = operation(self._page_extractor_locked())
+        except Exception as exc:
+            from browser.extractor import ExtractionError
+
+            if isinstance(exc, ExtractionError):
+                return _err(exc.error_type, exc.message)
+            return _err("extract_failed", f"页面结构化提取失败: {exc}")
+        if not isinstance(payload, dict):
+            return _err("extract_failed", "页面结构化提取返回了无效结果")
+        payload.update(
+            {
+                "ok": True,
+                "snapshot_id": snapshot_id,
+                "url": self._page.url,
+                "page_id": self._current_page_id,
+            }
+        )
+        try:
+            return json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            return _err("extract_failed", f"页面结构化结果无法序列化: {exc}")
+
+    def find_in_page(self, query: str, snapshot_id: str, max_results: int = 20) -> str:
+        """只读查找当前页面文本，不滚动、不调用浏览器查找窗口。"""
+        with self._lock:
+            return self._p9_read_result_locked(
+                snapshot_id,
+                lambda extractor: extractor.find_in_page(query, max_results),
+            )
+
+    def extract_links(self, snapshot_id: str, max_items: int = 100) -> str:
+        """只读提取当前页面链接及可用 ref，不改变快照生命周期。"""
+        with self._lock:
+            return self._p9_read_result_locked(
+                snapshot_id, lambda extractor: extractor.extract_links(max_items)
+            )
+
+    def extract_tables(self, snapshot_id: str, max_items: int = 100) -> str:
+        """只读提取页面表格，不滚动或修改 DOM。"""
+        with self._lock:
+            return self._p9_read_result_locked(
+                snapshot_id, lambda extractor: extractor.extract_tables(max_items)
+            )
+
+    def extract_forms(self, snapshot_id: str, max_items: int = 100) -> str:
+        """只读提取表单结构，绝不提交、填充或聚焦控件。"""
+        with self._lock:
+            return self._p9_read_result_locked(
+                snapshot_id, lambda extractor: extractor.extract_forms(max_items)
+            )
+
+    def extract_metadata(self, snapshot_id: str) -> str:
+        """只读提取 title、meta、Open Graph 与合法 JSON-LD。"""
+        with self._lock:
+            return self._p9_read_result_locked(
+                snapshot_id, lambda extractor: extractor.extract_metadata()
+            )
+
+    def collect_paginated(
+        self,
+        snapshot_id: str,
+        *,
+        extract_kind: str,
+        max_pages: int = 5,
+        max_items: int = 200,
+        max_text_chars: int = 100_000,
+        same_origin: bool = True,
+        timeout_ms: int | None = None,
+    ) -> str:
+        """在固定预算内提取并跟随明确下一页控件；自动翻页会换发快照。"""
+        with self._lock:
+            self._require_started_locked()
+            no_page_error = self._require_current_page_locked()
+            if no_page_error is not None:
+                return no_page_error
+            stale_error = self._validate_snapshot_locked(snapshot_id)
+            if stale_error is not None:
+                return stale_error
+            try:
+                from browser.extractor import BrowseBudget, ExtractionError
+
+                budget = BrowseBudget.create(
+                    max_pages=max_pages,
+                    max_items=max_items,
+                    max_text_chars=max_text_chars,
+                    timeout_ms=timeout_ms,
+                )
+                payload = self._page_extractor_locked().collect_paginated(
+                    snapshot_id,
+                    extract_kind=extract_kind,
+                    budget=budget,
+                    same_origin=same_origin,
+                )
+            except Exception as exc:
+                if isinstance(exc, ExtractionError):
+                    return self._current_observation_error_locked(
+                        exc.error_type, exc.message
+                    )
+                return self._current_observation_error_locked(
+                    "extract_failed", f"分页收集失败: {exc}"
+                )
+            if not isinstance(payload, dict):
+                return self._current_observation_error_locked(
+                    "extract_failed", "分页收集返回了无效结果"
+                )
+            observation = self._current_observation_locked()
+            if (
+                observation is not None
+                and payload.get("snapshot_id") == observation[1]
+            ):
+                payload["snapshot"] = observation[0]
+            try:
+                frames = self._frame_tree_locked()
+            except Exception as exc:
+                return self._current_observation_error_locked(
+                    "page_closed"
+                    if self._is_permanent_browser_error(exc)
+                    else "extract_failed",
+                    f"分页收集后读取页面结构失败: {exc}",
+                )
+            dialogs = payload.get("dialogs")
+            payload.update(
+                {
+                    "ok": True,
+                    "page_id": self._current_page_id,
+                    "url": self._page.url,
+                    "frames": frames,
+                    "dialogs": dialogs if isinstance(dialogs, list) else [],
+                    "event_type": payload.get("event_type")
+                    if isinstance(payload.get("event_type"), str)
+                    else "none",
+                    "used_fallback": payload.get("used_fallback") is True,
+                }
+            )
+            try:
+                return json.dumps(payload, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                return self._current_observation_error_locked(
+                    "extract_failed", f"分页收集结果无法序列化: {exc}"
+                )
 
     # --- 图片与音频理解(P8) ---
 
@@ -3335,6 +3634,9 @@ class BrowserSession:
         previous_url: str,
         previous_marker: str,
         before_pages: set[str],
+        *,
+        settle_navigation: bool = True,
+        event_collection_timeout_ms: int = 250,
     ) -> str:
         """动作已发出但失败时，尽量返回当前的新观察结果。"""
         if error_type == "page_closed":
@@ -3349,6 +3651,8 @@ class BrowserSession:
             error_type=error_type,
             error=error,
             record_navigation=False,
+            settle_navigation=settle_navigation,
+            event_collection_timeout_ms=event_collection_timeout_ms,
         )
 
     def _dom_marker_locked(self) -> str:
@@ -3415,16 +3719,21 @@ class BrowserSession:
         record_navigation: bool = True,
         settle_navigation: bool = True,
         snapshot_attempts: int = 1,
+        event_collection_timeout_ms: int = 250,
     ) -> str:
         """统一归并 popup、对话框、导航和普通 DOM 更新后的观察结果。"""
-        # 最多约 250ms 收集异步 popup/dialog，不把一次固定 sleep 当作事件事实。
+        # 在短而明确的窗口收集异步 popup/dialog，不把一次固定 sleep 当作事件事实。
         new_pages: list[str] = []
-        for _ in range(5):
+        event_deadline = monotonic() + max(0, event_collection_timeout_ms) / 1000.0
+        while True:
             new_pages = [page_id for page_id in self._pages if page_id not in before_pages]
             if new_pages or self._last_dialog_event is not None:
                 break
+            remaining_ms = int((event_deadline - monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
             try:
-                self._page.wait_for_timeout(50)
+                self._page.wait_for_timeout(min(50, remaining_ms))
             except Exception as exc:
                 return _err(self._classify_interaction_error(exc), f"{action_name} 后页面不可用: {exc}")
         event_type = "none"

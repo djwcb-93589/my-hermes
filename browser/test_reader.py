@@ -71,6 +71,15 @@ cookie/表单/延迟/下载/iframe/弹窗等真实 HTTP 语义,覆盖已实现�
 59. 产物生命周期:list/get/delete/cleanup_artifacts
 60. screenshot/download/upload 拒绝 stale snapshot_id
 61. get/delete 不存在 artifact_id 返回 artifact_not_found
+62. analyze_* 参数校验(prompt 空/sources 空/timeout 非正)
+63. analyze_media source 解析:artifact_id/工作区路径/不存在/绝对路径/含..
+64. analyze_image 类型不匹配(传音频)返回 unsupported_media_type
+65. analyze_image 不支持的扩展名返回 unsupported_media_type
+66. analyze_image 有效图片 + 未配置 ARK_API_KEY 返回 multimodal_not_configured
+67. analyze_page stale snapshot_id 拒绝
+68. analyze_page 参数校验(prompt 空/full_page 非布尔)
+69. analyze_page 未配置 key 返回 multimodal_not_configured
+70. analyze_audio 类型不匹配(传图片)
 
 playwright 或浏览器未装时整组 skip,不报 error。
 """
@@ -1708,6 +1717,247 @@ def test_artifact_not_found_errors() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P8 多模态测试:analyze_media / analyze_image / analyze_audio / analyze_page
+#
+# 多模态分析需调豆包模型(ARK_API_KEY + DOUBAO_MULTIMODAL_MODEL)。
+# 无 key 时仍能测:参数校验、source 解析、类型不匹配、未配置错误 --
+# 这些在调模型前就返回。有 key 时额外测真实分析(单独 skip)。
+# ---------------------------------------------------------------------------
+
+
+def _make_png_bytes() -> bytes:
+    """造一个最小有效 PNG(1x1 红点),供 analyze_image 测试。"""
+    # 标准 1x1 红色 PNG 字节。
+    return bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108020000"
+        "00907753de0000000c4944415408d763f8ffff3f0005fe02fe5c9d96"
+        "3a0000000049454e44ae426082"
+    )
+
+
+def _make_fake_audio_bytes() -> bytes:
+    """造一段假的 mp3 字节(内容无效但扩展名是 .mp3),用于测类型不匹配。
+
+    analyze 只按扩展名判定类型(validate_media),不真正解码,所以假字节足够。
+    """
+    return b"ID3\x03\x00" + b"\x00" * 200
+
+
+def _write_workspace_file(name: str, content: bytes) -> str:
+    """在工作区(cwd)内写一个临时文件,返回相对路径名(供 analyze 当 source)。"""
+    Path(name).write_bytes(content)
+    return name
+
+
+def test_analyze_media_rejects_invalid_args() -> None:
+    """analyze_* 参数校验:prompt 空、sources 空、timeout 非正。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _observation(s.navigate(_fixture_url("/")))
+        # prompt 空。
+        r = _parse_result(s.analyze_image("a.png", "  ", timeout_ms=None))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args", (
+            f"空 prompt 应 invalid_args: {r}"
+        )
+        # sources 空(空列表)。
+        r = _parse_result(s.analyze_media([], "描述", timeout_ms=None))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_media_path", (
+            f"空 sources 应 invalid_media_path: {r}"
+        )
+        # sources 是非法类型(数字)。
+        r = _parse_result(s.analyze_media(123, "描述", timeout_ms=None))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_media_path"
+        # timeout 非正。
+        r = _parse_result(s.analyze_image("a.png", "描述", timeout_ms=0))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args"
+        r = _parse_result(s.analyze_image("a.png", "描述", timeout_ms=-5))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args"
+        # timeout 是 bool。
+        r = _parse_result(s.analyze_image("a.png", "描述", timeout_ms=True))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args"
+
+
+def test_analyze_media_source_resolution() -> None:
+    """source 解析:artifact_id 有效、工作区路径、不存在、绝对路径、含..。"""
+    from browser.session import BrowserSession
+    png_name = _write_workspace_file(
+        "analyze_test_pic.png", _make_png_bytes()
+    )
+    try:
+        with BrowserSession() as s:
+            _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+            # screenshot 产生一个 artifact(PNG)。
+            shot = _parse_result(s.screenshot(snapshot_id))
+            artifact_id = shot["artifact"]["artifact_id"]
+
+            # 用 artifact_id 作 source -- 解析通过(到模型阶段才报未配置)。
+            r = _parse_result(s.analyze_image(artifact_id, "描述这张图"))
+            # 未配置 key 时应 multimodal_not_configured(说明 source 解析成功)。
+            if r.get("error_type") == "multimodal_not_configured":
+                pass  # source 解析成功,只是没配 key
+            elif r.get("ok"):
+                pass  # 配了 key,真实分析了
+            else:
+                assert False, f"artifact_id source 解析应成功或未配置,实际: {r}"
+
+            # 工作区相对路径(有效 PNG)-- 同样到模型阶段。
+            r = _parse_result(s.analyze_image(png_name, "描述"))
+            assert r.get("ok") or r.get("error_type") == "multimodal_not_configured", (
+                f"工作区 PNG source 应解析成功: {r}"
+            )
+
+            # 不存在的路径。
+            r = _parse_result(s.analyze_image("nonexistent_file.png", "描述"))
+            assert r.get("ok") is False
+            assert r.get("error_type") == "media_not_found", (
+                f"不存在路径应 media_not_found: {r}"
+            )
+
+            # 绝对路径 -- 拒绝(必须在 workspace 内)。
+            r = _parse_result(s.analyze_image(str(Path("x.png").resolve()), "描述"))
+            assert r.get("ok") is False
+            assert r.get("error_type") == "invalid_media_path", (
+                f"绝对路径应 invalid_media_path: {r}"
+            )
+
+            # 含 .. 的路径。
+            r = _parse_result(s.analyze_image("../escape.png", "描述"))
+            assert r.get("ok") is False
+            assert r.get("error_type") == "invalid_media_path"
+    finally:
+        Path(png_name).unlink(missing_ok=True)
+
+
+def test_analyze_image_rejects_unsupported_extension() -> None:
+    """analyze_image 不支持的扩展名返回 unsupported_media_type。"""
+    from browser.session import BrowserSession
+    # 造一个 .txt 文件(非图片非音频)。
+    txt_name = _write_workspace_file("analyze_test.txt", b"not an image")
+    try:
+        with BrowserSession() as s:
+            _observation(s.navigate(_fixture_url("/")))
+            r = _parse_result(s.analyze_image(txt_name, "描述"))
+            assert r.get("ok") is False
+            assert r.get("error_type") == "unsupported_media_type", (
+                f".txt 应 unsupported_media_type: {r}"
+            )
+    finally:
+        Path(txt_name).unlink(missing_ok=True)
+
+
+def test_analyze_image_type_mismatch_with_audio() -> None:
+    """analyze_image 传音频文件返回 unsupported_media_type(类型不匹配)。
+
+    类型不匹配在 validate_media 阶段判定,不需要 API key。
+    """
+    from browser.session import BrowserSession
+    mp3_name = _write_workspace_file(
+        "analyze_test_audio.mp3", _make_fake_audio_bytes()
+    )
+    try:
+        with BrowserSession() as s:
+            _observation(s.navigate(_fixture_url("/")))
+            # analyze_image 只接受 image,传 mp3 应类型不匹配。
+            r = _parse_result(s.analyze_image(mp3_name, "描述"))
+            assert r.get("ok") is False
+            assert r.get("error_type") == "unsupported_media_type", (
+                f"analyze_image 传音频应 unsupported_media_type: {r}"
+            )
+    finally:
+        Path(mp3_name).unlink(missing_ok=True)
+
+
+def test_analyze_audio_type_mismatch_with_image() -> None:
+    """analyze_audio 传图片返回 unsupported_media_type。"""
+    from browser.session import BrowserSession
+    png_name = _write_workspace_file(
+        "analyze_test_pic2.png", _make_png_bytes()
+    )
+    try:
+        with BrowserSession() as s:
+            _observation(s.navigate(_fixture_url("/")))
+            r = _parse_result(s.analyze_audio(png_name, "描述"))
+            assert r.get("ok") is False
+            assert r.get("error_type") == "unsupported_media_type", (
+                f"analyze_audio 传图片应 unsupported_media_type: {r}"
+            )
+    finally:
+        Path(png_name).unlink(missing_ok=True)
+
+
+def test_analyze_image_not_configured_returns_error() -> None:
+    """有效图片 + 未配置 ARK_API_KEY 返回 multimodal_not_configured。
+
+    已配置 key 时这条会真实调模型(跳到 ok 分支),所以已配置环境不断言未配置。
+    """
+    import os
+    from browser.session import BrowserSession
+    if os.getenv("ARK_API_KEY") and os.getenv("DOUBAO_MULTIMODAL_MODEL"):
+        return  # 已配置,这个"未配置"测试不适用,跳过
+    png_name = _write_workspace_file(
+        "analyze_test_pic3.png", _make_png_bytes()
+    )
+    try:
+        with BrowserSession() as s:
+            _observation(s.navigate(_fixture_url("/")))
+            r = _parse_result(s.analyze_image(png_name, "描述这张图片"))
+            assert r.get("ok") is False, f"未配置应失败: {r}"
+            assert r.get("error_type") == "multimodal_not_configured", (
+                f"未配置应 multimodal_not_configured: {r}"
+            )
+    finally:
+        Path(png_name).unlink(missing_ok=True)
+
+
+def test_analyze_page_rejects_stale_snapshot() -> None:
+    """analyze_page 拒绝 stale snapshot_id。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, stale_id = _observation(s.navigate(_fixture_url("/")))
+        _observation(s.navigate(_fixture_url("/")))  # 让 stale_id 失效
+        r = _parse_result(s.analyze_page(stale_id, "描述页面"))
+        assert r.get("ok") is False, f"analyze_page 应拒绝 stale: {r}"
+        assert r.get("error_type") == "stale_snapshot", (
+            f"错误类型应为 stale_snapshot: {r.get('error_type')}"
+        )
+
+
+def test_analyze_page_rejects_invalid_args() -> None:
+    """analyze_page 参数校验:prompt 空、full_page 非布尔。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        # prompt 空。
+        r = _parse_result(s.analyze_page(snapshot_id, "  "))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args", (
+            f"空 prompt 应 invalid_args: {r}"
+        )
+        # full_page 非布尔。
+        r = _parse_result(s.analyze_page(snapshot_id, "描述", full_page="yes"))  # type: ignore[arg-type]
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args", (
+            f"full_page 非布尔应 invalid_args: {r}"
+        )
+        # timeout 非正。
+        r = _parse_result(s.analyze_page(snapshot_id, "描述", timeout_ms=0))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args"
+
+
+def test_analyze_page_not_configured_returns_error() -> None:
+    """analyze_page 未配置 key 时返回 multimodal_not_configured(截图成功后)。"""
+    import os
+    from browser.session import BrowserSession
+    if os.getenv("ARK_API_KEY") and os.getenv("DOUBAO_MULTIMODAL_MODEL"):
+        return  # 已配置,跳过"未配置"测试
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        r = _parse_result(s.analyze_page(snapshot_id, "描述这个页面"))
+        assert r.get("ok") is False, f"未配置应失败: {r}"
+        assert r.get("error_type") == "multimodal_not_configured", (
+            f"未配置应 multimodal_not_configured: {r.get('error_type')}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 简单测试运行器:依次跑,统计 pass/fail,失败打印 traceback。
 # ---------------------------------------------------------------------------
 
@@ -1844,6 +2094,24 @@ _TESTS: list[tuple[str, Any]] = [
      test_p7_actions_reject_stale_snapshot),
     ("test_artifact_not_found_errors",
      test_artifact_not_found_errors),
+    ("test_analyze_media_rejects_invalid_args",
+     test_analyze_media_rejects_invalid_args),
+    ("test_analyze_media_source_resolution",
+     test_analyze_media_source_resolution),
+    ("test_analyze_image_rejects_unsupported_extension",
+     test_analyze_image_rejects_unsupported_extension),
+    ("test_analyze_image_type_mismatch_with_audio",
+     test_analyze_image_type_mismatch_with_audio),
+    ("test_analyze_audio_type_mismatch_with_image",
+     test_analyze_audio_type_mismatch_with_image),
+    ("test_analyze_image_not_configured_returns_error",
+     test_analyze_image_not_configured_returns_error),
+    ("test_analyze_page_rejects_stale_snapshot",
+     test_analyze_page_rejects_stale_snapshot),
+    ("test_analyze_page_rejects_invalid_args",
+     test_analyze_page_rejects_invalid_args),
+    ("test_analyze_page_not_configured_returns_error",
+     test_analyze_page_not_configured_returns_error),
 ]
 
 
