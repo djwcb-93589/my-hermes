@@ -27,6 +27,13 @@
   逃生舱:AX tree 看不到的元素、结构化数据用它。危险:JS 改 DOM 后旧 ref
   失效,按交互操作处理(失效旧观察、取新快照)。接 agent 时必须 unknown_on_crash。
 
+条件等待(P4,结束后自动返回新快照):
+- ``wait_for_url(pattern, snapshot_id, timeout_ms=None)`` -- 等待 URL 匹配 glob 模式
+- ``wait_for_text(text, snapshot_id, timeout_ms=None)`` -- 等待可见文本出现
+- ``wait_for_ref(ref, snapshot_id, timeout_ms=None)`` -- 等待已有 ref 对应元素可见
+- ``wait_for_load_state(state, snapshot_id, timeout_ms=None)`` -- 等待页面加载状态
+  等待超时或被 ``cancel_event`` 取消时也会返回当前页面的新快照，调用方可继续决策。
+
 为什么是同步
 ------------
 独立测试阶段 sync 更简洁:CLI 不用 ``asyncio.run()``,测试不用 async def。
@@ -59,7 +66,9 @@ import json
 import math
 import sys
 import threading
-from typing import Any
+from fnmatch import fnmatchcase
+from time import monotonic
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from browser.accessibility import format_snapshot
@@ -620,6 +629,258 @@ class BrowserSession:
                 return _err("snapshot_failed", f"滚动后取快照失败: {exc}")
             return _ok(snapshot, new_snapshot_id, self._page.url)
 
+    # --- 条件等待(P4) ---
+    # 等待会在页面状态变化后生成新快照，因此与交互操作一样会使旧 snapshot_id 失效。
+    def wait_for_url(
+        self,
+        pattern: str,
+        snapshot_id: str,
+        *,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """等待当前 URL 匹配 glob ``pattern``，例如 ``"**/search*"``。"""
+        if not isinstance(pattern, str) or not pattern.strip():
+            return _err("invalid_args", "pattern 必须是非空字符串")
+        with self._lock:
+            return self._wait_with_condition_locked(
+                snapshot_id=snapshot_id,
+                timeout_ms=timeout_ms,
+                cancel_event=cancel_event,
+                condition=lambda: fnmatchcase(self._page.url, pattern),
+                description=f"URL 匹配 {pattern!r}",
+            )
+
+    def wait_for_text(
+        self,
+        text: str,
+        snapshot_id: str,
+        *,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """等待页面出现可见的 ``text``。"""
+        if not isinstance(text, str) or not text.strip():
+            return _err("invalid_args", "text 必须是非空字符串")
+
+        def text_is_visible() -> bool:
+            locator = self._page.get_by_text(text, exact=False)
+            for index in range(locator.count()):
+                if locator.nth(index).is_visible(timeout=1):
+                    return True
+            return False
+
+        with self._lock:
+            return self._wait_with_condition_locked(
+                snapshot_id=snapshot_id,
+                timeout_ms=timeout_ms,
+                cancel_event=cancel_event,
+                condition=text_is_visible,
+                description=f"可见文本 {text!r}",
+            )
+
+    def wait_for_ref(
+        self,
+        ref: str,
+        snapshot_id: str,
+        *,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """等待指定快照中的 ``ref`` 对应元素变为可见。"""
+        if not isinstance(ref, str) or not ref.strip():
+            return _err("invalid_args", "ref 必须是非空字符串")
+        with self._lock:
+            self._require_started_locked()
+            stale_error = self._validate_snapshot_locked(snapshot_id)
+            if stale_error is not None:
+                return stale_error
+            backend_id = self._ref_to_backend_id.get(ref)
+            if backend_id is None:
+                return _err(
+                    "invalid_ref",
+                    f"ref {ref} 无效。请先调用 snapshot 获取当前页面的新 ref。",
+                )
+
+            def ref_is_visible() -> bool:
+                return self._is_backend_node_visible_locked(backend_id)
+
+            return self._wait_with_condition_locked(
+                snapshot_id=snapshot_id,
+                timeout_ms=timeout_ms,
+                cancel_event=cancel_event,
+                condition=ref_is_visible,
+                description=f"元素 {ref}",
+            )
+
+    def wait_for_load_state(
+        self,
+        state: str,
+        snapshot_id: str,
+        *,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """等待 ``domcontentloaded``、``load`` 或 ``networkidle`` 状态。"""
+        normalized_state = state.lower().strip() if isinstance(state, str) else ""
+        if normalized_state not in {"domcontentloaded", "load", "networkidle"}:
+            return _err(
+                "invalid_args",
+                "state 必须是 domcontentloaded、load 或 networkidle",
+            )
+        with self._lock:
+            return self._wait_with_condition_locked(
+                snapshot_id=snapshot_id,
+                timeout_ms=timeout_ms,
+                cancel_event=cancel_event,
+                condition=lambda: self._is_load_state_ready_locked(normalized_state),
+                description=f"加载状态 {normalized_state}",
+            )
+
+    def _wait_with_condition_locked(
+        self,
+        *,
+        snapshot_id: str,
+        timeout_ms: int | None,
+        cancel_event: threading.Event | None,
+        condition: Callable[[], bool],
+        description: str,
+    ) -> str:
+        """在已持锁的会话中轮询条件，并统一处理成功、超时和取消。"""
+        self._require_started_locked()
+        stale_error = self._validate_snapshot_locked(snapshot_id)
+        if stale_error is not None:
+            return stale_error
+        resolved_timeout = self._resolve_wait_timeout(timeout_ms)
+        if resolved_timeout is None:
+            return _err(
+                "invalid_args",
+                "timeout_ms 必须是大于 0 的整数或 None",
+            )
+
+        previous_url = self._page.url
+        previous_position = self._position_marker_locked()
+        # 条件等待期间 DOM、URL 都可能已变化；开始等待即废弃旧观察结果。
+        self._invalidate_snapshot_locked()
+        deadline = monotonic() + resolved_timeout / 1000
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return self._finish_wait_failure_locked(
+                    "wait_cancelled",
+                    f"等待{description}已取消",
+                    previous_url,
+                    previous_position,
+                )
+            try:
+                if condition():
+                    return self._finish_wait_success_locked(
+                        previous_url, previous_position
+                    )
+            except Exception as exc:
+                return self._finish_wait_failure_locked(
+                    "wait_failed",
+                    f"等待{description}时页面访问失败: {exc}",
+                    previous_url,
+                    previous_position,
+                )
+
+            remaining_ms = int((deadline - monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return self._finish_wait_failure_locked(
+                    "wait_timeout",
+                    f"等待{description}超时({resolved_timeout}ms)",
+                    previous_url,
+                    previous_position,
+                )
+            # 使用短轮询保持取消响应；同步 API 在这里阻塞的是 BrowserSession 所在线程。
+            self._page.wait_for_timeout(min(100, remaining_ms))
+
+    def _resolve_wait_timeout(self, timeout_ms: int | None) -> int | None:
+        """解析单次等待的超时；None 继承会话默认值。"""
+        if timeout_ms is None:
+            return self._timeout_ms
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+            return None
+        return timeout_ms
+
+    def _is_backend_node_visible_locked(self, backend_id: int) -> bool:
+        """通过 backendDOMNodeId 检查元素仍连接在页面中且可见。"""
+        client = self._context.new_cdp_session(self._page)
+        try:
+            try:
+                resolved = client.send("DOM.resolveNode", {"backendNodeId": backend_id})
+                object_id = resolved.get("object", {}).get("objectId")
+                if not object_id:
+                    return False
+                result = client.send(
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": object_id,
+                        "functionDeclaration": _JS_IS_VISIBLE,
+                        "returnByValue": True,
+                    },
+                )
+            except Exception:
+                # 元素被框架重绘而脱离 DOM 时，不是浏览器故障，只代表条件未满足。
+                return False
+            return result.get("result", {}).get("value") is True
+        finally:
+            client.detach()
+
+    def _is_load_state_ready_locked(self, state: str) -> bool:
+        """以非阻塞短探测检查加载状态，避免一次调用占满总超时。"""
+        if state == "domcontentloaded":
+            return self._page.evaluate("document.readyState") in {"interactive", "complete"}
+        if state == "load":
+            return self._page.evaluate("document.readyState") == "complete"
+        try:
+            # 给本次探测一个很短的窗口，既能接住即将发生的 networkidle，
+            # 也不会让取消信号被一次长等待拖住。
+            self._page.wait_for_load_state("networkidle", timeout=100)
+            return True
+        except Exception:
+            return False
+
+    def _finish_wait_success_locked(
+        self,
+        previous_url: str,
+        previous_position: str,
+    ) -> str:
+        """等待成功后采集新快照，并同步内部历史记录。"""
+        try:
+            snapshot, new_snapshot_id = self._observe_after_action_locked(
+                previous_url,
+                previous_position=previous_position,
+                record_navigation=True,
+            )
+        except Exception as exc:
+            return _err("snapshot_failed", f"等待结束后获取快照失败: {exc}")
+        return _ok(snapshot, new_snapshot_id, self._page.url)
+
+    def _finish_wait_failure_locked(
+        self,
+        error_type: str,
+        error: str,
+        previous_url: str,
+        previous_position: str,
+    ) -> str:
+        """等待未满足时也返回当前页面快照，调用方可据此继续决策。"""
+        try:
+            snapshot, new_snapshot_id = self._observe_after_action_locked(
+                previous_url,
+                previous_position=previous_position,
+                record_navigation=True,
+            )
+        except Exception as exc:
+            return _err("snapshot_failed", f"等待结束后获取快照失败: {exc}")
+        return _err_with_observation(
+            error_type,
+            error,
+            snapshot,
+            new_snapshot_id,
+            self._page.url,
+        )
+
     # --- 高级读取(P3) ---
     # get_text 是纯读取,不改变页面状态,因此不失效旧 snapshot_id、不取新快照。
     # 调用方拿到文本后,手里的 ref 仍然有效,可继续 click/type。
@@ -924,6 +1185,18 @@ _JS_GET_TEXT = """function() {
     return this.textContent || '';
 }"""
 
+# 通过 CDP 解析旧 ref 时，以连接状态、计算样式和布局尺寸共同判断可见性。
+_JS_IS_VISIBLE = """function() {
+    if (!(this instanceof Element) || !this.isConnected) return false;
+    const style = window.getComputedStyle(this);
+    if (style.display === 'none' || style.visibility === 'hidden' ||
+        style.visibility === 'collapse' || Number(style.opacity) === 0) {
+        return false;
+    }
+    const rect = this.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}"""
+
 # console():包装用户表达式,捕获 JS 异常,JSON.stringify 兜底非可序列化返回值。
 # 用户表达式作为字符串注入,在函数体内 eval 执行(保留其作用域语义)。
 # 返回 {ok, result, unserializable, error} 结构供 Python 解析。
@@ -1000,6 +1273,27 @@ def _err_no_history(snapshot: str, snapshot_id: str, url: str) -> str:
             "ok": False,
             "error_type": "no_history",
             "error": "没有浏览历史可回退/前进",
+            "snapshot_id": snapshot_id,
+            "snapshot": snapshot,
+            "url": url,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _err_with_observation(
+    error_type: str,
+    error: str,
+    snapshot: str,
+    snapshot_id: str,
+    url: str,
+) -> str:
+    """返回带当前观察结果的失败，便于等待失败后继续决策。"""
+    return json.dumps(
+        {
+            "ok": False,
+            "error_type": error_type,
+            "error": error,
             "snapshot_id": snapshot_id,
             "snapshot": snapshot,
             "url": url,

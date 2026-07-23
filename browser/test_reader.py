@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 import traceback
 from typing import Any
 
@@ -887,6 +888,110 @@ def test_console_rejects_empty_expression() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P4 测试:条件等待
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_url_returns_new_snapshot() -> None:
+    """当前 URL 已匹配时，wait_for_url 应立即成功并换发快照。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>ready</p>")
+        )
+        result = _parse_result(
+            s.wait_for_url("data:text/html*", snapshot_id, timeout_ms=500)
+        )
+        assert result.get("ok") is True, f"wait_for_url 失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_for_text_returns_new_snapshot() -> None:
+    """页面已有可见文本时，wait_for_text 应成功。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>visible target</p>")
+        )
+        result = _parse_result(s.wait_for_text("visible target", snapshot_id, timeout_ms=500))
+        assert result.get("ok") is True, f"wait_for_text 失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_for_ref_returns_new_snapshot() -> None:
+    """快照中仍可见的元素应能通过 wait_for_ref 确认。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snapshot, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<button>Continue</button>")
+        )
+        ref = _find_ref_for_role(snapshot, "button", "Continue")
+        assert ref, "测试页缺少 button ref"
+        result = _parse_result(s.wait_for_ref(ref, snapshot_id, timeout_ms=500))
+        assert result.get("ok") is True, f"wait_for_ref 失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_for_load_state_returns_new_snapshot() -> None:
+    """已完成的 data 页面应满足 load 状态。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>loaded</p>")
+        )
+        result = _parse_result(s.wait_for_load_state("load", snapshot_id, timeout_ms=500))
+        assert result.get("ok") is True, f"wait_for_load_state 失败: {result}"
+        assert result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_timeout_returns_current_observation() -> None:
+    """条件超时时应保留当前页面的新快照，供调用方继续操作。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>available</p>")
+        )
+        result = _parse_result(s.wait_for_text("never appears", snapshot_id, timeout_ms=100))
+        assert result.get("ok") is False, f"未出现文本不应成功: {result}"
+        assert result.get("error_type") == "wait_timeout"
+        assert result.get("snapshot"), "超时时应返回当前快照"
+        assert result.get("snapshot_id") and result.get("snapshot_id") != snapshot_id
+
+
+def test_wait_cancelled_returns_current_observation() -> None:
+    """取消等待应立刻返回 wait_cancelled 及当前页面的新快照。"""
+    from browser.session import BrowserSession
+    cancel_event = threading.Event()
+    cancel_event.set()
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>available</p>")
+        )
+        result = _parse_result(
+            s.wait_for_text(
+                "never appears",
+                snapshot_id,
+                timeout_ms=500,
+                cancel_event=cancel_event,
+            )
+        )
+        assert result.get("ok") is False, f"已取消等待不应成功: {result}"
+        assert result.get("error_type") == "wait_cancelled"
+        assert result.get("snapshot"), "取消时应返回当前快照"
+
+
+def test_wait_rejects_stale_snapshot() -> None:
+    """所有等待入口都必须拒绝过期的 snapshot_id。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, stale_id = _observation(s.navigate("data:text/html;charset=utf-8,<p>a</p>"))
+        _observation(s.navigate("data:text/html;charset=utf-8,<p>b</p>"))
+        result = _parse_result(s.wait_for_text("b", stale_id, timeout_ms=500))
+        assert result.get("ok") is False, f"过期 snapshot_id 不应成功: {result}"
+        assert result.get("error_type") == "stale_snapshot"
+
+
+# ---------------------------------------------------------------------------
 # 简单测试运行器:依次跑,统计 pass/fail,失败打印 traceback。
 # ---------------------------------------------------------------------------
 
@@ -963,6 +1068,20 @@ _TESTS: list[tuple[str, Any]] = [
      test_console_rejects_stale_snapshot),
     ("test_console_rejects_empty_expression",
      test_console_rejects_empty_expression),
+    ("test_wait_for_url_returns_new_snapshot",
+     test_wait_for_url_returns_new_snapshot),
+    ("test_wait_for_text_returns_new_snapshot",
+     test_wait_for_text_returns_new_snapshot),
+    ("test_wait_for_ref_returns_new_snapshot",
+     test_wait_for_ref_returns_new_snapshot),
+    ("test_wait_for_load_state_returns_new_snapshot",
+     test_wait_for_load_state_returns_new_snapshot),
+    ("test_wait_timeout_returns_current_observation",
+     test_wait_timeout_returns_current_observation),
+    ("test_wait_cancelled_returns_current_observation",
+     test_wait_cancelled_returns_current_observation),
+    ("test_wait_rejects_stale_snapshot",
+     test_wait_rejects_stale_snapshot),
 ]
 
 

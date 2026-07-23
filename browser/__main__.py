@@ -27,6 +27,12 @@ CLI:``python -m browser <url> [--action ...]``。
     python -m browser https://en.wikipedia.org --action get_text --ref e1
     python -m browser https://en.wikipedia.org --action console --expression "document.title"
 
+    # P4 条件等待
+    python -m browser https://example.com --action wait_url --url-pattern "https://example.com/*"
+    python -m browser https://example.com --action wait_text --wait-text "Example Domain"
+    python -m browser https://example.com --action wait_ref --ref e1
+    python -m browser https://example.com --action wait_load --load-state domcontentloaded
+
 所有动作都先 navigate 到 url，再使用这次导航在当前进程内生成的
 snapshot_id 执行动作。CLI 每次运行都是新会话，因此 back/forward 的
 连续历史应使用同一个 ``BrowserSession`` 脚本或演示程序完成。
@@ -55,7 +61,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default="navigate",
         choices=["navigate", "click", "type", "press", "select",
                  "back", "forward", "reload", "scroll",
-                 "get_text", "console"],
+                 "get_text", "console",
+                 "wait_url", "wait_text", "wait_ref", "wait_load"],
         help="动作(默认 navigate)",
     )
     parser.add_argument("--ref", help="目标元素的 ref(如 e1),click/type/select/get_text(可选)必填")
@@ -71,6 +78,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=5000,
         help="get_text 返回文本最大字符数(默认 5000)",
+    )
+    parser.add_argument(
+        "--url-pattern",
+        help="wait_url 的 URL glob 模式，例如 https://example.com/*",
+    )
+    parser.add_argument(
+        "--wait-text",
+        help="wait_text 要等待出现的可见文本",
+    )
+    parser.add_argument(
+        "--load-state",
+        default="domcontentloaded",
+        help="wait_load 的状态:domcontentloaded/load/networkidle(默认 domcontentloaded)",
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        help="单次等待超时毫秒数；省略时沿用 --timeout",
     )
     parser.add_argument(
         "--no-clear",
@@ -170,6 +195,37 @@ def _run_action(s: BrowserSession, args: argparse.Namespace) -> str:
         if not args.expression:
             return _missing_arg("expression", "console")
         return s.console(args.expression, snapshot_id)
+    # P4 等待动作会使原 snapshot_id 失效，并在成功、超时或取消时都返回新快照。
+    if args.action == "wait_url":
+        if not args.url_pattern:
+            return _missing_arg("url-pattern", "wait_url")
+        return s.wait_for_url(
+            args.url_pattern,
+            snapshot_id,
+            timeout_ms=args.wait_timeout,
+        )
+    if args.action == "wait_text":
+        if not args.wait_text:
+            return _missing_arg("wait-text", "wait_text")
+        return s.wait_for_text(
+            args.wait_text,
+            snapshot_id,
+            timeout_ms=args.wait_timeout,
+        )
+    if args.action == "wait_ref":
+        if not args.ref:
+            return _missing_arg("ref", "wait_ref")
+        return s.wait_for_ref(
+            args.ref,
+            snapshot_id,
+            timeout_ms=args.wait_timeout,
+        )
+    if args.action == "wait_load":
+        return s.wait_for_load_state(
+            args.load_state,
+            snapshot_id,
+            timeout_ms=args.wait_timeout,
+        )
     return json.dumps(
         {"ok": False, "error_type": "unknown_action",
          "error": f"未知动作: {args.action}"},
