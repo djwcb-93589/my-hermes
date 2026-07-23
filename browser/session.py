@@ -66,12 +66,22 @@ import json
 import math
 import sys
 import threading
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from browser.accessibility import format_snapshot
+
+
+@dataclass(frozen=True)
+class _RefTextReadResult:
+    """元素文本读取的内部结果，避免用 JSON 字符串承载控制流。"""
+
+    text: str | None = None
+    error_type: str | None = None
+    error: str | None = None
 
 
 class BrowserSession:
@@ -642,6 +652,9 @@ class BrowserSession:
         """等待当前 URL 匹配 glob ``pattern``，例如 ``"**/search*"``。"""
         if not isinstance(pattern, str) or not pattern.strip():
             return _err("invalid_args", "pattern 必须是非空字符串")
+        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        if options_error is not None:
+            return options_error
         with self._lock:
             return self._wait_with_condition_locked(
                 snapshot_id=snapshot_id,
@@ -662,6 +675,9 @@ class BrowserSession:
         """等待页面出现可见的 ``text``。"""
         if not isinstance(text, str) or not text.strip():
             return _err("invalid_args", "text 必须是非空字符串")
+        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        if options_error is not None:
+            return options_error
 
         def text_is_visible() -> bool:
             locator = self._page.get_by_text(text, exact=False)
@@ -687,9 +703,16 @@ class BrowserSession:
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
     ) -> str:
-        """等待指定快照中的 ``ref`` 对应元素变为可见。"""
+        """等待指定快照中的 ``ref`` 对应的原 backend DOM 节点变为可见。
+
+        前端框架重绘后即使出现外观相同的新元素，也不会自动迁移到它；
+        这能避免等待期间把旧 ref 静默改指向另一个节点。
+        """
         if not isinstance(ref, str) or not ref.strip():
             return _err("invalid_args", "ref 必须是非空字符串")
+        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        if options_error is not None:
+            return options_error
         with self._lock:
             self._require_started_locked()
             stale_error = self._validate_snapshot_locked(snapshot_id)
@@ -728,6 +751,9 @@ class BrowserSession:
                 "invalid_args",
                 "state 必须是 domcontentloaded、load 或 networkidle",
             )
+        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        if options_error is not None:
+            return options_error
         with self._lock:
             return self._wait_with_condition_locked(
                 snapshot_id=snapshot_id,
@@ -758,14 +784,21 @@ class BrowserSession:
                 "timeout_ms 必须是大于 0 的整数或 None",
             )
 
-        previous_url = self._page.url
-        previous_position = self._position_marker_locked()
+        try:
+            previous_url = self._page.url
+            try:
+                previous_position = self._position_marker_locked()
+            except Exception:
+                # 导航切换期间 history.state 可能短暂不可读；这不妨碍等待本身。
+                previous_position = None
+        except Exception as exc:
+            return _err("wait_failed", f"开始等待时页面不可用: {exc}")
         # 条件等待期间 DOM、URL 都可能已变化；开始等待即废弃旧观察结果。
         self._invalidate_snapshot_locked()
         deadline = monotonic() + resolved_timeout / 1000
         while True:
             if cancel_event is not None and cancel_event.is_set():
-                return self._finish_wait_failure_locked(
+                return self._finish_wait_locked(
                     "wait_cancelled",
                     f"等待{description}已取消",
                     previous_url,
@@ -773,35 +806,77 @@ class BrowserSession:
                 )
             try:
                 if condition():
-                    return self._finish_wait_success_locked(
-                        previous_url, previous_position
+                    return self._finish_wait_locked(
+                        None, None, previous_url, previous_position
                     )
             except Exception as exc:
-                return self._finish_wait_failure_locked(
-                    "wait_failed",
-                    f"等待{description}时页面访问失败: {exc}",
-                    previous_url,
-                    previous_position,
-                )
+                if self._is_permanent_browser_error(exc):
+                    return _err("wait_failed", f"等待{description}时页面不可用: {exc}")
+                # 导航和框架重绘会暂时销毁执行上下文或 locator；视为本轮未命中。
 
             remaining_ms = int((deadline - monotonic()) * 1000)
             if remaining_ms <= 0:
-                return self._finish_wait_failure_locked(
+                return self._finish_wait_locked(
                     "wait_timeout",
                     f"等待{description}超时({resolved_timeout}ms)",
                     previous_url,
                     previous_position,
                 )
+            if cancel_event is not None and cancel_event.is_set():
+                return self._finish_wait_locked(
+                    "wait_cancelled",
+                    f"等待{description}已取消",
+                    previous_url,
+                    previous_position,
+                )
             # 使用短轮询保持取消响应；同步 API 在这里阻塞的是 BrowserSession 所在线程。
-            self._page.wait_for_timeout(min(100, remaining_ms))
+            try:
+                self._page.wait_for_timeout(min(100, remaining_ms))
+            except Exception as exc:
+                if self._is_permanent_browser_error(exc):
+                    return _err("wait_failed", f"等待{description}时页面不可用: {exc}")
+                # 有些导航窗口拒绝任何 page 调用；短暂退让后再次检查条件。
+                sleep(min(0.05, max(0.0, remaining_ms / 1000)))
+
+    def _validate_wait_options(
+        self,
+        timeout_ms: int | None,
+        cancel_event: threading.Event | None,
+    ) -> str | None:
+        """在失效快照前验证等待选项，避免无效参数改变会话状态。"""
+        if self._resolve_wait_timeout(timeout_ms) is None:
+            return _err("invalid_args", "timeout_ms 必须是大于 0 的整数或 None")
+        if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+            return _err("invalid_args", "cancel_event 必须是 threading.Event 或 None")
+        return None
 
     def _resolve_wait_timeout(self, timeout_ms: int | None) -> int | None:
         """解析单次等待的超时；None 继承会话默认值。"""
-        if timeout_ms is None:
-            return self._timeout_ms
-        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+        resolved_timeout = self._timeout_ms if timeout_ms is None else timeout_ms
+        if (
+            isinstance(resolved_timeout, bool)
+            or not isinstance(resolved_timeout, int)
+            or resolved_timeout <= 0
+        ):
             return None
-        return timeout_ms
+        return resolved_timeout
+
+    def _is_permanent_browser_error(self, exc: Exception) -> bool:
+        """区分已关闭的浏览器资源与导航期间可恢复的短暂异常。"""
+        if self._page is None or self._context is None or self._browser is None:
+            return True
+        message = str(exc).lower()
+        permanent_markers = (
+            "target page, context or browser has been closed",
+            "target page has been closed",
+            "page has been closed",
+            "context has been closed",
+            "browser has been closed",
+            "browser is disconnected",
+            "connection closed",
+            "target closed",
+        )
+        return any(marker in message for marker in permanent_markers)
 
     def _is_backend_node_visible_locked(self, backend_id: int) -> bool:
         """通过 backendDOMNodeId 检查元素仍连接在页面中且可见。"""
@@ -836,49 +911,40 @@ class BrowserSession:
         try:
             # 给本次探测一个很短的窗口，既能接住即将发生的 networkidle，
             # 也不会让取消信号被一次长等待拖住。
-            self._page.wait_for_load_state("networkidle", timeout=100)
+            self._page.wait_for_load_state("networkidle", timeout=50)
             return True
         except Exception:
             return False
 
-    def _finish_wait_success_locked(
+    def _finish_wait_locked(
         self,
+        error_type: str | None,
+        error: str | None,
         previous_url: str,
-        previous_position: str,
+        previous_position: str | None,
     ) -> str:
-        """等待成功后采集新快照，并同步内部历史记录。"""
+        """等待专用收尾：直接取快照，不再引入动作后的额外等待。"""
         try:
-            snapshot, new_snapshot_id = self._observe_after_action_locked(
-                previous_url,
-                previous_position=previous_position,
-                record_navigation=True,
-            )
+            snapshot, new_snapshot_id = self._snapshot_locked()
         except Exception as exc:
-            return _err("snapshot_failed", f"等待结束后获取快照失败: {exc}")
-        return _ok(snapshot, new_snapshot_id, self._page.url)
-
-    def _finish_wait_failure_locked(
-        self,
-        error_type: str,
-        error: str,
-        previous_url: str,
-        previous_position: str,
-    ) -> str:
-        """等待未满足时也返回当前页面快照，调用方可据此继续决策。"""
+            return _err("wait_failed", f"等待结束时获取当前快照失败: {exc}")
         try:
-            snapshot, new_snapshot_id = self._observe_after_action_locked(
-                previous_url,
-                previous_position=previous_position,
-                record_navigation=True,
-            )
+            self._record_navigation_locked(previous_url, previous_position)
+        except Exception:
+            # 快照已经是可继续使用的最新观察；历史记录失败不应丢弃它。
+            pass
+        try:
+            current_url = self._page.url
         except Exception as exc:
-            return _err("snapshot_failed", f"等待结束后获取快照失败: {exc}")
+            return _err("wait_failed", f"等待结束时页面不可用: {exc}")
+        if error_type is None:
+            return _ok(snapshot, new_snapshot_id, current_url)
         return _err_with_observation(
             error_type,
-            error,
+            error or "等待未完成",
             snapshot,
             new_snapshot_id,
-            self._page.url,
+            current_url,
         )
 
     # --- 高级读取(P3) ---
@@ -903,8 +969,14 @@ class BrowserSession:
         ``max_chars`` 限制返回文本长度,默认 5000。超长时截断并置
         ``truncated=True``,避免整页文本撑爆 tool result。
         """
-        if max_chars <= 0:
-            return _err("invalid_args", f"max_chars 必须为正数,收到: {max_chars}")
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or max_chars <= 0
+        ):
+            return _err("invalid_args", f"max_chars 必须是正整数,收到: {max_chars!r}")
+        if ref is not None and not isinstance(ref, str):
+            return _err("invalid_args", "ref 必须是字符串或 None")
 
         with self._lock:
             self._require_started_locked()
@@ -922,32 +994,42 @@ class BrowserSession:
             else:
                 # 解析 ref -> 调 textContent。和交互操作同一条 CDP 路径,
                 # 但只读不改:不失效旧观察结果,执行后不取新快照。
-                text_or_err = self._read_ref_text_locked(ref)
-                if isinstance(text_or_err, str) and text_or_err.startswith('{"ok":false'):
-                    return text_or_err
-                full_text = text_or_err  # str
+                read_result = self._read_ref_text_locked(ref)
+                if read_result.error_type is not None:
+                    return _err(
+                        read_result.error_type,
+                        read_result.error or "读取元素文本失败",
+                    )
+                full_text = read_result.text or ""
 
-            full_text = full_text or ""
+            full_text = full_text if isinstance(full_text, str) else str(full_text or "")
             if len(full_text) <= max_chars:
                 return _ok_text(full_text, False, snapshot_id, self._page.url)
             return _ok_text(
                 full_text[:max_chars], True, snapshot_id, self._page.url
             )
 
-    def _read_ref_text_locked(self, ref: str) -> str:
+    def _read_ref_text_locked(self, ref: str) -> _RefTextReadResult:
         """调用方已持锁时,解析 ref 并返回元素的 textContent。
 
-        失败时返回一个 ``{"ok": false, ...}`` JSON 字符串(供调用方直接
-        return);成功时返回纯文本字符串。
+        内部结果显式区分文本与错误，调用方不再从 JSON 字符串猜测失败。
         """
         backend_id = self._ref_to_backend_id.get(ref)
         if backend_id is None:
-            return _err(
-                "invalid_ref",
-                f"ref {ref} 无效。ref 在每次 snapshot 之间失效,"
-                "请重新调 navigate 或 snapshot 取新 ref。",
+            return _RefTextReadResult(
+                error_type="invalid_ref",
+                error=(
+                    f"ref {ref} 无效。ref 在每次 snapshot 之间失效,"
+                    "请重新调 navigate 或 snapshot 取新 ref。"
+                ),
             )
-        client = self._context.new_cdp_session(self._page)
+        try:
+            client = self._context.new_cdp_session(self._page)
+        except Exception as exc:
+            return _RefTextReadResult(
+                error_type="resolve_failed",
+                error=f"创建 ref 解析会话失败: {exc}",
+            )
         try:
             try:
                 resolved = client.send(
@@ -955,11 +1037,27 @@ class BrowserSession:
                     {"backendNodeId": backend_id},
                 )
             except Exception as exc:
-                return _err("resolve_failed", f"解析 ref 失败: {exc}")
+                return _RefTextReadResult(
+                    error_type="resolve_failed",
+                    error=f"解析 ref 失败: {exc}",
+                )
+            if not isinstance(resolved, dict):
+                return _RefTextReadResult(
+                    error_type="resolve_failed",
+                    error="DOM.resolveNode 返回了无效结果",
+                )
             remote_obj = resolved.get("object", {})
+            if not isinstance(remote_obj, dict):
+                return _RefTextReadResult(
+                    error_type="resolve_failed",
+                    error="DOM.resolveNode 返回了无效 object 结构",
+                )
             object_id = remote_obj.get("objectId")
             if not object_id:
-                return _err("resolve_failed", "DOM.resolveNode 未返回 objectId")
+                return _RefTextReadResult(
+                    error_type="resolve_failed",
+                    error="DOM.resolveNode 未返回 objectId",
+                )
             try:
                 call_result = client.send(
                     "Runtime.callFunctionOn",
@@ -970,21 +1068,56 @@ class BrowserSession:
                     },
                 )
             except Exception as exc:
-                return _err("get_text_failed", f"读取元素文本失败: {exc}")
+                return _RefTextReadResult(
+                    error_type="get_text_failed",
+                    error=f"读取元素文本失败: {exc}",
+                )
         finally:
-            client.detach()
+            try:
+                client.detach()
+            except Exception:
+                pass
         # CDP callFunctionOn 返回结构:{"result": {"type": "string", "value": "..."}}
         # 注意:这与 _interact 里取 result_val 的路径不同 -- _interact 只检查
         # 错误标志(subtype/exceptionDetails),不读返回值;这里要读 value。
+        if not isinstance(call_result, dict):
+            return _RefTextReadResult(
+                error_type="get_text_failed",
+                error="读取元素文本时收到无效 CDP 返回结构",
+            )
         remote_result = call_result.get("result", {})
+        if not isinstance(remote_result, dict):
+            return _RefTextReadResult(
+                error_type="get_text_failed",
+                error="读取元素文本时未返回有效结果",
+            )
         if remote_result.get("subtype") == "error" or "exceptionDetails" in call_result:
             exc_detail = call_result.get("exceptionDetails", {})
-            exc_msg = exc_detail.get("exception", {}).get("description", "未知 JS 错误")
-            return _err("get_text_failed", f"JS 执行错误: {exc_msg}")
+            if not isinstance(exc_detail, dict):
+                exc_detail = {}
+            exception = exc_detail.get("exception", {})
+            if not isinstance(exception, dict):
+                exception = {}
+            exc_msg = exception.get("description", "未知 JS 错误")
+            return _RefTextReadResult(
+                error_type="get_text_failed",
+                error=f"JS 执行错误: {exc_msg}",
+            )
         # textContent 可能是 null(空元素),统一成空串。
-        return remote_result.get("value") or ""
+        value = remote_result.get("value")
+        if value is not None and not isinstance(value, str):
+            return _RefTextReadResult(
+                error_type="get_text_failed",
+                error="元素文本返回值不是字符串",
+            )
+        return _RefTextReadResult(text=value or "")
 
-    def console(self, expression: str, snapshot_id: str) -> str:
+    def console(
+        self,
+        expression: str,
+        snapshot_id: str,
+        max_chars: int = 5000,
+    ) -> str:
         """在页面里执行任意 JavaScript 表达式,返回序列化结果。
 
         **逃生舱**:AX tree 看不到的元素、结构化数据、非文本状态,都能用
@@ -998,10 +1131,18 @@ class BrowserSession:
         JS 副作用不可逆,重跑可能重复提交表单或重复扣款。
 
         返回值用 JSON 序列化;非可序列化(Map/Set/循环引用/函数)兜底成
-        ``"<unserializable>"`` 字符串,不报错。
+        ``"<unserializable>"`` 字符串,不报错。``max_chars`` 限制结果的
+        序列化长度；超限时 ``result`` 返回安全截断的文本，同时带回
+        ``truncated`` 与 ``original_length``。
         """
-        if not expression or not expression.strip():
+        if not isinstance(expression, str) or not expression.strip():
             return _err("invalid_args", "expression 不能为空")
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or max_chars <= 0
+        ):
+            return _err("invalid_args", f"max_chars 必须是正整数,收到: {max_chars!r}")
 
         with self._lock:
             self._require_started_locked()
@@ -1032,6 +1173,10 @@ class BrowserSession:
             # JS 侧序列化失败的返回值也兜底成这个字符串。
             if call_result.get("unserializable"):
                 js_result = "<unserializable>"
+            js_result, truncated, original_length = _truncate_console_result(
+                js_result,
+                max_chars,
+            )
             try:
                 snapshot, new_snapshot_id = self._observe_after_action_locked(
                     previous_url,
@@ -1040,7 +1185,14 @@ class BrowserSession:
                 )
             except Exception as exc:
                 return _err("snapshot_failed", f"执行后取快照失败: {exc}")
-            return _ok_console(js_result, snapshot, new_snapshot_id, self._page.url)
+            return _ok_console(
+                js_result,
+                snapshot,
+                new_snapshot_id,
+                self._page.url,
+                truncated=truncated,
+                original_length=original_length,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1386,23 @@ def _js_escape(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
 
 
+def _truncate_console_result(result: Any, max_chars: int) -> tuple[Any, bool, int]:
+    """按 JSON 序列化长度限制 console 结果，并保证外层返回仍可编码。"""
+    try:
+        serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = json.dumps("<unserializable>", ensure_ascii=False)
+        result = "<unserializable>"
+    original_length = len(serialized)
+    if original_length <= max_chars:
+        return result, False, original_length
+    if max_chars == 1:
+        return "…", True, original_length
+    # 截断的是 JSON 表示文本，而不是半个 Python 对象；外层会再次 JSON 编码，
+    # 因此调用方永远能收到合法 JSON，不会被残缺对象破坏解析。
+    return serialized[: max_chars - 1] + "…", True, original_length
+
+
 def _normalize_url(url: str) -> str:
     """补全命令行常见的裸域名，保留已有协议的地址。"""
     normalized = url.strip()
@@ -1316,12 +1485,22 @@ def _ok_text(text: str, truncated: bool, snapshot_id: str, url: str) -> str:
     )
 
 
-def _ok_console(result: Any, snapshot: str, snapshot_id: str, url: str) -> str:
-    """console 成功返回:JS 结果(已序列化)+ 新快照。snapshot_id 是新的。"""
+def _ok_console(
+    result: Any,
+    snapshot: str,
+    snapshot_id: str,
+    url: str,
+    *,
+    truncated: bool,
+    original_length: int,
+) -> str:
+    """console 成功返回:结果、新快照及结果长度信息。"""
     return json.dumps(
         {
             "ok": True,
             "result": result,
+            "truncated": truncated,
+            "original_length": original_length,
             "snapshot_id": snapshot_id,
             "snapshot": snapshot,
             "url": url,
