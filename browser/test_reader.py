@@ -25,6 +25,18 @@ browser 模块独立测试(无 pytest)。
 17. scroll 不改 URL 但 snapshot_id 刷新
 18. scroll 非法 direction 返回 invalid_args
 19. scroll 零/负 amount 返回 invalid_args
+20. get_text 整页返回连贯 innerText(子标签文本拼好)
+21. get_text(ref) 返回元素 textContent,含后代、不含 box 外文本
+22. get_text 纯读取:不失效旧 snapshot_id,ref 仍可操作
+23. get_text 超长文本截断 + truncated 标记
+24. get_text 拒绝 stale snapshot_id
+25. console 返回序列化的结构化结果
+26. console 返回复杂对象(dict/list)
+27. console 不可序列化返回值(循环引用)兜底成 '<unserializable>'
+28. console JS 抛异常返回 console_failed 错误
+29. console 改 DOM 后旧 ref 失效(stale_snapshot)
+30. console 拒绝 stale snapshot_id
+31. console 空表达式返回 invalid_args
 
 playwright 或浏览器未装时整组 skip,不报 error。
 """
@@ -666,6 +678,215 @@ def test_scroll_rejects_non_numeric_amount_and_non_string_direction() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P3 测试:get_text / console
+# ---------------------------------------------------------------------------
+
+
+def test_get_text_whole_page_returns_inner_text() -> None:
+    """get_text(ref=None) 返回整页可见文本,把子标签文本拼成连贯字符串。"""
+    from browser.session import BrowserSession
+    # <p>Hello <b>World</b></p> -- innerText 应是 "Hello World",不是碎片。
+    html = '<div id="main"><p>Hello <b>World</b></p></div>'
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate("data:text/html;charset=utf-8," + html))
+        result = _parse_result(s.get_text(None, snapshot_id))
+        assert result.get("ok") is True, f"get_text 失败: {result}"
+        assert "Hello World" in result.get("text", ""), (
+            f"整页文本应含 'Hello World',实际: {result.get('text')!r}"
+        )
+        assert result.get("truncated") is False
+
+
+def test_get_text_by_ref_returns_element_textcontent() -> None:
+    """get_text(ref) 返回该交互元素的 textContent。
+
+    ref 体系只给交互元素(link/button/textbox 等)分配编号,所以 get_text(ref)
+    主要用于读这些元素的文字(如按钮文字、链接文字)。读非交互容器的内容
+    是 console 的职责(用 document.querySelector 定位)。
+
+    这里用 button 验证:它的文字就是 ref 指向元素的 textContent。
+    """
+    from browser.session import BrowserSession
+    html = '<button id="b">提交<b>表单</b></button><button id="other">其他</button>'
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate("data:text/html;charset=utf-8," + html))
+        ref = _find_ref_for_role(snap, "button", "提交")
+        assert ref, "快照里找不到 '提交' 按钮"
+        result = _parse_result(s.get_text(ref, snapshot_id))
+        assert result.get("ok") is True, f"get_text(ref) 失败: {result}"
+        text = result.get("text", "")
+        # textContent 含后代 <b> 的文字,拼成"提交表单"。
+        assert "提交" in text and "表单" in text, (
+            f"元素文本应含 '提交表单',实际: {text!r}"
+        )
+        assert "其他" not in text, "不应包含另一个按钮的文字"
+
+
+def test_get_text_preserves_snapshot_id_and_ref_still_valid() -> None:
+    """get_text 是纯读取:不失效旧 snapshot_id,之后 ref 仍能操作。
+
+    这是 get_text 与交互操作的关键差异 -- 读完文本不破坏页面观察结果,
+    agent 能继续用手里的 ref click/type。
+    """
+    from browser.session import BrowserSession
+    html = '<input id="i" value="hello"><button id="b">btn</button>'
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate("data:text/html;charset=utf-8," + html))
+        # 整页 get_text。
+        result = _parse_result(s.get_text(None, snapshot_id))
+        assert result.get("ok") is True, f"get_text 失败: {result}"
+        # snapshot_id 应保持不变(纯读取)。
+        assert result.get("snapshot_id") == snapshot_id, (
+            "get_text 不应改变 snapshot_id(纯读取)"
+        )
+        # 旧 snapshot_id 仍有效 -- 用它操作 ref 应成功而非 stale。
+        ref = _find_ref_for_role(snap, "button", "btn")
+        assert ref, "快照里找不到 button"
+        click_result = _parse_result(s.click(ref, snapshot_id))
+        assert click_result.get("ok") is True, (
+            f"get_text 后用旧 snapshot_id 操作应成功,实际: {click_result}"
+        )
+
+
+def test_get_text_truncates_long_text() -> None:
+    """整页文本超过 max_chars 时截断,并置 truncated=True。"""
+    from browser.session import BrowserSession
+    long_text = "A" * 1000
+    html = f'<div>{long_text}</div>'
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate("data:text/html;charset=utf-8," + html))
+        result = _parse_result(s.get_text(None, snapshot_id, max_chars=50))
+        assert result.get("ok") is True, f"get_text 失败: {result}"
+        assert result.get("truncated") is True, "长文本应被截断"
+        assert len(result.get("text", "")) == 50, (
+            f"截断后应正好 50 字符,实际 {len(result.get('text', ''))}"
+        )
+
+
+def test_get_text_rejects_stale_snapshot() -> None:
+    """get_text 也必须拒绝已被替代的 snapshot_id。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, stale_id = _observation(s.navigate("data:text/html;charset=utf-8,<p>a</p>"))
+        _observation(s.navigate("data:text/html;charset=utf-8,<p>b</p>"))
+        result = _parse_result(s.get_text(None, stale_id))
+        assert result.get("ok") is False, f"过期 snapshot_id 不应成功: {result}"
+        assert result.get("error_type") == "stale_snapshot"
+
+
+def test_console_returns_serialized_result() -> None:
+    """console 读取结构化数据,返回 JSON 可解析的结果。"""
+    from browser.session import BrowserSession
+    html = '<div><h2>标题</h2><h2>副标题</h2></div>'
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate("data:text/html;charset=utf-8," + html))
+        result = _parse_result(s.console('document.querySelectorAll("h2").length', snapshot_id))
+        assert result.get("ok") is True, f"console 失败: {result}"
+        assert result.get("result") == 2, f"应返回 2,实际: {result.get('result')}"
+        # console 改 DOM 后产生新 snapshot_id。
+        assert result.get("snapshot_id") != snapshot_id
+        assert result.get("snapshot"), "console 后应返回新快照"
+
+
+def test_console_returns_complex_object() -> None:
+    """console 返回的对象/数组应正确序列化成 Python dict/list。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>hello</p>")
+        )
+        result = _parse_result(
+            s.console('({name: "abc", count: 3, list: [1, 2, 3]})', snapshot_id)
+        )
+        assert result.get("ok") is True, f"console 失败: {result}"
+        obj = result.get("result")
+        assert obj == {"name": "abc", "count": 3, "list": [1, 2, 3]}, (
+            f"对象序列化错误,实际: {obj}"
+        )
+
+
+def test_console_handles_unserializable() -> None:
+    """函数/循环引用等不可序列化返回值应兜底成 '<unserializable>',不报错。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>hello</p>")
+        )
+        # 循环引用对象 -- JSON.stringify 会抛错,应兜底。
+        result = _parse_result(
+            s.console('var a = {}; a.self = a; a', snapshot_id)
+        )
+        assert result.get("ok") is True, f"循环引用不应导致失败: {result}"
+        assert result.get("result") == "<unserializable>", (
+            f"循环引用应兜底成 '<unserializable>',实际: {result.get('result')!r}"
+        )
+
+
+def test_console_handles_js_exception() -> None:
+    """JS 抛异常时返回 console_failed 错误,不崩溃。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>hello</p>")
+        )
+        result = _parse_result(s.console('undefinedFunc()', snapshot_id))
+        assert result.get("ok") is False, f"JS 异常不应成功: {result}"
+        assert result.get("error_type") == "console_failed"
+        # 错误信息应含 JS 异常内容。
+        assert "undefinedFunc" in result.get("error", ""), (
+            f"错误信息应含异常名,实际: {result.get('error')!r}"
+        )
+
+
+def test_console_invalidates_ref_after_dom_change() -> None:
+    """console 用 JS 改 DOM 后,旧 ref 应失效(stale_snapshot)。
+
+    这是 console 按交互操作处理的核心:JS 可能改了 DOM,旧 backendDOMNodeId
+    对应的观察结果必须作废,否则 agent 会用旧 ref 操作新页面。
+    """
+    from browser.session import BrowserSession
+    html = '<button id="b">btn</button>'
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate("data:text/html;charset=utf-8," + html))
+        ref = _find_ref_for_role(snap, "button", "btn")
+        assert ref, "快照里找不到 button"
+        # 用 console 删除该按钮,改变 DOM。
+        result = _parse_result(
+            s.console('document.getElementById("b").remove()', snapshot_id)
+        )
+        assert result.get("ok") is True, f"console 删元素失败: {result}"
+        # 旧 snapshot_id 应已失效。
+        assert result.get("snapshot_id") != snapshot_id
+        # 用旧 snapshot_id 操作 ref 应被拒。
+        stale = _parse_result(s.click(ref, snapshot_id))
+        assert stale.get("ok") is False, "DOM 改变后旧 ref 不应可用"
+        assert stale.get("error_type") == "stale_snapshot"
+
+
+def test_console_rejects_stale_snapshot() -> None:
+    """console 也必须拒绝已被替代的 snapshot_id。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, stale_id = _observation(s.navigate("data:text/html;charset=utf-8,<p>a</p>"))
+        _observation(s.navigate("data:text/html;charset=utf-8,<p>b</p>"))
+        result = _parse_result(s.console('1+1', stale_id))
+        assert result.get("ok") is False, f"过期 snapshot_id 不应成功: {result}"
+        assert result.get("error_type") == "stale_snapshot"
+
+
+def test_console_rejects_empty_expression() -> None:
+    """空表达式应返回 invalid_args。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(
+            s.navigate("data:text/html;charset=utf-8,<p>hello</p>")
+        )
+        result = _parse_result(s.console("   ", snapshot_id))
+        assert result.get("ok") is False
+        assert result.get("error_type") == "invalid_args"
+
+
+# ---------------------------------------------------------------------------
 # 简单测试运行器:依次跑,统计 pass/fail,失败打印 traceback。
 # ---------------------------------------------------------------------------
 
@@ -718,6 +939,30 @@ _TESTS: list[tuple[str, Any]] = [
      test_p2_actions_reject_stale_snapshot),
     ("test_scroll_rejects_non_numeric_amount_and_non_string_direction",
      test_scroll_rejects_non_numeric_amount_and_non_string_direction),
+    ("test_get_text_whole_page_returns_inner_text",
+     test_get_text_whole_page_returns_inner_text),
+    ("test_get_text_by_ref_returns_element_textcontent",
+     test_get_text_by_ref_returns_element_textcontent),
+    ("test_get_text_preserves_snapshot_id_and_ref_still_valid",
+     test_get_text_preserves_snapshot_id_and_ref_still_valid),
+    ("test_get_text_truncates_long_text",
+     test_get_text_truncates_long_text),
+    ("test_get_text_rejects_stale_snapshot",
+     test_get_text_rejects_stale_snapshot),
+    ("test_console_returns_serialized_result",
+     test_console_returns_serialized_result),
+    ("test_console_returns_complex_object",
+     test_console_returns_complex_object),
+    ("test_console_handles_unserializable",
+     test_console_handles_unserializable),
+    ("test_console_handles_js_exception",
+     test_console_handles_js_exception),
+    ("test_console_invalidates_ref_after_dom_change",
+     test_console_invalidates_ref_after_dom_change),
+    ("test_console_rejects_stale_snapshot",
+     test_console_rejects_stale_snapshot),
+    ("test_console_rejects_empty_expression",
+     test_console_rejects_empty_expression),
 ]
 
 

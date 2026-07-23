@@ -20,6 +20,13 @@
 - ``reload(snapshot_id)`` -- 重新加载当前页
 - ``scroll(direction, snapshot_id, amount=400)`` -- 滚动页面(up/down/left/right)
 
+高级读取(P3):
+- ``get_text(ref, snapshot_id, max_chars=5000)`` -- 读元素/整页连贯文本。
+  纯读取:不失效旧 snapshot_id、不取新快照(ref 仍可用)。整页文本默认截断。
+- ``console(expression, snapshot_id)`` -- 执行任意 JS,返回序列化结果。
+  逃生舱:AX tree 看不到的元素、结构化数据用它。危险:JS 改 DOM 后旧 ref
+  失效,按交互操作处理(失效旧观察、取新快照)。接 agent 时必须 unknown_on_crash。
+
 为什么是同步
 ------------
 独立测试阶段 sync 更简洁:CLI 不用 ``asyncio.run()``,测试不用 async def。
@@ -613,6 +620,167 @@ class BrowserSession:
                 return _err("snapshot_failed", f"滚动后取快照失败: {exc}")
             return _ok(snapshot, new_snapshot_id, self._page.url)
 
+    # --- 高级读取(P3) ---
+    # get_text 是纯读取,不改变页面状态,因此不失效旧 snapshot_id、不取新快照。
+    # 调用方拿到文本后,手里的 ref 仍然有效,可继续 click/type。
+    # console 执行任意 JS,可能改变 DOM/状态,因此按交互操作处理:失效旧 ref、取新快照。
+
+    def get_text(
+        self,
+        ref: str | None,
+        snapshot_id: str,
+        max_chars: int = 5000,
+    ) -> str:
+        """读取元素或整页的连贯文本。
+
+        - ``ref=None``:返回整页可见文本(``document.body.innerText``)。
+        - 传 ``ref``:返回该元素的 ``textContent``(含后代文本)。
+
+        纯读取,不改页面:不失效旧 snapshot_id、不取新快照。返回里携带的
+        ``snapshot_id`` 与传入相同,调用方可继续用手里已有的 ref 操作。
+
+        ``max_chars`` 限制返回文本长度,默认 5000。超长时截断并置
+        ``truncated=True``,避免整页文本撑爆 tool result。
+        """
+        if max_chars <= 0:
+            return _err("invalid_args", f"max_chars 必须为正数,收到: {max_chars}")
+
+        with self._lock:
+            self._require_started_locked()
+            stale_error = self._validate_snapshot_locked(snapshot_id)
+            if stale_error is not None:
+                return stale_error
+
+            if ref is None:
+                # 整页可见文本。innerText 会反映渲染后的换行与可见性,
+                # 比 textContent 更接近"人看到的内容"。
+                try:
+                    full_text = self._page.evaluate("document.body.innerText")
+                except Exception as exc:
+                    return _err("get_text_failed", f"读取整页文本失败: {exc}")
+            else:
+                # 解析 ref -> 调 textContent。和交互操作同一条 CDP 路径,
+                # 但只读不改:不失效旧观察结果,执行后不取新快照。
+                text_or_err = self._read_ref_text_locked(ref)
+                if isinstance(text_or_err, str) and text_or_err.startswith('{"ok":false'):
+                    return text_or_err
+                full_text = text_or_err  # str
+
+            full_text = full_text or ""
+            if len(full_text) <= max_chars:
+                return _ok_text(full_text, False, snapshot_id, self._page.url)
+            return _ok_text(
+                full_text[:max_chars], True, snapshot_id, self._page.url
+            )
+
+    def _read_ref_text_locked(self, ref: str) -> str:
+        """调用方已持锁时,解析 ref 并返回元素的 textContent。
+
+        失败时返回一个 ``{"ok": false, ...}`` JSON 字符串(供调用方直接
+        return);成功时返回纯文本字符串。
+        """
+        backend_id = self._ref_to_backend_id.get(ref)
+        if backend_id is None:
+            return _err(
+                "invalid_ref",
+                f"ref {ref} 无效。ref 在每次 snapshot 之间失效,"
+                "请重新调 navigate 或 snapshot 取新 ref。",
+            )
+        client = self._context.new_cdp_session(self._page)
+        try:
+            try:
+                resolved = client.send(
+                    "DOM.resolveNode",
+                    {"backendNodeId": backend_id},
+                )
+            except Exception as exc:
+                return _err("resolve_failed", f"解析 ref 失败: {exc}")
+            remote_obj = resolved.get("object", {})
+            object_id = remote_obj.get("objectId")
+            if not object_id:
+                return _err("resolve_failed", "DOM.resolveNode 未返回 objectId")
+            try:
+                call_result = client.send(
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": object_id,
+                        "functionDeclaration": _JS_GET_TEXT,
+                        "returnByValue": True,
+                    },
+                )
+            except Exception as exc:
+                return _err("get_text_failed", f"读取元素文本失败: {exc}")
+        finally:
+            client.detach()
+        # CDP callFunctionOn 返回结构:{"result": {"type": "string", "value": "..."}}
+        # 注意:这与 _interact 里取 result_val 的路径不同 -- _interact 只检查
+        # 错误标志(subtype/exceptionDetails),不读返回值;这里要读 value。
+        remote_result = call_result.get("result", {})
+        if remote_result.get("subtype") == "error" or "exceptionDetails" in call_result:
+            exc_detail = call_result.get("exceptionDetails", {})
+            exc_msg = exc_detail.get("exception", {}).get("description", "未知 JS 错误")
+            return _err("get_text_failed", f"JS 执行错误: {exc_msg}")
+        # textContent 可能是 null(空元素),统一成空串。
+        return remote_result.get("value") or ""
+
+    def console(self, expression: str, snapshot_id: str) -> str:
+        """在页面里执行任意 JavaScript 表达式,返回序列化结果。
+
+        **逃生舱**:AX tree 看不到的元素、结构化数据、非文本状态,都能用
+        console 读取或操作。
+
+        **危险**:JS 能做任何事--读 cookie、发请求、改 DOM、导航。执行后
+        旧 ref 可能失效(JS 可能改了 DOM),因此按交互操作处理:失效旧观察
+        结果、取新快照。
+
+        接 agent 时,console 必须 ``unknown_on_crash``(不能 retry_safe):
+        JS 副作用不可逆,重跑可能重复提交表单或重复扣款。
+
+        返回值用 JSON 序列化;非可序列化(Map/Set/循环引用/函数)兜底成
+        ``"<unserializable>"`` 字符串,不报错。
+        """
+        if not expression or not expression.strip():
+            return _err("invalid_args", "expression 不能为空")
+
+        with self._lock:
+            self._require_started_locked()
+            stale_error = self._validate_snapshot_locked(snapshot_id)
+            if stale_error is not None:
+                return stale_error
+            previous_url = self._page.url
+            previous_position = self._position_marker_locked()
+            # JS 可能改 DOM,先失效旧观察结果。
+            self._invalidate_snapshot_locked()
+            # 用包装函数执行:try-catch 捕获 JS 异常,JSON.stringify 兜底
+            # 非可序列化返回值。returnByValue 让 CDP 把结果序列化传回。
+            wrapped = _JS_CONSOLE_WRAPPER.format(escaped_expr=_js_escape(expression))
+            try:
+                call_result = self._page.evaluate(wrapped)
+            except Exception as exc:
+                return _err("console_failed", f"执行表达式失败: {exc}")
+            # page.evaluate 返回的是 Python 对象(str/dict/None 等),
+            # 因为 JS 侧已经序列化成 {ok, result/error} 结构。
+            if not isinstance(call_result, dict):
+                return _err("console_failed", f"返回结构异常: {call_result!r}")
+            if call_result.get("error"):
+                return _err(
+                    "console_failed",
+                    f"JS 抛出异常: {call_result.get('error')}",
+                )
+            js_result = call_result.get("result", "<unserializable>")
+            # JS 侧序列化失败的返回值也兜底成这个字符串。
+            if call_result.get("unserializable"):
+                js_result = "<unserializable>"
+            try:
+                snapshot, new_snapshot_id = self._observe_after_action_locked(
+                    previous_url,
+                    previous_position=previous_position,
+                    record_navigation=True,
+                )
+            except Exception as exc:
+                return _err("snapshot_failed", f"执行后取快照失败: {exc}")
+            return _ok_console(js_result, snapshot, new_snapshot_id, self._page.url)
+
 
 # ---------------------------------------------------------------------------
 # ref 映射构建。必须与 ``accessibility.py::format_snapshot`` 的 ref 分配
@@ -751,6 +919,42 @@ _JS_SELECT_TEMPLATE = """function() {{
     return null;
 }}"""
 
+# get_text():返回元素 textContent(含后代文本)。null 安全(空元素返回空串)。
+_JS_GET_TEXT = """function() {
+    return this.textContent || '';
+}"""
+
+# console():包装用户表达式,捕获 JS 异常,JSON.stringify 兜底非可序列化返回值。
+# 用户表达式作为字符串注入,在函数体内 eval 执行(保留其作用域语义)。
+# 返回 {ok, result, unserializable, error} 结构供 Python 解析。
+_JS_CONSOLE_WRAPPER = """(() => {{
+    try {{
+        var value = eval({escaped_expr});
+        var hasValue = true;
+        // 函数/undefined 不能 JSON.stringify 成有意义的结果。
+        if (typeof value === 'function' || value === undefined) {{
+            return {{ok: true, result: String(value), unserializable: false, error: null}};
+        }}
+        try {{
+            var serialized = JSON.stringify(value, (key, val) => {{
+                if (typeof val === 'function' || typeof val === 'symbol') {{
+                    return val.toString();
+                }}
+                // 循环引用会让 JSON.stringify 抛错,落到 catch。
+                return val;
+            }});
+            if (serialized === undefined) {{
+                return {{ok: true, result: '<unserializable>', unserializable: true, error: null}};
+            }}
+            return {{ok: true, result: JSON.parse(serialized), unserializable: false, error: null}};
+        }} catch (_) {{
+            return {{ok: true, result: '<unserializable>', unserializable: true, error: null}};
+        }}
+    }} catch (e) {{
+        return {{ok: false, result: null, unserializable: false, error: String(e && e.message || e)}};
+    }}
+}})()"""
+
 
 def _js_escape(text: str) -> str:
     """把 Python 字符串转成 JS 字符串字面量(含引号)。"""
@@ -796,6 +1000,34 @@ def _err_no_history(snapshot: str, snapshot_id: str, url: str) -> str:
             "ok": False,
             "error_type": "no_history",
             "error": "没有浏览历史可回退/前进",
+            "snapshot_id": snapshot_id,
+            "snapshot": snapshot,
+            "url": url,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _ok_text(text: str, truncated: bool, snapshot_id: str, url: str) -> str:
+    """get_text 成功返回:文本 + 截断标记。snapshot_id 与传入相同(纯读取)。"""
+    return json.dumps(
+        {
+            "ok": True,
+            "text": text,
+            "truncated": truncated,
+            "snapshot_id": snapshot_id,
+            "url": url,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _ok_console(result: Any, snapshot: str, snapshot_id: str, url: str) -> str:
+    """console 成功返回:JS 结果(已序列化)+ 新快照。snapshot_id 是新的。"""
+    return json.dumps(
+        {
+            "ok": True,
+            "result": result,
             "snapshot_id": snapshot_id,
             "snapshot": snapshot,
             "url": url,

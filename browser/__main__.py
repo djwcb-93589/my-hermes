@@ -22,6 +22,11 @@ CLI:``python -m browser <url> [--action ...]``。
     python -m browser https://en.wikipedia.org --action reload
     python -m browser https://en.wikipedia.org --action scroll --direction down
 
+    # P3 高级读取:get_text(整页或元素文本)/ console(执行 JS)
+    python -m browser https://en.wikipedia.org --action get_text
+    python -m browser https://en.wikipedia.org --action get_text --ref e1
+    python -m browser https://en.wikipedia.org --action console --expression "document.title"
+
 所有动作都先 navigate 到 url，再使用这次导航在当前进程内生成的
 snapshot_id 执行动作。CLI 每次运行都是新会话，因此 back/forward 的
 连续历史应使用同一个 ``BrowserSession`` 脚本或演示程序完成。
@@ -49,13 +54,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--action",
         default="navigate",
         choices=["navigate", "click", "type", "press", "select",
-                 "back", "forward", "reload", "scroll"],
+                 "back", "forward", "reload", "scroll",
+                 "get_text", "console"],
         help="动作(默认 navigate)",
     )
-    parser.add_argument("--ref", help="目标元素的 ref(如 e1),click/type/select 必填")
+    parser.add_argument("--ref", help="目标元素的 ref(如 e1),click/type/select/get_text(可选)必填")
     parser.add_argument("--text", help="要输入的文字,type 必填")
     parser.add_argument("--key", help="要按的键(如 Enter),press 必填")
     parser.add_argument("--value", help="要选的值,select 必填")
+    parser.add_argument(
+        "--expression",
+        help="要执行的 JS 表达式,console 必填",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=5000,
+        help="get_text 返回文本最大字符数(默认 5000)",
+    )
     parser.add_argument(
         "--no-clear",
         action="store_true",
@@ -146,6 +162,14 @@ def _run_action(s: BrowserSession, args: argparse.Namespace) -> str:
         return s.reload(snapshot_id)
     if args.action == "scroll":
         return s.scroll(args.direction, snapshot_id, args.amount)
+    # P3 高级读取:get_text 可选 ref(None=整页),console 执行任意 JS。
+    if args.action == "get_text":
+        # ref=None 传 Python None 表示整页;CLI 用 --ref 缺省即整页。
+        return s.get_text(args.ref, snapshot_id, max_chars=args.max_chars)
+    if args.action == "console":
+        if not args.expression:
+            return _missing_arg("expression", "console")
+        return s.console(args.expression, snapshot_id)
     return json.dumps(
         {"ok": False, "error_type": "unknown_action",
          "error": f"未知动作: {args.action}"},
