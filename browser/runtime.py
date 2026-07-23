@@ -57,11 +57,12 @@ class BrowserWorker:
             if workspace_root is not None
             else Path.cwd().resolve()
         )
-        self._artifact_dir = (
-            Path(artifact_dir).resolve()
-            if artifact_dir is not None
-            else self._workspace_root / ".browser_artifacts"
+        self._artifact_dir_config = self._artifact_dir_config_for_session(
+            session_key,
+            artifact_dir,
         )
+        # BrowserSession 只接受相对配置；绝对路径仅留给运行时内部比较和清理。
+        self._artifact_dir = (self._workspace_root / self._artifact_dir_config).resolve()
         self._headless = headless
         self._channel = channel
         self._on_failure = on_failure
@@ -99,13 +100,37 @@ class BrowserWorker:
 
     @property
     def artifact_dir(self) -> Path:
-        """返回创建后固定不变的会话产物目录，仅供 Manager 校验复用。"""
+        """返回内部解析后的会话产物目录，仅供运行时校验与清理。"""
         return Path(self._artifact_dir).resolve()
+
+    @property
+    def artifact_dir_config(self) -> Path:
+        """返回交给 BrowserSession 的相对产物目录配置。"""
+        return Path(self._artifact_dir_config)
 
     @staticmethod
     def _session_digest(session_key: str) -> str:
         """生成不泄露原始会话标识的稳定短摘要。"""
         return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:20]
+
+    @classmethod
+    def _artifact_dir_config_for_session(
+        cls,
+        session_key: str,
+        artifact_dir: str | Path | None,
+    ) -> Path:
+        """生成或校验会话专用的相对产物目录，绝不接受绝对路径。"""
+        expected = Path(".browser_artifacts") / cls._session_digest(session_key)
+        if artifact_dir is None:
+            return expected
+        configured = Path(artifact_dir)
+        if (
+            configured.is_absolute()
+            or ".." in configured.parts
+            or configured != expected
+        ):
+            raise ValueError("browser artifact_dir must be the session relative artifact directory")
+        return configured
 
     def is_idle(self, *, now: float, idle_timeout_seconds: float) -> bool:
         """仅在没有执行或排队请求且超过时限时允许 Manager 回收。"""
@@ -174,7 +199,7 @@ class BrowserWorker:
                 headless=self._headless,
                 channel=self._channel,
                 workspace_root=self._workspace_root,
-                artifact_dir=self._artifact_dir,
+                artifact_dir=self._artifact_dir_config,
             )
             session.start()
         except Exception as exc:
@@ -260,9 +285,8 @@ class BrowserManager:
         self._workspace_root = (
             Path(workspace_root).resolve() if workspace_root is not None else None
         )
-        self._artifact_dir = (
-            Path(artifact_dir).resolve() if artifact_dir is not None else None
-        )
+        if artifact_dir is not None and Path(artifact_dir) != Path(".browser_artifacts"):
+            raise ValueError("BrowserManager artifact_dir is fixed to .browser_artifacts")
         self._headless = headless
         self._channel = channel
         self._workers: dict[str, BrowserWorker] = {}
@@ -280,31 +304,31 @@ class BrowserManager:
         session_key: str,
         *,
         workspace_root: str | Path | None = None,
+        require_workspace_root: bool = False,
     ) -> BrowserWorker:
         """同一会话并发请求只创建一个 worker，不允许模型提供 session_key。"""
         normalized_key = str(session_key or "").strip()
         if not normalized_key:
             raise ValueError("browser session_key is required")
-        resolved_workspace = self._resolve_workspace_root(workspace_root)
-        resolved_artifact_dir = self._session_artifact_dir(
-            normalized_key, resolved_workspace
-        )
         with self._lock:
             self._cleanup_idle_locked()
             worker = self._workers.get(normalized_key)
             if worker is not None and not worker.failed:
-                if (
-                    worker.workspace_root != resolved_workspace
-                    or worker.artifact_dir != resolved_artifact_dir
-                ):
-                    raise ValueError("browser workspace configuration conflicts with the existing session")
                 return worker
             if worker is not None:
                 self._workers.pop(normalized_key, None)
+            # 只有首次创建或失效重建时才读取 backend 当前工作目录。
+            if require_workspace_root and (
+                not isinstance(workspace_root, (str, Path))
+                or not str(workspace_root).strip()
+            ):
+                raise ValueError("browser workspace_root is required for a new session")
+            resolved_workspace = self._resolve_workspace_root(workspace_root)
+            artifact_dir_config = self._session_artifact_dir(normalized_key)
             worker = BrowserWorker(
                 normalized_key,
                 workspace_root=resolved_workspace,
-                artifact_dir=resolved_artifact_dir,
+                artifact_dir=artifact_dir_config,
                 headless=self._headless,
                 channel=self._channel,
                 on_failure=self._remove_failed_worker,
@@ -380,14 +404,9 @@ class BrowserManager:
             raise ValueError("browser workspace_root must be an existing directory")
         return resolved
 
-    def _session_artifact_dir(
-        self,
-        session_key: str,
-        workspace_root: Path,
-    ) -> Path:
-        """按会话摘要隔离产物，不把原始 session_key 写入路径。"""
-        root = self._artifact_dir or workspace_root / ".browser_artifacts"
-        return root / BrowserWorker._session_digest(session_key)
+    def _session_artifact_dir(self, session_key: str) -> Path:
+        """返回固定相对目录，实际绝对位置由各 worker 的工作区决定。"""
+        return Path(".browser_artifacts") / BrowserWorker._session_digest(session_key)
 
     def _remove_failed_worker(self, session_key: str, worker: BrowserWorker) -> None:
         with self._lock:

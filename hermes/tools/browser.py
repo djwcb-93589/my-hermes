@@ -85,9 +85,11 @@ def _worker(kwargs: dict[str, Any]):
         return None, _error("browser_session_unavailable", "browser requires a trusted session context")
     try:
         backend = _trusted_backend(kwargs)
-        workspace_root = _backend_workspace_root(backend)
+        workspace_root = getattr(backend, "cwd", None)
         return default_browser_manager.get_worker(
-            session_key, workspace_root=workspace_root
+            session_key,
+            workspace_root=workspace_root,
+            require_workspace_root=True,
         ), None
     except Exception as exc:
         return None, _error("browser_worker_unavailable", f"browser worker is unavailable: {exc.__class__.__name__}")
@@ -160,25 +162,6 @@ def _artifact_snapshot(artifact: dict[str, Any], *, snapshot_id: str | None = No
     return state
 
 
-def _workspace_file_snapshot(
-    value: Any,
-    workspace_root: Path,
-) -> dict[str, Any] | None:
-    if not isinstance(value, str) or not value or Path(value).is_absolute():
-        return None
-    raw = Path(value)
-    if ".." in raw.parts:
-        return None
-    root = workspace_root.resolve()
-    try:
-        resolved = (root / raw).resolve(strict=True)
-        if root != resolved and root not in resolved.parents:
-            return None
-    except (OSError, RuntimeError):
-        return None
-    return _file_state(resolved)
-
-
 def _trusted_backend(kwargs: dict[str, Any]) -> Any:
     """只从工具运行上下文取得当前会话的 backend。"""
     backend = kwargs.get("backend")
@@ -187,15 +170,62 @@ def _trusted_backend(kwargs: dict[str, Any]) -> Any:
     return get_backend(session_key=kwargs["session_key"])
 
 
-def _backend_workspace_root(backend: Any) -> Path:
-    """把可信 backend 的当前工作目录收敛为可供本地浏览器使用的目录。"""
-    raw_cwd = getattr(backend, "cwd", None)
-    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
-        raise ValueError("backend workspace is unavailable")
-    root = Path(raw_cwd).resolve()
-    if not root.is_dir():
-        raise ValueError("backend workspace is not available on this host")
-    return root
+def _has_symlink_component(path: Path) -> bool:
+    """检查宿主机绝对路径的每一级，拒绝通过目录符号链接绕过工作区。"""
+    if not path.is_absolute():
+        return True
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _normalized_upload_paths(
+    backend: Any,
+    worker: Any,
+    raw_paths: list[Any],
+) -> tuple[list[str], list[dict[str, Any]]] | str:
+    """按 backend 当前目录解析上传输入，再收敛到 worker 固定工作区的相对路径。"""
+    if getattr(backend, "backend_type", None) != "local":
+        return "browser_workspace_unavailable"
+    workspace_root = worker.workspace_root
+    normalized_paths: list[str] = []
+    snapshots: list[dict[str, Any]] = []
+    for value in raw_paths:
+        if not isinstance(value, str) or not value or Path(value).is_absolute():
+            return "invalid_path"
+        raw_path = Path(value)
+        if ".." in raw_path.parts:
+            return "invalid_path"
+        try:
+            candidate = Path(backend.resolve_path(value))
+            if not candidate.is_absolute() or _has_symlink_component(candidate):
+                return "invalid_path"
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            return "file_not_found"
+        except (OSError, RuntimeError):
+            return "invalid_path"
+        try:
+            relative = resolved.relative_to(workspace_root)
+        except ValueError:
+            return "path_outside_workspace"
+        if not resolved.is_file() or _has_symlink_component(resolved):
+            return "invalid_path"
+        snapshot = _file_state(resolved)
+        if snapshot is None:
+            return "invalid_path"
+        # 审批记录只保存固定工作区内的相对身份，不暴露宿主机绝对路径。
+        workspace_path = relative.as_posix()
+        snapshot["workspace_path"] = workspace_path
+        normalized_paths.append(workspace_path)
+        snapshots.append(snapshot)
+    return normalized_paths, snapshots
 
 
 def _approval_options(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -247,19 +277,35 @@ def handle_browser_upload_files(args: Any, **kwargs: Any) -> str:
     validated = _validate(args, {"ref", "paths", "snapshot_id"}, {"ref", "paths", "snapshot_id"})
     if isinstance(validated, str):
         return validated
-    try:
-        workspace_root = _backend_workspace_root(_trusted_backend(kwargs))
-    except Exception:
-        return _error("browser_workspace_unavailable", "browser workspace is unavailable")
     raw_paths = validated["paths"] if isinstance(validated["paths"], list) else [validated["paths"]]
-    snapshots = [
-        _workspace_file_snapshot(path, workspace_root) for path in raw_paths
-    ]
-    if not raw_paths or any(item is None for item in snapshots):
-        return _error("invalid_path", "upload paths must be existing regular files inside the workspace")
+    if not raw_paths:
+        return _error("invalid_path", "upload paths must be a non-empty list")
     worker, error = _worker(kwargs)
     if error is not None:
         return error
+    try:
+        backend = _trusted_backend(kwargs)
+        normalized = _normalized_upload_paths(backend, worker, raw_paths)
+    except Exception:
+        normalized = "invalid_path"
+    if isinstance(normalized, str):
+        error_type = normalized if isinstance(normalized, str) else "invalid_path"
+        messages = {
+            "browser_workspace_unavailable": "browser upload only supports a local backend workspace",
+            "file_not_found": "upload file does not exist",
+            "path_outside_workspace": "upload file is outside the fixed browser workspace",
+            "invalid_path": "upload paths must be local regular files inside the fixed browser workspace",
+        }
+        return _error(
+            error_type,
+            messages[error_type],
+        )
+    normalized_paths, snapshots = normalized
+    # BrowserSession 与审批都以这组固定工作区内的规范化相对路径为准。
+    upload_args = {
+        **validated,
+        "paths": normalized_paths,
+    }
     context = {
         **_current_page(worker),
         "ref": validated["ref"],
@@ -281,7 +327,7 @@ def handle_browser_upload_files(args: Any, **kwargs: Any) -> str:
     )
     if decision_error is not None:
         return decision_error
-    return _public_result(_call(worker, "upload_files", **validated))
+    return _public_result(_call(worker, "upload_files", **upload_args))
 
 
 def handle_browser_console(args: Any, **kwargs: Any) -> str:
