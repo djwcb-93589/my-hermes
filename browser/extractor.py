@@ -169,7 +169,7 @@ class PageExtractor:
         limit = self._positive_limit(max_results, "max_results")
         ref_selector = "a[href], button, input, textarea, select, [role=button]"
         result = self._evaluate(
-            """(input) => {
+            r"""(input) => {
                 const query = input.query.toLocaleLowerCase();
                 const limit = input.limit;
                 const ignored = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
@@ -245,7 +245,7 @@ class PageExtractor:
         limit = self._positive_limit(max_items, "max_items")
         raw_links = self._ensure_list(
             self._evaluate(
-                """(input) => {
+                r"""(input) => {
                     const links = Array.from(document.querySelectorAll('a[href]'));
                     const clip = (value) => String(value || '').slice(0, input.textLimit);
                     return links.slice(0, input.limit + 1).map((element, index) => {
@@ -299,7 +299,7 @@ class PageExtractor:
         limit = self._positive_limit(max_items, "max_items", maximum=100)
         raw_tables = self._ensure_list(
             self._evaluate(
-                """(input) => {
+                r"""(input) => {
                     const text = (element) => (element
                         ? element.textContent.replace(/\s+/g, ' ').trim().slice(0, input.textLimit)
                         : '');
@@ -343,7 +343,7 @@ class PageExtractor:
         limit = self._positive_limit(max_items, "max_items", maximum=100)
         raw_forms = self._ensure_list(
             self._evaluate(
-                """(input) => {
+                r"""(input) => {
                     const controls = Array.from(document.querySelectorAll('input, textarea, select'));
                     const clip = (value, limit) => String(value || '').slice(0, limit);
                     const labelOf = (element) => {
@@ -508,7 +508,7 @@ class PageExtractor:
     def _find_next_page(self) -> dict[str, Any] | None:
         """只选择明确标记或具有明确可访问名称的下一页控件。"""
         candidate = self._evaluate(
-            """() => {
+            r"""() => {
                 const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
                 const nextNames = new Set(['next', 'next page', '下一页', '下页', '下一頁']);
                 const toUrl = (element) => {

@@ -24,7 +24,8 @@ _GATEWAY_APPROVAL_COLUMNS = (
     "id, route_key, conversation_id, requester_user_id, source_message_id, "
     "tool_call_id, tool_message_id, tool_name, tool_args_json, summary, "
     "details_json, status, decision_message_id, result_content, "
-    "source_event_json, agent_state_json, created_at, expires_at, updated_at"
+    "source_event_json, agent_state_json, created_at, expires_at, updated_at, "
+    "grant_scope, execution_started"
 )
 
 def _normalize_gateway_approval_agent_state(value: dict | None) -> dict:
@@ -104,6 +105,8 @@ def _gateway_approval_row(row) -> dict | None:
         "created_at": float(row[16]),
         "expires_at": float(row[17]),
         "updated_at": float(row[18]),
+        "grant_scope": str(row[19]) if row[19] is not None else None,
+        "execution_started": bool(row[20]),
     }
 
 
@@ -204,7 +207,7 @@ def expire_gateway_approvals(
 
 
 def recover_gateway_approvals(conn: sqlite3.Connection) -> dict:
-    """启动恢复：过期 pending，executing 转为不可重试的未知结果。"""
+    """启动恢复：未开始的执行保留给队列，已开始或失去队列的执行记为未知。"""
     now = time.time()
     with transaction(conn):
         expired = _expire_gateway_approvals_in_transaction(conn, now)
@@ -213,6 +216,17 @@ def recover_gateway_approvals(conn: sqlite3.Connection) -> dict:
             SELECT {_GATEWAY_APPROVAL_COLUMNS}
             FROM gateway_approval_requests
             WHERE status='executing'
+              AND (
+                  execution_started=1
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM gateway_message_queue AS queue
+                      WHERE queue.route_key=gateway_approval_requests.route_key
+                        AND queue.task_kind='approval_resume'
+                        AND queue.approval_id=gateway_approval_requests.id
+                        AND queue.status IN ('queued', 'processing')
+                  )
+              )
             """
         ).fetchall()
         requests = [_gateway_approval_row(row) for row in rows]
@@ -233,6 +247,17 @@ def recover_gateway_approvals(conn: sqlite3.Connection) -> dict:
                 UPDATE gateway_approval_requests
                 SET status='execution_unknown', updated_at=?
                 WHERE status='executing'
+                  AND (
+                      execution_started=1
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM gateway_message_queue AS queue
+                          WHERE queue.route_key=gateway_approval_requests.route_key
+                            AND queue.task_kind='approval_resume'
+                            AND queue.approval_id=gateway_approval_requests.id
+                            AND queue.status IN ('queued', 'processing')
+                      )
+                  )
                 """,
                 (now,),
             )
@@ -273,7 +298,13 @@ def create_gateway_approval_with_outbox(
     normalized_requester_user_id = str(requester_user_id or "").strip()
     if not request_id.startswith("approval_"):
         raise DBError("invalid gateway approval request id")
-    if tool_name not in {"file", "terminal", "gateway_send_file", "cron"}:
+    if tool_name not in {
+        "file",
+        "terminal",
+        "gateway_send_file",
+        "cron",
+        "media_analyze",
+    }:
         raise DBError("invalid gateway approval tool")
     if not tool_call_id or not isinstance(tool_args, dict):
         raise DBError("invalid gateway approval tool call")
@@ -654,17 +685,42 @@ def claim_gateway_approval(
         changed = conn.execute(
             """
             UPDATE gateway_approval_requests
-            SET status='executing', decision_message_id=?, updated_at=?
+            SET status='executing', decision_message_id=?, grant_scope=?,
+                execution_started=0, updated_at=?
             WHERE id=? AND status='pending'
             """,
-            (decision_message_id, now, request["id"]),
+            (decision_message_id, normalized_scope, now, request["id"]),
         ).rowcount
         if changed != 1:
             return {"outcome": "conflict"}
+        request["grant_scope"] = normalized_scope
         request["status"] = "executing"
         request["decision_message_id"] = decision_message_id
-        request["grant_scope"] = normalized_scope
+        request["execution_started"] = False
         request["updated_at"] = now
+        message_id, event_json = _build_gateway_approval_resume_event(request)
+        accepted = _enqueue_gateway_message_in_transaction(
+            conn,
+            request["route_key"],
+            message_id,
+            event_json,
+            task_kind="approval_resume",
+            approval_id=request["id"],
+        )
+        if not accepted:
+            raise DBError("gateway approval resume queue identity is occupied")
+        resume_task = _gateway_approval_resume_task_row(
+            conn,
+            request["route_key"],
+            message_id,
+        )
+        if (
+            resume_task is None
+            or resume_task["task_kind"] != "approval_resume"
+            or resume_task["approval_id"] != request["id"]
+            or resume_task["event_json"] != event_json
+        ):
+            raise DBError("gateway approval resume task identity mismatch")
         _emit_gateway_approval_audit(
             request,
             decision="approved",
@@ -672,7 +728,11 @@ def claim_gateway_approval(
             decision_source="user",
             timestamp=now,
         )
-        return {"outcome": "claimed", "request": request}
+        return {
+            "outcome": "claimed",
+            "request": request,
+            "resume_task": resume_task,
+        }
 
 
 def deny_gateway_approval(
@@ -761,7 +821,7 @@ def finish_gateway_approval(
             """
             UPDATE gateway_approval_requests
             SET status=?, result_content=?, updated_at=?
-            WHERE id=? AND status='executing'
+            WHERE id=? AND status='executing' AND execution_started=1
             """,
             (final_status, str(result_content), now, request_id),
         ).rowcount
@@ -851,98 +911,110 @@ def _gateway_approval_resume_task_row(
     }
 
 
-def finish_gateway_approval_and_enqueue_resume(
+def _approval_history_matches(
     conn: sqlite3.Connection,
-    request_id: str,
-    result_content: str,
-    *,
-    succeeded: bool,
-) -> dict:
-    """原子固化工具结果、审批终态和唯一的 history-only 恢复任务。"""
-    final_status = "executed" if succeeded else "failed"
+    approval: dict,
+) -> bool:
+    """确认恢复只会执行数据库历史中那一次已审批的原始调用。"""
+    rows = conn.execute(
+        """
+        SELECT id, role, content, tool_calls, tool_call_id
+        FROM messages
+        WHERE session_id=?
+        ORDER BY id
+        """,
+        (approval["conversation_id"],),
+    ).fetchall()
+    matching_calls = 0
+    matching_results: list[str] = []
+    for message_id, role, content, tool_calls_json, tool_call_id in rows:
+        if role == "assistant" and tool_calls_json:
+            try:
+                tool_calls = json.loads(tool_calls_json)
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(tool_calls, list):
+                return False
+            for call in tool_calls:
+                if not isinstance(call, dict) or call.get("id") != approval["tool_call_id"]:
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    return False
+                try:
+                    arguments = json.loads(function.get("arguments"))
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    function.get("name") != approval["tool_name"]
+                    or arguments != approval["tool_args"]
+                ):
+                    return False
+                matching_calls += 1
+        if role == "tool" and tool_call_id == approval["tool_call_id"]:
+            if int(message_id) != approval["tool_message_id"]:
+                return False
+            matching_results.append(str(content or ""))
+    if matching_calls != 1 or len(matching_results) != 1:
+        return False
+    current_result = matching_results[0]
+    if approval["status"] == "executing":
+        return _is_approval_placeholder(current_result, approval["id"])
+    return (
+        approval["status"] in {"executed", "failed"}
+        and approval["result_content"] is not None
+        and current_result == approval["result_content"]
+    )
+
+
+def _is_approval_placeholder(content: object, approval_id: str) -> bool:
+    """识别尚未被真实工具结果替换的审批占位结果。"""
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return False
+    request = payload.get("approval_request") if isinstance(payload, dict) else None
+    return (
+        isinstance(payload, dict)
+        and payload.get("approval_required") is True
+        and isinstance(request, dict)
+        and request.get("id") == approval_id
+    )
+
+
+def begin_gateway_approval_execution(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+    message_id: str,
+    approval_id: str,
+) -> dict | None:
+    """在 route worker 即将派发工具前把可安全恢复的审批标记为已开始。"""
     with transaction(conn):
-        row = conn.execute(
-            f"""
-            SELECT {_GATEWAY_APPROVAL_COLUMNS}
-            FROM gateway_approval_requests
-            WHERE id=?
-            """,
-            (request_id,),
-        ).fetchone()
-        request = _gateway_approval_row(row)
-        if request is None:
-            raise DBError("gateway approval request not found")
-
-        # 终态重复调用只返回已有事实，绝不重新创建已经完成的恢复任务。
-        if request["status"] in {"executed", "failed"}:
-            message_id = _approval_resume_message_id(request["id"])
-            return {
-                "approval": request,
-                "resume_task": _gateway_approval_resume_task_row(
-                    conn,
-                    request["route_key"],
-                    message_id,
-                ),
-                "already_finished": True,
-            }
-        if request["status"] != "executing":
-            raise DBError("gateway approval is not executing")
-
-        message_id, event_json = _build_gateway_approval_resume_event(request)
-        now = time.time()
-        conn.execute(
-            "UPDATE messages SET content=? WHERE id=?",
-            (str(result_content), request["tool_message_id"]),
+        resume = get_gateway_approval_resume(
+            conn,
+            route_key,
+            conversation_id,
+            message_id,
+            approval_id,
         )
+        if resume is None:
+            return None
+        approval = resume["approval"]
+        if approval["status"] != "executing" or approval["execution_started"]:
+            return None
         changed = conn.execute(
             """
             UPDATE gateway_approval_requests
-            SET status=?, result_content=?, updated_at=?
-            WHERE id=? AND status='executing'
+            SET execution_started=1, updated_at=?
+            WHERE id=? AND status='executing' AND execution_started=0
             """,
-            (final_status, str(result_content), now, request_id),
+            (time.time(), approval_id),
         ).rowcount
         if changed != 1:
-            raise DBError("gateway approval terminal transition failed")
-
-        accepted = _enqueue_gateway_message_in_transaction(
-            conn,
-            request["route_key"],
-            message_id,
-            event_json,
-            task_kind="approval_resume",
-            approval_id=request["id"],
-        )
-        if not accepted:
-            raise DBError("gateway approval resume queue identity is occupied")
-        task = _gateway_approval_resume_task_row(
-            conn,
-            request["route_key"],
-            message_id,
-        )
-        if (
-            task is None
-            or task["task_kind"] != "approval_resume"
-            or task["approval_id"] != request["id"]
-            or task["event_json"] != event_json
-        ):
-            raise DBError("gateway approval resume task identity mismatch")
-
-        request["status"] = final_status
-        request["result_content"] = str(result_content)
-        request["updated_at"] = now
-        _emit_gateway_approval_audit(
-            request,
-            decision=final_status,
-            grant_scope=None,
-            decision_source="tool_execution",
-            timestamp=now,
-        )
-        return {
-            "approval": request,
-            "resume_task": task,
-            "already_finished": False,
-        }
+            return None
+        approval["execution_started"] = True
+        return approval
 
 
 def get_gateway_approval_resume(
@@ -974,12 +1046,22 @@ def get_gateway_approval_resume(
         SELECT {_GATEWAY_APPROVAL_COLUMNS}
         FROM gateway_approval_requests
         WHERE id=? AND route_key=? AND conversation_id=?
-          AND status IN ('executed', 'failed')
+          AND status IN ('executing', 'executed', 'failed')
         """,
         (approval_id, route_key, conversation_id),
     ).fetchone()
     approval = _gateway_approval_row(row)
     if approval is None:
+        return None
+    if (
+        not approval["fingerprint"]
+        or not approval_request_binding_matches(
+            approval["tool_name"],
+            approval["tool_args"],
+            approval["details"],
+            session_key=conversation_id,
+        )
+    ):
         return None
     expected_id, expected_event_json = _build_gateway_approval_resume_event(approval)
     if expected_id != message_id or task["event_json"] != expected_event_json:
@@ -991,6 +1073,8 @@ def get_gateway_approval_resume(
         approval["source_message_id"],
     )
     if approval["source_message_id"] not in source_ids:
+        return None
+    if not _approval_history_matches(conn, approval):
         return None
     return {
         "approval": approval,

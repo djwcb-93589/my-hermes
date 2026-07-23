@@ -16,7 +16,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             tool_call_id TEXT NOT NULL,
             tool_message_id INTEGER NOT NULL UNIQUE,
             tool_name TEXT NOT NULL CHECK (
-                tool_name IN ('file', 'terminal', 'gateway_send_file', 'cron')
+                tool_name IN (
+                    'file', 'terminal', 'gateway_send_file', 'cron',
+                    'media_analyze'
+                )
             ),
             tool_args_json TEXT NOT NULL,
             summary TEXT NOT NULL,
@@ -28,12 +31,16 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 )
             ),
             decision_message_id TEXT,
+            grant_scope TEXT,
             result_content TEXT,
             source_event_json TEXT NOT NULL,
             agent_state_json TEXT NOT NULL,
             created_at REAL NOT NULL,
             expires_at REAL NOT NULL,
             updated_at REAL NOT NULL,
+            execution_started INTEGER NOT NULL DEFAULT 0 CHECK (
+                execution_started IN (0, 1)
+            ),
             FOREIGN KEY (conversation_id)
                 REFERENCES sessions(id) ON DELETE CASCADE,
             FOREIGN KEY (tool_message_id)

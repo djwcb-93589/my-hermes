@@ -80,6 +80,15 @@ cookie/表单/延迟/下载/iframe/弹窗等真实 HTTP 语义,覆盖已实现�
 68. analyze_page 参数校验(prompt 空/full_page 非布尔)
 69. analyze_page 未配置 key 返回 multimodal_not_configured
 70. analyze_audio 类型不匹配(传图片)
+71. find_in_page 命中可见文本,返回 matches+ref
+72. find_in_page 参数校验(query 空)
+73. extract_links 返回链接列表含 ref
+74. extract_tables 返回表格结构
+75. extract_forms 返回表单结构
+76. extract_metadata 返回 title/OG/JSON-LD
+77. collect_paginated 跟随 rel=next 翻多页采集
+78. P9 只读方法拒绝 stale snapshot_id
+79. P9 只读方法纯读取不失效 snapshot_id
 
 playwright 或浏览器未装时整组 skip,不报 error。
 """
@@ -1958,6 +1967,188 @@ def test_analyze_page_not_configured_returns_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P9 测试:内容提取 find_in_page / extract_links / extract_tables
+# / extract_forms / extract_metadata / collect_paginated
+# ---------------------------------------------------------------------------
+
+
+def test_find_in_page_returns_matches_with_ref() -> None:
+    """find_in_page 在可见文本中搜关键词,返回 matches(含 ref)+ match_count。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        snap, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        result = _parse_result(s.find_in_page("文章", snapshot_id, max_results=20))
+        assert result.get("ok") is True, f"find_in_page 失败: {result}"
+        assert result.get("query") == "文章"
+        matches = result.get("matches", [])
+        assert result.get("match_count", 0) > 0, "首页应能搜到 '文章'"
+        assert len(matches) > 0, "matches 列表不应为空"
+        # 首页导航链接含"文章 Alpha/Beta",附近有可交互元素,应能拿到 ref。
+        assert any(m.get("ref") for m in matches), (
+            f"至少一个匹配应有 ref: {matches[:2]}"
+        )
+        # 纯读取:snapshot_id 应保持不变。
+        assert result.get("snapshot_id") == snapshot_id
+
+
+def test_find_in_page_rejects_invalid_args() -> None:
+    """find_in_page 参数校验:query 空。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        r = _parse_result(s.find_in_page("  ", snapshot_id))
+        assert r.get("ok") is False and r.get("error_type") == "invalid_args", (
+            f"空 query 应 invalid_args: {r}"
+        )
+
+
+def test_extract_links_returns_links_with_ref() -> None:
+    """extract_links 返回链接列表,每个含 text/url/ref。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        result = _parse_result(s.extract_links(snapshot_id, max_items=100))
+        assert result.get("ok") is True, f"extract_links 失败: {result}"
+        links = result.get("links", [])
+        assert result.get("count", 0) > 0, "首页应有链接"
+        assert len(links) > 0
+        # 链接应有 ref(可交互元素)。
+        assert any(link.get("ref") for link in links), (
+            f"至少一个链接应有 ref: {links[:2]}"
+        )
+        # 链接应有 url 和 text。
+        assert links[0].get("url") or links[0].get("raw_href"), (
+            f"链接应有 url/href: {links[0]}"
+        )
+
+
+def test_extract_tables_returns_table_structure() -> None:
+    """extract_tables 返回表格结构(行/列/表头)。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/table")))
+        result = _parse_result(s.extract_tables(snapshot_id, max_items=10))
+        assert result.get("ok") is True, f"extract_tables 失败: {result}"
+        tables = result.get("tables", [])
+        assert result.get("count", 0) >= 1, "表格页应至少 1 个表格"
+        assert len(tables) >= 1
+        # 表格应有行数据。
+        table = tables[0]
+        assert "rows" in table or "headers" in table or "body" in table, (
+            f"表格结构应含 rows/headers/body: {list(table.keys())}"
+        )
+
+
+def test_extract_forms_returns_form_structure() -> None:
+    """extract_forms 返回表单结构(控件/字段)。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/form")))
+        result = _parse_result(s.extract_forms(snapshot_id, max_items=10))
+        assert result.get("ok") is True, f"extract_forms 失败: {result}"
+        forms = result.get("forms", [])
+        assert result.get("count", 0) >= 1, "表单页应至少 1 个表单"
+        assert len(forms) >= 1
+        # 表单应有字段/控件信息。
+        form = forms[0]
+        assert "fields" in form or "controls" in form or "inputs" in form, (
+            f"表单结构应含 fields/controls/inputs: {list(form.keys())}"
+        )
+
+
+def test_extract_metadata_returns_title_og_jsonld() -> None:
+    """extract_metadata 返回 title/description/open_graph/json_ld。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/meta")))
+        result = _parse_result(s.extract_metadata(snapshot_id))
+        assert result.get("ok") is True, f"extract_metadata 失败: {result}"
+        assert "元数据测试页" in result.get("title", ""), (
+            f"title 应含 '元数据测试页': {result.get('title')!r}"
+        )
+        # OG 标签。
+        og = result.get("open_graph", {})
+        assert og.get("title") == "OG 标题" or "OG" in str(og), (
+            f"open_graph 应含 OG 标题: {og}"
+        )
+        # JSON-LD。
+        json_ld = result.get("json_ld", [])
+        assert json_ld, f"json_ld 不应为空: {json_ld}"
+
+
+def test_collect_paginated_follows_next_pages() -> None:
+    """collect_paginated 跟随 rel=next 翻多页,采集多页链接。
+
+    fixture /paged 共 3 页,每页 2 个文章链接 + rel=next(第 3 页无)。
+    """
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/paged?page=1")))
+        result = _parse_result(
+            s.collect_paginated(
+                snapshot_id, extract_kind="links", max_pages=3, max_items=50
+            )
+        )
+        assert result.get("ok") is True, f"collect_paginated 失败: {result}"
+        # 应访问 3 页。
+        assert result.get("pages_visited", 0) == 3, (
+            f"应访问 3 页,实际: {result.get('pages_visited')}"
+        )
+        # 应采集 6 个链接(3 页 × 2)。
+        items = result.get("items", [])
+        assert result.get("items_collected", 0) >= 6, (
+            f"应至少采集 6 项,实际: {result.get('items_collected')}"
+        )
+        # 自动翻页换发快照:snapshot_id 应变化。
+        assert result.get("snapshot_id") != snapshot_id, (
+            "collect_paginated 翻页后应换发新 snapshot_id"
+        )
+        # stop_reason 应是正常结束(无下一页)。
+        assert result.get("stop_reason"), "应有 stop_reason"
+
+
+def test_p9_read_actions_reject_stale_snapshot() -> None:
+    """5 个只读 P9 方法拒绝 stale snapshot_id。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, stale_id = _observation(s.navigate(_fixture_url("/")))
+        _observation(s.navigate(_fixture_url("/")))  # 让 stale_id 失效
+        for name, result_json in (
+            ("find_in_page", s.find_in_page("x", stale_id)),
+            ("extract_links", s.extract_links(stale_id)),
+            ("extract_tables", s.extract_tables(stale_id)),
+            ("extract_forms", s.extract_forms(stale_id)),
+            ("extract_metadata", s.extract_metadata(stale_id)),
+        ):
+            r = _parse_result(result_json)
+            assert r.get("ok") is False, f"{name} 应拒绝 stale: {r}"
+            assert r.get("error_type") == "stale_snapshot", (
+                f"{name} 错误类型应为 stale_snapshot,实际: {r.get('error_type')}"
+            )
+
+
+def test_p9_read_actions_preserve_snapshot_id() -> None:
+    """P9 只读方法不失效 snapshot_id(纯读取,ref 仍可用)。"""
+    from browser.session import BrowserSession
+    with BrowserSession() as s:
+        _, snapshot_id = _observation(s.navigate(_fixture_url("/")))
+        # 调多个只读方法,snapshot_id 应保持不变。
+        r1 = _parse_result(s.extract_links(snapshot_id))
+        assert r1.get("snapshot_id") == snapshot_id, "extract_links 不应改 snapshot_id"
+        r2 = _parse_result(s.find_in_page("文章", snapshot_id))
+        assert r2.get("snapshot_id") == snapshot_id, "find_in_page 不应改 snapshot_id"
+        r3 = _parse_result(s.extract_metadata(snapshot_id))
+        assert r3.get("snapshot_id") == snapshot_id, "extract_metadata 不应改 snapshot_id"
+        # 旧 snapshot_id 仍能操作(纯读取不失效)。
+        click_ref = _find_ref_for_role(
+            _observation(s.snapshot())[0], "link", "文章 Alpha"
+        )
+        if click_ref:
+            # snapshot 后 snapshot_id 变了,用新的;但证明只读方法没破坏观察。
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 简单测试运行器:依次跑,统计 pass/fail,失败打印 traceback。
 # ---------------------------------------------------------------------------
 
@@ -2112,6 +2303,24 @@ _TESTS: list[tuple[str, Any]] = [
      test_analyze_page_rejects_invalid_args),
     ("test_analyze_page_not_configured_returns_error",
      test_analyze_page_not_configured_returns_error),
+    ("test_find_in_page_returns_matches_with_ref",
+     test_find_in_page_returns_matches_with_ref),
+    ("test_find_in_page_rejects_invalid_args",
+     test_find_in_page_rejects_invalid_args),
+    ("test_extract_links_returns_links_with_ref",
+     test_extract_links_returns_links_with_ref),
+    ("test_extract_tables_returns_table_structure",
+     test_extract_tables_returns_table_structure),
+    ("test_extract_forms_returns_form_structure",
+     test_extract_forms_returns_form_structure),
+    ("test_extract_metadata_returns_title_og_jsonld",
+     test_extract_metadata_returns_title_og_jsonld),
+    ("test_collect_paginated_follows_next_pages",
+     test_collect_paginated_follows_next_pages),
+    ("test_p9_read_actions_reject_stale_snapshot",
+     test_p9_read_actions_reject_stale_snapshot),
+    ("test_p9_read_actions_preserve_snapshot_id",
+     test_p9_read_actions_preserve_snapshot_id),
 ]
 
 

@@ -87,6 +87,13 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             self._send_html(pages.popup_page())
         elif path == "/upload":
             self._send_html(pages.upload_page())
+        elif path == "/table":
+            self._send_html(pages.table_page())
+        elif path == "/meta":
+            self._send_html(pages.metadata_page())
+        elif path == "/paged":
+            page = _parse_int(query.get("page"), default=1)
+            self._send_html(pages.paged_page(page))
         elif path == "/dialog":
             self._send_html(pages.dialog_page())
         elif path == "/download":

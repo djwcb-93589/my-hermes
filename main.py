@@ -23,7 +23,6 @@ def cli_loop():
     """默认模式：原始 input → run_conversation REPL。"""
     register_all()
 
-    print("=== s15: Scheduled Tasks (CLI mode) ===")
     print(f"Profile (HERMES_HOME): {HERMES_HOME}")
     print(f"Model: {MODEL} | Base URL: {BASE_URL}")
 

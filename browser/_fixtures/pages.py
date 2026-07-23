@@ -486,6 +486,84 @@ def upload_page() -> str:
 </html>"""
 
 
+def table_page() -> str:
+    """表格页:含一个带表头的表格,测 extract_tables。
+
+    表格有 thead/tbody,多行多列,便于断言结构。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>表格页</title></head>
+<body>
+  <h1>表格页</h1>
+  <table id="t1">
+    <thead><tr><th>姓名</th><th>城市</th><th>分数</th></tr></thead>
+    <tbody>
+      <tr><td>张三</td><td>北京</td><td>90</td></tr>
+      <tr><td>李四</td><td>上海</td><td>85</td></tr>
+      <tr><td>王五</td><td>深圳</td><td>78</td></tr>
+    </tbody>
+  </table>
+  <a href="/">返回首页</a>
+</body>
+</html>"""
+
+
+def metadata_page() -> str:
+    """元数据页:含 title、meta description、Open Graph、JSON-LD。
+
+    测 extract_metadata 的 title/description/open_graph/json_ld 字段。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>元数据测试页</title>
+  <meta name="description" content="这是一个用于测试元数据提取的页面">
+  <meta property="og:title" content="OG 标题">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://example.com/meta">
+  <script type="application/ld+json">
+  {"@context": "https://schema.org", "@type": "Article", "headline": "JSON-LD 文章"}
+  </script>
+</head>
+<body>
+  <h1>元数据测试页</h1>
+  <p>页面内容本身不重要,重要的是 head 里的元数据。</p>
+  <a href="/">返回首页</a>
+</body>
+</html>"""
+
+
+def paged_page(page: int) -> str:
+    """分页页:每页有不同链接,第 1/2 页有 rel=next 下一页链接。
+
+    测 collect_paginated 自动翻页。共 3 页,第 3 页无下一页。
+    每页有 2 个文章链接(不同页内容不同),下一页用 rel="next" 标记。
+    """
+    page = max(1, min(page, 3))
+    # 每页 2 个链接,内容随页码变化。
+    links = "\n".join(
+        f'<li><a href="/article?name=page{page}-item{i}">第{page}页项{i}</a></li>'
+        for i in range(1, 3)
+    )
+    next_link = ""
+    if page < 3:
+        next_link = f'<a rel="next" href="/paged?page={page + 1}">下一页</a>'
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>分页第{page}页</title></head>
+<body>
+  <h1>分页第{page}页</h1>
+  <ul>
+    {links}
+  </ul>
+  {next_link}
+  <a href="/">返回首页</a>
+</body>
+</html>"""
+
+
 def not_found_page(path: str) -> str:
     """404 页。"""
     return f"""<!DOCTYPE html>

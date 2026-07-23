@@ -13,7 +13,6 @@ from hermes.persistence.approval import (
     expire_gateway_approvals,
     fail_gateway_approval_identity_unavailable,
     finish_gateway_approval,
-    finish_gateway_approval_and_enqueue_resume,
     get_gateway_approval_resume,
     get_pending_gateway_approval,
     recover_gateway_approvals,
