@@ -87,14 +87,11 @@ class SessionStore:
         conn = init_db(self.db_path)
         try:
             persisted = get_gateway_conversation_id(conn, route_key)
-            conversation_id = persisted or route_key
-            if persisted is None:
-                set_gateway_conversation_id(
-                    conn,
-                    route_key,
-                    conversation_id,
-                )
-            return conversation_id
+            if not persisted:
+                # 首次使用该路由：生成 UUID 作为会话 ID，避免把 route_key 当成 conversation_id
+                persisted = str(uuid.uuid4())
+                set_gateway_conversation_id(conn, route_key, persisted)
+            return persisted
         finally:
             conn.close()
 
@@ -169,8 +166,11 @@ class SessionStore:
                         get_gateway_conversation_id,
                         route_key,
                     )
-                    conversation_id = persisted or route_key
-                    if persisted is None:
+                    if persisted:
+                        conversation_id = persisted
+                    else:
+                        # 首次使用该路由：生成 UUID 作为会话 ID，避免把 route_key 当成 conversation_id
+                        conversation_id = str(uuid.uuid4())
                         await self.persistence.call(
                             set_gateway_conversation_id,
                             route_key,

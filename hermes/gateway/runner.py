@@ -1131,7 +1131,7 @@ class GatewayRunner:
                 "",
             ])
         lines.extend([
-            "使用 /resume 2 切换对话。",
+            "使用 /resume <序号> 切换对话。",
             "序号以当前列表为准。",
         ])
         return "\n".join(lines)

@@ -14,4 +14,13 @@ dependencies = [
     "qrcode>=7.4",
     "httpx>=0.28,<1",
     "tzdata>=2026.3",
+    "playwright>=1.61.0",
 ]
+
+[project.optional-dependencies]
+# 浏览器读取模块(optional)。安装后还需 `playwright install chromium` 下载浏览器。
+# 放在 optional 里,不用浏览器的用户不必承担 ~300MB 的下载成本。
+browser = ["playwright>=1.40"]
+
+[tool.setuptools.packages.find]
+include = ["hermes", "hermes.*", "browser", "browser.*"]
