@@ -99,7 +99,7 @@ _WINDOWS_RESERVED_FILENAMES = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
-_MAX_ARTIFACT_FILENAME_CHARS = 240
+_MAX_ARTIFACT_FILENAME_BYTES = 240
 
 
 @dataclass(frozen=True)
@@ -336,6 +336,9 @@ class BrowserSession:
         """把浏览器建议名称收敛为 artifact_dir 内的单一安全文件名。"""
         candidate = Path(suggested or "").name
         candidate = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", candidate)
+        # 路径项最终按 UTF-8 写入文件系统；先替换异常代理字符，避免后续长度
+        # 计算与实际写入不一致。
+        candidate = candidate.encode("utf-8", errors="replace").decode("utf-8")
         # 保留开头的点，才能把 `.txt` 识别为“只有扩展名”的建议名称。
         candidate = candidate.strip(" ").rstrip(". ")
         last_dot = candidate.rfind(".")
@@ -352,38 +355,60 @@ class BrowserSession:
         if suffix is not None:
             extension = f".{suffix.lstrip('.')}"
         # 过长扩展名本身也会挤占目录项长度，且保留其开头仍足以说明用途。
-        extension = extension[:32]
+        extension = self._utf8_truncate(extension, 32)
         if stem.upper() in _WINDOWS_RESERVED_FILENAMES:
             stem = f"_{stem}"
         return self._fit_artifact_filename_locked(
-            stem, extension, max_chars=120, fallback=prefix
+            stem, extension, max_bytes=120, fallback=prefix
         )
+
+    @staticmethod
+    def _utf8_truncate(text: str, max_bytes: int) -> str:
+        """按 UTF-8 字节预算截断文本，始终在完整字符边界结束。"""
+        if max_bytes <= 0:
+            return ""
+        normalized = text.encode("utf-8", errors="replace").decode("utf-8")
+        used_bytes = 0
+        characters: list[str] = []
+        for character in normalized:
+            character_bytes = len(character.encode("utf-8"))
+            if used_bytes + character_bytes > max_bytes:
+                break
+            characters.append(character)
+            used_bytes += character_bytes
+        return "".join(characters)
 
     @staticmethod
     def _fit_artifact_filename_locked(
         stem: str,
         extension: str,
         *,
-        max_chars: int,
+        max_bytes: int,
         fallback: str,
     ) -> str:
-        """在有限名称预算内保留扩展名，并保证结果不是空文件名。"""
-        if max_chars < 2:
+        """在 UTF-8 字节预算内保留扩展名，并保证结果不是空文件名。"""
+        if max_bytes < 2:
             raise ValueError("产物文件名预算不足")
-        safe_extension = extension[: min(len(extension), 32, max_chars - 1)]
-        allowed_stem = max_chars - len(safe_extension)
-        safe_stem = (stem.strip(" .") or fallback)[:allowed_stem].strip(" .")
+        safe_extension = BrowserSession._utf8_truncate(
+            extension, min(32, max_bytes - 1)
+        )
+        allowed_stem = max_bytes - len(safe_extension.encode("utf-8"))
+        safe_stem = BrowserSession._utf8_truncate(
+            stem.strip(" .") or fallback, allowed_stem
+        ).strip(" .")
         if not safe_stem:
-            safe_stem = fallback[:allowed_stem] or "f"
+            safe_stem = BrowserSession._utf8_truncate(fallback, allowed_stem).strip(" .") or "f"
         if safe_stem.upper() in _WINDOWS_RESERVED_FILENAMES:
-            reserved_safe_stem = f"_{safe_stem}"
-            safe_stem = reserved_safe_stem[:allowed_stem] or "f"
+            safe_stem = BrowserSession._utf8_truncate(
+                f"_{safe_stem}", allowed_stem
+            ).strip(" .") or "f"
         return f"{safe_stem}{safe_extension}"
 
     def _new_artifact_paths_locked(self, kind: str, filename: str) -> tuple[Path, Path]:
         """原子预留带随机标识的正式文件名，并分配同目录临时文件。"""
         # 临时名为 .{kind}-{uuid}-{filename}.{uuid}.tmp，长度开销比正式名更大。
-        filename_budget = _MAX_ARTIFACT_FILENAME_CHARS - len(kind) - 72
+        # 文件系统限制的是编码后的目录项字节数，而不是 Python 字符数。
+        filename_budget = _MAX_ARTIFACT_FILENAME_BYTES - len(kind.encode("utf-8")) - 72
         last_dot = filename.rfind(".")
         if last_dot > 0:
             filename_stem, filename_extension = filename[:last_dot], filename[last_dot:]
@@ -392,12 +417,18 @@ class BrowserSession:
         filename = self._fit_artifact_filename_locked(
             filename_stem,
             filename_extension,
-            max_chars=min(120, filename_budget),
+            max_bytes=min(120, filename_budget),
             fallback="artifact",
         )
         while True:
             self._artifact_counter += 1
             unique_name = f"{kind}-{uuid4().hex}-{filename}"
+            temporary_name = f".{unique_name}.{uuid4().hex}.tmp"
+            if (
+                len(unique_name.encode("utf-8")) > _MAX_ARTIFACT_FILENAME_BYTES
+                or len(temporary_name.encode("utf-8")) > _MAX_ARTIFACT_FILENAME_BYTES
+            ):
+                raise ValueError("产物文件名超出文件系统长度限制")
             final_path = (self.artifact_dir / unique_name).resolve(strict=False)
             if not self._is_relative_to(final_path, self.artifact_dir):
                 raise ValueError("产物路径越界")
@@ -414,7 +445,7 @@ class BrowserSession:
             else:
                 os.close(descriptor)
                 break
-        temporary_path = self.artifact_dir / f".{unique_name}.{uuid4().hex}.tmp"
+        temporary_path = self.artifact_dir / temporary_name
         return final_path, temporary_path
 
     def _artifact_payload_locked(self, artifact: _Artifact) -> dict[str, Any]:
@@ -444,6 +475,13 @@ class BrowserSession:
             pass
         finally:
             self._artifacts.pop(artifact.artifact_id, None)
+
+    def _discard_new_artifact_on_failure_locked(
+        self, artifact: _Artifact | None
+    ) -> None:
+        """只回滚本次新建的产物；清理异常不影响原始失败结果。"""
+        if artifact is not None:
+            self._discard_artifact_locked(artifact)
 
     def _publish_artifact_locked(
         self,
@@ -2723,6 +2761,8 @@ class BrowserSession:
             stale_error = self._validate_snapshot_locked(snapshot_id)
             if stale_error is not None:
                 return stale_error
+            artifact: _Artifact | None = None
+            completed = False
             try:
                 artifact = self._publish_artifact_locked(
                     "screenshot",
@@ -2735,19 +2775,29 @@ class BrowserSession:
                     page_id=self._current_page_id,
                     source_url=self._page.url,
                 )
+                observation = self._current_observation_locked()
+                if observation is None:
+                    return _err("screenshot_failed", "页面截图完成后原快照已不可用")
+                snapshot, active_snapshot_id = observation
+                result = self._add_result_fields(
+                    self._ok_snapshot_locked(
+                        snapshot, active_snapshot_id, event_type="none"
+                    ),
+                    artifact=self._artifact_payload_locked(artifact),
+                )
+                result_payload = json.loads(result)
+                if not isinstance(result_payload, dict) or not result_payload.get("ok"):
+                    raise RuntimeError("页面截图结果构造失败")
+                completed = True
+                return result
             except Exception as exc:
                 return self._current_observation_error_locked(
                     "page_closed" if self._is_permanent_browser_error(exc) else "screenshot_failed",
                     f"页面截图失败: {exc}",
                 )
-            observation = self._current_observation_locked()
-            if observation is None:
-                return _err("screenshot_failed", "页面截图完成后原快照已不可用")
-            snapshot, active_snapshot_id = observation
-            return self._add_result_fields(
-                self._ok_snapshot_locked(snapshot, active_snapshot_id, event_type="none"),
-                artifact=self._artifact_payload_locked(artifact),
-            )
+            finally:
+                if not completed:
+                    self._discard_new_artifact_on_failure_locked(artifact)
 
     def _passive_screenshot_state_locked(self) -> tuple[str, str, float, float, tuple[str, ...], str | None]:
         """读取截图前后必须保持不变的页面状态，不触发交互动作。"""
@@ -2905,6 +2955,8 @@ class BrowserSession:
             target = self._locator_for_ref_locked(ref)
             if isinstance(target, str):
                 return self._p7_ref_error_with_observation_locked(target)
+            artifact: _Artifact | None = None
+            completed = False
             try:
                 # 截图不是会触发页面事件的操作；清除意外留下的临时对话框信息，
                 # 但保留调用方为后续真实操作声明的 next policy。
@@ -2928,12 +2980,26 @@ class BrowserSession:
                 )
                 after_state = self._passive_screenshot_state_locked()
                 if after_state != before_state:
-                    self._discard_artifact_locked(artifact)
                     self._last_dialog_event = None
                     return self._current_observation_error_locked(
                         "screenshot_failed",
                         "截图期间页面状态发生变化，已丢弃图片产物",
                     )
+                observation = self._current_observation_locked()
+                if observation is None:
+                    return _err("screenshot_failed", "元素截图完成后原快照已不可用")
+                snapshot, active_snapshot_id = observation
+                result = self._add_result_fields(
+                    self._ok_snapshot_locked(
+                        snapshot, active_snapshot_id, event_type="none"
+                    ),
+                    artifact=self._artifact_payload_locked(artifact),
+                )
+                result_payload = json.loads(result)
+                if not isinstance(result_payload, dict) or not result_payload.get("ok"):
+                    raise RuntimeError("元素截图结果构造失败")
+                completed = True
+                return result
             except Exception as exc:
                 self._last_dialog_event = None
                 return self._current_observation_error_locked(
@@ -2944,14 +3010,8 @@ class BrowserSession:
                 self._clear_native_markers_locked([target])
                 self._active_dialog_policy = None
                 self._last_dialog_event = None
-            observation = self._current_observation_locked()
-            if observation is None:
-                return _err("screenshot_failed", "元素截图完成后原快照已不可用")
-            snapshot, active_snapshot_id = observation
-            return self._add_result_fields(
-                self._ok_snapshot_locked(snapshot, active_snapshot_id, event_type="none"),
-                artifact=self._artifact_payload_locked(artifact),
-            )
+                if not completed:
+                    self._discard_new_artifact_on_failure_locked(artifact)
 
     def _upload_error_type(self, exc: Exception) -> str:
         """上传失败优先保留可操作性错误，其余统一为上传失败。"""
