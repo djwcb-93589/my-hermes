@@ -1170,8 +1170,111 @@ class BrowserSession:
             )
         )
 
+    def _p9_popup_failure_locked(
+        self,
+        original_page_id: str | None,
+        before_pages: set[str],
+    ) -> str:
+        """分页按钮意外开新页时关闭新页，并只恢复原页面的可继续观察。"""
+        popup_page_ids = [
+            page_id for page_id in self._pages if page_id not in before_pages
+        ]
+        for page_id in popup_page_ids:
+            state = self._pages.get(page_id)
+            if state is None:
+                continue
+            try:
+                state.page.close(run_before_unload=False)
+            except Exception:
+                # 关闭失败不能改变“本次分页不可继续”的原始结论。
+                pass
+        if original_page_id is None or original_page_id not in self._pages:
+            return _err("page_closed", "分页时原页面已关闭，无法恢复")
+        try:
+            self._select_page_locked(original_page_id, invalidate=False)
+            snapshot, snapshot_id = self._snapshot_locked()
+        except Exception as exc:
+            return _err("navigation_failed", f"分页意外打开新页面且无法恢复原页面: {exc}")
+        return self._err_observation_locked(
+            "navigation_failed",
+            "分页按钮打开了新页面，已关闭新页面并保留原页面",
+            snapshot,
+            snapshot_id,
+            event_type="popup",
+            extra={"popup_page_ids": popup_page_ids},
+        )
+
+    def _p9_content_marker_locked(self) -> str:
+        """在浏览器内生成短内容标记，供同 URL 的 AJAX 分页判断是否已更新。"""
+        return str(
+            self._page.evaluate(
+                """() => {
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT
+                    );
+                    const sampleLimit = 50000;
+                    let hash = 2166136261;
+                    let totalLength = 0;
+                    let sampledLength = 0;
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        const text = node.nodeValue || '';
+                        totalLength += text.length;
+                        const end = Math.min(text.length, sampleLimit - sampledLength);
+                        for (let index = 0; index < end; index += 1) {
+                            hash ^= text.charCodeAt(index);
+                            hash = Math.imul(hash, 16777619);
+                        }
+                        sampledLength += end;
+                    }
+                    return `${totalLength}:${sampledLength}:${hash >>> 0}`;
+                }"""
+            )
+        )
+
+    def _p9_wait_for_button_change_locked(
+        self,
+        previous_url: str,
+        previous_marker: str,
+        previous_content_marker: str,
+        before_pages: set[str],
+        deadline: float,
+    ) -> str:
+        """在分页剩余预算内等待导航或 DOM 真正变化，而非固定短暂停顿。"""
+        while True:
+            if any(page_id not in before_pages for page_id in self._pages):
+                return "popup"
+            if self._page is None or self._page.is_closed():
+                return "page_closed"
+            try:
+                self._ensure_dom_version_locked()
+                current_marker = str(
+                    self._page.evaluate("window.__browserDomVersion || 0")
+                )
+                current_content_marker = self._p9_content_marker_locked()
+            except Exception as exc:
+                if self._is_permanent_browser_error(exc):
+                    return "page_closed"
+                if not self._is_transient_wait_error(exc):
+                    return "failed"
+                current_marker = previous_marker
+                current_content_marker = previous_content_marker
+            if (
+                self._page.url != previous_url
+                or current_marker != previous_marker
+                or current_content_marker != previous_content_marker
+            ):
+                return "changed"
+            remaining_ms = int((deadline - monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return "timeout"
+            try:
+                self._page.wait_for_timeout(min(50, remaining_ms))
+            except Exception as exc:
+                return "page_closed" if self._is_permanent_browser_error(exc) else "failed"
+
     def _p9_click_next_button_locked(self, index: int, timeout_ms: int) -> str:
-        """只点击提取器识别出的明确下一页按钮，不接受任意页面选择器。"""
+        """只点击分页区域中的明确下一页按钮，并等到页面确实发生变化。"""
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:
             return _err("invalid_args", "下一页按钮索引无效")
         if (
@@ -1183,16 +1286,31 @@ class BrowserSession:
 
         def click_next() -> str:
             before_pages = set(self._pages)
+            original_page_id = self._current_page_id
             previous_url = self._page.url
             previous_position = self._position_marker_locked()
             previous_marker = self._dom_marker_locked()
+            try:
+                previous_content_marker = self._p9_content_marker_locked()
+            except Exception as exc:
+                return _err(
+                    "page_closed"
+                    if self._is_permanent_browser_error(exc)
+                    else "interaction_failed",
+                    f"开始分页时无法读取页面内容: {exc}",
+                )
+            deadline = monotonic() + timeout_ms / 1000.0
             self._invalidate_snapshot_locked()
             try:
                 self._page.locator('button, [role="button"]').nth(index).click(
                     timeout=timeout_ms
                 )
             except Exception as exc:
-                return self._finalize_interaction_locked(
+                if any(page_id not in before_pages for page_id in self._pages):
+                    return self._p9_popup_failure_locked(
+                        original_page_id, before_pages
+                    )
+                result = self._finalize_interaction_locked(
                     previous_url,
                     None,
                     "collect_paginated_next",
@@ -1203,9 +1321,53 @@ class BrowserSession:
                     error=f"collect_paginated_next 失败: {exc}",
                     record_navigation=False,
                     settle_navigation=False,
-                    event_collection_timeout_ms=min(250, timeout_ms),
+                    event_collection_timeout_ms=0,
                 )
-            return self._finalize_interaction_locked(
+                if any(page_id not in before_pages for page_id in self._pages):
+                    return self._p9_popup_failure_locked(
+                        original_page_id, before_pages
+                    )
+                return result
+            change = self._p9_wait_for_button_change_locked(
+                previous_url,
+                previous_marker,
+                previous_content_marker,
+                before_pages,
+                deadline,
+            )
+            if change == "popup":
+                return self._p9_popup_failure_locked(original_page_id, before_pages)
+            if change == "page_closed":
+                return _err("page_closed", "分页时页面已关闭")
+            if change == "failed":
+                return self._finalize_interaction_locked(
+                    previous_url,
+                    None,
+                    "collect_paginated_next",
+                    False,
+                    before_pages,
+                    previous_marker,
+                    error_type="interaction_failed",
+                    error="等待分页结果时无法读取页面状态",
+                    record_navigation=False,
+                    settle_navigation=False,
+                    event_collection_timeout_ms=0,
+                )
+            if change == "timeout":
+                return self._finalize_interaction_locked(
+                    previous_url,
+                    None,
+                    "collect_paginated_next",
+                    False,
+                    before_pages,
+                    previous_marker,
+                    error_type="repeated_page",
+                    error="分页按钮在预算内没有引起页面内容变化",
+                    record_navigation=False,
+                    settle_navigation=False,
+                    event_collection_timeout_ms=0,
+                )
+            result = self._finalize_interaction_locked(
                 previous_url,
                 previous_position,
                 "collect_paginated_next",
@@ -1213,8 +1375,11 @@ class BrowserSession:
                 before_pages,
                 previous_marker,
                 settle_navigation=False,
-                event_collection_timeout_ms=min(250, timeout_ms),
+                event_collection_timeout_ms=0,
             )
+            if any(page_id not in before_pages for page_id in self._pages):
+                return self._p9_popup_failure_locked(original_page_id, before_pages)
+            return result
 
         return self._execute_with_dialog_policy_locked(click_next)
 

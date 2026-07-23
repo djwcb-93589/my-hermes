@@ -4,18 +4,42 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
+from hermes.approval import build_assessment_response, is_remote_approval
+from hermes.approval_policy import (
+    approved_media_snapshots_candidate,
+    assess_media_analysis,
+    assess_path_policy_denial,
+)
 from hermes.backends import get_backend
 from hermes.backends.local import LocalBackend
+from hermes.config import SENSITIVE_FILE_PATTERNS
+from hermes.file_state import (
+    FileStateSnapshotError,
+    capture_file_state_snapshot,
+    file_state_snapshot_matches,
+)
 from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessDeniedError
 
 
 _ALLOWED_FIELDS = frozenset({"paths", "prompt", "media_type", "timeout_ms"})
 _MEDIA_TYPES = frozenset({"auto", "image", "audio"})
 _MAX_MEDIA_FILES = 20
+_EXTERNAL_MEDIA_APPROVAL_SUMMARY = (
+    "这些本地媒体文件将被发送给外部多模态模型服务，并可能产生费用。"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedMedia:
+    """保存已通过本地路径检查的媒体源及其规范化路径。"""
+
+    source: MediaSource
+    abs_path: str
 
 
 def _result(payload: dict[str, Any]) -> str:
@@ -23,14 +47,14 @@ def _result(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _error(error_type: str, error: str) -> str:
+def _error(error_type: str, error: str, *, fatal: bool = False) -> str:
     """所有可预期失败都返回可供 Agent 判断的非致命结构化结果。"""
     return _result(
         {
             "ok": False,
             "error_type": error_type,
             "error": error,
-            "fatal": False,
+            "fatal": fatal,
         }
     )
 
@@ -46,6 +70,17 @@ def _has_symlink_component(path: Path) -> bool:
         except OSError:
             return True
     return False
+
+
+def _is_sensitive(abs_path: str) -> bool:
+    """按共享敏感文件规则阻断任何发送到外部媒体服务的路径。"""
+    normalized = abs_path.replace("\\", "/").lower()
+    return any(pattern.search(normalized) for pattern in SENSITIVE_FILE_PATTERNS)
+
+
+def _current_model_name() -> str:
+    """读取与多模态服务相同的模型配置，用于绑定审批身份。"""
+    return os.getenv("DOUBAO_MULTIMODAL_MODEL", "").strip()
 
 
 def _validate_args(args: Any) -> tuple[list[str], str, str, int | None] | str:
@@ -89,10 +124,15 @@ def _is_relative_input_path(raw_path: str) -> bool:
     )
 
 
-def _resolve_media_sources(backend: LocalBackend, paths: list[str]) -> list[MediaSource] | str:
+def _resolve_media_sources(
+    backend: LocalBackend,
+    paths: list[str],
+    *,
+    session_key: str,
+) -> list[_ResolvedMedia] | str:
     """通过 LocalBackend 与共享路径策略将相对路径变成可读取的普通文件。"""
     path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
-    sources: list[MediaSource] = []
+    sources: list[_ResolvedMedia] = []
     for raw_path in paths:
         try:
             resolved_text = backend.resolve_path(raw_path)
@@ -108,15 +148,28 @@ def _resolve_media_sources(backend: LocalBackend, paths: list[str]) -> list[Medi
             if allowed_path.is_symlink() or not allowed_path.is_file():
                 return _error("invalid_media_path", "media path must reference a regular file")
         except PathAccessDeniedError:
-            return _error("path_policy_denied", "media path is blocked by the filesystem policy")
+            return build_assessment_response(
+                assess_path_policy_denial(
+                    "media_analyze",
+                    session_key=session_key,
+                ),
+                _EXTERNAL_MEDIA_APPROVAL_SUMMARY,
+            ) or _error(
+                "path_policy_denied",
+                "media path is blocked by the filesystem policy",
+                fatal=True,
+            )
         except (OSError, RuntimeError, TypeError, ValueError):
             return _error("invalid_media_path", "media path cannot be resolved safely")
         sources.append(
-            MediaSource(
+            _ResolvedMedia(
+                source=MediaSource(
                 path=allowed_path,
                 source_type="workspace",
                 artifact_id=None,
                 filename=allowed_path.name,
+                ),
+                abs_path=str(allowed_path),
             )
         )
     return sources
@@ -135,6 +188,61 @@ def _public_media(media: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _capture_media_snapshots(
+    backend: LocalBackend,
+    sources: list[_ResolvedMedia],
+) -> tuple[dict, ...] | str:
+    """在创建审批请求前捕获所有文件的稳定状态，避免审批与发送脱节。"""
+    path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
+    snapshots: list[dict] = []
+    try:
+        for item in sources:
+            snapshots.append(
+                capture_file_state_snapshot(
+                    backend,
+                    item.abs_path,
+                    path_policy=path_policy,
+                )
+            )
+    except (FileStateSnapshotError, OSError, TypeError, ValueError):
+        return _error(
+            "approval_snapshot_unavailable",
+            "could not capture a stable media file state for approval",
+        )
+    return tuple(snapshots)
+
+
+def _approved_media_state_matches(
+    backend: LocalBackend,
+    sources: list[_ResolvedMedia],
+    snapshots: tuple[dict, ...],
+) -> bool:
+    """在审批恢复和外发前逐项确认路径、文件类型与内容状态仍一致。"""
+    if len(sources) != len(snapshots):
+        return False
+    path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
+    try:
+        for item, snapshot in zip(sources, snapshots, strict=True):
+            path = Path(item.abs_path)
+            if (
+                snapshot.get("abs_path") != item.abs_path
+                or _has_symlink_component(path)
+                or path.is_symlink()
+                or not path.is_file()
+                or _is_sensitive(item.abs_path)
+                or not file_state_snapshot_matches(
+                    backend,
+                    item.abs_path,
+                    snapshot,
+                    path_policy=path_policy,
+                )
+            ):
+                return False
+    except (FileStateSnapshotError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 def handle_media_analyze(args: Any, **kwargs: Any) -> str:
     """分析当前 LocalBackend 工作目录中的一个或多个已授权媒体文件。"""
     validated_args = _validate_args(args)
@@ -150,14 +258,85 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
     if not isinstance(backend, LocalBackend):
         return _error("unsupported_backend", "media_analyze only supports the local backend")
 
-    sources = _resolve_media_sources(backend, paths)
+    sources = _resolve_media_sources(
+        backend,
+        paths,
+        session_key=session_key,
+    )
     if isinstance(sources, str):
         return sources
+
+    if any(_is_sensitive(item.abs_path) for item in sources):
+        return _error(
+            "sensitive_media_denied",
+            "sensitive local files cannot be sent to an external media service",
+            fatal=True,
+        )
+
+    approval_grant = kwargs.get("approval_grant")
+    approved_snapshots = approved_media_snapshots_candidate(
+        approval_grant,
+        args,
+        session_key=session_key,
+    )
+    if approved_snapshots is not None:
+        media_snapshots = approved_snapshots
+        if not _approved_media_state_matches(
+            backend,
+            sources,
+            media_snapshots,
+        ):
+            return _error(
+                "approval_stale",
+                "approved media file state changed; request approval again",
+            )
+    else:
+        captured_snapshots = _capture_media_snapshots(backend, sources)
+        if isinstance(captured_snapshots, str):
+            return captured_snapshots
+        media_snapshots = captured_snapshots
+
+    try:
+        assessment = assess_media_analysis(
+            args,
+            normalized_paths=[item.abs_path for item in sources],
+            media_snapshots=media_snapshots,
+            session_key=session_key,
+            remote_approval=is_remote_approval(kwargs),
+            provider="doubao_ark",
+            model=_current_model_name(),
+            approval_grant=approval_grant,
+            security_policy=backend.tool_approval_policy,
+            backend_context=backend.approval_risk_context(),
+            intelligent_advisor=backend.intelligent_approval_advisor,
+        )
+    except (TypeError, ValueError):
+        return _error(
+            "approval_snapshot_unavailable",
+            "could not prepare media analysis approval",
+        )
+    policy_response = build_assessment_response(
+        assessment,
+        _EXTERNAL_MEDIA_APPROVAL_SUMMARY,
+    )
+    if policy_response is not None:
+        return policy_response
+
+    # 审批通过后再次复核，确保调用外部服务前文件没有被替换或变成敏感路径。
+    if not _approved_media_state_matches(
+        backend,
+        sources,
+        media_snapshots,
+    ):
+        return _error(
+            "approval_stale",
+            "approved media file state changed; request approval again",
+        )
 
     expected_type = None if media_type == "auto" else media_type
     try:
         analysis = MultimodalAnalyzer().analyze(
-            sources,
+            [item.source for item in sources],
             prompt,
             timeout_ms=timeout_ms,
             expected_type=expected_type,
@@ -230,10 +409,10 @@ def register(registry) -> None:
             },
         },
         handler=handle_media_analyze,
-        execution_environments=("cli",),
+        execution_environments=("cli", "gateway"),
         unattended_allowed=False,
-        approval_mode="none",
-        risk_level="medium",
+        approval_mode="interactive_or_remote",
+        risk_level="high",
         default_enabled_environments=("cli",),
         retry_safe=False,
         unknown_on_crash=True,

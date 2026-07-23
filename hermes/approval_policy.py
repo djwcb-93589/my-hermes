@@ -508,6 +508,7 @@ class TrustedApprovalGrant:
     normalized_command: str | None = None
     cwd: str | None = None
     file_snapshot: dict | None = None
+    media_snapshots: tuple[dict, ...] | None = None
     session_rule: TerminalSessionGrantRule | FileSessionGrantRule | None = None
     _issuer: object = field(repr=False, compare=False, default=None)
 
@@ -1594,7 +1595,13 @@ def issue_trusted_approval_grant(
     session_key = normalize_approval_session_key(
         request.get("conversation_id")
     )
-    if tool_name not in {"file", "terminal", "gateway_send_file", "cron"}:
+    if tool_name not in {
+        "file",
+        "terminal",
+        "gateway_send_file",
+        "cron",
+        "media_analyze",
+    }:
         raise ValueError("unsupported approval grant tool")
     if not isinstance(arguments, dict) or not isinstance(details, dict):
         raise ValueError("approval grant request is invalid")
@@ -1712,6 +1719,51 @@ def issue_trusted_approval_grant(
             session_key=session_key,
             approved_abs_path=approved_abs_path,
             file_snapshot=file_snapshot,
+            _issuer=_TRUSTED_GRANT_ISSUER,
+        )
+
+    if tool_name == "media_analyze":
+        if normalized_scope != "once":
+            raise ValueError("media analysis approval only supports once scope")
+        media_snapshots = _normalize_media_analysis_snapshots(
+            details.get("media_snapshots")
+        )
+        normalized_paths = details.get("normalized_paths")
+        media_files = details.get("media_files")
+        provider = details.get("provider")
+        model = details.get("model")
+        if (
+            not isinstance(normalized_paths, list)
+            or normalized_paths != [item["abs_path"] for item in media_snapshots]
+            or media_files != [
+                {
+                    "abs_path": item["abs_path"],
+                    "size_bytes": item["size"],
+                }
+                for item in media_snapshots
+            ]
+            or provider != "doubao_ark"
+            or not isinstance(model, str)
+        ):
+            raise ValueError("media analysis approval details are invalid")
+        expected = _canonical_fingerprint(_media_analysis_fingerprint_payload(
+            arguments,
+            media_snapshots,
+            session_key=session_key,
+            provider=provider,
+            model=model,
+            backend_context=details.get("backend_risk"),
+        ))
+        if fingerprint != expected:
+            raise ValueError("media analysis approval fingerprint is invalid")
+        return TrustedApprovalGrant(
+            scope=normalized_scope,
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            fingerprint=fingerprint,
+            session_key=session_key,
+            media_snapshots=media_snapshots,
             _issuer=_TRUSTED_GRANT_ISSUER,
         )
 
@@ -2994,6 +3046,72 @@ def approved_file_snapshot_candidate(
     return dict(snapshot) if isinstance(snapshot, dict) else None
 
 
+def _normalize_media_analysis_snapshots(value: object) -> tuple[dict, ...]:
+    """规范化媒体外传审批绑定的有序文件状态快照。"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("media snapshots must be a non-empty sequence")
+    snapshots: list[dict] = []
+    for item in value:
+        snapshot = normalize_file_state_snapshot(item)
+        if snapshot["exists"] is not True or snapshot["file_type"] != "file":
+            raise ValueError("media snapshot must describe an existing file")
+        snapshots.append(snapshot)
+    return tuple(snapshots)
+
+
+def approved_media_snapshots_candidate(
+    approval_grant: object,
+    arguments: dict,
+    *,
+    session_key: str,
+) -> tuple[dict, ...] | None:
+    """读取只绑定本次媒体分析请求的可信文件状态快照。"""
+    try:
+        normalized_session_key = normalize_approval_session_key(session_key)
+    except ValueError:
+        return None
+    if (
+        not approval_grant_identity_matches(
+            approval_grant,
+            "media_analyze",
+            arguments,
+        )
+        or approval_grant.scope != "once"
+        or approval_grant.session_key != normalized_session_key
+    ):
+        return None
+    try:
+        return _normalize_media_analysis_snapshots(
+            approval_grant.media_snapshots
+        )
+    except ValueError:
+        return None
+
+
+def _media_analysis_fingerprint_payload(
+    arguments: dict,
+    media_snapshots: Sequence[dict],
+    *,
+    session_key: str,
+    provider: str,
+    model: str,
+    backend_context: Mapping | None,
+) -> dict:
+    """生成媒体外传的一次性审批身份，不持久化媒体内容。"""
+    return {
+        "version": 1,
+        "tool_name": "media_analyze",
+        "arguments": dict(arguments),
+        "session_key": session_key,
+        "media_snapshots": list(
+            _normalize_media_analysis_snapshots(media_snapshots)
+        ),
+        "provider": provider,
+        "model": model,
+        "backend_risk": _backend_fingerprint_payload(backend_context),
+    }
+
+
 def _file_fingerprint_payload(
     arguments: dict,
     normalized_path: str | None,
@@ -3235,6 +3353,127 @@ def assess_gateway_send_file(
     )
 
 
+def assess_media_analysis(
+    arguments: dict,
+    *,
+    normalized_paths: Sequence[str],
+    media_snapshots: Sequence[dict],
+    session_key: str,
+    remote_approval: bool,
+    provider: str,
+    model: str,
+    approval_grant: object = None,
+    security_policy: ApprovalSecurityPolicy | None = None,
+    backend_context: Mapping | None = None,
+    intelligent_advisor: IntelligentApprovalAdvisor | None = None,
+) -> ApprovalAssessment:
+    """为外部媒体分析创建仅可执行一次的高风险审批身份。"""
+    normalized_session_key = normalize_approval_session_key(session_key)
+    normalized_arguments = dict(arguments)
+    normalized_provider = str(provider or "").strip()
+    normalized_model = str(model or "").strip()
+    if normalized_provider != "doubao_ark":
+        raise ValueError("media analysis provider is invalid")
+    snapshots = _normalize_media_analysis_snapshots(media_snapshots)
+    paths = list(normalized_paths)
+    if paths != [snapshot["abs_path"] for snapshot in snapshots]:
+        raise ValueError("media snapshots do not match normalized paths")
+    safe_backend_context = _backend_fingerprint_payload(backend_context)
+    fingerprint = _canonical_fingerprint(_media_analysis_fingerprint_payload(
+        normalized_arguments,
+        snapshots,
+        session_key=normalized_session_key,
+        provider=normalized_provider,
+        model=normalized_model,
+        backend_context=safe_backend_context,
+    ))
+    grant_matches = (
+        approval_grant_identity_matches(
+            approval_grant,
+            "media_analyze",
+            arguments,
+        )
+        and approval_grant.scope == "once"
+        and approval_grant.session_key == normalized_session_key
+        and approval_grant.fingerprint == fingerprint
+        and approval_grant.media_snapshots == snapshots
+    )
+    if grant_matches:
+        decision = ALLOW
+        reason = "approved media analysis matches the current files and request"
+        error_type = None
+        error = None
+        fatal = False
+        decision_source = "once_grant"
+    elif approval_grant is not None:
+        decision = DENY
+        reason = "media analysis approval grant no longer matches this request"
+        error_type = "approval_stale"
+        error = "approved media file state changed; request approval again"
+        fatal = False
+        decision_source = "grant_validation"
+    else:
+        # 媒体会离开本机并可能产生费用，任何运行环境均要求显式一次性审批。
+        decision = ASK
+        reason = (
+            "external media analysis sends local files to a third-party "
+            "model service"
+        )
+        error_type = None
+        error = None
+        fatal = False
+        decision_source = (
+            "remote_approval" if remote_approval else "interactive_approval"
+        )
+
+    details = {
+        "operation_type": "media.external_analysis",
+        "normalized_paths": paths,
+        "media_snapshots": list(snapshots),
+        "media_files": [
+            {
+                "abs_path": snapshot["abs_path"],
+                "size_bytes": snapshot["size"],
+            }
+            for snapshot in snapshots
+        ],
+        "prompt": normalized_arguments.get("prompt"),
+        "media_type": normalized_arguments.get("media_type", "auto"),
+        "provider": normalized_provider,
+        "model": normalized_model,
+        "session_key_fingerprint": _identifier_fingerprint(
+            normalized_session_key
+        ),
+        "reason": reason,
+        "fingerprint": fingerprint,
+        "risk_level": HIGH.value,
+        "allowed_grant_scopes": ["once"],
+        "backend_risk": safe_backend_context,
+        "decision_source": decision_source,
+    }
+    assessment = ApprovalAssessment(
+        tool_name="media_analyze",
+        decision=decision,
+        risk_level=HIGH,
+        fingerprint=fingerprint,
+        reason=reason,
+        normalized_arguments=normalized_arguments,
+        details=details,
+        session_key=normalized_session_key,
+        error_type=error_type,
+        error=error,
+        fatal=fatal,
+    )
+    active_security_policy = (
+        security_policy or DEFAULT_APPROVAL_SECURITY_POLICY
+    )
+    return apply_intelligent_approval(
+        assessment,
+        security_policy=active_security_policy,
+        advisor=intelligent_advisor,
+    )
+
+
 def approval_request_binding_matches(
     tool_name: str,
     arguments: dict,
@@ -3265,6 +3504,51 @@ def approval_request_binding_matches(
         "sha256:"
     ):
         return False
+
+    if tool_name == "media_analyze":
+        try:
+            normalized_session_key = normalize_approval_session_key(
+                session_key
+            )
+            snapshots = _normalize_media_analysis_snapshots(
+                details.get("media_snapshots")
+            )
+        except ValueError:
+            return False
+        normalized_paths = details.get("normalized_paths")
+        media_files = details.get("media_files")
+        provider = details.get("provider")
+        model = details.get("model")
+        if (
+            details.get("operation_type") != "media.external_analysis"
+            or details.get("allowed_grant_scopes") != ["once"]
+            or details.get("session_key_fingerprint")
+            != _identifier_fingerprint(normalized_session_key)
+            or not isinstance(normalized_paths, list)
+            or normalized_paths != [item["abs_path"] for item in snapshots]
+            or media_files != [
+                {
+                    "abs_path": item["abs_path"],
+                    "size_bytes": item["size"],
+                }
+                for item in snapshots
+            ]
+            or provider != "doubao_ark"
+            or not isinstance(model, str)
+            or details.get("prompt") != arguments.get("prompt")
+            or details.get("media_type")
+            != arguments.get("media_type", "auto")
+        ):
+            return False
+        expected = _canonical_fingerprint(_media_analysis_fingerprint_payload(
+            arguments,
+            snapshots,
+            session_key=normalized_session_key,
+            provider=provider,
+            model=model,
+            backend_context=backend_risk,
+        ))
+        return fingerprint == expected
 
     if tool_name == "gateway_send_file":
         try:
