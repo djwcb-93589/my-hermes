@@ -797,6 +797,7 @@ class BrowserSession:
             snapshot,
             snapshot_id,
             self._page.url,
+            self._page_title_locked(),
             page_id=self._current_page_id,
             frames=self._frame_tree_locked(),
             event_type=event_type,
@@ -820,6 +821,7 @@ class BrowserSession:
             snapshot,
             snapshot_id,
             self._page.url,
+            self._page_title_locked(),
             page_id=self._current_page_id,
             frames=self._frame_tree_locked(),
             event_type=event_type,
@@ -913,6 +915,14 @@ class BrowserSession:
     def _dialogs_payload_locked(self) -> list[dict[str, str]]:
         return [] if self._last_dialog_event is None else [self._last_dialog_event]
 
+    def _page_title_locked(self) -> str:
+        """读取当前标题；页面切换瞬间不可读时保留空字符串而不影响观察结果。"""
+        try:
+            title = self._page.title()
+        except Exception:
+            return ""
+        return title if isinstance(title, str) else ""
+
     # --- 读取操作 ---
 
     def navigate(self, url: str) -> str:
@@ -953,6 +963,7 @@ class BrowserSession:
             # 给 AJAX 一点喘息时间;不用 networkidle --对长轮询站点会一直等。
             if post_navigation_wait_ms > 0:
                 self._page.wait_for_timeout(post_navigation_wait_ms)
+            self._wait_for_url_settle_locked()
             return self._finalize_interaction_locked(
                 previous_url,
                 previous_position,
@@ -974,13 +985,35 @@ class BrowserSession:
                 event_collection_timeout_ms=event_collection_timeout_ms,
             )
 
-    def snapshot(self) -> str:
-        """对当前 page 取一次带 ``snapshot_id`` 的观察结果 JSON。"""
+    def _wait_for_url_settle_locked(
+        self,
+        *,
+        timeout_ms: int = 1000,
+    ) -> None:
+        """在有限窗口内收集服务端或脚本重定向，避免过早返回过渡地址。"""
+        deadline = monotonic() + max(0, timeout_ms) / 1000.0
+        while monotonic() < deadline:
+            try:
+                remaining_ms = int((deadline - monotonic()) * 1000)
+                self._page.wait_for_timeout(min(50, max(1, remaining_ms)))
+                # 读取 URL 本身能及时暴露页面关闭；最终观察仍在收尾阶段生成。
+                _ = self._page.url
+            except Exception:
+                return
+
+    def snapshot(self, snapshot_id: str | None = None) -> str:
+        """对当前 page 取观察结果；提供旧 ``snapshot_id`` 时先确认它仍有效。"""
+        if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id):
+            return _err("invalid_args", "snapshot_id 必须是非空字符串")
         with self._lock:
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
                 return no_page_error
+            if snapshot_id is not None:
+                stale_error = self._validate_snapshot_locked(snapshot_id)
+                if stale_error is not None:
+                    return stale_error
             snapshot, snapshot_id = self._snapshot_locked()
             return self._ok_snapshot_locked(snapshot, snapshot_id)
 
@@ -4200,6 +4233,7 @@ def _observation_result(
     snapshot: str,
     snapshot_id: str,
     url: str,
+    title: str,
     *,
     page_id: str | None,
     frames: list[dict[str, Any]],
@@ -4215,6 +4249,7 @@ def _observation_result(
         "snapshot_id": snapshot_id,
         "snapshot": snapshot,
         "url": url,
+        "title": title,
         "page_id": page_id,
         "frames": frames,
         "event_type": event_type,
