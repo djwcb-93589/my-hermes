@@ -41,6 +41,7 @@ from hermes.db import (
     create_cron_run_artifact,
     claim_gateway_file_delivery,
     claim_gateway_approval,
+    claim_gateway_approval_with_ack_outbox,
     complete_gateway_delivery,
     complete_gateway_message,
     create_gateway_file_delivery_outbox,
@@ -4346,15 +4347,44 @@ class GatewayRunner:
                     content = "用法：/approve [once|session]"
                 else:
                     approval_selector, grant_scope = parsed_approval
-                    decision = await self.persistence.call(
-                        claim_gateway_approval,
-                        route_key,
-                        ctx.conversation_id,
-                        actor_id,
-                        approval_selector,
-                        event.message_id,
-                        grant_scope,
+                    content = (
+                        "审批已通过，操作已进入原会话的恢复队列；成功后将启用"
+                        "受限会话授权。"
+                        if grant_scope == "session"
+                        else "审批已通过，操作已进入原会话的恢复队列。"
                     )
+                    has_adapter = event.source.platform in self.adapters
+                    if has_adapter:
+                        ack_outbox = self._build_outbox(
+                            route_key,
+                            event,
+                            content,
+                            str(uuid.uuid4()),
+                            "approval_command",
+                        )
+                        decision = await self.persistence.call(
+                            claim_gateway_approval_with_ack_outbox,
+                            route_key,
+                            ctx.conversation_id,
+                            actor_id,
+                            approval_selector,
+                            event.message_id,
+                            grant_scope,
+                            ack_outbox,
+                            **self._runtime_fence_kwargs(),
+                        )
+                    else:
+                        # 嵌入式调用没有可持久投递的 Adapter，保留直接回复，
+                        # 但仍由同一领取入口先持久化恢复任务。
+                        decision = await self.persistence.call(
+                            claim_gateway_approval,
+                            route_key,
+                            ctx.conversation_id,
+                            actor_id,
+                            approval_selector,
+                            event.message_id,
+                            grant_scope,
+                        )
                     outcome = str(decision.get("outcome", ""))
                     if outcome == "claimed":
                         resume_task = decision.get("resume_task")
@@ -4366,19 +4396,39 @@ class GatewayRunner:
                         resume_event = self._deserialize_event(
                             str(resume_task["event_json"])
                         )
-                        self._accepted_messages.add(
-                            (route_key, resume_event.message_id)
+                        if not has_adapter:
+                            sent = await self._reply(event, content)
+                            if sent is not None and sent.success:
+                                self._accepted_messages.add(
+                                    (route_key, resume_event.message_id)
+                                )
+                                await self._handle_message_serialized(
+                                    resume_event,
+                                    from_queue=True,
+                                )
+                            return
+                        ack_outbox_id = decision.get("ack_outbox_id")
+                        if not isinstance(ack_outbox_id, str) or not ack_outbox_id:
+                            raise RuntimeError(
+                                "approved gateway operation is missing its "
+                                "acknowledgement outbox"
+                            )
+                        self._accepted_messages.add((
+                            route_key,
+                            event.message_id,
+                        ))
+                        self._accepted_messages.add((
+                            route_key,
+                            resume_event.message_id,
+                        ))
+                        self.sessions.enqueue(ctx, resume_event)
+                        self._launch_durable_reply_worker(
+                            route_key,
+                            event,
+                            ack_outbox_id,
+                            ctx,
                         )
-                        await self._handle_message_serialized(
-                            resume_event,
-                            from_queue=True,
-                        )
-                        content = (
-                            "审批已通过，操作已进入原会话的恢复队列；成功后将启用"
-                            "受限会话授权。"
-                            if grant_scope == "session"
-                            else "审批已通过，操作已进入原会话的恢复队列。"
-                        )
+                        return
                     else:
                         content = _approval_command_reply(
                             outcome,

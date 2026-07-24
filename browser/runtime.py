@@ -34,8 +34,8 @@ _SUPPORTED_BROWSER_CHANNELS = frozenset({
 
 
 def _default_artifact_root() -> Path:
-    """返回项目工作区之外、仅供浏览器产物使用的固定目录。"""
-    return Path.home() / ".hermes" / "browser-artifacts"
+    """返回 browser 包内预先约定的下载与截图目录根。"""
+    return Path(__file__).resolve().parent
 
 
 class BrowserRuntimeError(RuntimeError):
@@ -210,8 +210,8 @@ class BrowserWorker:
         session_key: str,
         artifact_dir: str | Path | None,
     ) -> Path:
-        """生成或校验会话专用的相对产物目录，绝不接受绝对路径。"""
-        expected = Path(cls._session_digest(session_key))
+        """只接受类型目录共同根，文件名本身以 UUID 保持跨会话唯一。"""
+        expected = Path(".")
         if artifact_dir is None:
             return expected
         configured = Path(artifact_dir)
@@ -220,7 +220,7 @@ class BrowserWorker:
             or ".." in configured.parts
             or configured != expected
         ):
-            raise ValueError("browser artifact_dir must be the session relative artifact directory")
+            raise ValueError("browser artifact_dir must be the shared relative artifact root")
         return configured
 
     def is_idle(self, *, now: float, idle_timeout_seconds: float) -> bool:
@@ -647,8 +647,8 @@ class BrowserManager:
         return resolved
 
     def _session_artifact_dir(self, session_key: str) -> Path:
-        """返回 artifact_root 下固定的会话隔离目录配置。"""
-        return Path(BrowserWorker._session_digest(session_key))
+        """返回 download 与 screenshot 的共同根目录配置。"""
+        return Path(".")
 
     def _remove_failed_worker(self, session_key: str, worker: BrowserWorker) -> None:
         with self._lock:

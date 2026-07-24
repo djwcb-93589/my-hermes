@@ -104,6 +104,12 @@ _WINDOWS_RESERVED_FILENAMES = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
+
+_ARTIFACT_DIRECTORY_BY_KIND = {
+    "download": "download",
+    "screenshot": "screenshot",
+    "element-screenshot": "screenshot",
+}
 _MAX_ARTIFACT_FILENAME_BYTES = 240
 
 
@@ -190,6 +196,7 @@ class BrowserSession:
         # 分离，避免下载和截图污染项目目录。
         self.artifact_root = self._resolve_artifact_root(artifact_root)
         self.artifact_dir = self._resolve_artifact_dir(artifact_dir)
+        self._artifact_directories = self._resolve_artifact_directories()
         self._artifacts: dict[str, _Artifact] = {}
         self._artifact_counter = 0
         # P9 提取器只读取当前页面；延迟创建以避免普通浏览会话加载无关逻辑。
@@ -281,10 +288,9 @@ class BrowserSession:
 
     def _resolve_artifact_root(self, artifact_root: str | Path | None) -> Path:
         """解析可信运行时提供的浏览器产物根目录。"""
-        # 未指定时也使用用户目录中的专用位置，避免直接使用 BrowserSession
-        # 的命令行入口把下载和截图写入当前项目工作区。
+        # 未指定时使用 browser 包内的专用目录；下载和截图不再散落到项目根目录。
         raw_root = (
-            Path.home() / ".hermes" / "browser-artifacts"
+            Path(__file__).resolve().parent
             if artifact_root is None
             else Path(artifact_root).expanduser()
         )
@@ -302,8 +308,8 @@ class BrowserSession:
         return resolved
 
     def _resolve_artifact_dir(self, artifact_dir: str | Path | None) -> Path:
-        """创建并验证只用于会话产物的受限输出目录。"""
-        raw_dir = Path(".browser-artifacts") if artifact_dir is None else Path(artifact_dir)
+        """创建并验证浏览器产物类型目录的共同根目录。"""
+        raw_dir = Path(".") if artifact_dir is None else Path(artifact_dir)
         if raw_dir.is_absolute() or self._contains_parent_reference(raw_dir):
             raise ValueError("artifact_dir 必须是 artifact_root 内不含 '..' 的相对目录")
         candidate = self.artifact_root / raw_dir
@@ -319,6 +325,48 @@ class BrowserSession:
         if self._has_symlink_component(resolved, self.artifact_root):
             raise ValueError("artifact_dir 不能包含符号链接")
         return resolved
+
+    def _resolve_artifact_directories(self) -> dict[str, Path]:
+        """创建下载与截图的固定目录，不接受按会话改变的输出位置。"""
+        directories: dict[str, Path] = {}
+        for directory_name in sorted(set(_ARTIFACT_DIRECTORY_BY_KIND.values())):
+            candidate = self.artifact_dir / directory_name
+            if self._has_symlink_component(candidate, self.artifact_dir):
+                raise ValueError("artifact output directory cannot contain symlinks")
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                resolved = candidate.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError("artifact output directory cannot be created") from exc
+            if (
+                not self._is_relative_to(resolved, self.artifact_dir)
+                or not resolved.is_dir()
+                or self._has_symlink_component(resolved, self.artifact_dir)
+            ):
+                raise ValueError("artifact output directory is invalid")
+            directories[directory_name] = resolved
+        return directories
+
+    def _artifact_directory_for_kind_locked(self, kind: str) -> Path:
+        """根据产物类型选择固定下载或截图目录。"""
+        directory_name = _ARTIFACT_DIRECTORY_BY_KIND.get(kind)
+        if directory_name is None:
+            raise ValueError("unsupported artifact kind")
+        return self._artifact_directories[directory_name]
+
+    def _is_safe_artifact_path_locked(self, path: Path, kind: str) -> bool:
+        """确认登记路径仍位于该类型专用目录且没有符号链接。"""
+        try:
+            directory = self._artifact_directory_for_kind_locked(kind)
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            not path.is_symlink()
+            and self._is_relative_to(resolved, directory)
+            and not self._has_symlink_component(path, directory)
+            and resolved.is_file()
+        )
 
     def _configured_artifact_dir_locked(self, artifact_dir: str | Path) -> Path:
         """解析已有会话的目录参数，但不因冲突检查创建新目录。"""
@@ -366,7 +414,7 @@ class BrowserSession:
         prefix: str,
         suffix: str | None = None,
     ) -> str:
-        """把浏览器建议名称收敛为 artifact_dir 内的单一安全文件名。"""
+        """把浏览器建议名称收敛为专用产物目录内的单一安全文件名。"""
         candidate = Path(suggested or "").name
         candidate = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", candidate)
         # 路径项最终按 UTF-8 写入文件系统；先替换异常代理字符，避免后续长度
@@ -439,6 +487,7 @@ class BrowserSession:
 
     def _new_artifact_paths_locked(self, kind: str, filename: str) -> tuple[Path, Path]:
         """原子预留带随机标识的正式文件名，并分配同目录临时文件。"""
+        artifact_directory = self._artifact_directory_for_kind_locked(kind)
         # 临时名为 .{kind}-{uuid}-{filename}.{uuid}.tmp，长度开销比正式名更大。
         # 文件系统限制的是编码后的目录项字节数，而不是 Python 字符数。
         filename_budget = _MAX_ARTIFACT_FILENAME_BYTES - len(kind.encode("utf-8")) - 72
@@ -462,8 +511,8 @@ class BrowserSession:
                 or len(temporary_name.encode("utf-8")) > _MAX_ARTIFACT_FILENAME_BYTES
             ):
                 raise ValueError("产物文件名超出文件系统长度限制")
-            final_path = (self.artifact_dir / unique_name).resolve(strict=False)
-            if not self._is_relative_to(final_path, self.artifact_dir):
+            final_path = (artifact_directory / unique_name).resolve(strict=False)
+            if not self._is_relative_to(final_path, artifact_directory):
                 raise ValueError("产物路径越界")
             # UUID 降低碰撞概率；排他创建才是跨会话不覆盖的最终保证。
             try:
@@ -478,11 +527,11 @@ class BrowserSession:
             else:
                 os.close(descriptor)
                 break
-        temporary_path = self.artifact_dir / temporary_name
+        temporary_path = artifact_directory / temporary_name
         return final_path, temporary_path
 
     def _artifact_payload_locked(self, artifact: _Artifact) -> dict[str, Any]:
-        return {
+        payload = {
             "artifact_id": artifact.artifact_id,
             "kind": artifact.kind,
             "path": str(artifact.path),
@@ -492,16 +541,19 @@ class BrowserSession:
             "page_id": artifact.page_id,
             "source_url": artifact.source_url,
         }
+        package_root = Path(__file__).resolve().parent
+        if self.artifact_root == package_root and self.artifact_dir == package_root:
+            directory = self._artifact_directory_for_kind_locked(artifact.kind)
+            payload["agent_path"] = str(
+                Path("browser") / directory.name / artifact.filename
+            )
+        return payload
 
     def _discard_artifact_locked(self, artifact: _Artifact) -> None:
         """尽力删除刚生成但不应发布的会话产物，且不保留登记。"""
         try:
             resolved = artifact.path.resolve(strict=True)
-            if (
-                not artifact.path.is_symlink()
-                and self._is_relative_to(resolved, self.artifact_dir)
-                and resolved.is_file()
-            ):
+            if self._is_safe_artifact_path_locked(artifact.path, artifact.kind):
                 resolved.unlink()
         except Exception:
             # 截图或下载的原始失败语义不能被清理问题覆盖。
@@ -533,13 +585,13 @@ class BrowserSession:
                 raise OSError("产物写入未生成普通文件")
             os.replace(temporary_path, final_path)
             resolved = final_path.resolve(strict=True)
-            if not self._is_relative_to(resolved, self.artifact_dir) or resolved.is_symlink():
+            if not self._is_safe_artifact_path_locked(final_path, kind):
                 raise OSError("产物路径越界或不是普通文件")
             stat = resolved.stat()
         except Exception:
             for path in (temporary_path, final_path):
                 try:
-                    if path.exists() and not path.is_symlink() and self._is_relative_to(path.resolve(), self.artifact_dir):
+                    if path.exists() and self._is_safe_artifact_path_locked(path, kind):
                         path.unlink()
                 except Exception:
                     pass
@@ -1101,7 +1153,7 @@ class BrowserSession:
             )
 
     def delete_artifact(self, artifact_id: str) -> str:
-        """仅删除当前会话登记且仍位于 artifact_dir 内的单个文件。"""
+        """仅删除当前会话登记且仍位于对应专用目录的单个文件。"""
         if not isinstance(artifact_id, str) or not artifact_id:
             return _err("artifact_not_found", "artifact_id 必须是非空字符串")
         with self._lock:
@@ -1110,11 +1162,7 @@ class BrowserSession:
                 return _err("artifact_not_found", f"未找到产物 {artifact_id}")
             try:
                 resolved = artifact.path.resolve(strict=True)
-                if (
-                    artifact.path.is_symlink()
-                    or not self._is_relative_to(resolved, self.artifact_dir)
-                    or not resolved.is_file()
-                ):
+                if not self._is_safe_artifact_path_locked(artifact.path, artifact.kind):
                     return _err("artifact_not_found", f"产物 {artifact_id} 不再是可删除的会话文件")
                 resolved.unlink()
             except FileNotFoundError:
@@ -1135,12 +1183,8 @@ class BrowserSession:
                     continue
                 try:
                     resolved = artifact.path.resolve(strict=True)
-                    if (
-                        artifact.path.is_symlink()
-                        or not self._is_relative_to(resolved, self.artifact_dir)
-                        or not resolved.is_file()
-                    ):
-                        raise OSError("产物不再是 artifact_dir 内的普通文件")
+                    if not self._is_safe_artifact_path_locked(artifact.path, artifact.kind):
+                        raise OSError("artifact is no longer a regular file in its output directory")
                     resolved.unlink()
                 except FileNotFoundError:
                     # 外部已删除时不再保留不可恢复的登记项。
@@ -1630,11 +1674,7 @@ class BrowserSession:
             return _err("media_not_found", f"产物 {artifact.artifact_id} 已不存在")
         except (OSError, RuntimeError):
             return _err("invalid_media_path", f"产物 {artifact.artifact_id} 无法安全解析")
-        if (
-            not self._is_relative_to(resolved, self.artifact_dir)
-            or self._has_symlink_component(artifact.path, self.artifact_dir)
-            or not resolved.is_file()
-        ):
+        if not self._is_safe_artifact_path_locked(artifact.path, artifact.kind):
             return _err("invalid_media_path", f"产物 {artifact.artifact_id} 不再是安全媒体文件")
         return MediaSource(
             path=resolved,

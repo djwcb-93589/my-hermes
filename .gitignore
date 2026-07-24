@@ -31,3 +31,5 @@ cache
 !飞书操作手册.md
 .claude/
 .browser-artifacts/
+browser/download/
+browser/screenshot/

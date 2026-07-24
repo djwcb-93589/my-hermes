@@ -638,6 +638,108 @@ def _select_gateway_approval(
     return "found", _gateway_approval_row(rows[0])
 
 
+def _claim_gateway_approval_in_transaction(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+    requester_user_id: str,
+    selector: str | None,
+    decision_message_id: str,
+    grant_scope: str = "once",
+    *,
+    now: float,
+) -> dict:
+    """在调用方事务中验证并领取审批，不创建任何投递或恢复工作。"""
+    _expire_gateway_approvals_in_transaction(conn, now)
+    outcome, request = _select_gateway_approval(
+        conn,
+        route_key,
+        selector,
+        conversation_id=conversation_id,
+    )
+    if request is None:
+        return {"outcome": outcome}
+    current_actor_id = str(requester_user_id or "").strip()
+    stored_actor_id = str(request["requester_user_id"] or "").strip()
+    if (
+        not current_actor_id
+        or not stored_actor_id
+        or stored_actor_id != current_actor_id
+    ):
+        return {"outcome": "forbidden", "request": request}
+    if request["conversation_id"] != conversation_id:
+        return {"outcome": "stale_conversation", "request": request}
+    if request["status"] != "pending":
+        return {"outcome": request["status"], "request": request}
+    normalized_scope = str(grant_scope or "").strip().lower()
+    if normalized_scope not in {"once", "session"}:
+        return {"outcome": "invalid_scope", "request": request}
+    if not is_grant_scope_allowed(
+        request["details"].get("risk_level"),
+        normalized_scope,
+    ):
+        return {"outcome": "scope_forbidden", "request": request}
+    changed = conn.execute(
+        """
+        UPDATE gateway_approval_requests
+        SET status='executing', decision_message_id=?, grant_scope=?,
+            execution_started=0, updated_at=?
+        WHERE id=? AND status='pending'
+        """,
+        (decision_message_id, normalized_scope, now, request["id"]),
+    ).rowcount
+    if changed != 1:
+        return {"outcome": "conflict"}
+    request["grant_scope"] = normalized_scope
+    request["status"] = "executing"
+    request["decision_message_id"] = decision_message_id
+    request["execution_started"] = False
+    request["updated_at"] = now
+    return {"outcome": "claimed", "request": request}
+
+
+def _create_gateway_approval_resume_task_in_transaction(
+    conn: sqlite3.Connection,
+    request: dict,
+) -> dict:
+    """为已领取审批写入唯一的原会话恢复任务。"""
+    message_id, event_json = _build_gateway_approval_resume_event(request)
+    accepted = _enqueue_gateway_message_in_transaction(
+        conn,
+        request["route_key"],
+        message_id,
+        event_json,
+        task_kind="approval_resume",
+        approval_id=request["id"],
+    )
+    if not accepted:
+        raise DBError("gateway approval resume queue identity is occupied")
+    resume_task = _gateway_approval_resume_task_row(
+        conn,
+        request["route_key"],
+        message_id,
+    )
+    if (
+        resume_task is None
+        or resume_task["task_kind"] != "approval_resume"
+        or resume_task["approval_id"] != request["id"]
+        or resume_task["event_json"] != event_json
+    ):
+        raise DBError("gateway approval resume task identity mismatch")
+    return resume_task
+
+
+def _emit_claimed_gateway_approval_audit(request: dict, now: float) -> None:
+    """仅在领取、投递确认和恢复任务均已提交后记录审批审计。"""
+    _emit_gateway_approval_audit(
+        request,
+        decision="approved",
+        grant_scope=request["grant_scope"],
+        decision_source="user",
+        timestamp=now,
+    )
+
+
 def claim_gateway_approval(
     conn: sqlite3.Connection,
     route_key: str,
@@ -647,89 +749,80 @@ def claim_gateway_approval(
     decision_message_id: str,
     grant_scope: str = "once",
 ) -> dict:
-    """校验审批归属并以 CAS 把当前唯一 pending 转为 executing。"""
+    """领取审批并写入恢复任务，保留没有确认回执的嵌入式兼容入口。"""
     now = time.time()
     with transaction(conn):
-        _expire_gateway_approvals_in_transaction(conn, now)
-        outcome, request = _select_gateway_approval(
+        decision = _claim_gateway_approval_in_transaction(
             conn,
             route_key,
+            conversation_id,
+            requester_user_id,
             selector,
-            conversation_id=conversation_id,
+            decision_message_id,
+            grant_scope,
+            now=now,
         )
-        if request is None:
-            return {"outcome": outcome}
-        current_actor_id = str(requester_user_id or "").strip()
-        stored_actor_id = str(request["requester_user_id"] or "").strip()
-        if (
-            not current_actor_id
-            or not stored_actor_id
-            or stored_actor_id != current_actor_id
-        ):
-            return {"outcome": "forbidden", "request": request}
-        if request["conversation_id"] != conversation_id:
-            return {"outcome": "stale_conversation", "request": request}
-        if request["status"] != "pending":
-            return {"outcome": request["status"], "request": request}
-        normalized_scope = str(grant_scope or "").strip().lower()
-        if normalized_scope not in {"once", "session"}:
-            return {"outcome": "invalid_scope", "request": request}
-        if not is_grant_scope_allowed(
-            request["details"].get("risk_level"),
-            normalized_scope,
-        ):
-            return {"outcome": "scope_forbidden", "request": request}
-        changed = conn.execute(
-            """
-            UPDATE gateway_approval_requests
-            SET status='executing', decision_message_id=?, grant_scope=?,
-                execution_started=0, updated_at=?
-            WHERE id=? AND status='pending'
-            """,
-            (decision_message_id, normalized_scope, now, request["id"]),
-        ).rowcount
-        if changed != 1:
-            return {"outcome": "conflict"}
-        request["grant_scope"] = normalized_scope
-        request["status"] = "executing"
-        request["decision_message_id"] = decision_message_id
-        request["execution_started"] = False
-        request["updated_at"] = now
-        message_id, event_json = _build_gateway_approval_resume_event(request)
-        accepted = _enqueue_gateway_message_in_transaction(
+        if decision["outcome"] != "claimed":
+            return decision
+        decision["resume_task"] = _create_gateway_approval_resume_task_in_transaction(
             conn,
-            request["route_key"],
-            message_id,
-            event_json,
-            task_kind="approval_resume",
-            approval_id=request["id"],
+            decision["request"],
         )
-        if not accepted:
-            raise DBError("gateway approval resume queue identity is occupied")
-        resume_task = _gateway_approval_resume_task_row(
+    _emit_claimed_gateway_approval_audit(decision["request"], now)
+    return decision
+
+
+def claim_gateway_approval_with_ack_outbox(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+    requester_user_id: str,
+    selector: str | None,
+    decision_message_id: str,
+    grant_scope: str,
+    ack_outbox: dict,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+) -> dict:
+    """原子领取审批、保存确认 Outbox，并写入原会话恢复任务。"""
+    now = time.time()
+    with transaction(conn):
+        decision = _claim_gateway_approval_in_transaction(
             conn,
-            request["route_key"],
-            message_id,
+            route_key,
+            conversation_id,
+            requester_user_id,
+            selector,
+            decision_message_id,
+            grant_scope,
+            now=now,
         )
+        if decision["outcome"] != "claimed":
+            return decision
         if (
-            resume_task is None
-            or resume_task["task_kind"] != "approval_resume"
-            or resume_task["approval_id"] != request["id"]
-            or resume_task["event_json"] != event_json
+            not isinstance(ack_outbox, dict)
+            or str(ack_outbox.get("route_key", "")) != route_key
+            or str(ack_outbox.get("source_message_id", ""))
+            != decision_message_id
+            or str(ack_outbox.get("queue_message_id", decision_message_id))
+            != decision_message_id
         ):
-            raise DBError("gateway approval resume task identity mismatch")
-        _emit_gateway_approval_audit(
-            request,
-            decision="approved",
-            grant_scope=normalized_scope,
-            decision_source="user",
-            timestamp=now,
+            raise DBError("gateway approval acknowledgement outbox is invalid")
+        decision["ack_outbox_id"] = _insert_gateway_outbox(
+            conn,
+            ack_outbox,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
         )
-        return {
-            "outcome": "claimed",
-            "request": request,
-            "resume_task": resume_task,
-        }
+        decision["resume_task"] = _create_gateway_approval_resume_task_in_transaction(
+            conn,
+            decision["request"],
+        )
+    _emit_claimed_gateway_approval_audit(decision["request"], now)
+    return decision
 
 
 def deny_gateway_approval(

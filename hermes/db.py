@@ -9,6 +9,7 @@ from hermes.persistence.approval import (
     cancel_pending_gateway_approvals,
     cancel_pending_gateway_approvals_for_session,
     claim_gateway_approval,
+    claim_gateway_approval_with_ack_outbox,
     create_gateway_approval_with_outbox,
     deny_gateway_approval,
     expire_gateway_approvals,
