@@ -15,7 +15,7 @@ import math
 import yaml
 from openai import AsyncOpenAI, OpenAI
 
-from hermes.approval_policy import ApprovalSecurityPolicy
+from hermes.approval_security import ApprovalSecurityPolicy
 from hermes.path_policy import PathAccessPolicy
 
 

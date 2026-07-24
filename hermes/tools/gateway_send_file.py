@@ -7,9 +7,11 @@ import json
 from collections.abc import Mapping
 
 from hermes.approval import build_assessment_response, is_remote_approval
-from hermes.approval_policy import assess_gateway_send_file
-from hermes.approval_handlers import get_approval_handler, register_approval_handler
-from hermes.tools.gateway_send_file_approval import GatewaySendFileApprovalHandler
+from hermes.tools.gateway_send_file_approval import (
+    assess_gateway_send_file,
+    gateway_send_file_grant_matches_runtime,
+    register_gateway_send_file_approval_handler,
+)
 from hermes.db import DBError
 from hermes.gateway.outbound_delivery import OutboundDeliveryService
 from hermes.outbound_file import (
@@ -148,6 +150,23 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
             "forbidden",
             "gateway_send_file requires a trusted once approval grant",
         )
+    if not gateway_send_file_grant_matches_runtime(
+        approval_grant,
+        args,
+        file_snapshot=snapshot,
+        session_key=context["conversation_id"],
+        route_key=context["route_key"],
+        source_message_id=context["source_message_id"],
+        platform=context["platform"],
+        chat_id=context["chat_id"],
+        reply_to_message_id=context["reply_to_message_id"],
+        thread_id=context["thread_id"],
+    ):
+        return _error(
+            "approval_stale",
+            "approved file or Gateway target changed; request approval again",
+            fatal=False,
+        )
     delivery_digest = hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
     delivery_id = f"delivery_{delivery_digest[:32]}"
     delivery = {
@@ -187,10 +206,7 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
 
 
 def register(registry) -> None:
-    if get_approval_handler("gateway_send_file") is None:
-        register_approval_handler(
-            "gateway_send_file", GatewaySendFileApprovalHandler()
-        )
+    register_gateway_send_file_approval_handler()
     registry.register(
         name="gateway_send_file",
         toolset="messaging",

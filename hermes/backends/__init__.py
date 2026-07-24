@@ -31,7 +31,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
-from hermes.approval_policy import (
+from hermes.approval_security import (
     ApprovalSecurityPolicy,
     DEFAULT_APPROVAL_SECURITY_POLICY,
 )

@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from hermes.path_utils import git_bash_to_windows_path
 
-from hermes.approval_policy import classify_terminal_command
+from hermes.tools.terminal_approval import classify_terminal_command
 from hermes.cron.artifacts import cron_job_artifact_root
 
 

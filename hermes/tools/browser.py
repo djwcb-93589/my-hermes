@@ -9,16 +9,16 @@ from typing import Any, Callable
 
 from browser.runtime import default_browser_manager
 from hermes.approval import build_assessment_response, is_remote_approval
-from hermes.approval_policy import (
-    HIGH,
-    MEDIUM,
+from hermes.tools.browser_approval import (
     approved_browser_media_snapshots_candidate,
     approved_browser_operation_context_candidate,
     assess_browser_operation,
     assess_external_media_analysis,
+    browser_media_snapshot_matches,
+    browser_operation_risk_level,
+    browser_operation_state_matches,
+    register_browser_approval_handlers,
 )
-from hermes.approval_handlers import get_approval_handler, register_approval_handler
-from hermes.tools.browser_approval import BrowserApprovalHandler
 from hermes.backends import get_backend
 
 
@@ -30,14 +30,6 @@ _INTERNAL_RESULT_FIELDS = {
     "parent_abs_path",
     "thread",
 }
-_HIGH_RISK_OPERATIONS = {
-    "browser_upload_files": HIGH,
-    "browser_console": HIGH,
-    "browser_delete_artifact": MEDIUM,
-    "browser_cleanup_artifacts": HIGH,
-}
-
-
 def _result(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
@@ -255,7 +247,9 @@ def _allow_high_risk_execution(
     if pending is not None:
         return pending
     if approval_grant is not None:
-        if approved_context != current_context:
+        if not browser_operation_state_matches(
+            approval_grant, approved_context, current_context
+        ):
             return _error("approval_stale", "approved browser operation changed; request approval again")
         return None
     if assessment.decision.value == "allow":
@@ -317,7 +311,8 @@ def handle_browser_upload_files(args: Any, **kwargs: Any) -> str:
     assessment = assess_browser_operation(
         "browser_upload_files", validated,
         session_key=kwargs["session_key"], source_context=context,
-        risk_level=HIGH, **_approval_options(kwargs),
+        risk_level=browser_operation_risk_level("browser_upload_files"),
+        **_approval_options(kwargs),
     )
     pending = build_assessment_response(assessment, "Upload selected local files to the current webpage.")
     approved = approved_browser_operation_context_candidate(
@@ -342,7 +337,9 @@ def handle_browser_console(args: Any, **kwargs: Any) -> str:
     context = {**_current_page(worker), "snapshot_id": validated["snapshot_id"], "expression": validated["expression"]}
     assessment = assess_browser_operation(
         "browser_console", validated, session_key=kwargs["session_key"],
-        source_context=context, risk_level=HIGH, **_approval_options(kwargs),
+        source_context=context,
+        risk_level=browser_operation_risk_level("browser_console"),
+        **_approval_options(kwargs),
     )
     pending = build_assessment_response(assessment, "Run JavaScript in the current webpage.")
     approved = approved_browser_operation_context_candidate(kwargs.get("approval_grant"), "browser_console", validated, session_key=kwargs["session_key"])
@@ -376,7 +373,8 @@ def _handle_artifact_change(tool_name: str, method: str, args: Any, kwargs: dict
     context = {"artifacts": snapshots}
     assessment = assess_browser_operation(
         tool_name, validated, session_key=kwargs["session_key"], source_context=context,
-        risk_level=_HIGH_RISK_OPERATIONS[tool_name], **_approval_options(kwargs),
+        risk_level=browser_operation_risk_level(tool_name),
+        **_approval_options(kwargs),
     )
     pending = build_assessment_response(assessment, "Delete browser session artifact files.")
     approved = approved_browser_operation_context_candidate(kwargs.get("approval_grant"), tool_name, validated, session_key=kwargs["session_key"])
@@ -422,7 +420,7 @@ def handle_browser_analyze_page(args: Any, **kwargs: Any) -> str:
             candidate,
             snapshot_id=snapshot.get("snapshot_id"),
         )
-        if current != snapshot:
+        if not browser_media_snapshot_matches(snapshot, current):
             return _error("approval_stale", "approved screenshot state changed; request approval again")
         artifact = candidate
         context = {
@@ -518,15 +516,7 @@ _TIMEOUT = {"type": "integer", "minimum": 1}
 
 def register(registry) -> None:
     """注册默认关闭、显式启用 browser toolset 后才可见的浏览器工具。"""
-    for tool_name in (
-        "browser_upload_files",
-        "browser_console",
-        "browser_delete_artifact",
-        "browser_cleanup_artifacts",
-        "browser_analyze_page",
-    ):
-        if get_approval_handler(tool_name) is None:
-            register_approval_handler(tool_name, BrowserApprovalHandler())
+    register_browser_approval_handlers()
     operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool]] = [
         ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False),
         ("browser_snapshot", "snapshot", "Read the current page and create a snapshot whose refs are valid only for that page.", {}, [], _handle_simple("snapshot", set(), set()), True),

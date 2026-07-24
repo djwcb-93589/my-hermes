@@ -10,21 +10,18 @@ from typing import Any
 
 from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
 from hermes.approval import build_assessment_response, is_remote_approval
-from hermes.approval_policy import (
+from hermes.tools.media_approval import (
     approved_media_snapshots_candidate,
+    approved_media_state_matches,
+    assess_media_path_policy_denial,
     assess_media_analysis,
-    assess_path_policy_denial,
+    has_symlink_component,
+    is_sensitive_media_path,
+    register_media_approval_handler,
 )
-from hermes.approval_handlers import get_approval_handler, register_approval_handler
-from hermes.tools.media_approval import MediaApprovalHandler
 from hermes.backends import get_backend
 from hermes.backends.local import LocalBackend
-from hermes.config import SENSITIVE_FILE_PATTERNS
-from hermes.file_state import (
-    FileStateSnapshotError,
-    capture_file_state_snapshot,
-    file_state_snapshot_matches,
-)
+from hermes.file_state import FileStateSnapshotError, capture_file_state_snapshot
 from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessDeniedError
 
 
@@ -59,25 +56,6 @@ def _error(error_type: str, error: str, *, fatal: bool = False) -> str:
             "fatal": fatal,
         }
     )
-
-
-def _has_symlink_component(path: Path) -> bool:
-    """拒绝目标自身及已有父目录中的符号链接，避免解析后越过授权语义。"""
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            return True
-    return False
-
-
-def _is_sensitive(abs_path: str) -> bool:
-    """按共享敏感文件规则阻断任何发送到外部媒体服务的路径。"""
-    normalized = abs_path.replace("\\", "/").lower()
-    return any(pattern.search(normalized) for pattern in SENSITIVE_FILE_PATTERNS)
 
 
 def _current_model_name() -> str:
@@ -141,7 +119,7 @@ def _resolve_media_sources(
             if not _is_relative_input_path(raw_path):
                 return _error("invalid_media_path", "media paths must be relative to the current session cwd")
             requested_path = Path(resolved_text)
-            if _has_symlink_component(requested_path):
+            if has_symlink_component(requested_path):
                 return _error("invalid_media_path", "symbolic links are not supported for media files")
             allowed_text = path_policy.require_allowed(resolved_text, cwd=backend.cwd)
             allowed_path = Path(allowed_text)
@@ -151,10 +129,7 @@ def _resolve_media_sources(
                 return _error("invalid_media_path", "media path must reference a regular file")
         except PathAccessDeniedError:
             return build_assessment_response(
-                assess_path_policy_denial(
-                    "media_analyze",
-                    session_key=session_key,
-                ),
+                assess_media_path_policy_denial(session_key=session_key),
                 _EXTERNAL_MEDIA_APPROVAL_SUMMARY,
             ) or _error(
                 "path_policy_denied",
@@ -214,37 +189,6 @@ def _capture_media_snapshots(
     return tuple(snapshots)
 
 
-def _approved_media_state_matches(
-    backend: LocalBackend,
-    sources: list[_ResolvedMedia],
-    snapshots: tuple[dict, ...],
-) -> bool:
-    """在审批恢复和外发前逐项确认路径、文件类型与内容状态仍一致。"""
-    if len(sources) != len(snapshots):
-        return False
-    path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
-    try:
-        for item, snapshot in zip(sources, snapshots, strict=True):
-            path = Path(item.abs_path)
-            if (
-                snapshot.get("abs_path") != item.abs_path
-                or _has_symlink_component(path)
-                or path.is_symlink()
-                or not path.is_file()
-                or _is_sensitive(item.abs_path)
-                or not file_state_snapshot_matches(
-                    backend,
-                    item.abs_path,
-                    snapshot,
-                    path_policy=path_policy,
-                )
-            ):
-                return False
-    except (FileStateSnapshotError, OSError, TypeError, ValueError):
-        return False
-    return True
-
-
 def handle_media_analyze(args: Any, **kwargs: Any) -> str:
     """分析当前 LocalBackend 工作目录中的一个或多个已授权媒体文件。"""
     validated_args = _validate_args(args)
@@ -268,7 +212,7 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
     if isinstance(sources, str):
         return sources
 
-    if any(_is_sensitive(item.abs_path) for item in sources):
+    if any(is_sensitive_media_path(item.abs_path) for item in sources):
         return _error(
             "sensitive_media_denied",
             "sensitive local files cannot be sent to an external media service",
@@ -283,7 +227,7 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
     )
     if approved_snapshots is not None:
         media_snapshots = approved_snapshots
-        if not _approved_media_state_matches(
+        if not approved_media_state_matches(
             backend,
             sources,
             media_snapshots,
@@ -325,7 +269,7 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
         return policy_response
 
     # 审批通过后再次复核，确保调用外部服务前文件没有被替换或变成敏感路径。
-    if not _approved_media_state_matches(
+    if not approved_media_state_matches(
         backend,
         sources,
         media_snapshots,
@@ -364,8 +308,7 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
 
 def register(registry) -> None:
     """注册仅供交互式 CLI 会话调用的高成本媒体分析能力。"""
-    if get_approval_handler("media_analyze") is None:
-        register_approval_handler("media_analyze", MediaApprovalHandler())
+    register_media_approval_handler()
     registry.register(
         name="media_analyze",
         toolset="media",

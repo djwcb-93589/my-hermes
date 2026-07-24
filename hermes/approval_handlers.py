@@ -18,6 +18,14 @@ class ApprovalHandler(Protocol):
     ) -> bool:
         """校验签发给工具的可信 Binding。"""
 
+    def build_session_rule(self, grant: object) -> object | None:
+        """从可信 Grant 构造工具专用会话规则；不支持时返回 None。"""
+
+    def session_rule_matches(
+        self, rule: object, runtime_context: dict
+    ) -> bool:
+        """判断运行时上下文是否仍满足工具专用会话规则。"""
+
 
 _HANDLERS: dict[str, ApprovalHandler] = {}
 
@@ -28,9 +36,13 @@ def register_approval_handler(tool_name: str, handler: ApprovalHandler) -> None:
         raise ValueError("approval handler tool name is invalid")
     if tool_name in _HANDLERS:
         raise ValueError(f"approval handler already registered: {tool_name}")
-    if not callable(getattr(handler, "validate_request_binding", None)) or not callable(
-        getattr(handler, "validate_grant_binding", None)
-    ):
+    required_methods = (
+        "validate_request_binding",
+        "validate_grant_binding",
+        "build_session_rule",
+        "session_rule_matches",
+    )
+    if any(not callable(getattr(handler, method, None)) for method in required_methods):
         raise TypeError("approval handler is invalid")
     _HANDLERS[tool_name] = handler
 

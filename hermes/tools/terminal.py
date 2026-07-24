@@ -8,13 +8,12 @@ from hermes.approval import (
     build_assessment_response,
     is_remote_approval,
 )
-from hermes.approval_policy import (
-    assess_path_policy_denial,
+from hermes.tools.terminal_approval import (
     assess_terminal_operation,
+    assess_terminal_path_policy_denial,
     normalize_terminal_command,
+    register_terminal_approval_handler,
 )
-from hermes.approval_handlers import get_approval_handler, register_approval_handler
-from hermes.tools.terminal_approval import TerminalApprovalHandler
 from hermes.backends import (
     INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
     get_backend,
@@ -74,10 +73,7 @@ def run_terminal(args, **kwargs):
             )
         except PathAccessDeniedError:
             return build_assessment_response(
-                assess_path_policy_denial(
-                    "terminal",
-                    session_key=session_key,
-                ),
+                assess_terminal_path_policy_denial(session_key=session_key),
                 "执行 Terminal 命令",
             )
 
@@ -158,8 +154,7 @@ def run_terminal(args, **kwargs):
 
 
 def register(registry):
-    if get_approval_handler("terminal") is None:
-        register_approval_handler("terminal", TerminalApprovalHandler())
+    register_terminal_approval_handler()
     registry.register(
         name="terminal",
         toolset="terminal",

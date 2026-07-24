@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -11,13 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from hermes.approval import build_approval_required, is_remote_approval
-from hermes.approval_policy import (
-    approval_binding_fingerprint,
-    approval_grant_identity_matches,
+from hermes.approval import is_remote_approval
+from hermes.cron.approval import (
+    approval_scope_for_job,
+    approved_candidate_job_id,
+    cron_approval_response,
+    cron_grant_matches,
+    register_cron_approval_handler,
 )
-from hermes.approval_handlers import get_approval_handler, register_approval_handler
-from hermes.cron.approval import CronApprovalHandler
 from hermes.config import DB_PATH
 from hermes.cron.capability import (
     _normalise_path,
@@ -74,12 +74,6 @@ _PROMPT_BARE_PATH_RE = re.compile(
     r")"
 )
 _PROMPT_PATH_TRAILING_PUNCTUATION = ".,;:!?，。；：！？、)]}）】》」”"
-
-
-def _fingerprint(payload: dict) -> str:
-    """生成与 Gateway 一次性审批绑定的稳定摘要。"""
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _json(payload: dict) -> str:
@@ -140,165 +134,6 @@ def _validate_prompt_paths_within_workdir(
                 f"prompt absolute path is outside workdir: {raw_path!r}; "
                 f"set workdir to contain every absolute path in prompt"
             ) from exc
-
-
-def _approval_scope_for_job(job: CronJob) -> tuple[dict, dict]:
-    """从同一份 registry 解析可展示且可写入 grant 的规范化能力范围。"""
-    register_all()
-    scope = build_capability_scope(job)
-    resolution = registry.resolve(ToolPolicy(
-        ExecutionEnvironment.CRON,
-        enabled_toolsets=frozenset(scope["toolsets"]),
-        unattended=True,
-        trusted_context=frozenset({"cron_execution"}),
-        # 工具声明风险不能替代命令风险上限；终端命令仍由 guard 逐次限制。
-        max_risk_level=ToolRiskLevel.HIGH,
-    ))
-    if not resolution.allowed_tool_names:
-        raise ValueError("Cron capability grant has no eligible tools")
-    canonical_scope = {
-        "capability_scope": scope,
-        "allowed_tool_names": sorted(resolution.allowed_tool_names),
-    }
-    return canonical_scope, scope
-
-
-def _approval_scope_identity(canonical_scope: dict, *, action: str) -> dict:
-    """审批始终绑定候选任务身份、版本和完整能力范围。"""
-    scope = dict(canonical_scope["capability_scope"])
-    return {
-        "capability_scope": scope,
-        "allowed_tool_names": list(canonical_scope["allowed_tool_names"]),
-    }
-
-
-def _scope_display_path(value: object, limit: int = 180) -> str:
-    """审批界面只显示限长、脱敏的授权路径。"""
-    text = redact_explicit_secrets(str(value or ""))
-    return text if len(text) <= limit else f"{text[:limit]}…"
-
-
-def _cron_scope_display(job: CronJob, canonical_scope: dict) -> dict:
-    """为 Gateway 审批构造不含 route key、密钥和原始命令的展示摘要。"""
-    scope = canonical_scope["capability_scope"]
-    tools = list(canonical_scope["allowed_tool_names"])
-    display_tools = tools[:12]
-    if len(tools) > len(display_tools):
-        display_tools.append(f"… and {len(tools) - len(display_tools)} more")
-    roots = [_scope_display_path(root) for root in scope["allowed_roots"][:8]]
-    if len(scope["allowed_roots"]) > len(roots):
-        roots.append(f"… and {len(scope['allowed_roots']) - len(roots)} more")
-    target = dict(scope.get("delivery_target") or {})
-    target_kind = "thread" if target.get("thread_id") else ("chat" if target.get("chat_id") else "none")
-    prompt_summary = redact_explicit_secrets(str(job.prompt).strip().replace("\n", " "))[:240]
-    return {
-        "name": redact_explicit_secrets(str(job.name or "(unnamed Cron task)"))[:160],
-        "prompt_summary": prompt_summary,
-        "prompt_digest": scope["prompt_digest"],
-        "schedule": str(job.schedule),
-        "timezone": str(job.timezone),
-        "toolsets": list(scope["toolsets"]),
-        "tool_names": display_tools,
-        "workdir": _scope_display_path(scope["workdir"]),
-        "allowed_roots": roots,
-        "allow_file_write": bool(scope["allow_file_write"]),
-        "terminal_risk_max": scope["terminal_risk_max"],
-        "terminal_allowed_executables": list(scope["terminal_allowed_executables"][:12]),
-        "terminal_allow_shell_operators": bool(scope["terminal_allow_shell_operators"]),
-        "terminal_allow_redirection": bool(scope["terminal_allow_redirection"]),
-        "terminal_allow_background": bool(scope["terminal_allow_background"]),
-        "terminal_allow_network": bool(scope["terminal_allow_network"]),
-        "terminal_allowed_workdirs": [
-            _scope_display_path(value)
-            for value in scope["terminal_allowed_workdirs"][:8]
-        ],
-        "delivery_platform": str(target.get("platform") or "none"),
-        "delivery_target_kind": target_kind,
-        "delivery_policy": str(job.delivery_config.get("policy") or "text"),
-        "timeout_seconds": scope["timeout_seconds"],
-        "max_artifact_file_bytes": scope["max_artifact_file_bytes"],
-        "max_artifact_total_bytes": scope["max_artifact_total_bytes"],
-    }
-
-
-def _cron_approval_fingerprint(
-    args: dict,
-    session_key: str,
-    action: str,
-    canonical_scope: dict,
-    candidate_job_id: str,
-) -> str:
-    """将一次性审批同时绑定调用参数、会话、动作和完整规范化能力范围。"""
-    return approval_binding_fingerprint(
-        "cron",
-        args,
-        session_key=session_key,
-        binding=_cron_approval_binding(
-            action,
-            canonical_scope,
-            candidate_job_id=candidate_job_id,
-        ),
-    )
-
-
-def _cron_approval_binding(
-    action: str,
-    canonical_scope: dict,
-    *,
-    candidate_job_id: str,
-) -> dict:
-    """冻结一次 Cron 授权执行前必须复检的能力范围。"""
-    return {
-        "backend_risk": {
-            "backend_type": "gateway",
-            "host_mounts": False,
-            "docker_socket": False,
-            "remote_host": False,
-        },
-        "cron_action": action,
-        "scope_digest": _fingerprint(
-            _approval_scope_identity(canonical_scope, action=action)
-        ),
-        "prompt_digest": canonical_scope["capability_scope"]["prompt_digest"],
-        "cron_candidate_job_id": candidate_job_id,
-        "risk_level": "high",
-    }
-
-
-def _cron_approval_response(
-    args: dict,
-    job: CronJob,
-    *,
-    action: str,
-    canonical_scope: dict,
-) -> str:
-    """请求一次只用于创建或替换 Cron 持久授权的远程审批。"""
-    session_key = job.session_key
-    binding = _cron_approval_binding(
-        action,
-        canonical_scope,
-        candidate_job_id=job.job_id,
-    )
-    fingerprint = approval_binding_fingerprint(
-        "cron",
-        args,
-        session_key=session_key,
-        binding=binding,
-    )
-    return build_approval_required(
-        "cron",
-        "Authorize this Cron task's bounded unattended capabilities",
-        details={
-            "binding_version": 1,
-            "binding": binding,
-            "operation_type": "cron.capability_grant",
-            "risk_level": "high",
-            "allowed_grant_scopes": ["once"],
-            "decision_source": "cron_capability_policy",
-            "cron_scope_display": _cron_scope_display(job, canonical_scope),
-            "fingerprint": fingerprint,
-        },
-    )
 
 
 def _trusted_origin(kwargs: dict) -> dict:
@@ -443,24 +278,6 @@ def _validate_schedule_recurrence(
         )
 
 
-def _approved_candidate_job_id(args: dict, kwargs: dict) -> str | None:
-    """仅复用 Gateway 已签发的一次性审批中保存的候选任务身份。"""
-    grant = kwargs.get("approval_grant")
-    binding = getattr(grant, "binding", {})
-    candidate_job_id = binding.get("cron_candidate_job_id") if isinstance(binding, dict) else None
-    if (
-        approval_grant_identity_matches(grant, "cron", args)
-        and getattr(grant, "scope", None) == "once"
-        and getattr(grant, "session_key", None)
-        == str(kwargs.get("session_key") or "cli")
-        and isinstance(candidate_job_id, str)
-        and len(candidate_job_id) == 12
-        and all(char in "0123456789abcdef" for char in candidate_job_id)
-    ):
-        return candidate_job_id
-    return None
-
-
 def _new_job(args: dict, **kwargs) -> CronJob:
     """从公开参数和可信来源构造新的任务定义。"""
     schedule = args.get("schedule")
@@ -496,7 +313,11 @@ def _new_job(args: dict, **kwargs) -> CronJob:
     source = "gateway" if gateway_origin else "cli"
     creator_id = str(kwargs.get("creator_id") or (f"cli:{session_key}" if source == "cli" else session_key))
     job = CronJob(
-        job_id=_approved_candidate_job_id(args, kwargs) or uuid.uuid4().hex[:12],
+        job_id=approved_candidate_job_id(
+            kwargs.get("approval_grant"),
+            args,
+            session_key=session_key,
+        ) or uuid.uuid4().hex[:12],
         schedule=schedule.strip(), prompt=prompt.strip(),
         session_key=session_key, created_at=datetime.now().isoformat(), next_fire=next_fire,
         one_shot=one_shot, name=str(args.get("name") or ""), created_source=source,
@@ -521,7 +342,11 @@ def _grant_for_job(
     canonical_scope: dict | None = None,
 ) -> dict:
     """冻结当前注册表中同时满足 Cron 策略和本任务授权的工具名。"""
-    canonical_scope, scope = (canonical_scope, build_capability_scope(job)) if canonical_scope is not None else _approval_scope_for_job(job)
+    canonical_scope, scope = (
+        (canonical_scope, build_capability_scope(job))
+        if canonical_scope is not None
+        else approval_scope_for_job(job)
+    )
     if canonical_scope["capability_scope"] != scope:
         raise ValueError("Cron approval scope does not match the task definition")
     return build_cron_capability_grant(
@@ -539,17 +364,6 @@ def _requires_gateway_authorization(job: CronJob) -> bool:
         not job.one_shot
         or "terminal" in scope["toolsets"]
         or scope["allow_external_communication"]
-    )
-
-
-def _approved(args: dict, kwargs: dict, expected_fingerprint: str) -> bool:
-    """确认本次调用确实由 Gateway 已领取的一次性 grant 恢复。"""
-    grant = kwargs.get("approval_grant")
-    return bool(
-        approval_grant_identity_matches(grant, "cron", args)
-        and getattr(grant, "scope", None) == "once"
-        and getattr(grant, "session_key", None) == str(kwargs.get("session_key") or "cli")
-        and getattr(grant, "fingerprint", None) == expected_fingerprint
     )
 
 
@@ -653,11 +467,15 @@ def handle_cron_tool(args, **kwargs):
     try:
         if action == "create":
             job = _new_job(args, **kwargs)
-            canonical_scope, _ = _approval_scope_for_job(job)
-            approval_fingerprint = _cron_approval_fingerprint(
-                args, job.session_key, "create", canonical_scope, job.job_id
+            canonical_scope, _ = approval_scope_for_job(job)
+            approved = cron_grant_matches(
+                kwargs.get("approval_grant"),
+                args,
+                session_key=job.session_key,
+                action="create",
+                canonical_scope=canonical_scope,
+                candidate_job_id=job.job_id,
             )
-            approved = _approved(args, kwargs, approval_fingerprint)
             if kwargs.get("approval_grant") is not None and not approved:
                 return _json({
                     "ok": False,
@@ -669,7 +487,7 @@ def handle_cron_tool(args, **kwargs):
                 and _requires_gateway_authorization(job)
                 and not approved
             ):
-                return _cron_approval_response(
+                return cron_approval_response(
                     args, job, action="create", canonical_scope=canonical_scope
                 )
             if not is_remote_approval(kwargs) and _requires_gateway_authorization(job):
@@ -677,7 +495,7 @@ def handle_cron_tool(args, **kwargs):
             stored = store.add(job)
             conn = init_db(str(db_path))
             try:
-                stored_scope, _ = _approval_scope_for_job(stored)
+                stored_scope, _ = approval_scope_for_job(stored)
                 create_cron_capability_grant(
                     conn,
                     _grant_for_job(
@@ -719,12 +537,15 @@ def handle_cron_tool(args, **kwargs):
                 _validate_system_capability_spec(candidate.capability_spec)
             _validate_terminal_capability(candidate.toolsets, candidate.capability_spec)
             sensitive = capability_change_requires_reauthorization(current, candidate)
-            canonical_scope, _ = _approval_scope_for_job(candidate)
-            approval_fingerprint = _cron_approval_fingerprint(
-                args, current.session_key, "update", canonical_scope,
-                candidate.job_id,
+            canonical_scope, _ = approval_scope_for_job(candidate)
+            approved = cron_grant_matches(
+                kwargs.get("approval_grant"),
+                args,
+                session_key=current.session_key,
+                action="update",
+                canonical_scope=canonical_scope,
+                candidate_job_id=candidate.job_id,
             )
-            approved = _approved(args, kwargs, approval_fingerprint)
             if kwargs.get("approval_grant") is not None and not approved:
                 return _json({
                     "ok": False,
@@ -737,7 +558,7 @@ def handle_cron_tool(args, **kwargs):
                 and is_remote_approval(kwargs)
                 and not approved
             ):
-                return _cron_approval_response(
+                return cron_approval_response(
                     args, candidate, action="update", canonical_scope=canonical_scope
                 )
             if (
@@ -757,7 +578,7 @@ def handle_cron_tool(args, **kwargs):
             if sensitive:
                 conn = init_db(str(db_path))
                 try:
-                    updated_scope, _ = _approval_scope_for_job(updated)
+                    updated_scope, _ = approval_scope_for_job(updated)
                     create_cron_capability_grant(
                         conn,
                         _grant_for_job(
@@ -824,8 +645,7 @@ def handle_cron_tool(args, **kwargs):
 
 
 def register(registry):
-    if get_approval_handler("cron") is None:
-        register_approval_handler("cron", CronApprovalHandler())
+    register_cron_approval_handler()
     registry.register(
         name="cron", toolset="cron",
         schema={

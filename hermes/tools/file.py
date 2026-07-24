@@ -20,22 +20,21 @@ from hermes.approval import (
     build_assessment_response,
     is_remote_approval,
 )
-from hermes.approval_policy import (
+from hermes.tools.file_approval import (
     DENY,
+    FileStateSnapshotError,
     approved_file_path_candidate,
     approved_file_snapshot_candidate,
+    approved_file_state_matches,
+    assess_file_path_policy_denial,
     assess_file_operation,
-    assess_path_policy_denial,
+    capture_file_approval_snapshot,
+    is_sensitive_file_path,
+    register_file_approval_handler,
+    requires_file_state_snapshot,
 )
-from hermes.approval_handlers import get_approval_handler, register_approval_handler
-from hermes.tools.file_approval import FileApprovalHandler
 from hermes.backends import get_backend, UnsupportedBackendError
 from hermes.config import SENSITIVE_FILE_PATTERNS
-from hermes.file_state import (
-    FileStateSnapshotError,
-    capture_file_state_snapshot,
-    file_state_snapshot_matches,
-)
 from hermes.path_policy import (
     ALLOW_ALL_PATH_POLICY,
     PathAccessDeniedError,
@@ -51,8 +50,7 @@ _PATH_ACTIONS = {"read", "read_range", "write", "append", "replace", "list", "st
 
 def _is_sensitive(abs_path: str) -> bool:
     """路径是否命中配置的敏感文件模式。"""
-    norm = abs_path.replace("\\", "/").lower()
-    return any(pat.search(norm) for pat in SENSITIVE_FILE_PATTERNS)
+    return is_sensitive_file_path(abs_path, SENSITIVE_FILE_PATTERNS)
 
 
 def _json(obj: dict) -> str:
@@ -84,15 +82,6 @@ def _file_exists(backend, abs_path: str) -> bool:
         return True
     except FileNotFoundError:
         return False
-
-
-def _requires_file_state_snapshot(args: dict) -> bool:
-    """标记必须把审批时状态绑定进 grant 的修改操作。"""
-    action = args.get("action")
-    return (
-        action in {"replace", "append"}
-        or (action == "write" and bool(args.get("overwrite", False)))
-    )
 
 
 def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
@@ -184,8 +173,7 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
             )
     except PathAccessDeniedError:
         return build_assessment_response(
-            assess_path_policy_denial(
-                "file",
+            assess_file_path_policy_denial(
                 session_key=session_key,
             ),
             f"执行 File {action} 操作",
@@ -234,7 +222,7 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
     )
     if file_snapshot is not None:
         try:
-            snapshot_matches = file_state_snapshot_matches(
+            snapshot_matches = approved_file_state_matches(
                 backend,
                 abs_path,
                 file_snapshot,
@@ -242,8 +230,7 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
             )
         except PathAccessDeniedError:
             return build_assessment_response(
-                assess_path_policy_denial(
-                    "file",
+                assess_file_path_policy_denial(
                     session_key=session_key,
                 ),
                 f"执行 File {action} 操作",
@@ -272,10 +259,10 @@ def handle_file(args, *, allow_sensitive: bool = False, **kwargs):
         remote_approval
         and approval_grant is None
         and not sensitive
-        and _requires_file_state_snapshot(args)
+        and requires_file_state_snapshot(args)
     ):
         try:
-            file_snapshot = capture_file_state_snapshot(
+            file_snapshot = capture_file_approval_snapshot(
                 backend,
                 abs_path,
                 path_policy=path_policy,
@@ -508,8 +495,7 @@ def _do_stat(backend, abs_path, rel_path):
 
 
 def register(registry):
-    if get_approval_handler("file") is None:
-        register_approval_handler("file", FileApprovalHandler())
+    register_file_approval_handler()
     registry.register(
         name="file",
         toolset="file",
