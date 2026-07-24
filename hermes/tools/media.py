@@ -15,6 +15,8 @@ from hermes.approval_policy import (
     assess_media_analysis,
     assess_path_policy_denial,
 )
+from hermes.approval_handlers import get_approval_handler, register_approval_handler
+from hermes.tools.media_approval import MediaApprovalHandler
 from hermes.backends import get_backend
 from hermes.backends.local import LocalBackend
 from hermes.config import SENSITIVE_FILE_PATTERNS
@@ -362,6 +364,8 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
 
 def register(registry) -> None:
     """注册仅供交互式 CLI 会话调用的高成本媒体分析能力。"""
+    if get_approval_handler("media_analyze") is None:
+        register_approval_handler("media_analyze", MediaApprovalHandler())
     registry.register(
         name="media_analyze",
         toolset="media",

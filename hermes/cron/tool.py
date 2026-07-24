@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from hermes.approval import build_approval_required, is_remote_approval
-from hermes.approval_policy import approval_grant_identity_matches
+from hermes.approval_policy import (
+    approval_binding_fingerprint,
+    approval_grant_identity_matches,
+)
+from hermes.approval_handlers import get_approval_handler, register_approval_handler
+from hermes.cron.approval import CronApprovalHandler
 from hermes.config import DB_PATH
 from hermes.cron.capability import (
     _normalise_path,
@@ -221,18 +226,43 @@ def _cron_approval_fingerprint(
     session_key: str,
     action: str,
     canonical_scope: dict,
+    candidate_job_id: str,
 ) -> str:
     """将一次性审批同时绑定调用参数、会话、动作和完整规范化能力范围。"""
-    backend_risk = {"backend_type": "gateway", "host_mounts": False, "docker_socket": False, "remote_host": False}
-    return _fingerprint({
-        "version": 2, "tool_name": "cron", "arguments": args,
-        "session_key": session_key, "backend_risk": backend_risk,
-        "action": action,
-        "capability_scope_digest": _fingerprint(
+    return approval_binding_fingerprint(
+        "cron",
+        args,
+        session_key=session_key,
+        binding=_cron_approval_binding(
+            action,
+            canonical_scope,
+            candidate_job_id=candidate_job_id,
+        ),
+    )
+
+
+def _cron_approval_binding(
+    action: str,
+    canonical_scope: dict,
+    *,
+    candidate_job_id: str,
+) -> dict:
+    """冻结一次 Cron 授权执行前必须复检的能力范围。"""
+    return {
+        "backend_risk": {
+            "backend_type": "gateway",
+            "host_mounts": False,
+            "docker_socket": False,
+            "remote_host": False,
+        },
+        "cron_action": action,
+        "scope_digest": _fingerprint(
             _approval_scope_identity(canonical_scope, action=action)
         ),
         "prompt_digest": canonical_scope["capability_scope"]["prompt_digest"],
-    })
+        "cron_candidate_job_id": candidate_job_id,
+        "risk_level": "high",
+    }
 
 
 def _cron_approval_response(
@@ -244,23 +274,27 @@ def _cron_approval_response(
 ) -> str:
     """请求一次只用于创建或替换 Cron 持久授权的远程审批。"""
     session_key = job.session_key
-    backend_risk = {"backend_type": "gateway", "host_mounts": False, "docker_socket": False, "remote_host": False}
-    scope_identity = _approval_scope_identity(canonical_scope, action=action)
-    fingerprint = _cron_approval_fingerprint(args, session_key, action, canonical_scope)
+    binding = _cron_approval_binding(
+        action,
+        canonical_scope,
+        candidate_job_id=job.job_id,
+    )
+    fingerprint = approval_binding_fingerprint(
+        "cron",
+        args,
+        session_key=session_key,
+        binding=binding,
+    )
     return build_approval_required(
         "cron",
         "Authorize this Cron task's bounded unattended capabilities",
         details={
+            "binding_version": 1,
+            "binding": binding,
             "operation_type": "cron.capability_grant",
             "risk_level": "high",
             "allowed_grant_scopes": ["once"],
-            "backend_risk": backend_risk,
             "decision_source": "cron_capability_policy",
-            "session_key_fingerprint": "sha256:" + hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:16],
-            "cron_action": action,
-            "cron_candidate_job_id": job.job_id,
-            "scope_digest": _fingerprint(scope_identity),
-            "prompt_digest": canonical_scope["capability_scope"]["prompt_digest"],
             "cron_scope_display": _cron_scope_display(job, canonical_scope),
             "fingerprint": fingerprint,
         },
@@ -412,7 +446,8 @@ def _validate_schedule_recurrence(
 def _approved_candidate_job_id(args: dict, kwargs: dict) -> str | None:
     """仅复用 Gateway 已签发的一次性审批中保存的候选任务身份。"""
     grant = kwargs.get("approval_grant")
-    candidate_job_id = getattr(grant, "cron_candidate_job_id", None)
+    binding = getattr(grant, "binding", {})
+    candidate_job_id = binding.get("cron_candidate_job_id") if isinstance(binding, dict) else None
     if (
         approval_grant_identity_matches(grant, "cron", args)
         and getattr(grant, "scope", None) == "once"
@@ -620,9 +655,15 @@ def handle_cron_tool(args, **kwargs):
             job = _new_job(args, **kwargs)
             canonical_scope, _ = _approval_scope_for_job(job)
             approval_fingerprint = _cron_approval_fingerprint(
-                args, job.session_key, "create", canonical_scope
+                args, job.session_key, "create", canonical_scope, job.job_id
             )
             approved = _approved(args, kwargs, approval_fingerprint)
+            if kwargs.get("approval_grant") is not None and not approved:
+                return _json({
+                    "ok": False,
+                    "error_type": "approval_stale",
+                    "error": "approved Cron capability scope changed; request approval again",
+                })
             if (
                 is_remote_approval(kwargs)
                 and _requires_gateway_authorization(job)
@@ -680,9 +721,16 @@ def handle_cron_tool(args, **kwargs):
             sensitive = capability_change_requires_reauthorization(current, candidate)
             canonical_scope, _ = _approval_scope_for_job(candidate)
             approval_fingerprint = _cron_approval_fingerprint(
-                args, current.session_key, "update", canonical_scope
+                args, current.session_key, "update", canonical_scope,
+                candidate.job_id,
             )
             approved = _approved(args, kwargs, approval_fingerprint)
+            if kwargs.get("approval_grant") is not None and not approved:
+                return _json({
+                    "ok": False,
+                    "error_type": "approval_stale",
+                    "error": "approved Cron capability scope changed; request approval again",
+                })
             if (
                 sensitive
                 and _requires_gateway_authorization(candidate)
@@ -776,6 +824,8 @@ def handle_cron_tool(args, **kwargs):
 
 
 def register(registry):
+    if get_approval_handler("cron") is None:
+        register_approval_handler("cron", CronApprovalHandler())
     registry.register(
         name="cron", toolset="cron",
         schema={

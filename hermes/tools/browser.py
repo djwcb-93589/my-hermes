@@ -17,6 +17,8 @@ from hermes.approval_policy import (
     assess_browser_operation,
     assess_external_media_analysis,
 )
+from hermes.approval_handlers import get_approval_handler, register_approval_handler
+from hermes.tools.browser_approval import BrowserApprovalHandler
 from hermes.backends import get_backend
 
 
@@ -516,6 +518,15 @@ _TIMEOUT = {"type": "integer", "minimum": 1}
 
 def register(registry) -> None:
     """注册默认关闭、显式启用 browser toolset 后才可见的浏览器工具。"""
+    for tool_name in (
+        "browser_upload_files",
+        "browser_console",
+        "browser_delete_artifact",
+        "browser_cleanup_artifacts",
+        "browser_analyze_page",
+    ):
+        if get_approval_handler(tool_name) is None:
+            register_approval_handler(tool_name, BrowserApprovalHandler())
     operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool]] = [
         ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False),
         ("browser_snapshot", "snapshot", "Read the current page and create a snapshot whose refs are valid only for that page.", {}, [], _handle_simple("snapshot", set(), set()), True),

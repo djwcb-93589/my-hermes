@@ -503,14 +503,7 @@ class TrustedApprovalGrant:
     arguments: dict
     fingerprint: str
     session_key: str
-    cron_candidate_job_id: str | None = None
-    approved_abs_path: str | None = None
-    normalized_command: str | None = None
-    cwd: str | None = None
-    file_snapshot: dict | None = None
-    media_snapshots: tuple[dict, ...] | None = None
-    browser_context: dict | None = None
-    session_rule: TerminalSessionGrantRule | FileSessionGrantRule | None = None
+    binding: dict
     _issuer: object = field(repr=False, compare=False, default=None)
 
 
@@ -796,6 +789,82 @@ def _canonical_fingerprint(payload: dict) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+_APPROVAL_BINDING_VERSION = 1
+
+
+def _normalize_approval_binding(value: object) -> dict:
+    """将工具专用审批状态收敛为独立且可持久化的 JSON 对象。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("approval binding must be an object")
+    try:
+        normalized = json.loads(json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("approval binding is not JSON serializable") from exc
+    if not isinstance(normalized, dict):
+        raise ValueError("approval binding must be an object")
+    return normalized
+
+
+def approval_binding_fingerprint(
+    tool_name: str,
+    arguments: dict,
+    *,
+    session_key: str,
+    binding: object,
+) -> str:
+    """为审批的通用身份和工具专用复检状态生成稳定指纹。"""
+    normalized_session_key = normalize_approval_session_key(session_key)
+    normalized_binding = _normalize_approval_binding(binding)
+    return _canonical_fingerprint({
+        "binding_version": _APPROVAL_BINDING_VERSION,
+        "tool_name": str(tool_name),
+        "arguments": dict(arguments),
+        "session_key": normalized_session_key,
+        "binding": normalized_binding,
+    })
+
+
+def _approval_details(
+    tool_name: str,
+    arguments: dict,
+    *,
+    session_key: str,
+    binding: object,
+    operation_type: str,
+    risk_level: ApprovalRiskLevel,
+    reason: str,
+    decision_source: str,
+    allowed_scopes: Sequence[str] | None = None,
+) -> tuple[dict, str]:
+    """构造不泄漏工具专用顶层字段的统一审批详情。"""
+    normalized_binding = _normalize_approval_binding(binding)
+    fingerprint = approval_binding_fingerprint(
+        tool_name,
+        arguments,
+        session_key=session_key,
+        binding=normalized_binding,
+    )
+    return {
+        "binding_version": _APPROVAL_BINDING_VERSION,
+        "binding": normalized_binding,
+        "fingerprint": fingerprint,
+        "operation_type": str(operation_type),
+        "risk_level": risk_level.value,
+        "allowed_grant_scopes": list(
+            allowed_scopes
+            if allowed_scopes is not None
+            else allowed_grant_scopes(risk_level)
+        ),
+        "reason": reason,
+        "decision_source": decision_source,
+    }, fingerprint
 
 
 def _identifier_fingerprint(value: str) -> str:
@@ -1596,19 +1665,6 @@ def issue_trusted_approval_grant(
     session_key = normalize_approval_session_key(
         request.get("conversation_id")
     )
-    if tool_name not in {
-        "file",
-        "terminal",
-        "gateway_send_file",
-        "cron",
-        "media_analyze",
-        "browser_analyze_page",
-        "browser_upload_files",
-        "browser_console",
-        "browser_delete_artifact",
-        "browser_cleanup_artifacts",
-    }:
-        raise ValueError("unsupported approval grant tool")
     if not isinstance(arguments, dict) or not isinstance(details, dict):
         raise ValueError("approval grant request is invalid")
     risk_level = normalize_risk_level(details.get("risk_level"))
@@ -1647,25 +1703,63 @@ def issue_trusted_approval_grant(
     if not request_id.startswith("approval_"):
         raise ValueError("approval grant request id is invalid")
 
-    if tool_name == "terminal":
-        normalized_command = normalize_terminal_command(
-            details.get("normalized_command")
-        )
-        cwd = str(details.get("cwd", "") or "").strip()
-        if not cwd:
-            raise ValueError("approval grant cwd is invalid")
-        session_rule = None
-        if normalized_scope == "session":
-            parsed = parse_terminal_command_for_grant(normalized_command)
+    if details.get("binding_version") != _APPROVAL_BINDING_VERSION:
+        raise ValueError("approval grant binding version is invalid")
+    binding = _normalize_approval_binding(details.get("binding"))
+    from hermes.approval_handlers import get_approval_handler
+    handler = get_approval_handler(tool_name)
+    if handler is None or not handler.validate_grant_binding(
+        arguments=arguments,
+        binding=binding,
+        session_key=session_key,
+    ):
+        raise ValueError("approval grant binding is invalid")
+    expected_fingerprint = approval_binding_fingerprint(
+        tool_name,
+        arguments,
+        session_key=session_key,
+        binding=binding,
+    )
+    if fingerprint != expected_fingerprint:
+        raise ValueError("approval grant fingerprint is invalid")
+    if not approval_request_binding_matches(
+        tool_name,
+        arguments,
+        details,
+        session_key=session_key,
+    ):
+        raise ValueError("approval grant operation binding is invalid")
+    return TrustedApprovalGrant(
+        scope=normalized_scope,
+        request_id=request_id,
+        tool_name=tool_name,
+        arguments=json.loads(json.dumps(arguments, ensure_ascii=False)),
+        fingerprint=fingerprint,
+        session_key=session_key,
+        binding=binding,
+        _issuer=_TRUSTED_GRANT_ISSUER,
+    )
+
+def _session_rule_from_grant(
+    grant: TrustedApprovalGrant,
+) -> TerminalSessionGrantRule | FileSessionGrantRule | None:
+    """由可信 Binding 重新构造可复用的低风险会话规则。"""
+    try:
+        risk_level = normalize_risk_level(grant.binding.get("risk_level"))
+        if grant.tool_name == "terminal":
+            command = normalize_terminal_command(
+                grant.binding.get("normalized_command")
+            )
+            cwd = str(grant.binding.get("cwd") or "").strip()
+            parsed = parse_terminal_command_for_grant(command)
             if (
-                parsed is None
+                not cwd
+                or parsed is None
                 or parsed.has_shell_operators
                 or not parsed.executable
             ):
-                raise ValueError(
-                    "terminal command cannot create a session grant"
-                )
-            session_rule = TerminalSessionGrantRule(
+                return None
+            return TerminalSessionGrantRule(
                 executable=parsed.executable,
                 argv_prefix=parsed.argv,
                 cwd_policy="exact",
@@ -1673,210 +1767,35 @@ def issue_trusted_approval_grant(
                 allow_shell_operators=False,
                 max_risk=risk_level,
             )
-        return TrustedApprovalGrant(
-            scope=normalized_scope,
-            request_id=request_id,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            fingerprint=fingerprint,
-            session_key=session_key,
-            normalized_command=normalized_command,
-            cwd=cwd,
-            session_rule=session_rule,
-            _issuer=_TRUSTED_GRANT_ISSUER,
-        )
-
-    if tool_name == "cron":
-        if normalized_scope != "once":
-            raise ValueError("cron capability approval only supports once scope")
-        candidate_job_id = details.get("cron_candidate_job_id")
-        if not isinstance(candidate_job_id, str) or not re.fullmatch(
-            r"[a-f0-9]{12}", candidate_job_id
-        ):
-            raise ValueError("cron capability approval candidate is invalid")
-        return TrustedApprovalGrant(
-            scope=normalized_scope,
-            request_id=request_id,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            fingerprint=fingerprint,
-            session_key=session_key,
-            cron_candidate_job_id=candidate_job_id,
-            _issuer=_TRUSTED_GRANT_ISSUER,
-        )
-
-    if tool_name == "gateway_send_file":
-        if normalized_scope != "once":
-            raise ValueError(
-                "gateway_send_file approval only supports once scope"
+        if grant.tool_name == "file":
+            action = str(grant.arguments.get("action") or "")
+            path = grant.binding.get("abs_path")
+            snapshot = grant.binding.get("file_snapshot")
+            if not isinstance(path, str) or not path:
+                return None
+            if snapshot is not None:
+                snapshot = normalize_file_state_snapshot(snapshot)
+                if snapshot["abs_path"] != path:
+                    return None
+            if _file_snapshot_required(grant.arguments) and snapshot is None:
+                return None
+            all_accessible = action in (
+                _FILE_READ_ACTIONS | _FILE_METADATA_ACTIONS
             )
-        file_snapshot = _normalize_gateway_send_file_snapshot(
-            details.get("file_snapshot")
-        )
-        approved_abs_path = details.get("abs_path")
-        if approved_abs_path != file_snapshot["abs_path"]:
-            raise ValueError("approval grant file path is invalid")
-        return TrustedApprovalGrant(
-            scope=normalized_scope,
-            request_id=request_id,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            fingerprint=fingerprint,
-            session_key=session_key,
-            approved_abs_path=approved_abs_path,
-            file_snapshot=file_snapshot,
-            _issuer=_TRUSTED_GRANT_ISSUER,
-        )
-
-    if tool_name == "media_analyze":
-        if normalized_scope != "once":
-            raise ValueError("media analysis approval only supports once scope")
-        media_snapshots = _normalize_media_analysis_snapshots(
-            details.get("media_snapshots")
-        )
-        normalized_paths = details.get("normalized_paths")
-        media_files = details.get("media_files")
-        provider = details.get("provider")
-        model = details.get("model")
-        if (
-            not isinstance(normalized_paths, list)
-            or normalized_paths != [item["abs_path"] for item in media_snapshots]
-            or media_files != [
-                {
-                    "abs_path": item["abs_path"],
-                    "size_bytes": item["size"],
-                }
-                for item in media_snapshots
-            ]
-            or provider != "doubao_ark"
-            or not isinstance(model, str)
-        ):
-            raise ValueError("media analysis approval details are invalid")
-        expected = _canonical_fingerprint(_media_analysis_fingerprint_payload(
-            arguments,
-            media_snapshots,
-            session_key=session_key,
-            provider=provider,
-            model=model,
-            backend_context=details.get("backend_risk"),
-        ))
-        if fingerprint != expected:
-            raise ValueError("media analysis approval fingerprint is invalid")
-        return TrustedApprovalGrant(
-            scope=normalized_scope,
-            request_id=request_id,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            fingerprint=fingerprint,
-            session_key=session_key,
-            media_snapshots=media_snapshots,
-            _issuer=_TRUSTED_GRANT_ISSUER,
-        )
-
-    if tool_name == "browser_analyze_page":
-        if normalized_scope != "once":
-            raise ValueError("browser page analysis only supports once scope")
-        snapshots = _normalize_browser_media_snapshots(details.get("media_snapshots"))
-        context = _normalize_browser_context(details.get("browser_context"))
-        provider = details.get("provider")
-        model = details.get("model")
-        if provider != "doubao_ark" or not isinstance(model, str):
-            raise ValueError("browser page analysis details are invalid")
-        expected = _canonical_fingerprint(_browser_media_fingerprint_payload(
-            tool_name,
-            arguments,
-            snapshots,
-            session_key=session_key,
-            provider=provider,
-            model=model,
-            source_context=context,
-            backend_context=details.get("backend_risk"),
-        ))
-        if fingerprint != expected:
-            raise ValueError("browser page analysis fingerprint is invalid")
-        return TrustedApprovalGrant(
-            scope=normalized_scope,
-            request_id=request_id,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            fingerprint=fingerprint,
-            session_key=session_key,
-            media_snapshots=snapshots,
-            browser_context=context,
-            _issuer=_TRUSTED_GRANT_ISSUER,
-        )
-
-    if tool_name in {
-        "browser_upload_files",
-        "browser_console",
-        "browser_delete_artifact",
-        "browser_cleanup_artifacts",
-    }:
-        if normalized_scope != "once":
-            raise ValueError("browser operation approval only supports once scope")
-        context = _normalize_browser_context(details.get("browser_context"))
-        expected = _canonical_fingerprint(_browser_operation_fingerprint_payload(
-            tool_name,
-            arguments,
-            session_key=session_key,
-            source_context=context,
-            backend_context=details.get("backend_risk"),
-        ))
-        if fingerprint != expected:
-            raise ValueError("browser operation fingerprint is invalid")
-        return TrustedApprovalGrant(
-            scope=normalized_scope,
-            request_id=request_id,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            fingerprint=fingerprint,
-            session_key=session_key,
-            browser_context=context,
-            _issuer=_TRUSTED_GRANT_ISSUER,
-        )
-
-    approved_abs_path = details.get("abs_path")
-    if not isinstance(approved_abs_path, str) or not approved_abs_path:
-        raise ValueError("approval grant file path is invalid")
-    file_snapshot = details.get("file_snapshot")
-    if file_snapshot is not None:
-        file_snapshot = normalize_file_state_snapshot(file_snapshot)
-    if _file_snapshot_required(arguments) and file_snapshot is None:
-        raise ValueError("approval grant file snapshot is required")
-    session_rule = None
-    if normalized_scope == "session":
-        action = str(arguments.get("action", ""))
-        all_accessible = action in (
-            _FILE_READ_ACTIONS | _FILE_METADATA_ACTIONS
-        )
-        path_under = (
-            None
-            if all_accessible
-            else os.path.dirname(approved_abs_path)
-        )
-        session_rule = FileSessionGrantRule(
-            actions=frozenset({action}),
-            path_under=path_under,
-            all_accessible=all_accessible,
-            allow_sensitive=False,
-            allow_overwrite=_file_operation_mutates_existing(
-                arguments,
-                file_snapshot,
-            ),
-            max_risk=risk_level,
-        )
-    return TrustedApprovalGrant(
-        scope=normalized_scope,
-        request_id=request_id,
-        tool_name=tool_name,
-        arguments=dict(arguments),
-        fingerprint=fingerprint,
-        session_key=session_key,
-        approved_abs_path=approved_abs_path,
-        file_snapshot=file_snapshot,
-        session_rule=session_rule,
-        _issuer=_TRUSTED_GRANT_ISSUER,
-    )
+            return FileSessionGrantRule(
+                actions=frozenset({action}),
+                path_under=None if all_accessible else os.path.dirname(path),
+                all_accessible=all_accessible,
+                allow_sensitive=False,
+                allow_overwrite=_file_operation_mutates_existing(
+                    grant.arguments,
+                    snapshot,
+                ),
+                max_risk=risk_level,
+            )
+    except (AttributeError, ValueError):
+        return None
+    return None
 
 
 def activate_session_grant(grant: TrustedApprovalGrant) -> bool:
@@ -1884,12 +1803,14 @@ def activate_session_grant(grant: TrustedApprovalGrant) -> bool:
     if (
         not _is_trusted_approval_grant(grant)
         or grant.scope != "session"
-        or grant.session_rule is None
     ):
+        return False
+    session_rule = _session_rule_from_grant(grant)
+    if session_rule is None:
         return False
     with _SESSION_GRANTS_LOCK:
         entries = _SESSION_GRANTS.setdefault(grant.session_key, [])
-        item = (grant.request_id, grant.session_rule)
+        item = (grant.request_id, session_rule)
         if item not in entries:
             entries.append(item)
     return True
@@ -3084,7 +3005,7 @@ def approved_file_path_candidate(
         or approval_grant.session_key != normalized_session_key
     ):
         return None
-    approved_path = approval_grant.approved_abs_path
+    approved_path = approval_grant.binding.get("abs_path")
     if isinstance(approved_path, str) and approved_path:
         return approved_path
     return None
@@ -3110,7 +3031,7 @@ def approved_file_snapshot_candidate(
         or approval_grant.session_key != normalized_session_key
     ):
         return None
-    snapshot = approval_grant.file_snapshot
+    snapshot = approval_grant.binding.get("file_snapshot")
     return dict(snapshot) if isinstance(snapshot, dict) else None
 
 
@@ -3199,50 +3120,6 @@ def _normalize_browser_context(value: object) -> dict:
     return normalized
 
 
-def _browser_media_fingerprint_payload(
-    tool_name: str,
-    arguments: dict,
-    media_snapshots: Sequence[dict],
-    *,
-    session_key: str,
-    provider: str,
-    model: str,
-    source_context: Mapping,
-    backend_context: Mapping | None,
-) -> dict:
-    """生成浏览器产物外发分析的一次性审批指纹。"""
-    return {
-        "version": 1,
-        "tool_name": tool_name,
-        "arguments": dict(arguments),
-        "session_key": session_key,
-        "media_snapshots": list(_normalize_browser_media_snapshots(media_snapshots)),
-        "provider": provider,
-        "model": model,
-        "browser_context": _normalize_browser_context(source_context),
-        "backend_risk": _backend_fingerprint_payload(backend_context),
-    }
-
-
-def _browser_operation_fingerprint_payload(
-    tool_name: str,
-    arguments: dict,
-    *,
-    session_key: str,
-    source_context: Mapping,
-    backend_context: Mapping | None,
-) -> dict:
-    """生成浏览器高风险本地操作的一次性审批指纹。"""
-    return {
-        "version": 1,
-        "tool_name": tool_name,
-        "arguments": dict(arguments),
-        "session_key": session_key,
-        "browser_context": _normalize_browser_context(source_context),
-        "backend_risk": _backend_fingerprint_payload(backend_context),
-    }
-
-
 def approved_media_snapshots_candidate(
     approval_grant: object,
     arguments: dict,
@@ -3266,54 +3143,10 @@ def approved_media_snapshots_candidate(
         return None
     try:
         return _normalize_media_analysis_snapshots(
-            approval_grant.media_snapshots
+            approval_grant.binding.get("media_snapshots")
         )
     except ValueError:
         return None
-
-
-def _media_analysis_fingerprint_payload(
-    arguments: dict,
-    media_snapshots: Sequence[dict],
-    *,
-    session_key: str,
-    provider: str,
-    model: str,
-    backend_context: Mapping | None,
-) -> dict:
-    """生成媒体外传的一次性审批身份，不持久化媒体内容。"""
-    return {
-        "version": 1,
-        "tool_name": "media_analyze",
-        "arguments": dict(arguments),
-        "session_key": session_key,
-        "media_snapshots": list(
-            _normalize_media_analysis_snapshots(media_snapshots)
-        ),
-        "provider": provider,
-        "model": model,
-        "backend_risk": _backend_fingerprint_payload(backend_context),
-    }
-
-
-def _file_fingerprint_payload(
-    arguments: dict,
-    normalized_path: str | None,
-    file_snapshot: dict | None,
-) -> dict:
-    """快照型写操作使用 v2 指纹，其余保持 v1 兼容。"""
-    payload = {
-        "version": 1,
-        "tool_name": "file",
-        "arguments": dict(arguments),
-        "abs_path": normalized_path,
-    }
-    if file_snapshot is not None:
-        payload["version"] = 2
-        payload["file_snapshot"] = normalize_file_state_snapshot(
-            file_snapshot
-        )
-    return payload
 
 
 _GATEWAY_SEND_FILE_IDENTITY_FIELDS = (
@@ -3404,27 +3237,6 @@ def _gateway_send_file_identity_details(
     }
 
 
-def _gateway_send_file_fingerprint_payload(
-    arguments: dict,
-    file_snapshot: dict,
-    identity_details: Mapping,
-) -> dict:
-    """生成只绑定摘要身份、不持久化完整聊天标识的任务指纹。"""
-    return {
-        "version": 1,
-        "tool_name": "gateway_send_file",
-        "arguments": dict(arguments),
-        "file_snapshot": _normalize_gateway_send_file_snapshot(
-            file_snapshot
-        ),
-        "target_identity": {
-            field_name: identity_details.get(field_name)
-            for field_name in _GATEWAY_SEND_FILE_IDENTITY_FIELDS
-        },
-        "platform": identity_details.get("platform"),
-    }
-
-
 def assess_gateway_send_file(
     arguments: dict,
     *,
@@ -3454,12 +3266,23 @@ def assess_gateway_send_file(
         reply_to_message_id=reply_to_message_id,
         thread_id=thread_id,
     )
-    fingerprint = _canonical_fingerprint(
-        _gateway_send_file_fingerprint_payload(
-            normalized_arguments,
-            normalized_snapshot,
-            identity,
-        )
+    binding = {
+        "file_snapshot": normalized_snapshot,
+        "target_identity": {
+            field_name: identity.get(field_name)
+            for field_name in _GATEWAY_SEND_FILE_IDENTITY_FIELDS
+        },
+        "platform": identity["platform"],
+        "backend_risk": _backend_fingerprint_payload({
+            "backend_type": "gateway",
+        }),
+        "risk_level": HIGH.value,
+    }
+    fingerprint = approval_binding_fingerprint(
+        "gateway_send_file",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
     )
     grant_matches = (
         approval_grant_identity_matches(
@@ -3470,8 +3293,7 @@ def assess_gateway_send_file(
         and approval_grant.scope == "once"
         and approval_grant.session_key == normalized_session_key
         and approval_grant.fingerprint == fingerprint
-        and approval_grant.approved_abs_path == normalized_snapshot["abs_path"]
-        and approval_grant.file_snapshot == normalized_snapshot
+        and approval_grant.binding == binding
     )
     if grant_matches:
         decision = ALLOW
@@ -3502,25 +3324,16 @@ def assess_gateway_send_file(
         fatal = True
         decision_source = "gateway_context"
 
-    details = {
-        "operation_type": "messaging.send_file",
-        "target_path": normalized_snapshot["abs_path"],
-        "abs_path": normalized_snapshot["abs_path"],
-        "file_snapshot": normalized_snapshot,
-        "size_bytes": normalized_snapshot["size_bytes"],
-        "sha256": normalized_snapshot["sha256"],
-        "target_platform": identity["platform"],
-        "target_chat_fingerprint": identity["chat_id_fingerprint"],
-        "reason": reason,
-        "fingerprint": fingerprint,
-        "risk_level": HIGH.value,
-        "allowed_grant_scopes": list(allowed_grant_scopes(HIGH)),
-        "backend_risk": _backend_fingerprint_payload({
-            "backend_type": "gateway",
-        }),
-        "decision_source": decision_source,
-        **identity,
-    }
+    details, fingerprint = _approval_details(
+        "gateway_send_file",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+        operation_type="messaging.send_file",
+        risk_level=HIGH,
+        reason=reason,
+        decision_source=decision_source,
+    )
     return ApprovalAssessment(
         tool_name="gateway_send_file",
         decision=decision,
@@ -3563,14 +3376,19 @@ def assess_media_analysis(
     if paths != [snapshot["abs_path"] for snapshot in snapshots]:
         raise ValueError("media snapshots do not match normalized paths")
     safe_backend_context = _backend_fingerprint_payload(backend_context)
-    fingerprint = _canonical_fingerprint(_media_analysis_fingerprint_payload(
+    binding = {
+        "media_snapshots": list(snapshots),
+        "provider": normalized_provider,
+        "model": normalized_model,
+        "backend_risk": safe_backend_context,
+        "risk_level": HIGH.value,
+    }
+    fingerprint = approval_binding_fingerprint(
+        "media_analyze",
         normalized_arguments,
-        snapshots,
         session_key=normalized_session_key,
-        provider=normalized_provider,
-        model=normalized_model,
-        backend_context=safe_backend_context,
-    ))
+        binding=binding,
+    )
     grant_matches = (
         approval_grant_identity_matches(
             approval_grant,
@@ -3580,7 +3398,7 @@ def assess_media_analysis(
         and approval_grant.scope == "once"
         and approval_grant.session_key == normalized_session_key
         and approval_grant.fingerprint == fingerprint
-        and approval_grant.media_snapshots == snapshots
+        and approval_grant.binding == binding
     )
     if grant_matches:
         decision = ALLOW
@@ -3610,31 +3428,17 @@ def assess_media_analysis(
             "remote_approval" if remote_approval else "interactive_approval"
         )
 
-    details = {
-        "operation_type": "media.external_analysis",
-        "normalized_paths": paths,
-        "media_snapshots": list(snapshots),
-        "media_files": [
-            {
-                "abs_path": snapshot["abs_path"],
-                "size_bytes": snapshot["size"],
-            }
-            for snapshot in snapshots
-        ],
-        "prompt": normalized_arguments.get("prompt"),
-        "media_type": normalized_arguments.get("media_type", "auto"),
-        "provider": normalized_provider,
-        "model": normalized_model,
-        "session_key_fingerprint": _identifier_fingerprint(
-            normalized_session_key
-        ),
-        "reason": reason,
-        "fingerprint": fingerprint,
-        "risk_level": HIGH.value,
-        "allowed_grant_scopes": ["once"],
-        "backend_risk": safe_backend_context,
-        "decision_source": decision_source,
-    }
+    details, fingerprint = _approval_details(
+        "media_analyze",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+        operation_type="media.external_analysis",
+        risk_level=HIGH,
+        reason=reason,
+        decision_source=decision_source,
+        allowed_scopes=("once",),
+    )
     assessment = ApprovalAssessment(
         tool_name="media_analyze",
         decision=decision,
@@ -3685,23 +3489,26 @@ def assess_external_media_analysis(
     snapshots = _normalize_browser_media_snapshots(media_snapshots)
     context = _normalize_browser_context(source_context)
     safe_backend_context = _backend_fingerprint_payload(backend_context)
-    fingerprint = _canonical_fingerprint(_browser_media_fingerprint_payload(
+    binding = {
+        "browser_context": context,
+        "media_snapshots": list(snapshots),
+        "provider": normalized_provider,
+        "model": normalized_model,
+        "backend_risk": safe_backend_context,
+        "risk_level": HIGH.value,
+    }
+    fingerprint = approval_binding_fingerprint(
         tool_name,
         normalized_arguments,
-        snapshots,
         session_key=normalized_session_key,
-        provider=normalized_provider,
-        model=normalized_model,
-        source_context=context,
-        backend_context=safe_backend_context,
-    ))
+        binding=binding,
+    )
     grant_matches = (
         approval_grant_identity_matches(approval_grant, tool_name, arguments)
         and approval_grant.scope == "once"
         and approval_grant.session_key == normalized_session_key
         and approval_grant.fingerprint == fingerprint
-        and approval_grant.media_snapshots == snapshots
-        and approval_grant.browser_context == context
+        and approval_grant.binding == binding
     )
     if grant_matches:
         decision, reason, error_type, error, decision_source = (
@@ -3727,21 +3534,17 @@ def assess_external_media_analysis(
             None,
             "remote_approval" if remote_approval else "interactive_approval",
         )
-    details = {
-        "operation_type": "browser.external_analysis",
-        "browser_context": context,
-        "media_snapshots": list(snapshots),
-        "provider": normalized_provider,
-        "model": normalized_model,
-        "prompt": normalized_arguments.get("prompt"),
-        "session_key_fingerprint": _identifier_fingerprint(normalized_session_key),
-        "reason": reason,
-        "fingerprint": fingerprint,
-        "risk_level": HIGH.value,
-        "allowed_grant_scopes": ["once"],
-        "backend_risk": safe_backend_context,
-        "decision_source": decision_source,
-    }
+    details, fingerprint = _approval_details(
+        tool_name,
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+        operation_type="browser.external_analysis",
+        risk_level=HIGH,
+        reason=reason,
+        decision_source=decision_source,
+        allowed_scopes=("once",),
+    )
     assessment = ApprovalAssessment(
         tool_name=tool_name,
         decision=decision,
@@ -3789,19 +3592,23 @@ def assess_browser_operation(
     normalized_arguments = dict(arguments)
     context = _normalize_browser_context(source_context)
     safe_backend_context = _backend_fingerprint_payload(backend_context)
-    fingerprint = _canonical_fingerprint(_browser_operation_fingerprint_payload(
+    binding = {
+        "browser_context": context,
+        "backend_risk": safe_backend_context,
+        "risk_level": risk_level.value,
+    }
+    fingerprint = approval_binding_fingerprint(
         tool_name,
         normalized_arguments,
         session_key=normalized_session_key,
-        source_context=context,
-        backend_context=safe_backend_context,
-    ))
+        binding=binding,
+    )
     grant_matches = (
         approval_grant_identity_matches(approval_grant, tool_name, arguments)
         and approval_grant.scope == "once"
         and approval_grant.session_key == normalized_session_key
         and approval_grant.fingerprint == fingerprint
-        and approval_grant.browser_context == context
+        and approval_grant.binding == binding
     )
     if grant_matches:
         decision, reason, error_type, error, decision_source = (
@@ -3827,17 +3634,17 @@ def assess_browser_operation(
             None,
             "remote_approval" if remote_approval else "interactive_approval",
         )
-    details = {
-        "operation_type": "browser.high_risk_operation",
-        "browser_context": context,
-        "session_key_fingerprint": _identifier_fingerprint(normalized_session_key),
-        "reason": reason,
-        "fingerprint": fingerprint,
-        "risk_level": risk_level.value,
-        "allowed_grant_scopes": ["once"],
-        "backend_risk": safe_backend_context,
-        "decision_source": decision_source,
-    }
+    details, fingerprint = _approval_details(
+        tool_name,
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+        operation_type="browser.high_risk_operation",
+        risk_level=risk_level,
+        reason=reason,
+        decision_source=decision_source,
+        allowed_scopes=("once",),
+    )
     assessment = ApprovalAssessment(
         tool_name=tool_name,
         decision=decision,
@@ -3875,7 +3682,9 @@ def approved_browser_media_snapshots_candidate(
             or approval_grant.session_key != normalized_session_key
         ):
             return None
-        return _normalize_browser_media_snapshots(approval_grant.media_snapshots)
+        return _normalize_browser_media_snapshots(
+            approval_grant.binding.get("media_snapshots")
+        )
     except (AttributeError, ValueError):
         return None
 
@@ -3896,7 +3705,9 @@ def approved_browser_operation_context_candidate(
             or approval_grant.session_key != normalized_session_key
         ):
             return None
-        return _normalize_browser_context(approval_grant.browser_context)
+        return _normalize_browser_context(
+            approval_grant.binding.get("browser_context")
+        )
     except (AttributeError, ValueError):
         return None
 
@@ -3911,8 +3722,36 @@ def approval_request_binding_matches(
     """校验 Tool Result 中的审批身份能由原始调用和当前会话重建。"""
     if not isinstance(details, dict):
         return False
+    if details.get("binding_version") != _APPROVAL_BINDING_VERSION:
+        return False
+    try:
+        normalized_session_key = normalize_approval_session_key(session_key)
+        binding = _normalize_approval_binding(details.get("binding"))
+    except ValueError:
+        return False
+    # 工具专用 Binding 只能由已注册 Handler 解释和接受。
+    from hermes.approval_handlers import get_approval_handler
+    from hermes.tools import ApprovalMode, registry
+
+    entry = registry.get_entry(tool_name)
+    handler = get_approval_handler(tool_name)
+    if (
+        entry is None
+        or entry.approval_mode == ApprovalMode.NONE
+        or handler is None
+        or not handler.validate_request_binding(
+            arguments=arguments,
+            binding=binding,
+            session_key=normalized_session_key,
+        )
+    ):
+        return False
     risk_level = details.get("risk_level")
     if risk_level not in {level.value for level in ApprovalRiskLevel}:
+        return False
+    if not isinstance(details.get("operation_type"), str) or not details[
+        "operation_type"
+    ]:
         return False
     detail_scopes = details.get("allowed_grant_scopes")
     permitted_scopes = allowed_grant_scopes(risk_level)
@@ -3923,12 +3762,6 @@ def approval_request_binding_matches(
         or any(scope not in permitted_scopes for scope in detail_scopes)
     ):
         return False
-    backend_risk = details.get("backend_risk")
-    if (
-        not isinstance(backend_risk, dict)
-        or backend_risk != _backend_fingerprint_payload(backend_risk)
-    ):
-        return False
     if not isinstance(details.get("decision_source"), str):
         return False
     fingerprint = details.get("fingerprint")
@@ -3936,253 +3769,19 @@ def approval_request_binding_matches(
         "sha256:"
     ):
         return False
-
-    if tool_name == "media_analyze":
-        try:
-            normalized_session_key = normalize_approval_session_key(
-                session_key
-            )
-            snapshots = _normalize_media_analysis_snapshots(
-                details.get("media_snapshots")
-            )
-        except ValueError:
-            return False
-        normalized_paths = details.get("normalized_paths")
-        media_files = details.get("media_files")
-        provider = details.get("provider")
-        model = details.get("model")
-        if (
-            details.get("operation_type") != "media.external_analysis"
-            or details.get("allowed_grant_scopes") != ["once"]
-            or details.get("session_key_fingerprint")
-            != _identifier_fingerprint(normalized_session_key)
-            or not isinstance(normalized_paths, list)
-            or normalized_paths != [item["abs_path"] for item in snapshots]
-            or media_files != [
-                {
-                    "abs_path": item["abs_path"],
-                    "size_bytes": item["size"],
-                }
-                for item in snapshots
-            ]
-            or provider != "doubao_ark"
-            or not isinstance(model, str)
-            or details.get("prompt") != arguments.get("prompt")
-            or details.get("media_type")
-            != arguments.get("media_type", "auto")
-        ):
-            return False
-        expected = _canonical_fingerprint(_media_analysis_fingerprint_payload(
-            arguments,
-            snapshots,
-            session_key=normalized_session_key,
-            provider=provider,
-            model=model,
-            backend_context=backend_risk,
-        ))
-        return fingerprint == expected
-
-    if tool_name == "browser_analyze_page":
-        try:
-            normalized_session_key = normalize_approval_session_key(session_key)
-            snapshots = _normalize_browser_media_snapshots(
-                details.get("media_snapshots")
-            )
-            context = _normalize_browser_context(details.get("browser_context"))
-        except ValueError:
-            return False
-        provider = details.get("provider")
-        model = details.get("model")
-        if (
-            details.get("operation_type") != "browser.external_analysis"
-            or details.get("allowed_grant_scopes") != ["once"]
-            or details.get("session_key_fingerprint")
-            != _identifier_fingerprint(normalized_session_key)
-            or provider != "doubao_ark"
-            or not isinstance(model, str)
-            or details.get("prompt") != arguments.get("prompt")
-        ):
-            return False
-        expected = _canonical_fingerprint(_browser_media_fingerprint_payload(
-            tool_name,
-            arguments,
-            snapshots,
-            session_key=normalized_session_key,
-            provider=provider,
-            model=model,
-            source_context=context,
-            backend_context=backend_risk,
-        ))
-        return fingerprint == expected
-
-    if tool_name in {
-        "browser_upload_files",
-        "browser_console",
-        "browser_delete_artifact",
-        "browser_cleanup_artifacts",
-    }:
-        try:
-            normalized_session_key = normalize_approval_session_key(session_key)
-            context = _normalize_browser_context(details.get("browser_context"))
-        except ValueError:
-            return False
-        if (
-            details.get("operation_type") != "browser.high_risk_operation"
-            or details.get("allowed_grant_scopes") != ["once"]
-            or details.get("session_key_fingerprint")
-            != _identifier_fingerprint(normalized_session_key)
-        ):
-            return False
-        expected = _canonical_fingerprint(_browser_operation_fingerprint_payload(
-            tool_name,
-            arguments,
-            session_key=normalized_session_key,
-            source_context=context,
-            backend_context=backend_risk,
-        ))
-        return fingerprint == expected
-
-    if tool_name == "gateway_send_file":
-        try:
-            normalized_session_key = normalize_approval_session_key(
-                session_key
-            )
-            file_snapshot = _normalize_gateway_send_file_snapshot(
-                details.get("file_snapshot")
-            )
-        except ValueError:
-            return False
-        if (
-            details.get("abs_path") != file_snapshot["abs_path"]
-            or details.get("size_bytes") != file_snapshot["size_bytes"]
-            or details.get("sha256") != file_snapshot["sha256"]
-            or details.get("session_key_fingerprint")
-            != _identifier_fingerprint(normalized_session_key)
-            or not isinstance(details.get("platform"), str)
-            or details.get("target_platform") != details.get("platform")
-            or details.get("target_chat_fingerprint")
-            != details.get("chat_id_fingerprint")
-            or any(
-                not isinstance(details.get(field_name), str)
-                for field_name in (
-                    "route_key_fingerprint",
-                    "source_message_fingerprint",
-                    "chat_id_fingerprint",
-                )
-            )
-        ):
-            return False
-        for field_name in _GATEWAY_SEND_FILE_IDENTITY_FIELDS:
-            value = details.get(field_name)
-            if value is not None and (
-                not isinstance(value, str)
-                or not value.startswith("sha256:")
-            ):
-                return False
-        expected = _canonical_fingerprint(
-            _gateway_send_file_fingerprint_payload(
-                arguments,
-                file_snapshot,
-                details,
-            )
-        )
-        return fingerprint == expected
-
-    if tool_name == "cron":
-        try:
-            normalized_session_key = normalize_approval_session_key(session_key)
-        except ValueError:
-            return False
-        cron_action = details.get("cron_action")
-        scope_digest = details.get("scope_digest")
-        prompt_digest = details.get("prompt_digest")
-        candidate_job_id = details.get("cron_candidate_job_id")
-        if (
-            details.get("operation_type") != "cron.capability_grant"
-            or details.get("session_key_fingerprint")
-            != _identifier_fingerprint(normalized_session_key)
-            or details.get("allowed_grant_scopes") != ["once"]
-            or cron_action not in {"create", "update"}
-            or not isinstance(scope_digest, str)
-            or not scope_digest.startswith("sha256:")
-            or not isinstance(prompt_digest, str)
-            or len(prompt_digest) != 64
-            or not isinstance(candidate_job_id, str)
-            or re.fullmatch(r"[a-f0-9]{12}", candidate_job_id) is None
-        ):
-            return False
-        expected = _canonical_fingerprint({
-            "version": 2,
-            "tool_name": "cron",
-            "arguments": arguments,
-            "session_key": normalized_session_key,
-            "backend_risk": backend_risk,
-            "action": cron_action,
-            "capability_scope_digest": scope_digest,
-            "prompt_digest": prompt_digest,
-        })
-        return fingerprint == expected
-
-    if tool_name == "file":
-        normalized_path = details.get("abs_path")
-        if not isinstance(normalized_path, str) or not normalized_path:
-            return False
-        try:
-            file_snapshot = details.get("file_snapshot")
-            if file_snapshot is not None:
-                file_snapshot = normalize_file_state_snapshot(file_snapshot)
-                if file_snapshot["abs_path"] != normalized_path:
-                    return False
-            if _file_snapshot_required(arguments) and file_snapshot is None:
-                return False
-        except ValueError:
-            return False
-        expected = _canonical_fingerprint(_file_fingerprint_payload(
-            arguments,
-            normalized_path,
-            file_snapshot,
-        ))
-        return fingerprint == expected
-
-    if tool_name == "terminal":
-        try:
-            normalized_command = normalize_terminal_command(
-                arguments.get("command")
-            )
-            normalized_session_key = normalize_approval_session_key(
-                session_key
-            )
-        except ValueError:
-            return False
-        normalized_cwd = details.get("cwd")
-        if not isinstance(normalized_cwd, str) or not normalized_cwd:
-            return False
-        if details.get("normalized_command") != normalized_command:
-            return False
-        if details.get("session_key_fingerprint") != _identifier_fingerprint(
-            normalized_session_key
-        ):
-            return False
-        expected = _canonical_fingerprint({
-            "version": 2,
-            "tool_name": "terminal",
-            "command": normalized_command,
-            "cwd": normalized_cwd,
-            "session_key": normalized_session_key,
-            "backend_risk": backend_risk,
-        })
-        return fingerprint == expected
-
-    return False
-
+    return fingerprint == approval_binding_fingerprint(
+        tool_name,
+        arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+    )
 
 def _terminal_grant_matches(
     approval_grant: object,
     arguments: dict,
     *,
     fingerprint: str,
-    normalized_command: str,
-    normalized_cwd: str,
+    binding: dict,
     session_key: str,
 ) -> bool:
     """Terminal grant 必须覆盖命令、cwd、会话和统一指纹。"""
@@ -4193,9 +3792,8 @@ def _terminal_grant_matches(
             arguments,
         )
         and approval_grant.fingerprint == fingerprint
-        and approval_grant.normalized_command == normalized_command
-        and approval_grant.cwd == normalized_cwd
         and approval_grant.session_key == session_key
+        and approval_grant.binding == binding
     )
 
 
@@ -4204,7 +3802,7 @@ def _file_grant_matches(
     arguments: dict,
     *,
     fingerprint: str,
-    normalized_path: str | None,
+    binding: dict,
     session_key: str,
 ) -> bool:
     """File grant 必须覆盖完整参数、规范化绝对路径和统一指纹。"""
@@ -4215,8 +3813,8 @@ def _file_grant_matches(
             arguments,
         )
         and approval_grant.fingerprint == fingerprint
-        and approval_grant.approved_abs_path == normalized_path
         and approval_grant.session_key == session_key
+        and approval_grant.binding == binding
     )
 
 
@@ -4246,14 +3844,6 @@ def assess_terminal_operation(
         security_policy or DEFAULT_APPROVAL_SECURITY_POLICY
     )
     safe_backend_context = _backend_fingerprint_payload(backend_context)
-    fingerprint = _canonical_fingerprint({
-        "version": 2,
-        "tool_name": "terminal",
-        "command": normalized_command,
-        "cwd": normalized_cwd,
-        "session_key": normalized_session_key,
-        "backend_risk": safe_backend_context,
-    })
     command_classification = classify_terminal_command(normalized_command)
     detected_dangerous = tuple(
         dangerous_matches or detect_dangerous_command(normalized_command)
@@ -4272,12 +3862,24 @@ def assess_terminal_operation(
             backend_risk.risk_floor,
         )
 
+    binding = {
+        "normalized_command": normalized_command,
+        "cwd": normalized_cwd,
+        "backend_risk": safe_backend_context,
+        "risk_level": risk_level.value,
+    }
+    fingerprint = approval_binding_fingerprint(
+        "terminal",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+    )
+
     grant_matches = _terminal_grant_matches(
         approval_grant,
         arguments,
         fingerprint=fingerprint,
-        normalized_command=normalized_command,
-        normalized_cwd=normalized_cwd,
+        binding=binding,
         session_key=normalized_session_key,
     )
     if policy_denial is not None:
@@ -4311,9 +3913,9 @@ def assess_terminal_operation(
     elif approval_grant is not None:
         decision = DENY
         reason = "Terminal approval grant 与当前操作身份不一致"
-        error_type = "approval_grant_mismatch"
-        error = "approval grant does not match this terminal operation"
-        fatal = True
+        error_type = "approval_stale"
+        error = "approved terminal operation changed; request approval again"
+        fatal = False
         decision_source = "grant_validation"
     elif terminal_session_grant_matches(
         session_key=normalized_session_key,
@@ -4360,22 +3962,16 @@ def assess_terminal_operation(
         fatal = False
         decision_source = "local_direct"
 
-    details = {
-        "command": normalized_command,
-        "normalized_command": normalized_command,
-        "cwd": normalized_cwd,
-        "operation_type": command_classification.operation_type,
-        "target_paths": list(command_classification.target_paths),
-        "reason": reason,
-        "session_key_fingerprint": _identifier_fingerprint(
-            normalized_session_key
-        ),
-        "fingerprint": fingerprint,
-        "risk_level": risk_level.value,
-        "allowed_grant_scopes": list(allowed_grant_scopes(risk_level)),
-        "backend_risk": safe_backend_context,
-        "decision_source": decision_source,
-    }
+    details, fingerprint = _approval_details(
+        "terminal",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+        operation_type=command_classification.operation_type,
+        risk_level=risk_level,
+        reason=reason,
+        decision_source=decision_source,
+    )
 
     assessment = ApprovalAssessment(
         tool_name="terminal",
@@ -4428,11 +4024,6 @@ def assess_file_operation(
         file_snapshot = normalize_file_state_snapshot(file_snapshot)
         if file_snapshot["abs_path"] != normalized_path:
             raise ValueError("file snapshot does not match normalized path")
-    fingerprint = _canonical_fingerprint(_file_fingerprint_payload(
-        normalized_arguments,
-        normalized_path,
-        file_snapshot,
-    ))
     if policy_denial is not None or sensitive:
         risk_level = CRITICAL
     elif action in _FILE_WRITE_ACTIONS:
@@ -4442,11 +4033,24 @@ def assess_file_operation(
     else:
         risk_level = LOW
 
+    binding = {
+        "abs_path": normalized_path,
+        "file_snapshot": file_snapshot,
+        "backend_risk": _backend_fingerprint_payload(backend_context),
+        "risk_level": risk_level.value,
+    }
+    fingerprint = approval_binding_fingerprint(
+        "file",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+    )
+
     grant_matches = _file_grant_matches(
         approval_grant,
         arguments,
         fingerprint=fingerprint,
-        normalized_path=normalized_path,
+        binding=binding,
         session_key=normalized_session_key,
     )
     if policy_denial is not None:
@@ -4473,9 +4077,9 @@ def assess_file_operation(
     elif approval_grant is not None:
         decision = DENY
         reason = "File approval grant 与当前操作身份不一致"
-        error_type = "approval_grant_mismatch"
-        error = "approval grant does not match this file operation"
-        fatal = True
+        error_type = "approval_stale"
+        error = "approved file operation changed; request approval again"
+        fatal = False
         decision_source = "grant_validation"
     elif file_session_grant_matches(
         session_key=normalized_session_key,
@@ -4537,20 +4141,16 @@ def assess_file_operation(
         fatal = False
         decision_source = "static_allowlist"
 
-    details = {
-        "action": action,
-        "operation_type": f"file.{action}",
-        "target_path": normalized_path,
-        "abs_path": normalized_path,
-        "reason": reason,
-        "fingerprint": fingerprint,
-        "risk_level": risk_level.value,
-        "allowed_grant_scopes": list(allowed_grant_scopes(risk_level)),
-        "backend_risk": _backend_fingerprint_payload(backend_context),
-        "decision_source": decision_source,
-    }
-    if file_snapshot is not None:
-        details["file_snapshot"] = file_snapshot
+    details, fingerprint = _approval_details(
+        "file",
+        normalized_arguments,
+        session_key=normalized_session_key,
+        binding=binding,
+        operation_type=f"file.{action}",
+        risk_level=risk_level,
+        reason=reason,
+        decision_source=decision_source,
+    )
 
     assessment = ApprovalAssessment(
         tool_name="file",

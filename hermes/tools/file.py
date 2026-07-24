@@ -27,6 +27,8 @@ from hermes.approval_policy import (
     assess_file_operation,
     assess_path_policy_denial,
 )
+from hermes.approval_handlers import get_approval_handler, register_approval_handler
+from hermes.tools.file_approval import FileApprovalHandler
 from hermes.backends import get_backend, UnsupportedBackendError
 from hermes.config import SENSITIVE_FILE_PATTERNS
 from hermes.file_state import (
@@ -506,6 +508,8 @@ def _do_stat(backend, abs_path, rel_path):
 
 
 def register(registry):
+    if get_approval_handler("file") is None:
+        register_approval_handler("file", FileApprovalHandler())
     registry.register(
         name="file",
         toolset="file",

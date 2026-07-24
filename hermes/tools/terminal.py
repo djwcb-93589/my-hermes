@@ -13,6 +13,8 @@ from hermes.approval_policy import (
     assess_terminal_operation,
     normalize_terminal_command,
 )
+from hermes.approval_handlers import get_approval_handler, register_approval_handler
+from hermes.tools.terminal_approval import TerminalApprovalHandler
 from hermes.backends import (
     INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
     get_backend,
@@ -156,6 +158,8 @@ def run_terminal(args, **kwargs):
 
 
 def register(registry):
+    if get_approval_handler("terminal") is None:
+        register_approval_handler("terminal", TerminalApprovalHandler())
     registry.register(
         name="terminal",
         toolset="terminal",

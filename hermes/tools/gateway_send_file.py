@@ -8,6 +8,8 @@ from collections.abc import Mapping
 
 from hermes.approval import build_assessment_response, is_remote_approval
 from hermes.approval_policy import assess_gateway_send_file
+from hermes.approval_handlers import get_approval_handler, register_approval_handler
+from hermes.tools.gateway_send_file_approval import GatewaySendFileApprovalHandler
 from hermes.db import DBError
 from hermes.gateway.outbound_delivery import OutboundDeliveryService
 from hermes.outbound_file import (
@@ -185,6 +187,10 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
 
 
 def register(registry) -> None:
+    if get_approval_handler("gateway_send_file") is None:
+        register_approval_handler(
+            "gateway_send_file", GatewaySendFileApprovalHandler()
+        )
     registry.register(
         name="gateway_send_file",
         toolset="messaging",
