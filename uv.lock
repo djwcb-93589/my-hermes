@@ -522,11 +522,6 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
-[package.optional-dependencies]
-browser = [
-    { name = "playwright" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
@@ -535,13 +530,11 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "openai", specifier = ">=1.0" },
     { name = "playwright", specifier = ">=1.61.0" },
-    { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qrcode", specifier = ">=7.4" },
     { name = "tzdata", specifier = ">=2026.3" },
     { name = "uvicorn", specifier = ">=0.20" },
 ]
-provides-extras = ["browser"]
 
 [[package]]
 name = "openai"

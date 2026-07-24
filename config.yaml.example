@@ -2,8 +2,8 @@
 model: anthropic/claude-sonnet-4
 # 主模型单次响应允许使用的最大 completion token 数。
 max_output_tokens: 8192
-# 主模型 API 的 OpenAI 兼容基础地址。
-base_url: https://openrouter.ai/api/v1
+# 主模型 API 的 OpenAI 兼容基础地址；留空时可由 OPENAI_BASE_URL 提供。
+base_url: ''
 # 主模型 API 密钥；建议后续迁移到 .env 并使用 ${OPENAI_API_KEY} 引用。
 api_key: ''
 # 主模型不可用时使用的回退模型配置；空值表示继承主模型对应配置。
@@ -97,6 +97,14 @@ security:
 
 # SQLite 状态数据库路径；相对路径以 Hermes 配置目录为基准解析。
 db_path: database/hermes.db
+# 浏览器工具运行配置；enabled 为 false 时不会向 CLI 或 Gateway 会话公开 browser 工具。
+browser:
+  enabled: false
+  headless: true
+  channel: chrome
+  idle_timeout_seconds: 1800
+  startup_timeout_seconds: 30
+  operation_timeout_seconds: 60
 # Terminal 执行 backend 与相关能力配置。
 terminal:
   # 执行 backend，可选 local、docker 或 ssh。
@@ -239,9 +247,9 @@ gateway:
         - messaging
         - cron
       # 飞书应用 App ID。
-      app_id: cli_aabc69518038dbfc
+      app_id: ''
       # 飞书应用 App Secret；建议后续迁移到 .env。
-      app_secret: *****
+      app_secret: ''
       # Webhook HTTP 服务监听地址。
       webhook_host: 127.0.0.1
       # Webhook HTTP 服务监听端口。
@@ -266,7 +274,7 @@ gateway:
       webhook_trusted_proxies: []
       # verification_token：飞书事件校验 token；建议后续迁移到 .env。
       # encrypt_key：飞书加密事件的 Encrypt Key；未启用加密时可留空。
-      verification_token: '3dWzi3Bs5ChmOtIbzjCyrgXZ23i4cEZm'
+      verification_token: ''
       encrypt_key: ''
       # 机器人 open_id；需要过滤机器人自身消息时使用。
       bot_open_id: ''

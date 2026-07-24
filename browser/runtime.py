@@ -9,9 +9,10 @@ from __future__ import annotations
 import atexit
 import hashlib
 import json
+import math
 import queue
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -20,10 +21,61 @@ from typing import Any, Callable
 from browser.session import BrowserSession
 
 
-def _error(error_type: str, error: str) -> str:
+_SUPPORTED_BROWSER_CHANNELS = frozenset({
+    "chrome",
+    "chrome-beta",
+    "chrome-dev",
+    "chrome-canary",
+    "msedge",
+    "msedge-beta",
+    "msedge-dev",
+    "msedge-canary",
+})
+
+
+def _default_artifact_root() -> Path:
+    """返回项目工作区之外、仅供浏览器产物使用的固定目录。"""
+    return Path.home() / ".hermes" / "browser-artifacts"
+
+
+class BrowserRuntimeError(RuntimeError):
+    """运行时配置或 worker 生命周期错误的稳定分类。"""
+
+    def __init__(self, error_type: str, message: str) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.message = message
+
+
+def _positive_seconds(value: object, name: str) -> float:
+    """校验运行时等待时长，拒绝布尔值、非有限值和非正数。"""
+    if isinstance(value, bool):
+        raise BrowserRuntimeError("invalid_browser_config", f"{name} is invalid")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BrowserRuntimeError("invalid_browser_config", f"{name} is invalid") from exc
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise BrowserRuntimeError("invalid_browser_config", f"{name} is invalid")
+    return normalized
+
+
+def _normalize_channel(value: object) -> str | None:
+    """只接受 Playwright 已知 channel；空值明确表示内置 Chromium。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BrowserRuntimeError("invalid_browser_config", "browser channel is invalid")
+    channel = value.strip() or None
+    if channel is not None and channel not in _SUPPORTED_BROWSER_CHANNELS:
+        raise BrowserRuntimeError("invalid_browser_config", "browser channel is invalid")
+    return channel
+
+
+def _error(error_type: str, error: str, **extra: Any) -> str:
     """把运行时异常收敛为不会中断调用方的稳定 JSON。"""
     return json.dumps(
-        {"ok": False, "error_type": error_type, "error": error},
+        {"ok": False, "error_type": error_type, "error": error, **extra},
         ensure_ascii=False,
     )
 
@@ -46,9 +98,12 @@ class BrowserWorker:
         session_key: str,
         *,
         workspace_root: str | Path | None = None,
+        artifact_root: str | Path | None = None,
         artifact_dir: str | Path | None = None,
         headless: bool = True,
-        channel: str | None = "chrome",
+        channel: str | None = None,
+        startup_timeout_seconds: float = 30.0,
+        operation_timeout_seconds: float = 60.0,
         on_failure: Callable[[str, "BrowserWorker"], None] | None = None,
     ) -> None:
         self.session_key = session_key
@@ -57,14 +112,29 @@ class BrowserWorker:
             if workspace_root is not None
             else Path.cwd().resolve()
         )
+        self._artifact_root = (
+            Path(artifact_root).expanduser().resolve()
+            if artifact_root is not None
+            else _default_artifact_root().resolve()
+        )
         self._artifact_dir_config = self._artifact_dir_config_for_session(
             session_key,
             artifact_dir,
         )
-        # BrowserSession 只接受相对配置；绝对路径仅留给运行时内部比较和清理。
-        self._artifact_dir = (self._workspace_root / self._artifact_dir_config).resolve()
+        # BrowserSession 的 artifact_dir 只接受相对配置；绝对根目录只由运行时提供。
+        self._artifact_dir = (self._artifact_root / self._artifact_dir_config).resolve()
+        if not isinstance(headless, bool):
+            raise BrowserRuntimeError("invalid_browser_config", "browser headless is invalid")
         self._headless = headless
-        self._channel = channel
+        self._channel = _normalize_channel(channel)
+        self._startup_timeout_seconds = _positive_seconds(
+            startup_timeout_seconds,
+            "browser startup timeout",
+        )
+        self._operation_timeout_seconds = _positive_seconds(
+            operation_timeout_seconds,
+            "browser operation timeout",
+        )
         self._on_failure = on_failure
         self._queue: queue.Queue[_WorkItem | None] = queue.Queue()
         self._ready = threading.Event()
@@ -73,6 +143,7 @@ class BrowserWorker:
         self._busy = False
         self._queued = 0
         self._failed = False
+        self._failure_error_type = "browser_worker_unavailable"
         self._failure_message = ""
         self._last_used = monotonic()
         self._thread = threading.Thread(
@@ -81,7 +152,12 @@ class BrowserWorker:
             daemon=True,
         )
         self._thread.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout=self._startup_timeout_seconds):
+            self._invalidate(
+                "browser_worker_startup_timeout",
+                "browser worker startup timed out",
+            )
+            self._close_async()
 
     @property
     def last_used(self) -> float:
@@ -94,6 +170,16 @@ class BrowserWorker:
         return self._failed
 
     @property
+    def failure_error_type(self) -> str:
+        """返回失效原因的稳定错误类型，供 Manager 传给可信调用方。"""
+        return self._failure_error_type
+
+    @property
+    def failure_message(self) -> str:
+        """返回不含线程、路径和 Playwright 细节的失败说明。"""
+        return self._failure_message
+
+    @property
     def workspace_root(self) -> Path:
         """返回创建后固定不变的工作区配置，仅供 Manager 校验复用。"""
         return Path(self._workspace_root).resolve()
@@ -102,6 +188,11 @@ class BrowserWorker:
     def artifact_dir(self) -> Path:
         """返回内部解析后的会话产物目录，仅供运行时校验与清理。"""
         return Path(self._artifact_dir).resolve()
+
+    @property
+    def artifact_root(self) -> Path:
+        """返回固定的浏览器产物根目录，仅供运行时内部使用。"""
+        return Path(self._artifact_root).resolve()
 
     @property
     def artifact_dir_config(self) -> Path:
@@ -120,7 +211,7 @@ class BrowserWorker:
         artifact_dir: str | Path | None,
     ) -> Path:
         """生成或校验会话专用的相对产物目录，绝不接受绝对路径。"""
-        expected = Path(".browser_artifacts") / cls._session_digest(session_key)
+        expected = Path(cls._session_digest(session_key))
         if artifact_dir is None:
             return expected
         configured = Path(artifact_dir)
@@ -152,21 +243,38 @@ class BrowserWorker:
         if not isinstance(method, str) or not method or method.startswith("_"):
             return _error("invalid_args", "browser method is invalid")
         future: Future[str] = Future()
+        effective_timeout = self._operation_timeout_seconds if timeout is None else timeout
+        try:
+            effective_timeout = _positive_seconds(
+                effective_timeout,
+                "browser operation timeout",
+            )
+        except BrowserRuntimeError:
+            return _error("invalid_args", "browser operation timeout is invalid")
         with self._state_lock:
             if self._closed.is_set() or self._failed:
                 return _error(
                     "browser_worker_unavailable",
-                    self._failure_message or "browser worker is closed",
+                    "browser worker is unavailable",
                 )
             self._queued += 1
             self._last_used = monotonic()
             self._queue.put(_WorkItem(method, args, dict(kwargs), future))
         try:
-            return future.result(timeout=timeout)
-        except TimeoutError:
-            return _error("browser_worker_timeout", "browser worker did not finish in time")
-        except Exception as exc:
-            return _error("browser_worker_failed", f"browser worker failed: {exc.__class__.__name__}")
+            return future.result(timeout=effective_timeout)
+        except FutureTimeoutError:
+            self._invalidate(
+                "browser_worker_timeout",
+                "browser operation timed out",
+            )
+            self._close_async()
+            return _error(
+                "browser_worker_timeout",
+                "browser operation timed out; its outcome is unknown",
+                execution_state="unknown",
+            )
+        except Exception:
+            return _error("browser_worker_failed", "browser worker failed")
 
     def close(self) -> None:
         """请求线程完成已有任务后关闭浏览器；重复调用安全。"""
@@ -199,12 +307,16 @@ class BrowserWorker:
                 headless=self._headless,
                 channel=self._channel,
                 workspace_root=self._workspace_root,
+                artifact_root=self._artifact_root,
                 artifact_dir=self._artifact_dir_config,
             )
             session.start()
-        except Exception as exc:
-            self._failed = True
-            self._failure_message = f"browser startup failed: {exc.__class__.__name__}"
+        except Exception:
+            self._mark_failed(
+                "browser_worker_startup_failed",
+                "browser worker startup failed",
+            )
+            self._notify_failure_async()
             self._ready.set()
             return
         self._ready.set()
@@ -229,20 +341,16 @@ class BrowserWorker:
                         result = target(*item.args, **item.kwargs)
                         if not isinstance(result, str):
                             result = _error("browser_worker_failed", "browser operation returned an invalid result")
-                except Exception as exc:
-                    result = _error(
-                        "browser_operation_failed",
-                        f"browser operation failed: {exc.__class__.__name__}",
-                    )
+                except Exception:
+                    result = _error("browser_operation_failed", "browser operation failed")
                 if not item.future.done():
                     item.future.set_result(result)
                 with self._state_lock:
                     self._busy = False
                     self._last_used = monotonic()
-        except BaseException as exc:
-            self._failed = True
-            self._failure_message = f"browser worker crashed: {exc.__class__.__name__}"
-            self._notify_failure()
+        except BaseException:
+            self._mark_failed("browser_worker_failed", "browser worker failed")
+            self._notify_failure_async()
         finally:
             if session is not None:
                 try:
@@ -268,6 +376,56 @@ class BrowserWorker:
             except Exception:
                 pass
 
+    def _mark_failed(self, error_type: str, message: str) -> bool:
+        """只允许首次失效原因决定 worker 的后续可见状态。"""
+        with self._state_lock:
+            if self._failed:
+                return False
+            self._failed = True
+            self._failure_error_type = error_type
+            self._failure_message = message
+        return True
+
+    def _invalidate(self, error_type: str, message: str) -> None:
+        """封闭失效 worker，取消尚未开始的请求并让 Manager 立即移除它。"""
+        if not self._mark_failed(error_type, message):
+            return
+        pending: list[_WorkItem] = []
+        with self._state_lock:
+            self._closed.set()
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    pending.append(item)
+            self._queued = 0
+            self._queue.put(None)
+        self._notify_failure_async()
+        for item in pending:
+            if not item.future.done():
+                item.future.set_result(_error(
+                    "browser_worker_unavailable",
+                    "browser worker is unavailable",
+                ))
+
+    def _close_async(self) -> None:
+        """超时调用方不能等待可能卡住的浏览器线程退出。"""
+        threading.Thread(
+            target=self.close,
+            name="browser-worker-close",
+            daemon=True,
+        ).start()
+
+    def _notify_failure_async(self) -> None:
+        """失败通知不能反向等待正持有 Manager 锁的启动调用。"""
+        threading.Thread(
+            target=self._notify_failure,
+            name="browser-worker-failure-notify",
+            daemon=True,
+        ).start()
+
 
 class BrowserManager:
     """按可信 session_key 隔离并复用 BrowserWorker。"""
@@ -277,18 +435,42 @@ class BrowserManager:
         *,
         idle_timeout_seconds: float = 1800.0,
         workspace_root: str | Path | None = None,
+        artifact_root: str | Path | None = None,
         artifact_dir: str | Path | None = None,
         headless: bool = True,
-        channel: str | None = "chrome",
+        channel: str | None = None,
+        startup_timeout_seconds: float = 30.0,
+        operation_timeout_seconds: float = 60.0,
+        _allow_reconfigure_once: bool = False,
     ) -> None:
-        self._idle_timeout_seconds = max(0.0, float(idle_timeout_seconds))
+        if not isinstance(headless, bool):
+            raise BrowserRuntimeError("invalid_browser_config", "browser headless is invalid")
+        self._idle_timeout_seconds = _positive_seconds(
+            idle_timeout_seconds,
+            "browser idle timeout",
+        )
         self._workspace_root = (
             Path(workspace_root).resolve() if workspace_root is not None else None
         )
-        if artifact_dir is not None and Path(artifact_dir) != Path(".browser_artifacts"):
-            raise ValueError("BrowserManager artifact_dir is fixed to .browser_artifacts")
+        self._artifact_root = (
+            Path(artifact_root).expanduser().resolve()
+            if artifact_root is not None
+            else _default_artifact_root().resolve()
+        )
+        if artifact_dir is not None:
+            raise ValueError("BrowserManager does not accept a shared artifact_dir")
         self._headless = headless
-        self._channel = channel
+        self._channel = _normalize_channel(channel)
+        self._startup_timeout_seconds = _positive_seconds(
+            startup_timeout_seconds,
+            "browser startup timeout",
+        )
+        self._operation_timeout_seconds = _positive_seconds(
+            operation_timeout_seconds,
+            "browser operation timeout",
+        )
+        self._allow_reconfigure_once = _allow_reconfigure_once
+        self._configured = not _allow_reconfigure_once
         self._workers: dict[str, BrowserWorker] = {}
         self._lock = threading.Lock()
         self._stop_reaper = threading.Event()
@@ -298,6 +480,59 @@ class BrowserManager:
             daemon=True,
         )
         self._reaper.start()
+
+    def configure_once(
+        self,
+        *,
+        idle_timeout_seconds: float,
+        headless: bool,
+        channel: str | None,
+        startup_timeout_seconds: float,
+        operation_timeout_seconds: float,
+    ) -> None:
+        """仅允许默认 Manager 在创建 worker 前接收一次可信运行时配置。"""
+        if not self._allow_reconfigure_once:
+            raise BrowserRuntimeError(
+                "browser_runtime_config_conflict",
+                "browser runtime configuration is fixed",
+            )
+        if not isinstance(headless, bool):
+            raise BrowserRuntimeError("invalid_browser_config", "browser headless is invalid")
+        normalized = (
+            _positive_seconds(idle_timeout_seconds, "browser idle timeout"),
+            headless,
+            _normalize_channel(channel),
+            _positive_seconds(startup_timeout_seconds, "browser startup timeout"),
+            _positive_seconds(operation_timeout_seconds, "browser operation timeout"),
+        )
+        with self._lock:
+            current = (
+                self._idle_timeout_seconds,
+                self._headless,
+                self._channel,
+                self._startup_timeout_seconds,
+                self._operation_timeout_seconds,
+            )
+            if self._configured:
+                if normalized != current:
+                    raise BrowserRuntimeError(
+                        "browser_runtime_config_conflict",
+                        "browser runtime configuration conflicts with active settings",
+                    )
+                return
+            if self._workers:
+                raise BrowserRuntimeError(
+                    "browser_runtime_config_conflict",
+                    "browser runtime configuration cannot change after startup",
+                )
+            (
+                self._idle_timeout_seconds,
+                self._headless,
+                self._channel,
+                self._startup_timeout_seconds,
+                self._operation_timeout_seconds,
+            ) = normalized
+            self._configured = True
 
     def get_worker(
         self,
@@ -328,13 +563,20 @@ class BrowserManager:
             worker = BrowserWorker(
                 normalized_key,
                 workspace_root=resolved_workspace,
+                artifact_root=self._artifact_root,
                 artifact_dir=artifact_dir_config,
                 headless=self._headless,
                 channel=self._channel,
+                startup_timeout_seconds=self._startup_timeout_seconds,
+                operation_timeout_seconds=self._operation_timeout_seconds,
                 on_failure=self._remove_failed_worker,
             )
             if worker.failed:
-                raise RuntimeError("browser worker startup failed")
+                worker._close_async()
+                raise BrowserRuntimeError(
+                    worker.failure_error_type,
+                    worker.failure_message or "browser worker startup failed",
+                )
             self._workers[normalized_key] = worker
             return worker
 
@@ -405,8 +647,8 @@ class BrowserManager:
         return resolved
 
     def _session_artifact_dir(self, session_key: str) -> Path:
-        """返回固定相对目录，实际绝对位置由各 worker 的工作区决定。"""
-        return Path(".browser_artifacts") / BrowserWorker._session_digest(session_key)
+        """返回 artifact_root 下固定的会话隔离目录配置。"""
+        return Path(BrowserWorker._session_digest(session_key))
 
     def _remove_failed_worker(self, session_key: str, worker: BrowserWorker) -> None:
         with self._lock:
@@ -415,8 +657,11 @@ class BrowserManager:
 
     def _reap_idle_workers(self) -> None:
         """没有新请求时也按固定节奏回收长期空闲的会话。"""
-        interval = min(60.0, max(1.0, self._idle_timeout_seconds / 4))
-        while not self._stop_reaper.wait(interval):
+        while not self._stop_reaper.is_set():
+            with self._lock:
+                interval = min(60.0, max(1.0, self._idle_timeout_seconds / 4))
+            if self._stop_reaper.wait(interval):
+                return
             try:
                 self.cleanup_idle()
             except Exception:
@@ -424,5 +669,25 @@ class BrowserManager:
                 pass
 
 
-default_browser_manager = BrowserManager()
+default_browser_manager = BrowserManager(_allow_reconfigure_once=True)
+
+
+def configure_default_browser_manager(
+    *,
+    idle_timeout_seconds: float,
+    headless: bool,
+    channel: str | None,
+    startup_timeout_seconds: float,
+    operation_timeout_seconds: float,
+) -> None:
+    """由 Hermes 工具适配层在启动前固定默认 Manager 的可信配置。"""
+    default_browser_manager.configure_once(
+        idle_timeout_seconds=idle_timeout_seconds,
+        headless=headless,
+        channel=channel,
+        startup_timeout_seconds=startup_timeout_seconds,
+        operation_timeout_seconds=operation_timeout_seconds,
+    )
+
+
 atexit.register(default_browser_manager.shutdown)

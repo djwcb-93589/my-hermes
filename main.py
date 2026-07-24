@@ -12,25 +12,42 @@ import json
 import os
 import sys
 
-from hermes.config import DB_PATH, MODEL, BASE_URL, HERMES_HOME
+from hermes.config import BROWSER_CONFIG, DB_PATH, MODEL, BASE_URL, HERMES_HOME
 from hermes.cli_approval import execute_cli_approval
 from hermes.conversation import run_conversation
 from hermes.db import init_db, create_session, replace_tool_message_content
 from hermes.session_resources import cleanup_all_session_resources
 from hermes.prompt import build_system_prompt
-from hermes.tools import register_all
+from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registry
+
+
+def _cli_tool_policy() -> ToolPolicy:
+    """只在配置启用时把 browser 加入当前 CLI 会话的工具边界。"""
+    base_policy = ToolPolicy(ExecutionEnvironment.CLI)
+    enabled_toolsets = set(registry.default_toolsets_for_policy(base_policy))
+    if BROWSER_CONFIG["enabled"]:
+        enabled_toolsets.add("browser")
+    return ToolPolicy(
+        ExecutionEnvironment.CLI,
+        enabled_toolsets=frozenset(enabled_toolsets),
+    )
 
 
 def cli_loop():
     """默认模式：原始 input → run_conversation REPL。"""
     register_all()
+    tool_policy = _cli_tool_policy()
+    enabled_toolsets = sorted(registry.resolve(tool_policy).toolsets)
 
     print(f"Profile (HERMES_HOME): {HERMES_HOME}")
     print(f"Model: {MODEL} | Base URL: {BASE_URL}")
 
     conn = init_db(DB_PATH)
     session_id = create_session(conn)
-    cached_prompt = build_system_prompt(os.getcwd())
+    cached_prompt = build_system_prompt(
+        os.getcwd(),
+        enabled_toolsets=enabled_toolsets,
+    )
     print(f"System prompt: {len(cached_prompt)} chars")
 
     print("Type 'quit' to exit. Use /approve [once|session] or /deny when prompted.\n")
@@ -82,6 +99,7 @@ def cli_loop():
                         cached_prompt,
                         session_key=session_id,
                         resume_from_history=True,
+                        tool_policy=tool_policy,
                     )
                     if resumed.get("status") == "awaiting_approval":
                         request = resumed.get("approval_request")
@@ -107,6 +125,7 @@ def cli_loop():
             result = run_conversation(
                 user_input, conn, session_id, cached_prompt,
                 session_key=session_id,
+                tool_policy=tool_policy,
             )
             if result.get("status") == "awaiting_approval":
                 request = result.get("approval_request")

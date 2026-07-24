@@ -175,6 +175,7 @@ class BrowserSession:
         timeout_ms: int = 30000,
         channel: str | None = "chrome",
         workspace_root: str | Path | None = None,
+        artifact_root: str | Path | None = None,
         artifact_dir: str | Path | None = None,
         multimodal_analyzer: MultimodalAnalyzer | None = None,
     ):
@@ -185,6 +186,9 @@ class BrowserSession:
         # 常用值:"chrome"、"msedge"、None。
         self._channel = channel
         self.workspace_root = self._resolve_workspace_root(workspace_root)
+        # artifact_root 是可信运行时提供的本地输出根目录；它与上传工作区
+        # 分离，避免下载和截图污染项目目录。
+        self.artifact_root = self._resolve_artifact_root(artifact_root)
         self.artifact_dir = self._resolve_artifact_dir(artifact_dir)
         self._artifacts: dict[str, _Artifact] = {}
         self._artifact_counter = 0
@@ -275,22 +279,44 @@ class BrowserSession:
             raise ValueError("workspace_root 必须是已存在的目录")
         return resolved
 
+    def _resolve_artifact_root(self, artifact_root: str | Path | None) -> Path:
+        """解析可信运行时提供的浏览器产物根目录。"""
+        # 未指定时也使用用户目录中的专用位置，避免直接使用 BrowserSession
+        # 的命令行入口把下载和截图写入当前项目工作区。
+        raw_root = (
+            Path.home() / ".hermes" / "browser-artifacts"
+            if artifact_root is None
+            else Path(artifact_root).expanduser()
+        )
+        if self._contains_parent_reference(raw_root):
+            raise ValueError("artifact_root 不允许包含 '..'")
+        try:
+            raw_root.mkdir(parents=True, exist_ok=True)
+            if raw_root.is_symlink():
+                raise ValueError("artifact_root 不能是符号链接")
+            resolved = raw_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"artifact_root 无法创建或解析: {exc}") from exc
+        if not resolved.is_dir():
+            raise ValueError("artifact_root 必须是目录")
+        return resolved
+
     def _resolve_artifact_dir(self, artifact_dir: str | Path | None) -> Path:
         """创建并验证只用于会话产物的受限输出目录。"""
         raw_dir = Path(".browser-artifacts") if artifact_dir is None else Path(artifact_dir)
         if raw_dir.is_absolute() or self._contains_parent_reference(raw_dir):
-            raise ValueError("artifact_dir 必须是 workspace_root 内不含 '..' 的相对目录")
-        candidate = self.workspace_root / raw_dir
-        if self._has_symlink_component(candidate, self.workspace_root):
+            raise ValueError("artifact_dir 必须是 artifact_root 内不含 '..' 的相对目录")
+        candidate = self.artifact_root / raw_dir
+        if self._has_symlink_component(candidate, self.artifact_root):
             raise ValueError("artifact_dir 不能包含符号链接")
         try:
             candidate.mkdir(parents=True, exist_ok=True)
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise ValueError(f"artifact_dir 无法创建或解析: {exc}") from exc
-        if not self._is_relative_to(resolved, self.workspace_root) or not resolved.is_dir():
-            raise ValueError("artifact_dir 必须位于 workspace_root 内")
-        if self._has_symlink_component(resolved, self.workspace_root):
+        if not self._is_relative_to(resolved, self.artifact_root) or not resolved.is_dir():
+            raise ValueError("artifact_dir 必须位于 artifact_root 内")
+        if self._has_symlink_component(resolved, self.artifact_root):
             raise ValueError("artifact_dir 不能包含符号链接")
         return resolved
 
@@ -298,13 +324,13 @@ class BrowserSession:
         """解析已有会话的目录参数，但不因冲突检查创建新目录。"""
         raw_dir = Path(artifact_dir)
         if raw_dir.is_absolute() or self._contains_parent_reference(raw_dir):
-            raise ValueError("artifact_dir 必须是 workspace_root 内不含 '..' 的相对目录")
-        candidate = self.workspace_root / raw_dir
-        if self._has_symlink_component(candidate, self.workspace_root):
+            raise ValueError("artifact_dir 必须是 artifact_root 内不含 '..' 的相对目录")
+        candidate = self.artifact_root / raw_dir
+        if self._has_symlink_component(candidate, self.artifact_root):
             raise ValueError("artifact_dir 不能包含符号链接")
         resolved = candidate.resolve(strict=False)
-        if not self._is_relative_to(resolved, self.workspace_root):
-            raise ValueError("artifact_dir 必须位于 workspace_root 内")
+        if not self._is_relative_to(resolved, self.artifact_root):
+            raise ValueError("artifact_dir 必须位于 artifact_root 内")
         if candidate.exists() and not candidate.is_dir():
             raise ValueError("artifact_dir 必须是目录")
         return resolved
@@ -4310,6 +4336,7 @@ def get_session(
     headless: bool = True,
     channel: str | None = "chrome",
     workspace_root: str | Path | None = None,
+    artifact_root: str | Path | None = None,
     artifact_dir: str | Path | None = None,
 ) -> BrowserSession:
     """按 session_key 取或建 BrowserSession。
@@ -4317,8 +4344,8 @@ def get_session(
     第一次调用会启动 Chromium;后续调用直接返回缓存实例。启动完成后才发布
     到池中，避免其它线程取得尚未初始化的 session。同步 Playwright 不能
     跨线程复用；跨线程获取同一个 key 会得到明确错误，后续 BrowserWorker
-    将负责把调用路由到固定线程。``workspace_root`` 与 ``artifact_dir`` 只在
-    首次创建时确定；后续调用省略它们即可复用，提供不同目录会抛出
+    将负责把调用路由到固定线程。``workspace_root``、``artifact_root`` 与
+    ``artifact_dir`` 只在首次创建时确定；后续调用省略它们即可复用，提供不同目录会抛出
     ``session_configuration_conflict``，不会静默改写会话的文件授权边界。
     """
     with _sessions_lock:
@@ -4332,6 +4359,13 @@ def get_session(
                         "session_configuration_conflict: "
                         "session_key 已绑定不同的 workspace_root"
                     )
+            if artifact_root is not None:
+                requested_artifact_root = s._resolve_artifact_root(artifact_root)
+                if requested_artifact_root != s.artifact_root:
+                    raise ValueError(
+                        "session_configuration_conflict: "
+                        "session_key 已绑定不同的 artifact_root"
+                    )
             if artifact_dir is not None:
                 requested_artifact_dir = s._configured_artifact_dir_locked(artifact_dir)
                 if requested_artifact_dir != s.artifact_dir:
@@ -4344,6 +4378,7 @@ def get_session(
             headless=headless,
             channel=channel,
             workspace_root=workspace_root,
+            artifact_root=artifact_root,
             artifact_dir=artifact_dir,
         )
         # 启动与发布必须是一个原子步骤；启动很少发生，值得用全局锁换取

@@ -20,6 +20,14 @@ from hermes.path_policy import PathAccessPolicy
 
 
 DEFAULT_CONFIG = {
+    "browser": {
+        "enabled": False,
+        "headless": True,
+        "channel": "chrome",
+        "idle_timeout_seconds": 1800.0,
+        "startup_timeout_seconds": 30.0,
+        "operation_timeout_seconds": 60.0,
+    },
     "security": {
         "filesystem": {
             "denied_paths": [],
@@ -54,6 +62,18 @@ DEFAULT_CONFIG = {
         "docker_mounts": [],
     },
 }
+
+
+_SUPPORTED_BROWSER_CHANNELS = frozenset({
+    "chrome",
+    "chrome-beta",
+    "chrome-dev",
+    "chrome-canary",
+    "msedge",
+    "msedge-beta",
+    "msedge-dev",
+    "msedge-canary",
+})
 
 
 def _expand_env_vars(value):
@@ -272,6 +292,55 @@ def _validate_terminal_backend_config(config: dict) -> None:
     terminal["docker_mounts"] = normalized_mounts
 
 
+def _validate_browser_config(config: dict) -> None:
+    """补齐并校验浏览器运行时配置，避免工具调用时才暴露配置错误。"""
+    browser = config.get("browser")
+    if browser is None:
+        browser = {}
+        config["browser"] = browser
+    if not isinstance(browser, dict):
+        raise ValueError("browser must be a mapping")
+
+    defaults = DEFAULT_CONFIG["browser"]
+    for name in ("enabled", "headless"):
+        value = browser.get(name, defaults[name])
+        if not isinstance(value, bool):
+            raise ValueError(f"browser.{name} must be a boolean")
+        browser[name] = value
+
+    raw_channel = browser.get("channel", defaults["channel"])
+    if raw_channel is None:
+        channel = None
+    elif not isinstance(raw_channel, str):
+        raise ValueError("browser.channel must be a string or null")
+    else:
+        channel = raw_channel.strip() or None
+        if channel is not None and channel not in _SUPPORTED_BROWSER_CHANNELS:
+            raise ValueError(
+                "browser.channel must be null, empty, or one of: "
+                f"{sorted(_SUPPORTED_BROWSER_CHANNELS)}"
+            )
+    browser["channel"] = channel
+
+    for name in (
+        "idle_timeout_seconds",
+        "startup_timeout_seconds",
+        "operation_timeout_seconds",
+    ):
+        raw_value = browser.get(name, defaults[name])
+        if isinstance(raw_value, bool):
+            raise ValueError(f"browser.{name} must be a positive number")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"browser.{name} must be a positive number"
+            ) from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"browser.{name} must be a positive number")
+        browser[name] = value
+
+
 def load_env(env_path=None):
     """Read a .env file and set as environment variables (simple implementation)."""
     from pathlib import Path
@@ -312,6 +381,7 @@ def load_config(config_path=None) -> dict:
     config = _expand_env_vars(config)
     _validate_filesystem_security_config(config)
     _validate_terminal_backend_config(config)
+    _validate_browser_config(config)
     return config
 
 
@@ -350,6 +420,9 @@ CONFIG_PATH = HERMES_HOME / "config.yaml"
 load_env()
 
 _config = load_config(CONFIG_PATH)
+
+# 仅供 Hermes 入口和 Browser 工具适配层读取；browser 包本身不反向依赖 Hermes。
+BROWSER_CONFIG = dict(_config["browser"])
 
 PATH_ACCESS_POLICY = PathAccessPolicy(
     _config["security"]["filesystem"]["denied_paths"],

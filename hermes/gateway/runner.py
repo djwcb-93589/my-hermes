@@ -629,6 +629,8 @@ def _load_gateway_context_config(
 
 def _load_gateway_platform_toolsets(
     gateway_cfg: dict,
+    *,
+    browser_enabled: bool,
 ) -> dict[str, tuple[str, ...]]:
     """读取各平台显式开放的工具集，未配置的平台保持无工具。"""
     platforms_cfg = gateway_cfg.get("platforms", {})
@@ -660,6 +662,9 @@ def _load_gateway_platform_toolsets(
         normalized: list[str] = []
         for raw_toolset in configured:
             toolset = raw_toolset.strip().lower()
+            # browser 的全局开关是额外门槛；平台列表不能绕过它。
+            if toolset == "browser" and not browser_enabled:
+                continue
             if toolset not in supported_toolsets:
                 raise ValueError(
                     f"gateway.platforms.{platform}.toolsets contains "
@@ -668,6 +673,8 @@ def _load_gateway_platform_toolsets(
                 )
             if toolset not in normalized:
                 normalized.append(toolset)
+        if browser_enabled and "browser" not in normalized:
+            normalized.append("browser")
         platform_toolsets[platform] = tuple(normalized)
 
     return platform_toolsets
@@ -767,8 +774,15 @@ class GatewayRunner:
         self._gateway_context_policies = _load_gateway_context_config(
             gateway_cfg
         )
+        browser_cfg = config.get("browser", {})
+        self._browser_enabled = bool(
+            browser_cfg.get("enabled", False)
+            if isinstance(browser_cfg, dict)
+            else False
+        )
         self._gateway_platform_toolsets = _load_gateway_platform_toolsets(
-            gateway_cfg
+            gateway_cfg,
+            browser_enabled=self._browser_enabled,
         )
         self.runtime_lease_ttl_seconds = _load_positive_seconds(
             gateway_cfg,
@@ -4803,6 +4817,33 @@ class GatewayRunner:
                 self._accepted_messages.discard(
                     (route_key, event.message_id)
                 )
+                # 用户已经收到“审批已通过”回执，但恢复执行最终失败。若没有
+                # 任何回复到达用户，补一条失败提示，避免审批通过后无下文。
+                if persisted_outbox is None:
+                    fallback_outbox = self._build_outbox(
+                        route_key,
+                        delivery_event,
+                        _SAFE_INTERNAL_REPLY,
+                        delivery_id,
+                        "internal_error",
+                        queue_message_id=event.message_id,
+                    )
+                    fallback_delivery_id = await self._enqueue_outbox_async(
+                        fallback_outbox
+                    )
+                    if (
+                        ctx.delivery_generation == generation
+                        and self._task_cancel_reason(ctx, generation) is None
+                    ):
+                        ctx.delivery_id = fallback_delivery_id
+                    await self._deliver_outbox(
+                        route_key,
+                        delivery_event,
+                        fallback_delivery_id,
+                        ctx,
+                        generation,
+                        invalidation_event,
+                    )
                 event_completed = True
                 await self._finish_processing_best_effort(
                     delivery_event,

@@ -7,8 +7,13 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from browser.runtime import default_browser_manager
+from browser.runtime import (
+    BrowserRuntimeError,
+    configure_default_browser_manager,
+    default_browser_manager,
+)
 from hermes.approval import build_assessment_response, is_remote_approval
+from hermes.config import BROWSER_CONFIG
 from hermes.tools.browser_approval import (
     approved_browser_media_snapshots_candidate,
     approved_browser_operation_context_candidate,
@@ -85,8 +90,10 @@ def _worker(kwargs: dict[str, Any]):
             workspace_root=workspace_root,
             require_workspace_root=True,
         ), None
-    except Exception as exc:
-        return None, _error("browser_worker_unavailable", f"browser worker is unavailable: {exc.__class__.__name__}")
+    except BrowserRuntimeError as exc:
+        return None, _error(exc.error_type, "browser worker is unavailable")
+    except Exception:
+        return None, _error("browser_worker_unavailable", "browser worker is unavailable")
 
 
 def _call(worker: Any, method: str, *args: Any, **kwargs: Any) -> str:
@@ -530,6 +537,13 @@ _TIMEOUT = {"type": "integer", "minimum": 1}
 
 def register(registry) -> None:
     """注册默认关闭、显式启用 browser toolset 后才可见的浏览器工具。"""
+    configure_default_browser_manager(
+        idle_timeout_seconds=BROWSER_CONFIG["idle_timeout_seconds"],
+        headless=BROWSER_CONFIG["headless"],
+        channel=BROWSER_CONFIG["channel"],
+        startup_timeout_seconds=BROWSER_CONFIG["startup_timeout_seconds"],
+        operation_timeout_seconds=BROWSER_CONFIG["operation_timeout_seconds"],
+    )
     register_browser_approval_handlers()
     operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool]] = [
         ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False),
