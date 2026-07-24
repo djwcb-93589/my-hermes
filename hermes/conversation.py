@@ -266,6 +266,7 @@ class ConversationAgentLoop(AgentLoop):
         model_kwargs: dict | None = None,
         fallback_model_kwargs: dict | None = None,
         cancel_checker=None,
+        resume_from_history: bool = False,
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
     ):
@@ -288,6 +289,7 @@ class ConversationAgentLoop(AgentLoop):
         self.max_continuations = max_continuations
         self.compression_threshold = compression_threshold
         self._existing_messages = existing_messages
+        self.resume_from_history = resume_from_history
         self._retry_count = 0
         self._continuation_count = 0
         self._fallback_model_kwargs = dict(
@@ -308,6 +310,8 @@ class ConversationAgentLoop(AgentLoop):
     # --- messages 初始化:主会话从 DB 加载历史 ---
 
     def init_messages(self, user_message: str) -> list[dict]:
+        if self.resume_from_history:
+            return list(self._existing_messages)
         # 复用调用方已 add_messages 过的 user_msg;这里只负责把历史 + 当前
         # user msg 拼成 messages 列表给循环用。
         return list(self._existing_messages) + [{"role": "user", "content": user_message}]
@@ -802,6 +806,8 @@ def run_conversation(
     enabled_toolsets: list[str] | None = None,
     tool_context: dict | None = None,
     tool_policy: ToolPolicy | None = None,
+    *,
+    resume_from_history: bool = False,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -809,16 +815,16 @@ def run_conversation(
     与原版完全一致;额外带 ok / status / error_type / fatal / retryable
     结构化字段,供调用方精确判断错误。
     """
-    # 关键顺序:先读历史(不含当前 user_msg),再 add_messages 当前 user_msg。
-    # 这样 ConversationAgentLoop.init_messages 拼 existing + [user_msg] 时,
-    # user message 在 API 调用 和 DB 里都只出现一次。
+    # 普通模式先读历史(不含当前 user_msg),再写入当前 user_msg，保证它只出现一次。
+    # 恢复模式只读取既有历史，不能额外插入空白或伪造的用户消息。
     #
     # DB 读写失败时直接返结构化 persistence_error,不启动 AgentLoop ——
     # 历史读不出 / user msg 写不进时,跑模型无意义。
     try:
         existing = get_session_messages(conn, session_id)
-        user_msg = {"role": "user", "content": user_message}
-        add_messages(conn, session_id, [user_msg])
+        if not resume_from_history:
+            user_msg = {"role": "user", "content": user_message}
+            add_messages(conn, session_id, [user_msg])
     except Exception as exc:
         return _persistence_error_response(exc)
 
@@ -845,6 +851,7 @@ def run_conversation(
             "max_tokens": FALLBACK_MAX_OUTPUT_TOKENS,
         },
         cancel_checker=cancel_checker,
+        resume_from_history=resume_from_history,
         allowed_tool_names=allowed_tool_names,
         tool_context=tool_context,
     )

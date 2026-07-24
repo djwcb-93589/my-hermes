@@ -34,6 +34,7 @@ from hermes.approval_security import (
     ApprovalSecurityPolicy,
     DEFAULT_APPROVAL_SECURITY_POLICY,
     PolicyDenial,
+    normalize_executable_name,
 )
 from hermes.path_policy import (
     PATH_POLICY_DENIED_ERROR_TYPE,
@@ -403,14 +404,6 @@ def _path_is_under(path: str, parent: str) -> bool:
     except ValueError:
         return False
 
-def _normalize_executable_name(executable: object) -> str:
-    """把 executable 收敛为跨 Windows/POSIX 可比较的 basename。"""
-    value = str(executable or "").strip().replace("\\", "/")
-    if not value:
-        return ""
-    return value.rsplit("/", 1)[-1].casefold()
-
-
 def _tokenize_shell(command: str) -> tuple[str, ...]:
     """尽力切分 Shell 文本；失败返回空元组，不宣称完整理解 Bash。"""
     try:
@@ -454,7 +447,7 @@ def _unwrap_shell_segment(
     while index < len(tokens) and _SHELL_ASSIGNMENT_RE.match(tokens[index]):
         index += 1
     while index < len(tokens):
-        executable = _normalize_executable_name(tokens[index])
+        executable = normalize_executable_name(tokens[index])
         if executable not in _SHELL_WRAPPERS:
             return tokens[index], tuple(tokens[index + 1:])
         index += 1
@@ -514,7 +507,7 @@ def _segment_has_mutation_intent(
     argv: Sequence[str],
 ) -> bool:
     """保守识别会改变文件或安全状态的简单命令段。"""
-    name = _normalize_executable_name(executable)
+    name = normalize_executable_name(executable)
     if name not in _MUTATING_EXECUTABLES:
         return False
     lowered = [str(token).casefold() for token in argv]
@@ -707,7 +700,7 @@ def _hardline_root_delete(
     """识别递归删除系统根、磁盘根或根级通配目标。"""
     for segment in _shell_command_segments(command):
         executable, argv = _unwrap_shell_segment(segment)
-        name = _normalize_executable_name(executable)
+        name = normalize_executable_name(executable)
         lowered = [str(token).casefold() for token in argv]
         if name == "rm":
             recursive = any(
@@ -798,7 +791,7 @@ def _hardline_raw_device_write(command: str) -> bool:
             return True
     for segment in _shell_command_segments(command):
         executable, argv = _unwrap_shell_segment(segment)
-        if _normalize_executable_name(executable) == "tee" and any(
+        if normalize_executable_name(executable) == "tee" and any(
             _RAW_DEVICE_RE.fullmatch(str(token).replace("\\", "/"))
             for token in argv
         ):
@@ -816,7 +809,7 @@ def _hardline_terminal_denial(
     """返回任何 grant 都不能覆盖的 Terminal hardline 拒绝。"""
     backend_type = str(backend_context.get("backend_type", "unknown"))
     executables = {
-        _normalize_executable_name(executable)
+        normalize_executable_name(executable)
         for executable in _extract_shell_executables(command)
     }
     if _hardline_root_delete(command, backend_type=backend_type):
@@ -2019,7 +2012,7 @@ def _terminal_policy_denial(
 
     executables = _extract_shell_executables(command)
     if any(
-        _normalize_executable_name(executable) in policy._denied_executables
+        normalize_executable_name(executable) in policy._denied_executables
         for executable in executables
     ):
         return PolicyDenial(

@@ -8,12 +8,14 @@ Hermes 入口。
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 
 from hermes.config import DB_PATH, MODEL, BASE_URL, HERMES_HOME
+from hermes.cli_approval import execute_cli_approval
 from hermes.conversation import run_conversation
-from hermes.db import init_db, create_session
+from hermes.db import init_db, create_session, replace_tool_message_content
 from hermes.session_resources import cleanup_all_session_resources
 from hermes.prompt import build_system_prompt
 from hermes.tools import register_all
@@ -31,17 +33,97 @@ def cli_loop():
     cached_prompt = build_system_prompt(os.getcwd())
     print(f"System prompt: {len(cached_prompt)} chars")
 
-    print("Type 'quit' to exit.\n")
+    print("Type 'quit' to exit. Use /approve [once|session] or /deny when prompted.\n")
+    pending_approval: dict | None = None
 
     try:
         while True:
             user_input = input("You: ").strip()
             if not user_input or user_input.lower() in ("quit", "exit"):
                 break
+            if pending_approval is not None:
+                command, _, requested_scope = user_input.partition(" ")
+                command = command.lower()
+                if command == "/deny":
+                    denied = json.dumps({
+                        "ok": False,
+                        "error_type": "approval_denied",
+                        "error": "operation was denied by the user",
+                    }, ensure_ascii=False)
+                    if not replace_tool_message_content(
+                        conn,
+                        session_id,
+                        str(pending_approval.get("tool_call_id", "")),
+                        denied,
+                    ):
+                        print("\nAssistant: approval result could not be recorded\n")
+                    else:
+                        print("\nAssistant: approval denied\n")
+                    pending_approval = None
+                    continue
+                if command != "/approve":
+                    print("\nAssistant: enter /approve [once|session] or /deny\n")
+                    continue
+                scope = (requested_scope.strip().lower() or "once")
+                try:
+                    execute_cli_approval(
+                        conn,
+                        session_id=session_id,
+                        request=pending_approval,
+                        scope=scope,
+                    )
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    print(f"\nAssistant: approval execution failed: {exc}\n")
+                else:
+                    resumed = run_conversation(
+                        "",
+                        conn,
+                        session_id,
+                        cached_prompt,
+                        session_key=session_id,
+                        resume_from_history=True,
+                    )
+                    if resumed.get("status") == "awaiting_approval":
+                        request = resumed.get("approval_request")
+                        if isinstance(request, dict):
+                            pending_approval = request
+                            scopes = request.get("details", {}).get(
+                                "allowed_grant_scopes", []
+                            )
+                            summary = str(request.get(
+                                "summary", "需要批准的工具操作"
+                            ))
+                            print(
+                                "\nAssistant: "
+                                f"{summary}\nApprove with /approve"
+                                f" (available scopes: {', '.join(scopes)}) or /deny\n"
+                            )
+                            continue
+                        print("\nAssistant: approval request is invalid\n")
+                    else:
+                        print(f"\nAssistant: {resumed['final_response']}\n")
+                pending_approval = None
+                continue
             result = run_conversation(
                 user_input, conn, session_id, cached_prompt,
                 session_key=session_id,
             )
+            if result.get("status") == "awaiting_approval":
+                request = result.get("approval_request")
+                if not isinstance(request, dict):
+                    print("\nAssistant: approval request is invalid\n")
+                    continue
+                pending_approval = request
+                scopes = request.get("details", {}).get(
+                    "allowed_grant_scopes", []
+                )
+                summary = str(request.get("summary", "需要批准的工具操作"))
+                print(
+                    "\nAssistant: "
+                    f"{summary}\nApprove with /approve"
+                    f" (available scopes: {', '.join(scopes)}) or /deny\n"
+                )
+                continue
             print(f"\nAssistant: {result['final_response']}\n")
     finally:
         conn.close()

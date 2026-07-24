@@ -116,6 +116,7 @@ from hermes.gateway.session_store import SessionStore
 from hermes.durable_tool_dispatcher import (
     DurableToolDispatcher,
     DurableToolExecutionContext,
+    tool_output_failed,
 )
 from hermes.tool_execution_recovery import ToolExecutionRecoveryService
 from hermes.gateway.types import (
@@ -5185,6 +5186,86 @@ class GatewayRunner:
             return
         next_event = ctx.pending.popleft()
         await self._handle_message_serialized(next_event, from_queue=True)
+
+    async def _execute_claimed_approval(
+        self,
+        execution: dict,
+        approval_grant: TrustedApprovalGrant,
+        *,
+        cancel_checker,
+    ) -> tuple[str, bool]:
+        """在已领取的 Gateway 审批边界内直接执行原始工具调用。"""
+        if cancel_checker():
+            return json.dumps({
+                "ok": False,
+                "error_type": "cancelled",
+                "error": "approval execution was cancelled",
+            }, ensure_ascii=False), False
+        try:
+            task_event = self._deserialize_event(
+                str(execution["source_event_json"])
+            )
+            if (
+                task_event.message_id != execution["source_message_id"]
+                or build_session_key(task_event.source, self.agent_name)
+                != execution["route_key"]
+                or approval_grant.session_key != execution["conversation_id"]
+            ):
+                raise ValueError("approval execution identity is invalid")
+            tool_policy = self._tool_policy_for_source(task_event.source)
+            resolution = registry.resolve(tool_policy)
+            entry = registry.get_entry(approval_grant.tool_name)
+            if (
+                entry is None
+                or entry.approval_mode == ApprovalMode.NONE
+                or approval_grant.tool_name
+                not in resolution.allowed_tool_names
+            ):
+                raise ValueError("approval execution tool is unavailable")
+            if self._runtime_lease_acquired:
+                self._require_sync_recovery_runtime_lease()
+
+            tool_context = {
+                "session_key": approval_grant.session_key,
+                "interactive_approval": False,
+                "approval_mode": "remote",
+                "approval_grant": approval_grant,
+                "allowed_tool_names": resolution.allowed_tool_names,
+            }
+            if "messaging" in resolution.toolsets:
+                tool_context.update(self._gateway_tool_context(
+                    task_event,
+                    str(execution["route_key"]),
+                    approval_grant.session_key,
+                ))
+            durable_context = DurableToolExecutionContext(
+                environment="gateway",
+                session_id=approval_grant.session_key,
+                source_message_id=task_event.message_id,
+                database_path=self.db_path,
+                gateway_lease_name=self._runtime_lease_name,
+                gateway_instance_id=self._runtime_instance_id,
+                gateway_lease_epoch=self._runtime_lease_epoch,
+            )
+            output = DurableToolDispatcher(
+                registry,
+                durable_context,
+            ).dispatch(
+                approval_grant.tool_name,
+                approval_grant.arguments,
+                tool_call_id=str(execution["tool_call_id"]),
+                **tool_context,
+            )
+            return output, not tool_output_failed(output)
+        except Exception as exc:
+            return json.dumps({
+                "ok": False,
+                "error_type": "approval_execution_failed",
+                "error": (
+                    "approved tool execution failed: "
+                    f"{type(exc).__name__}"
+                ),
+            }, ensure_ascii=False), False
 
     async def _run_agent(
         self,

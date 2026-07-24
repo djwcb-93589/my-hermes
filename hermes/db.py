@@ -27,6 +27,7 @@ from hermes.persistence.core import (
     get_gateway_visible_session_messages,
     get_session_messages,
     list_model_call_events,
+    replace_tool_message_content,
 )
 from hermes.persistence.cron import (
     advance_due_cron_job_without_run,

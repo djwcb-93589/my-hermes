@@ -28,6 +28,15 @@ class FileDenyRule:
     path_under: str
 
 
+def normalize_executable_name(value: object) -> str:
+    """将 executable 收敛为跨平台可比较的名称。"""
+    normalized = str(value or "").strip().replace("\\", "/")
+    if not normalized:
+        return ""
+    normalized = normalized.rsplit("/", 1)[-1].casefold()
+    return normalized.removesuffix(".exe")
+
+
 def _path_is_under(path: str, parent: str) -> bool:
     try:
         return os.path.commonpath((path, parent)) == parent
@@ -109,9 +118,7 @@ class ApprovalSecurityPolicy:
                     "security.approval.denied_executables entries must be "
                     f"non-empty strings (invalid item at index {index})"
                 )
-            name = os.path.basename(executable.strip()).lower()
-            if name.endswith(".exe"):
-                name = name[:-4]
+            name = normalize_executable_name(executable)
             normalized_executables.add(name)
 
         base_cwd = cwd if cwd is not None else os.getcwd()
@@ -131,15 +138,6 @@ class ApprovalSecurityPolicy:
             rules: Sequence[Mapping], *, field_name: str
         ) -> tuple[FileDenyRule, ...]:
             normalized: list[FileDenyRule] = []
-            allowed_actions = {
-                "read",
-                "read_range",
-                "write",
-                "append",
-                "replace",
-                "list",
-                "stat",
-            }
             for index, rule in enumerate(rules):
                 if not isinstance(rule, Mapping):
                     raise ValueError(
@@ -149,17 +147,17 @@ class ApprovalSecurityPolicy:
                 actions = rule.get("actions")
                 path_under = rule.get("path_under")
                 if (
-                    not isinstance(actions, (list, tuple))
+                    not isinstance(actions, (list, tuple, set, frozenset))
                     or not actions
                     or any(
                         not isinstance(action, str)
-                        or action not in allowed_actions
+                        or not action
                         for action in actions
                     )
                 ):
                     raise ValueError(
-                        f"{field_name} actions must be a non-empty File "
-                        f"action list (invalid item at index {index})"
+                        f"{field_name} actions must be a non-empty string "
+                        f"collection (invalid item at index {index})"
                     )
                 if not isinstance(path_under, str) or not path_under.strip():
                     raise ValueError(

@@ -103,6 +103,9 @@ def _file_policy_denial(
     normalized_path: str | None,
 ) -> FilePolicyDenial | None:
     """按 hardline、受保护路径和 action/path 组合检查 File 操作。"""
+    _validate_file_rule_actions(security_policy._denied_file_rules)
+    _validate_file_rule_actions(security_policy._approval_file_rules)
+    _validate_file_action(action)
     if normalized_path is None:
         return None
     hardline_paths = security_policy._hardline_protected_paths
@@ -151,6 +154,8 @@ def _requires_file_approval(
     normalized_path: str | None,
 ) -> bool:
     """判断操作是否命中远程 File 审批规则。"""
+    _validate_file_rule_actions(security_policy._approval_file_rules)
+    _validate_file_action(action)
     if normalized_path is None:
         return False
     return any(
@@ -161,6 +166,26 @@ def _requires_file_approval(
         )
         for rule in security_policy._approval_file_rules
     )
+
+
+def _validate_file_action(action: object) -> str:
+    """拒绝当前 File 工具未声明的 action。"""
+    if not isinstance(action, str) or action not in _FILE_ACTIONS:
+        raise ValueError("file action is invalid")
+    return action
+
+
+def _validate_file_rule_actions(rules: Sequence) -> None:
+    """在使用规则前确认配置只引用当前 File 工具支持的 action。"""
+    for rule in rules:
+        actions = getattr(rule, "actions", None)
+        if not isinstance(actions, frozenset) or not actions:
+            raise ValueError("file approval rule actions are invalid")
+        if any(
+            not isinstance(action, str) or action not in _FILE_ACTIONS
+            for action in actions
+        ):
+            raise ValueError("file approval rule contains an unknown action")
 
 
 def is_sensitive_file_path(

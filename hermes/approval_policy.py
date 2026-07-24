@@ -496,6 +496,60 @@ def issue_trusted_approval_grant(
     )
 
 
+def issue_interactive_approval_grant(
+    request: dict,
+    *,
+    session_key: str,
+    scope: str,
+) -> TrustedApprovalGrant:
+    """从当前进程已生成的交互式待审批结果签发一次内部 Grant。"""
+    normalized_session = normalize_approval_session_key(session_key)
+    normalized_scope = str(scope or "").strip().lower()
+    tool_name = str(request.get("tool_name", ""))
+    arguments = request.get("arguments")
+    details = request.get("details")
+    request_id = str(request.get("id", ""))
+    if (
+        not request_id.startswith("approval_")
+        or not isinstance(arguments, dict)
+        or not isinstance(details, dict)
+    ):
+        raise ValueError("interactive approval request is invalid")
+    risk_level = normalize_risk_level(details.get("risk_level"))
+    configured_scopes = details.get("allowed_grant_scopes")
+    if (
+        not isinstance(configured_scopes, list)
+        or normalized_scope not in configured_scopes
+        or not is_grant_scope_allowed(risk_level, normalized_scope)
+    ):
+        raise ValueError("interactive approval scope is invalid")
+    if not approval_request_binding_matches(
+        tool_name,
+        arguments,
+        details,
+        session_key=normalized_session,
+    ):
+        raise ValueError("interactive approval operation binding is invalid")
+    binding = _normalize_approval_binding(details.get("binding"))
+    handler = get_approval_handler(tool_name)
+    if handler is None or not handler.validate_grant_binding(
+        arguments=arguments,
+        binding=binding,
+        session_key=normalized_session,
+    ):
+        raise ValueError("interactive approval binding is invalid")
+    return TrustedApprovalGrant(
+        scope=normalized_scope,
+        request_id=request_id,
+        tool_name=tool_name,
+        arguments=json.loads(json.dumps(arguments, ensure_ascii=False)),
+        fingerprint=str(details["fingerprint"]),
+        session_key=normalized_session,
+        binding=binding,
+        _issuer=_TRUSTED_GRANT_ISSUER,
+    )
+
+
 def activate_session_grant(grant: TrustedApprovalGrant) -> bool:
     """让工具 Handler 构造不透明的会话授权规则。"""
     if not _is_trusted_approval_grant(grant) or grant.scope != "session":

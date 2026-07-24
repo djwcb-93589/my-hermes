@@ -140,6 +140,28 @@ def add_messages(
             _insert_message(conn, session_id, msg)
 
 
+def replace_tool_message_content(
+    conn: sqlite3.Connection,
+    session_id: str,
+    tool_call_id: str,
+    content: str,
+) -> bool:
+    """用受信任的工具执行结果替换同一调用的暂存 Tool Result。"""
+    changed = conn.execute(
+        """
+        UPDATE messages
+        SET content=?
+        WHERE session_id=? AND role='tool' AND tool_call_id=?
+        """,
+        (str(content), str(session_id), str(tool_call_id)),
+    ).rowcount
+    if changed != 1:
+        conn.rollback()
+        return False
+    conn.commit()
+    return True
+
+
 def get_session_messages(
     conn: sqlite3.Connection,
     session_id: str,
