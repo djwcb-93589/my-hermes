@@ -5247,10 +5247,14 @@ class GatewayRunner:
                 gateway_instance_id=self._runtime_instance_id,
                 gateway_lease_epoch=self._runtime_lease_epoch,
             )
-            output = DurableToolDispatcher(
+            dispatcher = DurableToolDispatcher(
                 registry,
                 durable_context,
-            ).dispatch(
+            )
+            # 审批恢复会执行同步工具；放到工作线程中等待，不能占住 Gateway
+            # 事件循环，否则 runtime lease 的心跳无法按时续约。
+            output = await asyncio.to_thread(
+                dispatcher.dispatch,
                 approval_grant.tool_name,
                 approval_grant.arguments,
                 tool_call_id=str(execution["tool_call_id"]),

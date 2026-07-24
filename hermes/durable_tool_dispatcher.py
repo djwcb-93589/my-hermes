@@ -12,6 +12,7 @@ from hermes.persistence.schema import init_db
 from hermes.persistence.tool_execution import (
     complete_tool_execution,
     create_tool_execution,
+    defer_tool_execution,
     fail_tool_execution,
     mark_tool_execution_unknown,
     retry_tool_execution,
@@ -33,6 +34,19 @@ def tool_output_failed(output: str) -> bool:
         or "error" in value
         or bool(value.get("error_type"))
         or value.get("fatal") is True
+    )
+
+
+def tool_output_awaits_approval(output: str) -> bool:
+    """识别尚未执行、等待人工确认的公共 Tool Result。"""
+    try:
+        value = json.loads(output)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("status") == "awaiting_approval"
+        and value.get("approval_required") is True
     )
 
 
@@ -119,7 +133,9 @@ class DurableToolDispatcher:
 
         result = {"output": output}
         try:
-            if tool_output_failed(output):
+            if tool_output_awaits_approval(output):
+                self._call(defer_tool_execution, execution_id, result)
+            elif tool_output_failed(output):
                 self._call(fail_tool_execution, execution_id, result)
             else:
                 self._call(complete_tool_execution, execution_id, result)

@@ -16,6 +16,7 @@ from .gateway import gateway_runtime_lease_is_valid
 
 TOOL_EXECUTION_STATUSES = frozenset({
     "prepared",
+    "awaiting_approval",
     "running",
     "succeeded",
     "failed",
@@ -99,7 +100,7 @@ def create_tool_execution(
     gateway_lease_epoch: int | None = None,
     execution_id: str | None = None,
 ) -> dict:
-    """创建或按环境与 tool_call_id 返回同一条 prepared Journal 记录。"""
+    """创建或按环境与 tool_call_id 返回同一条 Journal 记录。"""
     normalized_environment = _require_nonempty_string(environment, "environment")
     normalized_call_id = _require_nonempty_string(tool_call_id, "tool_call_id")
     normalized_name = _require_nonempty_string(tool_name, "tool_name")
@@ -192,7 +193,7 @@ def start_tool_execution(
     *,
     external_operation_id: str | None = None,
 ) -> dict:
-    """将 prepared 记录原子推进到 running，并累计本次执行尝试。"""
+    """将可执行记录原子推进到 running，并累计本次执行尝试。"""
     now = time.time()
     with transaction(conn):
         changed = conn.execute(
@@ -200,7 +201,7 @@ def start_tool_execution(
             UPDATE tool_executions
             SET status='running', attempt_count=attempt_count + 1,
                 external_operation_id=COALESCE(?, external_operation_id), updated_at=?
-            WHERE execution_id=? AND status='prepared'
+            WHERE execution_id=? AND status IN ('prepared', 'awaiting_approval')
             """,
             (external_operation_id, now, execution_id),
         ).rowcount
@@ -209,6 +210,34 @@ def start_tool_execution(
             raise DBError("tool execution not found")
         if changed != 1:
             raise DBError(f"tool execution cannot start from status {record['status']!r}")
+        return get_tool_execution(conn, execution_id)  # type: ignore[return-value]
+
+
+def defer_tool_execution(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    result: Any,
+) -> dict:
+    """保存等待人工确认的结果，并让同一调用可在批准后继续执行。"""
+    result_json = _serialize_json(result, "result")
+    now = time.time()
+    with transaction(conn):
+        changed = conn.execute(
+            """
+            UPDATE tool_executions
+            SET status='awaiting_approval', result_json=?, updated_at=?
+            WHERE execution_id=? AND status='running'
+            """,
+            (result_json, now, execution_id),
+        ).rowcount
+        record = get_tool_execution(conn, execution_id)
+        if record is None:
+            raise DBError("tool execution not found")
+        if changed != 1:
+            raise DBError(
+                "tool execution cannot await approval from "
+                f"status {record['status']!r}"
+            )
         return get_tool_execution(conn, execution_id)  # type: ignore[return-value]
 
 

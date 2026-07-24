@@ -89,6 +89,7 @@ from hermes.persistence.tool_execution import (
     TOOL_EXECUTION_STATUSES,
     complete_tool_execution,
     create_tool_execution,
+    defer_tool_execution,
     fail_tool_execution,
     get_tool_execution,
     get_tool_execution_by_call,

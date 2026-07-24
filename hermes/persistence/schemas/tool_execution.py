@@ -28,7 +28,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 recovery_policy IN ('retry_safe', 'unknown_on_crash', 'status_check')
             ),
             status TEXT NOT NULL CHECK (
-                status IN ('prepared', 'running', 'succeeded', 'failed', 'unknown')
+                status IN (
+                    'prepared', 'awaiting_approval', 'running',
+                    'succeeded', 'failed', 'unknown'
+                )
             ),
             result_json TEXT,
             external_operation_id TEXT,
