@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import queue
 import threading
@@ -19,6 +20,56 @@ from hermes.db import (
     replace_tool_message_content,
     session_exists,
 )
+
+
+DEFAULT_CLI_MESSAGE_QUEUE_LIMIT = 20
+
+
+class CLIMessageQueue:
+    """由终端主线程使用的有界普通消息队列。"""
+
+    def __init__(self, limit: int = DEFAULT_CLI_MESSAGE_QUEUE_LIMIT) -> None:
+        if limit <= 0:
+            raise ValueError("CLI message queue limit must be positive")
+        self._limit = limit
+        self._messages: deque[str] = deque()
+
+    def enqueue(self, message: str) -> bool:
+        """在未达到上限时保存一条原始用户文本。"""
+        if self.is_full():
+            return False
+        self._messages.append(message)
+        return True
+
+    def peek(self) -> str | None:
+        """查看下一条消息，但不改变队列。"""
+        return self._messages[0] if self._messages else None
+
+    def dequeue(self) -> str | None:
+        """取出最早进入队列的消息。"""
+        return self._messages.popleft() if self._messages else None
+
+    def clear(self) -> int:
+        """清空尚未提交的消息，并返回清空数量。"""
+        count = len(self._messages)
+        self._messages.clear()
+        return count
+
+    def is_empty(self) -> bool:
+        """返回是否没有待处理消息。"""
+        return not self._messages
+
+    def is_full(self) -> bool:
+        """返回是否已经达到消息上限。"""
+        return len(self._messages) >= self._limit
+
+    @property
+    def limit(self) -> int:
+        """返回当前队列允许保存的最大消息数。"""
+        return self._limit
+
+    def __len__(self) -> int:
+        return len(self._messages)
 
 
 @dataclass(frozen=True)
@@ -125,11 +176,11 @@ class CLIWorker:
                     session_id=task.session_id,
                     error=f"worker task failed: {type(exc).__name__}",
                 )
+            self._results.put(result)
             try:
                 self._on_result(result)
             except Exception:
                 pass
-            self._results.put(result)
 
     def _execute(self, task: CLIWorkerTask) -> CLIWorkerResult:
         """为单项工作创建、使用并关闭 SQLite 连接。"""

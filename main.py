@@ -13,7 +13,12 @@ import sys
 from datetime import datetime
 
 from hermes.config import BROWSER_CONFIG, MODEL, BASE_URL, HERMES_HOME
-from hermes.cli_state_machine import CLIWorker, CLIWorkerResult, CLIWorkerTask
+from hermes.cli_state_machine import (
+    CLIMessageQueue,
+    CLIWorker,
+    CLIWorkerResult,
+    CLIWorkerTask,
+)
 from hermes.cli_streaming import CLIStreamRenderer
 from hermes.cli_ui import CLIInput, patched_cli_stdout
 from hermes.session_resources import cleanup_all_session_resources
@@ -193,6 +198,7 @@ def cli_loop():
         renderer=cli_renderer,
         on_result=lambda result: _render_worker_result(result, cli_renderer),
     )
+    message_queue = CLIMessageQueue()
     worker_started = False
 
     try:
@@ -216,6 +222,34 @@ def cli_loop():
                 session_choices: dict[str, str] = {}
                 worker.start()
                 worker_started = True
+
+                def submit_next_queued_message() -> bool:
+                    """只在主线程确认当前结果后，按顺序提交下一条普通消息。"""
+                    if worker.is_busy() or pending_approval is not None:
+                        return False
+                    queued_input = message_queue.peek()
+                    if queued_input is None:
+                        return False
+                    task = CLIWorkerTask(
+                        kind="conversation",
+                        session_id=session_id,
+                        user_input=queued_input,
+                        cached_prompt=cached_prompt,
+                        tool_policy=tool_policy,
+                    )
+                    if not worker.submit(task):
+                        return False
+                    message_queue.dequeue()
+                    return True
+
+                def clear_queued_messages() -> None:
+                    """退出时丢弃未执行的普通消息。"""
+                    cleared = message_queue.clear()
+                    if cleared:
+                        print(
+                            "\nAssistant: discarded "
+                            f"{cleared} queued message(s)\n"
+                        )
 
                 def consume_worker_results() -> None:
                     """把 worker 的完成状态交回 CLI 路由状态。"""
@@ -251,8 +285,8 @@ def cli_loop():
 
                 while True:
                     consume_worker_results()
+                    submit_next_queued_message()
                     raw_user_input = cli_input.prompt()
-                    consume_worker_results()
                     stripped_user_input = raw_user_input.lstrip()
                     literal_input = (
                         raw_user_input.startswith("//")
@@ -266,18 +300,30 @@ def cli_loop():
                     if not user_input or (
                         not literal_input and user_input.lower() in ("quit", "exit")
                     ):
+                        clear_queued_messages()
                         break
                     command, _, command_argument = user_input.partition(" ")
                     command = "" if literal_input else command.lower()
                     if command in {"/quit", "/exit"}:
+                        clear_queued_messages()
                         break
-                    if worker.is_busy():
+
+                    consume_worker_results()
+                    submit_next_queued_message()
+
+                    if command in {"/sessions", "/resume", "/new"} and (
+                        worker.is_busy() or not message_queue.is_empty()
+                    ):
                         print(
-                            "\nAssistant: agent is running; later phases will support "
-                            "queuing.\n"
+                            "\nAssistant: cannot change sessions while agent is running "
+                            "or messages are queued.\n"
                         )
                         continue
+
                     if pending_approval is not None:
+                        if worker.is_busy():
+                            print("\nAssistant: agent is running; approval is still pending.\n")
+                            continue
                         if command == "/deny":
                             task = CLIWorkerTask(
                                 kind="deny",
@@ -305,6 +351,10 @@ def cli_loop():
                             )
                         continue
 
+                    if command in {"/approve", "/deny"}:
+                        print("\nAssistant: no approval is pending\n")
+                        continue
+
                     if command == "/resume":
                         selection = command_argument.strip()
                         if not selection:
@@ -330,6 +380,15 @@ def cli_loop():
                         print(f"\nAssistant: unknown command: {command}\n")
                         continue
                     else:
+                        if worker.is_busy() or not message_queue.is_empty():
+                            if message_queue.enqueue(user_input):
+                                print("\nAssistant: message queued.\n")
+                            else:
+                                print(
+                                    "\nAssistant: message queue is full "
+                                    f"(limit: {message_queue.limit}).\n"
+                                )
+                            continue
                         task = CLIWorkerTask(
                             kind="conversation",
                             session_id=session_id,
@@ -338,11 +397,17 @@ def cli_loop():
                             tool_policy=tool_policy,
                         )
                     if not worker.submit(task):
-                        print(
-                            "\nAssistant: agent is running; later phases will support "
-                            "queuing.\n"
-                        )
+                        if command:
+                            print("\nAssistant: agent is running.\n")
+                        elif message_queue.enqueue(user_input):
+                            print("\nAssistant: message queued.\n")
+                        else:
+                            print(
+                                "\nAssistant: message queue is full "
+                                f"(limit: {message_queue.limit}).\n"
+                            )
             finally:
+                message_queue.clear()
                 if worker_started:
                     worker.shutdown()
     finally:
