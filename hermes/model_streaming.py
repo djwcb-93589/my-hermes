@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Protocol
 
 
 @dataclass(frozen=True)
@@ -12,6 +13,19 @@ class StreamEvent:
     event_type: str
     attempt_id: str
     delta: str | None = None
+
+
+class AssistantMessageLike(Protocol):
+    """完整模型消息进入 AgentLoop 时所需的最小只读属性。"""
+
+    @property
+    def content(self) -> str | None: ...
+
+    @property
+    def tool_calls(self) -> object: ...
+
+    @property
+    def reasoning_content(self) -> str | None: ...
 
 
 @dataclass
@@ -44,7 +58,7 @@ class ModelAssistantMessage:
 class ModelTurnResult:
     """一次模型调用消费完成后的完整结果。"""
 
-    assistant_message: ModelAssistantMessage
+    assistant_message: AssistantMessageLike
     finish_reason: str | None
     usage: object | None = None
 

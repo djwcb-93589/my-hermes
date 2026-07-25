@@ -1145,8 +1145,9 @@ class AgentLoop:
         stream_kwargs = dict(self.model_kwargs)
         stream_kwargs["stream"] = True
         accumulator = SynchronousStreamAccumulator()
+        stream = None
+        self._emit_stream_event(StreamEvent("model_turn_started", attempt_id))
         try:
-            self.stream_sink(StreamEvent("model_turn_started", attempt_id))
             stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=api_messages,
@@ -1156,22 +1157,36 @@ class AgentLoop:
             for chunk in stream:
                 content_delta, reasoning_delta = accumulator.add_chunk(chunk)
                 if content_delta:
-                    self.stream_sink(
+                    self._emit_stream_event(
                         StreamEvent("text_delta", attempt_id, content_delta)
                     )
                 if reasoning_delta:
-                    self.stream_sink(
+                    self._emit_stream_event(
                         StreamEvent("reasoning_delta", attempt_id, reasoning_delta)
                     )
             result = accumulator.result()
-            self.stream_sink(StreamEvent("model_turn_completed", attempt_id))
-            return result
         except BaseException:
+            self._emit_stream_event(StreamEvent("model_turn_interrupted", attempt_id))
+            raise
+        finally:
             try:
-                self.stream_sink(StreamEvent("model_turn_interrupted", attempt_id))
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
             except Exception:
                 pass
-            raise
+        self._emit_stream_event(StreamEvent("model_turn_completed", attempt_id))
+        return result
+
+    def _emit_stream_event(self, event: StreamEvent) -> None:
+        """尽力发送展示事件，展示层异常不能影响模型调用。"""
+        sink = self.stream_sink
+        if sink is None:
+            return
+        try:
+            sink(event)
+        except Exception:
+            pass
 
     @staticmethod
     def _complete_model_turn(response) -> ModelTurnResult:
