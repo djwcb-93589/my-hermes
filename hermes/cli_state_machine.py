@@ -119,7 +119,6 @@ class CLIEvent:
     user_input: str = ""
     worker_result: CLIWorkerResult | None = None
     stream_event: object | None = None
-    input_was_cancelled: bool = False
 
     @classmethod
     def user_input_event(cls, user_input: str) -> "CLIEvent":
@@ -138,15 +137,8 @@ class CLIEvent:
         return cls(event_type=CLIEventType.SHUTDOWN)
 
     @classmethod
-    def cancel_request_event(
-        cls,
-        *,
-        input_was_cancelled: bool = False,
-    ) -> "CLIEvent":
-        return cls(
-            event_type=CLIEventType.CANCEL_REQUEST,
-            input_was_cancelled=input_was_cancelled,
-        )
+    def cancel_request_event(cls) -> "CLIEvent":
+        return cls(event_type=CLIEventType.CANCEL_REQUEST)
 
 
 class CLIEventQueue:
@@ -174,7 +166,7 @@ class CLIEventQueue:
         self.put(CLIEvent.shutdown_event())
 
     def post_cancel_request(self) -> None:
-        self.put(CLIEvent.cancel_request_event(input_was_cancelled=True))
+        self.put(CLIEvent.cancel_request_event())
 
 
 class CLIWorker:
@@ -410,8 +402,6 @@ class CLIControllerUI(Protocol):
 
     def stop_input(self) -> None: ...
 
-    def cancel_current_input(self) -> None: ...
-
 
 class CLIController:
     """串行处理 CLI 事件，并独占会话、审批和普通消息队列状态。"""
@@ -444,8 +434,8 @@ class CLIController:
             try:
                 event = self._events.get()
             except KeyboardInterrupt:
-                # Ctrl+C 与 /stop 使用同一协作式取消入口。
-                self._handle_cancel_request(announce_idle=False, clear_input=True)
+                # 保留主线程收到外部 SIGINT 时的事件化兼容兜底。
+                self._events.post_cancel_request()
                 continue
             self._handle_event(event)
             if event.event_type == CLIEventType.USER_INPUT and not self._shutting_down:
@@ -471,10 +461,7 @@ class CLIController:
                 self._ui.handle_stream_event(event.stream_event)
             return
         if event.event_type == CLIEventType.CANCEL_REQUEST:
-            self._handle_cancel_request(
-                announce_idle=False,
-                clear_input=not event.input_was_cancelled,
-            )
+            self._handle_cancel_request(announce_idle=False)
             return
         if event.event_type == CLIEventType.SHUTDOWN:
             self._begin_shutdown()
@@ -501,7 +488,7 @@ class CLIController:
             self._begin_shutdown()
             return
         if command == "/stop":
-            self._handle_cancel_request(announce_idle=True, clear_input=True)
+            self._handle_cancel_request(announce_idle=True)
             return
 
         if command in {"/sessions", "/resume", "/new"} and (
@@ -682,18 +669,13 @@ class CLIController:
         self,
         *,
         announce_idle: bool,
-        clear_input: bool,
     ) -> None:
         if self._pending_approval is not None and not self._running:
-            if clear_input:
-                self._ui.cancel_current_input()
             self._ui.show_message(
                 "当前任务正在等待审批，没有运行中的操作。\n请使用 /deny 拒绝审批。"
             )
             return
         if not self._running or self._current_cancel_event is None:
-            if clear_input:
-                self._ui.cancel_current_input()
             if announce_idle:
                 self._ui.show_message("当前没有正在运行的任务。")
             return
@@ -702,8 +684,6 @@ class CLIController:
                 self._ui.show_message("当前任务已经请求停止。")
             return
         self._current_cancel_event.set()
-        if clear_input:
-            self._ui.cancel_current_input()
         self._ui.show_message("已请求停止当前任务")
 
     def _request_current_cancellation(self) -> None:
