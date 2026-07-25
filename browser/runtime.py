@@ -90,6 +90,16 @@ def _cancelled_result(*, execution_state: str) -> str:
     )
 
 
+def _cancel_requested(cancel_checker) -> bool:
+    """安全读取受信任取消检查器，避免检查器故障打断浏览器调用。"""
+    if not callable(cancel_checker):
+        return False
+    try:
+        return bool(cancel_checker())
+    except Exception:
+        return False
+
+
 @dataclass(slots=True)
 class _WorkItem:
     """一条只在所属 worker 线程执行的方法调用。"""
@@ -255,7 +265,7 @@ class BrowserWorker:
         """串行执行 BrowserSession 公开方法，不把 Playwright 交给线程池。"""
         if not isinstance(method, str) or not method or method.startswith("_"):
             return _error("invalid_args", "browser method is invalid")
-        if callable(cancel_checker) and cancel_checker():
+        if _cancel_requested(cancel_checker):
             return _cancelled_result(execution_state="not_started")
         future: Future[str] = Future()
         cancel_event = threading.Event()
@@ -295,8 +305,7 @@ class BrowserWorker:
                     return _error("browser_worker_failed", "browser worker failed")
             if (
                 not cancellation_requested
-                and callable(cancel_checker)
-                and cancel_checker()
+                and _cancel_requested(cancel_checker)
             ):
                 cancel_event.set()
                 cancellation_requested = True

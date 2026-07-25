@@ -1260,10 +1260,7 @@ class AgentLoop:
         allowed_tool_names = getattr(self, "allowed_tool_names", None)
         if allowed_tool_names is not None:
             tool_context["allowed_tool_names"] = allowed_tool_names
-        if (
-            self.cancel_checker is not None
-            and self._tool_call_name(tool_call) == "terminal"
-        ):
+        if self.cancel_checker is not None:
             tool_context["cancel_checker"] = self.cancel_checker
         return dispatch_tool_call(
             tool_call, self.registry,
@@ -1712,10 +1709,7 @@ class AsyncAgentLoop(AgentLoop):
         allowed_tool_names = getattr(self, "allowed_tool_names", None)
         if allowed_tool_names is not None:
             tool_context["allowed_tool_names"] = allowed_tool_names
-        if (
-            self.cancel_checker is not None
-            and self._tool_call_name(tool_call) == "terminal"
-        ):
+        if self.cancel_checker is not None:
             tool_context["cancel_checker"] = self.cancel_checker
         return await asyncio.to_thread(
             dispatch_tool_call,
