@@ -108,6 +108,7 @@ from hermes.gateway.observability import (
     safe_route_digest,
 )
 from hermes.gateway.persistence import GatewayPersistence
+from hermes.persistence.gateway import delete_gateway_conversation_for_route
 from hermes.gateway.runtime_lease import GatewayRuntimeLease
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
@@ -1179,11 +1180,16 @@ class GatewayRunner:
         return value[:8] if value else "<unknown>"
 
     @classmethod
-    def _format_conversation_list(cls, conversations: list[dict]) -> str:
+    def _format_conversation_list(
+        cls,
+        conversations: list[dict],
+        page: int,
+    ) -> str:
         if not conversations:
             return "当前路由暂无可用对话。"
         lines = ["对话列表：", ""]
-        for index, conversation in enumerate(conversations, start=1):
+        for position, conversation in enumerate(conversations, start=1):
+            display_index = (page - 1) * 10 + position
             marker = "[当前] " if conversation.get("is_current") else ""
             active_at = (
                 conversation.get("last_message_at")
@@ -1199,14 +1205,17 @@ class GatewayRunner:
             except (OSError, OverflowError, TypeError, ValueError):
                 active_text = "未知"
             lines.extend([
-                f"{index}. {marker}{cls._short_conversation_id(conversation['conversation_id'])}",
+                f"{display_index}. {marker}{cls._short_conversation_id(conversation['conversation_id'])}",
                 f"   消息：{int(conversation.get('message_count', 0))} 条",
                 f"   最近：{cls._conversation_preview(conversation.get('preview'))}",
                 f"   活跃时间：{active_text}",
                 "",
             ])
         lines.extend([
+            f"当前第 {page} 页",
+            "使用 /sessions <页码> 查看其他页面。",
             "使用 /resume <序号> 切换对话。",
+            "使用 /delete <序号> 删除对话。",
             "序号以当前列表为准。",
         ])
         return "\n".join(lines)
@@ -4450,7 +4459,9 @@ class GatewayRunner:
 
         if (
             approval_resume_id is None
-            and cmd not in {"/sessions", "/status", "/new", "/stop"}
+            and cmd not in {
+                "/delete", "/sessions", "/status", "/new", "/stop",
+            }
         ):
             ctx = await self.sessions.get_or_create_async(
                 route_key, self._build_gateway_prompt(event.source),
@@ -4487,19 +4498,54 @@ class GatewayRunner:
                     ctx,
                 )
                 return
-        if cmd == "/sessions" and not command_argument:
-            ctx = await self.sessions.get_or_create_async(
-                route_key, self._build_gateway_prompt(event.source),
-            )
-            conversations = await self.persistence.call(
-                list_gateway_conversations,
-                route_key,
-                10,
-            )
-            content = self._format_conversation_list(conversations)
+        if cmd == "/sessions":
+            if (
+                command_argument
+                and (
+                    not command_argument.isdecimal()
+                    or int(command_argument) <= 0
+                )
+            ):
+                content = "用法：/sessions <页码>，页码必须是正整数。"
+                ctx = None
+            else:
+                page = int(command_argument) if command_argument else 1
+                ctx = await self.sessions.get_or_create_async(
+                    route_key, self._build_gateway_prompt(event.source),
+                )
+                conversations = await self.persistence.call(
+                    list_gateway_conversations,
+                    route_key,
+                    10,
+                    (page - 1) * 10,
+                )
+                if not conversations and page > 1:
+                    content = (
+                        "页码超出实际范围，请使用 /sessions <页码> "
+                        "查看有效页面。"
+                    )
+                else:
+                    mapping = {
+                        (page - 1) * 10 + position: conversation[
+                            "conversation_id"
+                        ]
+                        for position, conversation in enumerate(
+                            conversations,
+                            start=1,
+                        )
+                    }
+                    self.sessions.save_conversation_list_mapping(ctx, mapping)
+                    content = self._format_conversation_list(
+                        conversations,
+                        page,
+                    )
             if event.source.platform not in self.adapters:
                 await self._reply(event, content)
                 return
+            if ctx is None:
+                ctx = await self.sessions.get_or_create_async(
+                    route_key, self._build_gateway_prompt(event.source),
+                )
             await self._start_durable_reply_async(
                 route_key,
                 event,
@@ -4513,6 +4559,7 @@ class GatewayRunner:
                 route_key, self._build_gateway_prompt(event.source),
             )
             target = None
+            content = None
             if not command_argument:
                 content = (
                     "用法：/resume <序号或完整 conversation_id>\n"
@@ -4525,17 +4572,22 @@ class GatewayRunner:
                 )
             else:
                 if command_argument.isdecimal():
-                    conversations = await self.persistence.call(
-                        list_gateway_conversations,
-                        route_key,
-                        10,
-                    )
-                    try:
-                        selected_index = int(command_argument) - 1
-                    except ValueError:
-                        selected_index = -1
-                    if 0 <= selected_index < len(conversations):
-                        target = conversations[selected_index]
+                    mapping = self.sessions.get_conversation_list_mapping(ctx)
+                    if mapping is None:
+                        content = "请先使用 /sessions 查看当前会话列表。"
+                    else:
+                        conversation_id = mapping.get(int(command_argument))
+                        if conversation_id is None:
+                            content = (
+                                "该序号不在当前会话列表中，请先使用 "
+                                "/sessions <页码> 查看对应页面。"
+                            )
+                        else:
+                            target = await self.persistence.call(
+                                get_gateway_conversation_for_route,
+                                route_key,
+                                conversation_id,
+                            )
                 else:
                     target = await self.persistence.call(
                         get_gateway_conversation_for_route,
@@ -4543,7 +4595,9 @@ class GatewayRunner:
                         command_argument,
                     )
 
-                if target is None:
+                if content is not None:
+                    pass
+                elif target is None:
                     content = (
                         "未找到可切换的对话。\n"
                         "请使用 /sessions 查看当前会话的对话列表。"
@@ -4581,6 +4635,80 @@ class GatewayRunner:
                 event,
                 content,
                 "resume_command",
+                ctx,
+            )
+            return
+        if cmd == "/delete":
+            ctx = await self.sessions.get_or_create_async(
+                route_key, self._build_gateway_prompt(event.source),
+            )
+            if (
+                not command_argument
+                or not command_argument.isdecimal()
+                or int(command_argument) <= 0
+            ):
+                content = "用法：/delete <序号>，序号必须是正整数。"
+            else:
+                mapping = self.sessions.get_conversation_list_mapping(ctx)
+                if mapping is None:
+                    content = "请先使用 /sessions 查看当前会话列表。"
+                else:
+                    conversation_id = mapping.get(int(command_argument))
+                    if conversation_id is None:
+                        content = (
+                            "该序号不在当前会话列表中，请先使用 "
+                            "/sessions <页码> 查看对应页面。"
+                        )
+                    else:
+                        target = await self.persistence.call(
+                            get_gateway_conversation_for_route,
+                            route_key,
+                            conversation_id,
+                        )
+                        if target is None:
+                            content = (
+                                "删除失败：该会话不存在或无权访问。"
+                            )
+                        elif conversation_id == ctx.conversation_id:
+                            content = (
+                                "不能删除当前正在使用的会话，请先使用 /new 或 "
+                                "/resume <序号> 切换到其他会话。"
+                            )
+                        else:
+                            try:
+                                result = await self.persistence.call(
+                                    delete_gateway_conversation_for_route,
+                                    route_key,
+                                    conversation_id,
+                                )
+                            except Exception:
+                                content = "删除失败：暂时无法删除该会话，请稍后重试。"
+                            else:
+                                outcome = result.get("outcome")
+                                if outcome == "deleted":
+                                    self.sessions.clear_conversation_list_mapping(ctx)
+                                    content = "\n".join([
+                                        "会话 "
+                                        f"{self._short_conversation_id(conversation_id)} "
+                                        "已删除。",
+                                        "请重新使用 /sessions <页码> 刷新会话列表。",
+                                    ])
+                                elif outcome == "current":
+                                    content = (
+                                        "不能删除当前正在使用的会话，请先使用 /new 或 "
+                                        "/resume <序号> 切换到其他会话。"
+                                    )
+                                else:
+                                    content = "删除失败：该会话不存在或无权访问。"
+
+            if event.source.platform not in self.adapters:
+                await self._reply(event, content)
+                return
+            await self._start_durable_reply_async(
+                route_key,
+                event,
+                content,
+                "delete_command",
                 ctx,
             )
             return

@@ -15,6 +15,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "tzdata>=2026.3",
     "playwright>=1.61.0",
+    "prompt-toolkit>=3.0.52,<4",
 ]
 
 [tool.setuptools.packages.find]

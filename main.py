@@ -14,6 +14,7 @@ import sys
 
 from hermes.config import BROWSER_CONFIG, DB_PATH, MODEL, BASE_URL, HERMES_HOME
 from hermes.cli_approval import execute_cli_approval
+from hermes.cli_ui import CLIInput, patched_cli_stdout
 from hermes.conversation import run_conversation
 from hermes.db import init_db, create_session, replace_tool_message_content
 from hermes.session_resources import cleanup_all_session_resources
@@ -52,10 +53,16 @@ def cli_loop():
 
     print("Type 'quit' to exit. Use /approve [once|session] or /deny when prompted.\n")
     pending_approval: dict | None = None
+    cli_input = CLIInput()
+    stdout_context = None
+    stdout_context_entered = False
 
     try:
+        stdout_context = patched_cli_stdout()
+        stdout_context.__enter__()
+        stdout_context_entered = True
         while True:
-            user_input = input("You: ").strip()
+            user_input = cli_input.prompt().strip()
             if not user_input or user_input.lower() in ("quit", "exit"):
                 break
             if pending_approval is not None:
@@ -145,8 +152,12 @@ def cli_loop():
                 continue
             print(f"\nAssistant: {result['final_response']}\n")
     finally:
-        conn.close()
-        cleanup_all_session_resources()
+        try:
+            if stdout_context_entered and stdout_context is not None:
+                stdout_context.__exit__(None, None, None)
+        finally:
+            conn.close()
+            cleanup_all_session_resources()
 
 
 def main():

@@ -54,6 +54,9 @@ class SessionContext:
     # worker 已经完成业务收尾、但尚未在 route admission
     # 临界区内接力 pending。该阶段仍要阻止新消息越过队头。
     dispatching: bool = False
+    # 最近一次 /sessions 实际展示的序号与完整会话 ID 对应关系。
+    # None 表示本路由尚未执行过 /sessions，空字典表示列表已成功展示但没有会话。
+    conversation_list_mapping: dict[int, str] | None = None
 
 
 class SessionStore:
@@ -368,6 +371,28 @@ class SessionStore:
     def get(self, route_key: str) -> SessionContext | None:
         """读取现有运行期上下文，不创建会话或刷新活跃时间。"""
         return self._contexts.get(route_key)
+
+    @staticmethod
+    def save_conversation_list_mapping(
+        ctx: SessionContext,
+        mapping: dict[int, str],
+    ) -> None:
+        """保存本次列表展示的完整会话 ID，供后续命令精确定位。"""
+        ctx.conversation_list_mapping = dict(mapping)
+
+    @staticmethod
+    def get_conversation_list_mapping(
+        ctx: SessionContext,
+    ) -> dict[int, str] | None:
+        """读取最近一次列表映射，避免调用方意外修改运行期状态。"""
+        if ctx.conversation_list_mapping is None:
+            return None
+        return dict(ctx.conversation_list_mapping)
+
+    @staticmethod
+    def clear_conversation_list_mapping(ctx: SessionContext) -> None:
+        """清除已失效的列表映射。"""
+        ctx.conversation_list_mapping = None
 
     def begin_task(self, ctx: SessionContext) -> tuple[int, asyncio.Event]:
         """开始一个串行任务并返回其不可变的世代与失效事件。"""

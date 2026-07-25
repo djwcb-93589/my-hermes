@@ -633,9 +633,11 @@ def list_gateway_conversations(
     conn: sqlite3.Connection,
     route_key: str,
     limit: int = 10,
+    offset: int = 0,
 ) -> list[dict]:
     """列出单条 route 最近的对话；查询边界不能跨越 route_key。"""
     normalized_limit = max(1, min(10, int(limit)))
+    normalized_offset = max(0, int(offset))
     rows = conn.execute(
         """
         WITH route_conversations AS (
@@ -691,9 +693,9 @@ def list_gateway_conversations(
             ) DESC,
             route_conversation.last_selected_at DESC,
             route_conversation.conversation_id ASC
-        LIMIT ?
+        LIMIT ? OFFSET ?
         """,
-        (route_key, normalized_limit),
+        (route_key, normalized_limit, normalized_offset),
     ).fetchall()
     return [_gateway_conversation_summary(row) for row in rows]
 
@@ -747,6 +749,58 @@ def get_gateway_conversation_for_route(
         (route_key, conversation_id),
     ).fetchone()
     return _gateway_conversation_summary(row) if row is not None else None
+
+
+def delete_gateway_conversation_for_route(
+    conn: sqlite3.Connection,
+    route_key: str,
+    conversation_id: str,
+) -> dict[str, str]:
+    """按 route 原子删除非当前对话及其关联消息。"""
+    with transaction(conn):
+        route_conversation = conn.execute(
+            """
+            SELECT 1
+            FROM gateway_route_conversations
+            WHERE route_key=? AND conversation_id=?
+            """,
+            (route_key, conversation_id),
+        ).fetchone()
+        if route_conversation is None:
+            return {"outcome": "not_found"}
+
+        current_route = conn.execute(
+            """
+            SELECT 1
+            FROM gateway_session_routes
+            WHERE route_key=? AND conversation_id=?
+            """,
+            (route_key, conversation_id),
+        ).fetchone()
+        if current_route is not None:
+            return {"outcome": "current"}
+
+        session = conn.execute(
+            "SELECT 1 FROM sessions WHERE id=?",
+            (conversation_id,),
+        ).fetchone()
+        if session is None:
+            return {"outcome": "not_found"}
+
+        conn.execute(
+            """
+            DELETE FROM gateway_route_conversations
+            WHERE route_key=? AND conversation_id=?
+            """,
+            (route_key, conversation_id),
+        )
+        deleted = conn.execute(
+            "DELETE FROM sessions WHERE id=?",
+            (conversation_id,),
+        )
+        if deleted.rowcount != 1:
+            raise DBError("gateway conversation deletion failed")
+    return {"outcome": "deleted"}
 
 
 def _enqueue_gateway_message_in_transaction(
