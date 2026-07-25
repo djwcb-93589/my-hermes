@@ -219,4 +219,5 @@ def register(registry):
         approval_mode="interactive_or_remote",
         risk_level="high",
         default_enabled_environments=("cli", "cron"),
+        supports_cancellation=True,
     )

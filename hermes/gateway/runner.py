@@ -5450,6 +5450,7 @@ class GatewayRunner:
                 "approval_mode": "remote",
                 "approval_grant": approval_grant,
                 "allowed_tool_names": resolution.allowed_tool_names,
+                "cancel_checker": cancel_checker,
             }
             if "messaging" in resolution.toolsets:
                 tool_context.update(self._gateway_tool_context(

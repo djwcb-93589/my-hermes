@@ -121,6 +121,7 @@ class ToolEntry:
     retry_safe: bool
     unknown_on_crash: bool
     status_check: Callable | None
+    supports_cancellation: bool = False
 
 
 class ToolRegistry:
@@ -145,6 +146,7 @@ class ToolRegistry:
         retry_safe: bool = False,
         unknown_on_crash: bool | None = None,
         status_check: Callable | None = None,
+        supports_cancellation: bool = False,
     ) -> None:
         """注册一次工具及其跨入口运行策略。"""
         normalized_retry_safe = bool(retry_safe)
@@ -189,6 +191,7 @@ class ToolRegistry:
             retry_safe=normalized_retry_safe,
             unknown_on_crash=normalized_unknown_on_crash,
             status_check=status_check,
+            supports_cancellation=bool(supports_cancellation),
         )
 
     def get_entry(self, name: str) -> ToolEntry | None:
@@ -257,6 +260,7 @@ class ToolRegistry:
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        handler_kwargs = dict(kwargs)
         allowed_tool_names = kwargs.get("allowed_tool_names")
         if (
             allowed_tool_names is not None
@@ -276,7 +280,12 @@ class ToolRegistry:
                 denial = guard.authorize_skill(args.get("name"))
                 if denial is not None:
                     return json.dumps(denial, ensure_ascii=False)
-        return entry.handler(args, **kwargs)
+        if (
+            "cancel_checker" in handler_kwargs
+            and not entry.supports_cancellation
+        ):
+            handler_kwargs.pop("cancel_checker")
+        return entry.handler(args, **handler_kwargs)
 
     def get_definitions(
         self,

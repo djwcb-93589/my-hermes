@@ -19,6 +19,7 @@ def execute_cli_approval(
     session_id: str,
     request: dict,
     scope: str,
+    cancel_checker=None,
 ) -> str:
     """只把当前 CLI 循环保存的待审批调用交给原工具 handler。"""
     grant = issue_interactive_approval_grant(
@@ -35,6 +36,7 @@ def execute_cli_approval(
         session_key=grant.session_key,
         interactive_approval=True,
         approval_grant=grant,
+        cancel_checker=cancel_checker,
     )
     if not replace_tool_message_content(
         conn,
