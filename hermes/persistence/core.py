@@ -54,6 +54,51 @@ def session_exists(
     return conn.execute(query, params).fetchone() is not None
 
 
+def list_cli_sessions(
+    conn: sqlite3.Connection,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[dict]:
+    """列出有用户消息的 CLI 会话摘要。"""
+    normalized_limit = max(1, min(100, int(limit)))
+    normalized_offset = max(0, int(offset))
+    rows = conn.execute(
+        """
+        SELECT session.id, message.content, message.timestamp
+        FROM sessions AS session
+        INNER JOIN messages AS message
+            ON message.id = (
+                SELECT latest.id
+                FROM messages AS latest
+                WHERE latest.session_id = session.id
+                  AND latest.role = 'user'
+                  AND TRIM(
+                      COALESCE(latest.content, ''),
+                      char(9) || char(10) || char(13) || ' '
+                  ) <> ''
+                ORDER BY latest.timestamp DESC, latest.id DESC
+                LIMIT 1
+            )
+        WHERE session.source = 'cli'
+        ORDER BY message.timestamp DESC, message.id DESC, session.id ASC
+        LIMIT ? OFFSET ?
+        """,
+        (normalized_limit, normalized_offset),
+    ).fetchall()
+
+    summaries: list[dict] = []
+    for session_id, content, timestamp in rows:
+        preview = " ".join(str(content or "").split())
+        if len(preview) > 120:
+            preview = f"{preview[:117]}..."
+        summaries.append({
+            "session_id": session_id,
+            "preview": preview,
+            "timestamp": timestamp,
+        })
+    return summaries
+
+
 def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> int:
     """实际 INSERT 一行,不 commit(供 add_message / add_messages 复用)。"""
     if not session_id:

@@ -1144,7 +1144,10 @@ class AgentLoop:
         attempt_id = uuid.uuid4().hex
         stream_kwargs = dict(self.model_kwargs)
         stream_kwargs["stream"] = True
-        accumulator = SynchronousStreamAccumulator()
+        stream_options = dict(stream_kwargs.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        stream_kwargs["stream_options"] = stream_options
+        accumulator = SynchronousStreamAccumulator(attempt_id=attempt_id)
         stream = None
         self._emit_stream_event(StreamEvent("model_turn_started", attempt_id))
         try:

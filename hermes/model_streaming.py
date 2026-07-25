@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -82,12 +83,13 @@ def _value(obj, name: str, default=None):
 class SynchronousStreamAccumulator:
     """把 OpenAI 兼容流的多个 chunk 重建为一条完整模型消息。"""
 
-    def __init__(self) -> None:
+    def __init__(self, attempt_id: str | None = None) -> None:
         self._content_parts: list[str] = []
         self._reasoning_parts: list[str] = []
         self._tool_calls: dict[int, _ToolCallParts] = {}
         self._finish_reason: str | None = None
         self._usage = None
+        self._attempt_id = attempt_id or uuid.uuid4().hex
 
     def add_chunk(self, chunk) -> tuple[str, str]:
         """累加一个 chunk，并返回其中新增的正文和推理文本。"""
@@ -125,10 +127,10 @@ class SynchronousStreamAccumulator:
     def result(self) -> ModelTurnResult:
         """在所有 chunk 被消费后生成完整模型回合。"""
         tool_calls = []
-        for _index, parts in sorted(self._tool_calls.items()):
+        for index, parts in sorted(self._tool_calls.items()):
             tool_calls.append(
                 ModelToolCall(
-                    id=parts.id or "",
+                    id=parts.id or self._fallback_tool_call_id(index),
                     type=parts.type or "function",
                     function=ModelFunctionCall(
                         name="".join(parts.name_parts),
@@ -143,7 +145,7 @@ class SynchronousStreamAccumulator:
                 tool_calls=tool_calls,
                 reasoning_content=reasoning_content,
             ),
-            finish_reason=self._finish_reason,
+            finish_reason=self._finish_reason or "stop",
             usage=self._usage,
         )
 
@@ -171,3 +173,7 @@ class SynchronousStreamAccumulator:
         arguments = _value(function, "arguments")
         if arguments is not None:
             parts.argument_parts.append(str(arguments))
+
+    def _fallback_tool_call_id(self, index: int) -> str:
+        """为未提供 ID 的供应商生成本次尝试内稳定的工具调用 ID。"""
+        return f"call_stream_{self._attempt_id}_{index}"

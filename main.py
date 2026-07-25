@@ -11,14 +11,17 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime
 
 from hermes.config import BROWSER_CONFIG, DB_PATH, MODEL, BASE_URL, HERMES_HOME
 from hermes.cli_approval import execute_cli_approval
 from hermes.cli_streaming import CLIStreamRenderer
 from hermes.cli_ui import CLIInput, patched_cli_stdout
 from hermes.conversation import run_conversation
+from hermes.persistence.core import list_cli_sessions
 from hermes.db import (
     create_session,
+    get_session_messages,
     init_db,
     replace_tool_message_content,
     session_exists,
@@ -26,6 +29,71 @@ from hermes.db import (
 from hermes.session_resources import cleanup_all_session_resources
 from hermes.prompt import build_system_prompt
 from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registry
+
+
+CLI_SESSION_LIST_LIMIT = 10
+
+
+def _format_cli_session_time(timestamp: object) -> str:
+    """把会话摘要时间转换为便于终端确认的本地时间。"""
+    try:
+        return datetime.fromtimestamp(float(timestamp)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "unknown time"
+
+
+def _format_cli_preview(content: object, limit: int = 120) -> str:
+    """将多行消息压缩为一行预览。"""
+    preview = " ".join(str(content or "").split())
+    if len(preview) > limit:
+        return f"{preview[:limit - 3]}..."
+    return preview
+
+
+def _show_cli_sessions(
+    conn,
+    current_session_id: str | None,
+) -> dict[str, str]:
+    """显示最近 CLI 会话，并返回本次列表对应的选择映射。"""
+    sessions = list_cli_sessions(conn, limit=CLI_SESSION_LIST_LIMIT, offset=0)
+    if not sessions:
+        print("\nAssistant: no saved CLI sessions\n")
+        return {}
+
+    session_choices: dict[str, str] = {}
+    print("\nSessions:")
+    for index, session in enumerate(sessions, start=1):
+        choice = str(index)
+        session_id = str(session["session_id"])
+        session_choices[choice] = session_id
+        current_marker = " [current]" if session_id == current_session_id else ""
+        print(
+            f"  {choice}. {_format_cli_preview(session['preview'])} "
+            f"({_format_cli_session_time(session['timestamp'])}){current_marker}"
+        )
+    print("Use /resume <number> to restore a session.\n")
+    return session_choices
+
+
+def _show_resumed_context(conn, session_id: str) -> None:
+    """显示最近的可读消息，帮助用户确认恢复目标。"""
+    context: list[tuple[str, str]] = []
+    for message in get_session_messages(conn, session_id):
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        preview = _format_cli_preview(message.get("content"))
+        if preview:
+            label = "You" if role == "user" else "Assistant"
+            context.append((label, preview))
+
+    if not context:
+        print("Recent context: no text messages\n")
+        return
+    print("Recent context:")
+    for label, preview in context[-3:]:
+        print(f"  {label}: {preview}")
+    print()
 
 
 def _cli_tool_policy() -> ToolPolicy:
@@ -61,19 +129,31 @@ def cli_loop():
         print(f"System prompt: {len(cached_prompt)} chars")
 
         print(
-            "Type 'quit' to exit. Use /resume <session_id> or /new. "
+            "Type 'quit' to exit. Use /sessions, /resume <number>, or /new. "
             "Use /approve [once|session] or /deny when prompted.\n"
         )
         pending_approval: dict | None = None
+        session_choices: dict[str, str] = {}
 
         with patched_cli_stdout():
             while True:
-                user_input = cli_input.prompt().strip()
-                if not user_input or user_input.lower() in ("quit", "exit"):
+                raw_user_input = cli_input.prompt()
+                literal_input = (
+                    raw_user_input.startswith("//")
+                    or raw_user_input[:1].isspace()
+                )
+                user_input = (
+                    raw_user_input[1:]
+                    if raw_user_input.startswith("//")
+                    else raw_user_input.strip()
+                )
+                if not user_input or (
+                    not literal_input and user_input.lower() in ("quit", "exit")
+                ):
                     break
                 if pending_approval is not None:
                     command, _, requested_scope = user_input.partition(" ")
-                    command = command.lower()
+                    command = "" if literal_input else command.lower()
                     if command == "/deny":
                         denied = json.dumps({
                             "ok": False,
@@ -142,12 +222,13 @@ def cli_loop():
                     continue
 
                 command, _, command_argument = user_input.partition(" ")
-                command = command.lower()
+                command = "" if literal_input else command.lower()
                 if command == "/resume":
-                    requested_session_id = command_argument.strip()
-                    if not requested_session_id:
-                        print("\nAssistant: usage: /resume <session_id>\n")
+                    selection = command_argument.strip()
+                    if not selection:
+                        session_choices = _show_cli_sessions(conn, session_id)
                         continue
+                    requested_session_id = session_choices.get(selection, selection)
                     if not session_exists(
                         conn,
                         requested_session_id,
@@ -160,13 +241,14 @@ def cli_loop():
                         continue
                     session_id = requested_session_id
                     print(f"\nAssistant: resumed session {session_id}\n")
+                    _show_resumed_context(conn, session_id)
                     continue
                 if command == "/new":
                     session_id = None
                     print("\nAssistant: new session will start with your next message\n")
                     continue
                 if command == "/sessions":
-                    print("\nAssistant: /sessions is not available yet\n")
+                    session_choices = _show_cli_sessions(conn, session_id)
                     continue
                 if command.startswith("/"):
                     print(f"\nAssistant: unknown command: {command}\n")
