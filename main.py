@@ -14,6 +14,7 @@ import sys
 
 from hermes.config import BROWSER_CONFIG, DB_PATH, MODEL, BASE_URL, HERMES_HOME
 from hermes.cli_approval import execute_cli_approval
+from hermes.cli_streaming import CLIStreamRenderer
 from hermes.cli_ui import CLIInput, patched_cli_stdout
 from hermes.conversation import run_conversation
 from hermes.db import init_db, create_session, replace_tool_message_content
@@ -40,6 +41,7 @@ def cli_loop():
     tool_policy = _cli_tool_policy()
     enabled_toolsets = sorted(registry.resolve(tool_policy).toolsets)
     cli_input = CLIInput()
+    cli_renderer = CLIStreamRenderer()
     conn = init_db(DB_PATH)
 
     try:
@@ -95,6 +97,7 @@ def cli_loop():
                     except (RuntimeError, TypeError, ValueError) as exc:
                         print(f"\nAssistant: approval execution failed: {exc}\n")
                     else:
+                        cli_renderer.begin_request()
                         resumed = run_conversation(
                             "",
                             conn,
@@ -103,8 +106,10 @@ def cli_loop():
                             session_key=session_id,
                             resume_from_history=True,
                             tool_policy=tool_policy,
+                            stream_sink=cli_renderer.handle_event,
                         )
                         if resumed.get("status") == "awaiting_approval":
+                            cli_renderer.ensure_line_break()
                             request = resumed.get("approval_request")
                             if isinstance(request, dict):
                                 pending_approval = request
@@ -121,16 +126,25 @@ def cli_loop():
                                 )
                                 continue
                             print("\nAssistant: approval request is invalid\n")
-                        else:
+                        elif not cli_renderer.was_final_response_streamed(
+                            resumed["final_response"]
+                        ):
                             print(f"\nAssistant: {resumed['final_response']}\n")
                     pending_approval = None
                     continue
+
+                cli_renderer.begin_request()
                 result = run_conversation(
-                    user_input, conn, session_id, cached_prompt,
+                    user_input,
+                    conn,
+                    session_id,
+                    cached_prompt,
                     session_key=session_id,
                     tool_policy=tool_policy,
+                    stream_sink=cli_renderer.handle_event,
                 )
                 if result.get("status") == "awaiting_approval":
+                    cli_renderer.ensure_line_break()
                     request = result.get("approval_request")
                     if not isinstance(request, dict):
                         print("\nAssistant: approval request is invalid\n")
@@ -146,7 +160,10 @@ def cli_loop():
                         f" (available scopes: {', '.join(scopes)}) or /deny\n"
                     )
                     continue
-                print(f"\nAssistant: {result['final_response']}\n")
+                if not cli_renderer.was_final_response_streamed(
+                    result["final_response"]
+                ):
+                    print(f"\nAssistant: {result['final_response']}\n")
     finally:
         conn.close()
         cleanup_all_session_resources()
