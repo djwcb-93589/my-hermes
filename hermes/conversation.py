@@ -269,6 +269,7 @@ class ConversationAgentLoop(AgentLoop):
         resume_from_history: bool = False,
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
+        stream_sink=None,
     ):
         super().__init__(
             model=model,
@@ -281,6 +282,7 @@ class ConversationAgentLoop(AgentLoop):
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
             tool_context=tool_context,
+            stream_sink=stream_sink,
         )
         # 主会话专有状态
         self.conn = conn
@@ -808,6 +810,7 @@ def run_conversation(
     tool_policy: ToolPolicy | None = None,
     *,
     resume_from_history: bool = False,
+    stream_sink=None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -854,6 +857,7 @@ def run_conversation(
         resume_from_history=resume_from_history,
         allowed_tool_names=allowed_tool_names,
         tool_context=tool_context,
+        stream_sink=stream_sink,
     )
     result: AgentLoopResult = loop.run(user_message)
 

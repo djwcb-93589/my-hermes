@@ -21,12 +21,18 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Callable
 
 from hermes.approval import build_approval_deferred
 from hermes.config import client as _default_client
+from hermes.model_streaming import (
+    ModelTurnResult,
+    StreamEvent,
+    SynchronousStreamAccumulator,
+)
 from hermes.redaction import redact_explicit_secrets
 
 
@@ -631,6 +637,7 @@ class AgentLoop:
         model_kwargs: dict | None = None,
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
+        stream_sink: "Callable[[StreamEvent], None] | None" = None,
     ):
         self.model = model
         self.max_iterations = max_iterations
@@ -649,6 +656,7 @@ class AgentLoop:
         # 协作式取消检查器:返回 True 表示外部已请求取消,循环应尽快退出。
         # 默认 None = 不检查。后台 delegate 用它实现 cancel。
         self.cancel_checker = cancel_checker
+        self.stream_sink = stream_sink
         # 运行期状态(每次 run() 重置)
         self.iterations = 0
         self.tools_used: list[str] = []
@@ -847,8 +855,9 @@ class AgentLoop:
                 # "raise" 或任何未知返回值都重新抛,但被顶层兜底 catch
                 raise
 
-            assistant_msg = response.choices[0].message
-            finish_reason = response.choices[0].finish_reason
+            model_turn = self._complete_model_turn(response)
+            assistant_msg = model_turn.assistant_message
+            finish_reason = model_turn.finish_reason
             has_output = bool(assistant_msg.content or assistant_msg.tool_calls)
             outcome = "success"
             if not has_output:
@@ -1121,11 +1130,59 @@ class AgentLoop:
         api_messages = (
             [{"role": "system", "content": self.system_prompt}] + messages
         )
+        if self.stream_sink is not None:
+            return self._call_model_stream(api_messages)
         return self.client.chat.completions.create(
             model=self.model,
             messages=api_messages,
             tools=self.tools if self.tools else None,
             **self.model_kwargs,
+        )
+
+    def _call_model_stream(self, api_messages: list[dict]) -> ModelTurnResult:
+        """同步消费流，并在完成前不向循环暴露不完整的模型消息。"""
+        attempt_id = uuid.uuid4().hex
+        stream_kwargs = dict(self.model_kwargs)
+        stream_kwargs["stream"] = True
+        accumulator = SynchronousStreamAccumulator()
+        try:
+            self.stream_sink(StreamEvent("model_turn_started", attempt_id))
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=api_messages,
+                tools=self.tools if self.tools else None,
+                **stream_kwargs,
+            )
+            for chunk in stream:
+                content_delta, reasoning_delta = accumulator.add_chunk(chunk)
+                if content_delta:
+                    self.stream_sink(
+                        StreamEvent("text_delta", attempt_id, content_delta)
+                    )
+                if reasoning_delta:
+                    self.stream_sink(
+                        StreamEvent("reasoning_delta", attempt_id, reasoning_delta)
+                    )
+            result = accumulator.result()
+            self.stream_sink(StreamEvent("model_turn_completed", attempt_id))
+            return result
+        except BaseException:
+            try:
+                self.stream_sink(StreamEvent("model_turn_interrupted", attempt_id))
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _complete_model_turn(response) -> ModelTurnResult:
+        """把非流式或已累加的响应归一为完整模型回合。"""
+        if isinstance(response, ModelTurnResult):
+            return response
+        choice = response.choices[0]
+        return ModelTurnResult(
+            assistant_message=choice.message,
+            finish_reason=choice.finish_reason,
+            usage=getattr(response, "usage", None),
         )
 
     def _model_role(self) -> str:
