@@ -18,11 +18,11 @@ from hermes.cli_approval import execute_cli_approval
 from hermes.cli_streaming import CLIStreamRenderer
 from hermes.cli_ui import CLIInput, patched_cli_stdout
 from hermes.conversation import run_conversation
-from hermes.persistence.core import list_cli_sessions
 from hermes.db import (
     create_session,
     get_session_messages,
     init_db,
+    list_cli_sessions,
     replace_tool_message_content,
     session_exists,
 )
@@ -32,6 +32,7 @@ from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registr
 
 
 CLI_SESSION_LIST_LIMIT = 10
+CLI_REPLAY_MESSAGE_LIMIT = 4000
 
 
 def _format_cli_session_time(timestamp: object) -> str:
@@ -75,24 +76,59 @@ def _show_cli_sessions(
     return session_choices
 
 
-def _show_resumed_context(conn, session_id: str) -> None:
-    """显示最近的可读消息，帮助用户确认恢复目标。"""
-    context: list[tuple[str, str]] = []
-    for message in get_session_messages(conn, session_id):
-        role = message.get("role")
-        if role not in {"user", "assistant"}:
-            continue
-        preview = _format_cli_preview(message.get("content"))
-        if preview:
-            label = "You" if role == "user" else "Assistant"
-            context.append((label, preview))
+def _format_replayed_content(content: object) -> str:
+    """保留历史正文，并为单条超长消息设置终端显示上限。"""
+    text = str(content or "")
+    if len(text) <= CLI_REPLAY_MESSAGE_LIMIT:
+        return text
+    return f"{text[:CLI_REPLAY_MESSAGE_LIMIT]}\n[message truncated]"
 
-    if not context:
-        print("Recent context: no text messages\n")
+
+def _tool_call_names(tool_calls: object) -> list[str]:
+    """从已保存的工具调用中提取名称，避免回放原始参数。"""
+    if not isinstance(tool_calls, list):
+        return []
+
+    names: list[str] = []
+    for tool_call in tool_calls:
+        if isinstance(tool_call, dict):
+            function = tool_call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+        else:
+            function = getattr(tool_call, "function", None)
+            name = getattr(function, "name", None)
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _show_resumed_context(conn, session_id: str) -> None:
+    """逐条回放已保存的会话历史，不输出原始工具结果。"""
+    messages = get_session_messages(conn, session_id)
+    if not messages:
+        print("Restored conversation: no messages\n")
         return
-    print("Recent context:")
-    for label, preview in context[-3:]:
-        print(f"  {label}: {preview}")
+
+    print("Restored conversation:")
+    for message in messages:
+        role = message.get("role")
+        content = _format_replayed_content(message.get("content"))
+        if role == "user":
+            print(f"You: {content}")
+            continue
+        if role == "assistant":
+            if content:
+                print(f"Assistant: {content}")
+            tool_names = _tool_call_names(message.get("tool_calls"))
+            if tool_names:
+                print(f"Assistant: [tool: {', '.join(tool_names)}]")
+            elif not content and message.get("tool_calls"):
+                print("Assistant: [tool call]")
+            elif not content:
+                print("Assistant: [empty message]")
+            continue
+        if role == "tool":
+            print("Tool: [result omitted]")
     print()
 
 
@@ -129,7 +165,7 @@ def cli_loop():
         print(f"System prompt: {len(cached_prompt)} chars")
 
         print(
-            "Type 'quit' to exit. Use /sessions, /resume <number>, or /new. "
+            "Type '/quit' to exit. Use /sessions, /resume <number>, or /new. "
             "Use /approve [once|session] or /deny when prompted.\n"
         )
         pending_approval: dict | None = None
@@ -138,13 +174,14 @@ def cli_loop():
         with patched_cli_stdout():
             while True:
                 raw_user_input = cli_input.prompt()
+                stripped_user_input = raw_user_input.lstrip()
                 literal_input = (
                     raw_user_input.startswith("//")
                     or raw_user_input[:1].isspace()
                 )
                 user_input = (
-                    raw_user_input[1:]
-                    if raw_user_input.startswith("//")
+                    stripped_user_input[1:]
+                    if literal_input and stripped_user_input.startswith("//")
                     else raw_user_input.strip()
                 )
                 if not user_input or (
@@ -154,6 +191,8 @@ def cli_loop():
                 if pending_approval is not None:
                     command, _, requested_scope = user_input.partition(" ")
                     command = "" if literal_input else command.lower()
+                    if command in {"/quit", "/exit"}:
+                        break
                     if command == "/deny":
                         denied = json.dumps({
                             "ok": False,
@@ -223,6 +262,8 @@ def cli_loop():
 
                 command, _, command_argument = user_input.partition(" ")
                 command = "" if literal_input else command.lower()
+                if command in {"/quit", "/exit"}:
+                    break
                 if command == "/resume":
                     selection = command_argument.strip()
                     if not selection:
