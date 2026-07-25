@@ -1,37 +1,26 @@
 """
 Hermes 入口。
 
-默认模式：交互式 CLI REPL —— PromptSession → run_conversation → output。
+默认模式：交互式 CLI REPL —— PromptSession → CLI worker → output。
 其它模式经 argv 分发：--gateway、--simulate。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 from datetime import datetime
 
-from hermes.config import BROWSER_CONFIG, DB_PATH, MODEL, BASE_URL, HERMES_HOME
-from hermes.cli_approval import execute_cli_approval
+from hermes.config import BROWSER_CONFIG, MODEL, BASE_URL, HERMES_HOME
+from hermes.cli_state_machine import CLIWorker, CLIWorkerResult, CLIWorkerTask
 from hermes.cli_streaming import CLIStreamRenderer
 from hermes.cli_ui import CLIInput, patched_cli_stdout
-from hermes.conversation import run_conversation
-from hermes.db import (
-    create_session,
-    get_session_messages,
-    init_db,
-    list_cli_sessions,
-    replace_tool_message_content,
-    session_exists,
-)
 from hermes.session_resources import cleanup_all_session_resources
 from hermes.prompt import build_system_prompt
 from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registry
 
 
-CLI_SESSION_LIST_LIMIT = 10
 CLI_REPLAY_MESSAGE_LIMIT = 4000
 
 
@@ -52,11 +41,10 @@ def _format_cli_preview(content: object, limit: int = 120) -> str:
 
 
 def _show_cli_sessions(
-    conn,
+    sessions: tuple[dict, ...],
     current_session_id: str | None,
 ) -> dict[str, str]:
     """显示最近 CLI 会话，并返回本次列表对应的选择映射。"""
-    sessions = list_cli_sessions(conn, limit=CLI_SESSION_LIST_LIMIT, offset=0)
     if not sessions:
         print("\nAssistant: no saved CLI sessions\n")
         return {}
@@ -102,9 +90,8 @@ def _tool_call_names(tool_calls: object) -> list[str]:
     return names
 
 
-def _show_resumed_context(conn, session_id: str) -> None:
+def _show_resumed_context(messages: tuple[dict, ...]) -> None:
     """逐条回放已保存的会话历史，不输出原始工具结果。"""
-    messages = get_session_messages(conn, session_id)
     if not messages:
         print("Restored conversation: no messages\n")
         return
@@ -144,192 +131,221 @@ def _cli_tool_policy() -> ToolPolicy:
     )
 
 
+def _show_approval_prompt(result: dict, renderer: CLIStreamRenderer) -> None:
+    """显示保留的 CLI 审批提示。"""
+    renderer.ensure_line_break()
+    request = result.get("approval_request")
+    if not isinstance(request, dict):
+        print("\nAssistant: approval request is invalid\n")
+        return
+    scopes = request.get("details", {}).get("allowed_grant_scopes", [])
+    summary = str(request.get("summary", "需要批准的工具操作"))
+    print(
+        "\nAssistant: "
+        f"{summary}\nApprove with /approve"
+        f" (available scopes: {', '.join(scopes)}) or /deny\n"
+    )
+
+
+def _render_worker_result(
+    worker_result: CLIWorkerResult,
+    renderer: CLIStreamRenderer,
+) -> None:
+    """由 worker 调用，保持现有 CLI 的结果输出格式。"""
+    if worker_result.error is not None:
+        print(f"\nAssistant: {worker_result.error}\n")
+        return
+
+    if worker_result.kind == "list_sessions":
+        _show_cli_sessions(
+            worker_result.sessions,
+            worker_result.current_session_id,
+        )
+        return
+    if worker_result.kind == "resume":
+        print(f"\nAssistant: resumed session {worker_result.session_id}\n")
+        _show_resumed_context(worker_result.messages)
+        return
+    if worker_result.kind == "deny":
+        print("\nAssistant: approval denied\n")
+        return
+
+    result = worker_result.conversation_result
+    if not isinstance(result, dict):
+        print("\nAssistant: worker returned an invalid result\n")
+        return
+    if result.get("status") == "awaiting_approval":
+        _show_approval_prompt(result, renderer)
+        return
+    final_response = str(result.get("final_response", ""))
+    if not renderer.was_final_response_streamed(final_response):
+        print(f"\nAssistant: {final_response}\n")
+
+
 def cli_loop():
-    """默认模式：复用 PromptSession 的交互式 CLI REPL。"""
+    """默认模式：主线程读输入，单 worker 串行运行 CLI 工作。"""
     register_all()
     tool_policy = _cli_tool_policy()
     enabled_toolsets = sorted(registry.resolve(tool_policy).toolsets)
     cli_input = CLIInput()
     cli_renderer = CLIStreamRenderer()
-    conn = init_db(DB_PATH)
+    worker = CLIWorker(
+        renderer=cli_renderer,
+        on_result=lambda result: _render_worker_result(result, cli_renderer),
+    )
+    worker_started = False
 
     try:
-        print(f"Profile (HERMES_HOME): {HERMES_HOME}")
-        print(f"Model: {MODEL} | Base URL: {BASE_URL}")
-
-        session_id: str | None = None
-        cached_prompt = build_system_prompt(
-            os.getcwd(),
-            enabled_toolsets=enabled_toolsets,
-        )
-        print(f"System prompt: {len(cached_prompt)} chars")
-
-        print(
-            "Type '/quit' to exit. Use /sessions, /resume <number>, or /new. "
-            "Use /approve [once|session] or /deny when prompted.\n"
-        )
-        pending_approval: dict | None = None
-        session_choices: dict[str, str] = {}
-
         with patched_cli_stdout():
-            while True:
-                raw_user_input = cli_input.prompt()
-                stripped_user_input = raw_user_input.lstrip()
-                literal_input = (
-                    raw_user_input.startswith("//")
-                    or raw_user_input[:1].isspace()
+            try:
+                print(f"Profile (HERMES_HOME): {HERMES_HOME}")
+                print(f"Model: {MODEL} | Base URL: {BASE_URL}")
+
+                session_id: str | None = None
+                cached_prompt = build_system_prompt(
+                    os.getcwd(),
+                    enabled_toolsets=enabled_toolsets,
                 )
-                user_input = (
-                    stripped_user_input[1:]
-                    if literal_input and stripped_user_input.startswith("//")
-                    else raw_user_input.strip()
+                print(f"System prompt: {len(cached_prompt)} chars")
+
+                print(
+                    "Type '/quit' to exit. Use /sessions, /resume <number>, or /new. "
+                    "Use /approve [once|session] or /deny when prompted.\n"
                 )
-                if not user_input or (
-                    not literal_input and user_input.lower() in ("quit", "exit")
-                ):
-                    break
-                if pending_approval is not None:
-                    command, _, requested_scope = user_input.partition(" ")
+                pending_approval: dict | None = None
+                session_choices: dict[str, str] = {}
+                worker.start()
+                worker_started = True
+
+                def consume_worker_results() -> None:
+                    """把 worker 的完成状态交回 CLI 路由状态。"""
+                    nonlocal pending_approval, session_choices, session_id
+                    for worker_result in worker.drain_results():
+                        if worker_result.kind == "list_sessions":
+                            if worker_result.error is None:
+                                session_choices = {
+                                    str(index): str(session["session_id"])
+                                    for index, session in enumerate(
+                                        worker_result.sessions,
+                                        start=1,
+                                    )
+                                }
+                            continue
+                        if worker_result.kind == "resume":
+                            if worker_result.error is None:
+                                session_id = worker_result.session_id
+                            continue
+                        if worker_result.session_id is not None:
+                            session_id = worker_result.session_id
+                        if worker_result.kind == "deny" and worker_result.error is None:
+                            pending_approval = None
+                            continue
+                        result = worker_result.conversation_result
+                        if not isinstance(result, dict):
+                            continue
+                        if result.get("status") == "awaiting_approval":
+                            request = result.get("approval_request")
+                            pending_approval = request if isinstance(request, dict) else None
+                        else:
+                            pending_approval = None
+
+                while True:
+                    consume_worker_results()
+                    raw_user_input = cli_input.prompt()
+                    consume_worker_results()
+                    stripped_user_input = raw_user_input.lstrip()
+                    literal_input = (
+                        raw_user_input.startswith("//")
+                        or raw_user_input[:1].isspace()
+                    )
+                    user_input = (
+                        stripped_user_input[1:]
+                        if literal_input and stripped_user_input.startswith("//")
+                        else raw_user_input.strip()
+                    )
+                    if not user_input or (
+                        not literal_input and user_input.lower() in ("quit", "exit")
+                    ):
+                        break
+                    command, _, command_argument = user_input.partition(" ")
                     command = "" if literal_input else command.lower()
                     if command in {"/quit", "/exit"}:
                         break
-                    if command == "/deny":
-                        denied = json.dumps({
-                            "ok": False,
-                            "error_type": "approval_denied",
-                            "error": "operation was denied by the user",
-                        }, ensure_ascii=False)
-                        if not replace_tool_message_content(
-                            conn,
-                            session_id,
-                            str(pending_approval.get("tool_call_id", "")),
-                            denied,
-                        ):
-                            print("\nAssistant: approval result could not be recorded\n")
-                        else:
-                            print("\nAssistant: approval denied\n")
-                        pending_approval = None
-                        continue
-                    if command != "/approve":
-                        print("\nAssistant: enter /approve [once|session] or /deny\n")
-                        continue
-                    scope = (requested_scope.strip().lower() or "once")
-                    try:
-                        execute_cli_approval(
-                            conn,
-                            session_id=session_id,
-                            request=pending_approval,
-                            scope=scope,
-                        )
-                    except (RuntimeError, TypeError, ValueError) as exc:
-                        print(f"\nAssistant: approval execution failed: {exc}\n")
-                    else:
-                        cli_renderer.begin_request()
-                        resumed = run_conversation(
-                            "",
-                            conn,
-                            session_id,
-                            cached_prompt,
-                            session_key=session_id,
-                            resume_from_history=True,
-                            tool_policy=tool_policy,
-                            stream_sink=cli_renderer.handle_event,
-                        )
-                        if resumed.get("status") == "awaiting_approval":
-                            cli_renderer.ensure_line_break()
-                            request = resumed.get("approval_request")
-                            if isinstance(request, dict):
-                                pending_approval = request
-                                scopes = request.get("details", {}).get(
-                                    "allowed_grant_scopes", []
-                                )
-                                summary = str(request.get(
-                                    "summary", "需要批准的工具操作"
-                                ))
-                                print(
-                                    "\nAssistant: "
-                                    f"{summary}\nApprove with /approve"
-                                    f" (available scopes: {', '.join(scopes)}) or /deny\n"
-                                )
-                                continue
-                            print("\nAssistant: approval request is invalid\n")
-                        elif not cli_renderer.was_final_response_streamed(
-                            resumed["final_response"]
-                        ):
-                            print(f"\nAssistant: {resumed['final_response']}\n")
-                    pending_approval = None
-                    continue
-
-                command, _, command_argument = user_input.partition(" ")
-                command = "" if literal_input else command.lower()
-                if command in {"/quit", "/exit"}:
-                    break
-                if command == "/resume":
-                    selection = command_argument.strip()
-                    if not selection:
-                        session_choices = _show_cli_sessions(conn, session_id)
-                        continue
-                    requested_session_id = session_choices.get(selection, selection)
-                    if not session_exists(
-                        conn,
-                        requested_session_id,
-                        source="cli",
-                    ):
+                    if worker.is_busy():
                         print(
-                            "\nAssistant: session not found: "
-                            f"{requested_session_id}\n"
+                            "\nAssistant: agent is running; later phases will support "
+                            "queuing.\n"
                         )
                         continue
-                    session_id = requested_session_id
-                    print(f"\nAssistant: resumed session {session_id}\n")
-                    _show_resumed_context(conn, session_id)
-                    continue
-                if command == "/new":
-                    session_id = None
-                    print("\nAssistant: new session will start with your next message\n")
-                    continue
-                if command == "/sessions":
-                    session_choices = _show_cli_sessions(conn, session_id)
-                    continue
-                if command.startswith("/"):
-                    print(f"\nAssistant: unknown command: {command}\n")
-                    continue
-
-                if session_id is None:
-                    session_id = create_session(conn)
-                cli_renderer.begin_request()
-                result = run_conversation(
-                    user_input,
-                    conn,
-                    session_id,
-                    cached_prompt,
-                    session_key=session_id,
-                    tool_policy=tool_policy,
-                    stream_sink=cli_renderer.handle_event,
-                )
-                if result.get("status") == "awaiting_approval":
-                    cli_renderer.ensure_line_break()
-                    request = result.get("approval_request")
-                    if not isinstance(request, dict):
-                        print("\nAssistant: approval request is invalid\n")
+                    if pending_approval is not None:
+                        if command == "/deny":
+                            task = CLIWorkerTask(
+                                kind="deny",
+                                session_id=session_id,
+                                approval_request=pending_approval,
+                            )
+                        elif command == "/approve":
+                            task = CLIWorkerTask(
+                                kind="approve",
+                                session_id=session_id,
+                                cached_prompt=cached_prompt,
+                                tool_policy=tool_policy,
+                                approval_request=pending_approval,
+                                approval_scope=(
+                                    command_argument.strip().lower() or "once"
+                                ),
+                            )
+                        else:
+                            print("\nAssistant: enter /approve [once|session] or /deny\n")
+                            continue
+                        if session_id is None or not worker.submit(task):
+                            print(
+                                "\nAssistant: agent is running; later phases will "
+                                "support queuing.\n"
+                            )
                         continue
-                    pending_approval = request
-                    scopes = request.get("details", {}).get(
-                        "allowed_grant_scopes", []
-                    )
-                    summary = str(request.get("summary", "需要批准的工具操作"))
-                    print(
-                        "\nAssistant: "
-                        f"{summary}\nApprove with /approve"
-                        f" (available scopes: {', '.join(scopes)}) or /deny\n"
-                    )
-                    continue
-                if not cli_renderer.was_final_response_streamed(
-                    result["final_response"]
-                ):
-                    print(f"\nAssistant: {result['final_response']}\n")
+
+                    if command == "/resume":
+                        selection = command_argument.strip()
+                        if not selection:
+                            task = CLIWorkerTask(
+                                kind="list_sessions",
+                                current_session_id=session_id,
+                            )
+                        else:
+                            task = CLIWorkerTask(
+                                kind="resume",
+                                session_id=session_choices.get(selection, selection),
+                            )
+                    elif command == "/new":
+                        session_id = None
+                        print("\nAssistant: new session will start with your next message\n")
+                        continue
+                    elif command == "/sessions":
+                        task = CLIWorkerTask(
+                            kind="list_sessions",
+                            current_session_id=session_id,
+                        )
+                    elif command.startswith("/"):
+                        print(f"\nAssistant: unknown command: {command}\n")
+                        continue
+                    else:
+                        task = CLIWorkerTask(
+                            kind="conversation",
+                            session_id=session_id,
+                            user_input=user_input,
+                            cached_prompt=cached_prompt,
+                            tool_policy=tool_policy,
+                        )
+                    if not worker.submit(task):
+                        print(
+                            "\nAssistant: agent is running; later phases will support "
+                            "queuing.\n"
+                        )
+            finally:
+                if worker_started:
+                    worker.shutdown()
     finally:
-        conn.close()
         cleanup_all_session_resources()
 
 
