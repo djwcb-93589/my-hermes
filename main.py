@@ -17,7 +17,12 @@ from hermes.cli_approval import execute_cli_approval
 from hermes.cli_streaming import CLIStreamRenderer
 from hermes.cli_ui import CLIInput, patched_cli_stdout
 from hermes.conversation import run_conversation
-from hermes.db import init_db, create_session, replace_tool_message_content
+from hermes.db import (
+    create_session,
+    init_db,
+    replace_tool_message_content,
+    session_exists,
+)
 from hermes.session_resources import cleanup_all_session_resources
 from hermes.prompt import build_system_prompt
 from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registry
@@ -48,14 +53,17 @@ def cli_loop():
         print(f"Profile (HERMES_HOME): {HERMES_HOME}")
         print(f"Model: {MODEL} | Base URL: {BASE_URL}")
 
-        session_id = create_session(conn)
+        session_id: str | None = None
         cached_prompt = build_system_prompt(
             os.getcwd(),
             enabled_toolsets=enabled_toolsets,
         )
         print(f"System prompt: {len(cached_prompt)} chars")
 
-        print("Type 'quit' to exit. Use /approve [once|session] or /deny when prompted.\n")
+        print(
+            "Type 'quit' to exit. Use /resume <session_id> or /new. "
+            "Use /approve [once|session] or /deny when prompted.\n"
+        )
         pending_approval: dict | None = None
 
         with patched_cli_stdout():
@@ -133,6 +141,39 @@ def cli_loop():
                     pending_approval = None
                     continue
 
+                command, _, command_argument = user_input.partition(" ")
+                command = command.lower()
+                if command == "/resume":
+                    requested_session_id = command_argument.strip()
+                    if not requested_session_id:
+                        print("\nAssistant: usage: /resume <session_id>\n")
+                        continue
+                    if not session_exists(
+                        conn,
+                        requested_session_id,
+                        source="cli",
+                    ):
+                        print(
+                            "\nAssistant: session not found: "
+                            f"{requested_session_id}\n"
+                        )
+                        continue
+                    session_id = requested_session_id
+                    print(f"\nAssistant: resumed session {session_id}\n")
+                    continue
+                if command == "/new":
+                    session_id = None
+                    print("\nAssistant: new session will start with your next message\n")
+                    continue
+                if command == "/sessions":
+                    print("\nAssistant: /sessions is not available yet\n")
+                    continue
+                if command.startswith("/"):
+                    print(f"\nAssistant: unknown command: {command}\n")
+                    continue
+
+                if session_id is None:
+                    session_id = create_session(conn)
                 cli_renderer.begin_request()
                 result = run_conversation(
                     user_input,

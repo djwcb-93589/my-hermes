@@ -38,6 +38,22 @@ def ensure_session(
     conn.commit()
 
 
+def session_exists(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    source: str | None = None,
+) -> bool:
+    """检查指定来源的会话是否已经存在。"""
+    query = "SELECT 1 FROM sessions WHERE id = ?"
+    params: tuple[str, ...] = (session_id,)
+    if source is not None:
+        query += " AND source = ?"
+        params = (session_id, source)
+
+    return conn.execute(query, params).fetchone() is not None
+
+
 def _insert_message(conn: sqlite3.Connection, session_id: str, msg: dict) -> int:
     """实际 INSERT 一行,不 commit(供 add_message / add_messages 复用)。"""
     if not session_id:

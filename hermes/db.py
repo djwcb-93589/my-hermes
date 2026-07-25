@@ -29,6 +29,7 @@ from hermes.persistence.core import (
     get_session_messages,
     list_model_call_events,
     replace_tool_message_content,
+    session_exists,
 )
 from hermes.persistence.cron import (
     advance_due_cron_job_without_run,
