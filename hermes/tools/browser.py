@@ -96,8 +96,20 @@ def _worker(kwargs: dict[str, Any]):
         return None, _error("browser_worker_unavailable", "browser worker is unavailable")
 
 
-def _call(worker: Any, method: str, *args: Any, **kwargs: Any) -> str:
-    return worker.call(method, *args, **kwargs)
+def _call(
+    worker: Any,
+    method: str,
+    *args: Any,
+    cancel_checker=None,
+    **browser_method_kwargs: Any,
+) -> str:
+    """把受信任运行时取消能力交给固定浏览器线程。"""
+    return worker.call(
+        method,
+        *args,
+        cancel_checker=cancel_checker,
+        **browser_method_kwargs,
+    )
 
 
 def _multimodal_configuration(worker: Any) -> tuple[dict[str, str] | None, str | None]:
@@ -272,7 +284,14 @@ def _handle_simple(method: str, allowed: set[str], required: set[str]) -> Callab
         worker, error = _worker(kwargs)
         if error is not None:
             return error
-        return _public_result(_call(worker, method, **validated))
+        return _public_result(
+            _call(
+                worker,
+                method,
+                cancel_checker=kwargs.get("cancel_checker"),
+                **validated,
+            )
+        )
     return handler
 
 
@@ -345,7 +364,14 @@ def handle_browser_upload_files(args: Any, **kwargs: Any) -> str:
     )
     if decision_error is not None:
         return decision_error
-    return _public_result(_call(worker, "upload_files", **upload_args))
+    return _public_result(
+        _call(
+            worker,
+            "upload_files",
+            cancel_checker=kwargs.get("cancel_checker"),
+            **upload_args,
+        )
+    )
 
 
 def handle_browser_console(args: Any, **kwargs: Any) -> str:
@@ -369,7 +395,14 @@ def handle_browser_console(args: Any, **kwargs: Any) -> str:
     )
     if decision_error is not None:
         return decision_error
-    return _public_result(_call(worker, "console", **validated))
+    return _public_result(
+        _call(
+            worker,
+            "console",
+            cancel_checker=kwargs.get("cancel_checker"),
+            **validated,
+        )
+    )
 
 
 def _handle_artifact_change(tool_name: str, method: str, args: Any, kwargs: dict[str, Any]) -> str:
@@ -458,7 +491,14 @@ def handle_browser_analyze_page(args: Any, **kwargs: Any) -> str:
             "snapshot_id": validated["snapshot_id"],
             "full_page": validated.get("full_page", False),
         }
-        screenshot = _parse(_call(worker, "screenshot", **screenshot_args))
+        screenshot = _parse(
+            _call(
+                worker,
+                "screenshot",
+                cancel_checker=kwargs.get("cancel_checker"),
+                **screenshot_args,
+            )
+        )
         if not screenshot.get("ok"):
             return _public_result(_result(screenshot))
         candidate = screenshot.get("artifact")
@@ -509,6 +549,7 @@ def handle_browser_analyze_page(args: Any, **kwargs: Any) -> str:
             "analyze_image",
             snapshot["artifact_id"],
             validated["prompt"],
+            cancel_checker=kwargs.get("cancel_checker"),
             timeout_ms=validated.get("timeout_ms"),
         )
     )
@@ -545,43 +586,43 @@ def register(registry) -> None:
         operation_timeout_seconds=BROWSER_CONFIG["operation_timeout_seconds"],
     )
     register_browser_approval_handlers()
-    operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool]] = [
-        ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False),
-        ("browser_snapshot", "snapshot", "Read the current page and create a new snapshot. Optionally pass the latest snapshot_id to verify it is still current before refreshing.", {"snapshot_id": _SNAPSHOT}, [], _handle_simple("snapshot", {"snapshot_id"}, set()), False),
-        ("browser_click", "click", "Click a ref from snapshot_id. Use the returned new snapshot_id afterwards.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("click", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), False),
-        ("browser_type", "type", "Enter text into an editable ref and return a new snapshot_id.", {"ref": _REF, "text": _STRING, "snapshot_id": _SNAPSHOT, "clear": {"type": "boolean", "default": True}, "mode": {"type": "string", "enum": ["fill", "type"]}, "delay_ms": {"type": "integer", "minimum": 0}}, ["ref", "text", "snapshot_id"], _handle_simple("type", {"ref", "text", "snapshot_id", "clear", "mode", "delay_ms"}, {"ref", "text", "snapshot_id"}), False),
-        ("browser_press", "press", "Send a page keyboard key or shortcut and return a new snapshot_id.", {"key": _STRING, "snapshot_id": _SNAPSHOT}, ["key", "snapshot_id"], _handle_simple("press", {"key", "snapshot_id"}, {"key", "snapshot_id"}), False),
-        ("browser_select", "select", "Select one or more option values and return a new snapshot_id.", {"ref": _REF, "value": {"oneOf": [_STRING, {"type": "array", "minItems": 1, "items": _STRING}]}, "snapshot_id": _SNAPSHOT}, ["ref", "value", "snapshot_id"], _handle_simple("select", {"ref", "value", "snapshot_id"}, {"ref", "value", "snapshot_id"}), False),
+    operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool, bool]] = [
+        ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False, True),
+        ("browser_snapshot", "snapshot", "Read the current page and create a new snapshot. Optionally pass the latest snapshot_id to verify it is still current before refreshing.", {"snapshot_id": _SNAPSHOT}, [], _handle_simple("snapshot", {"snapshot_id"}, set()), False, False),
+        ("browser_click", "click", "Click a ref from snapshot_id. Use the returned new snapshot_id afterwards.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("click", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), False, True),
+        ("browser_type", "type", "Enter text into an editable ref and return a new snapshot_id.", {"ref": _REF, "text": _STRING, "snapshot_id": _SNAPSHOT, "clear": {"type": "boolean", "default": True}, "mode": {"type": "string", "enum": ["fill", "type"]}, "delay_ms": {"type": "integer", "minimum": 0}}, ["ref", "text", "snapshot_id"], _handle_simple("type", {"ref", "text", "snapshot_id", "clear", "mode", "delay_ms"}, {"ref", "text", "snapshot_id"}), False, True),
+        ("browser_press", "press", "Send a page keyboard key or shortcut and return a new snapshot_id.", {"key": _STRING, "snapshot_id": _SNAPSHOT}, ["key", "snapshot_id"], _handle_simple("press", {"key", "snapshot_id"}, {"key", "snapshot_id"}), False, True),
+        ("browser_select", "select", "Select one or more option values and return a new snapshot_id.", {"ref": _REF, "value": {"oneOf": [_STRING, {"type": "array", "minItems": 1, "items": _STRING}]}, "snapshot_id": _SNAPSHOT}, ["ref", "value", "snapshot_id"], _handle_simple("select", {"ref", "value", "snapshot_id"}, {"ref", "value", "snapshot_id"}), False, True),
     ]
     for name in ("back", "forward", "reload"):
-        operations.append((f"browser_{name}", name, f"Navigate browser history with {name}; use its new snapshot_id.", {"snapshot_id": _SNAPSHOT}, ["snapshot_id"], _handle_simple(name, {"snapshot_id"}, {"snapshot_id"}), False))
+        operations.append((f"browser_{name}", name, f"Navigate browser history with {name}; use its new snapshot_id.", {"snapshot_id": _SNAPSHOT}, ["snapshot_id"], _handle_simple(name, {"snapshot_id"}, {"snapshot_id"}), False, True))
     operations.extend([
-        ("browser_scroll", "scroll", "Scroll the current page and return a new snapshot_id.", {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}, "snapshot_id": _SNAPSHOT, "amount": {"type": "number", "exclusiveMinimum": 0}}, ["direction", "snapshot_id"], _handle_simple("scroll", {"direction", "snapshot_id", "amount"}, {"direction", "snapshot_id"}), False),
-        ("browser_wait_for_url", "wait_for_url", "Wait for a URL pattern and return a new snapshot_id.", {"pattern": _STRING, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["pattern", "snapshot_id"], _handle_simple("wait_for_url", {"pattern", "snapshot_id", "timeout_ms"}, {"pattern", "snapshot_id"}), False),
-        ("browser_wait_for_text", "wait_for_text", "Wait for visible text and return a new snapshot_id.", {"text": _STRING, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["text", "snapshot_id"], _handle_simple("wait_for_text", {"text", "snapshot_id", "timeout_ms"}, {"text", "snapshot_id"}), False),
-        ("browser_wait_for_ref", "wait_for_ref", "Wait only for the original backend node represented by ref; it does not migrate after framework rerendering.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["ref", "snapshot_id"], _handle_simple("wait_for_ref", {"ref", "snapshot_id", "timeout_ms"}, {"ref", "snapshot_id"}), False),
-        ("browser_wait_for_load_state", "wait_for_load_state", "Wait for a load state and return a new snapshot_id.", {"state": {"type": "string", "enum": ["domcontentloaded", "load", "networkidle"]}, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["state", "snapshot_id"], _handle_simple("wait_for_load_state", {"state", "snapshot_id", "timeout_ms"}, {"state", "snapshot_id"}), False),
-        ("browser_get_text", "get_text", "Read text for a ref without changing the snapshot.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "max_chars": {"type": "integer", "minimum": 1}}, ["ref", "snapshot_id"], _handle_simple("get_text", {"ref", "snapshot_id", "max_chars"}, {"ref", "snapshot_id"}), False),
-        ("browser_find_in_page", "find_in_page", "Find visible text without scrolling or changing the snapshot.", {"query": _STRING, "snapshot_id": _SNAPSHOT, "max_results": {"type": "integer", "minimum": 1}}, ["query", "snapshot_id"], _handle_simple("find_in_page", {"query", "snapshot_id", "max_results"}, {"query", "snapshot_id"}), False),
+        ("browser_scroll", "scroll", "Scroll the current page and return a new snapshot_id.", {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}, "snapshot_id": _SNAPSHOT, "amount": {"type": "number", "exclusiveMinimum": 0}}, ["direction", "snapshot_id"], _handle_simple("scroll", {"direction", "snapshot_id", "amount"}, {"direction", "snapshot_id"}), False, False),
+        ("browser_wait_for_url", "wait_for_url", "Wait for a URL pattern and return a new snapshot_id.", {"pattern": _STRING, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["pattern", "snapshot_id"], _handle_simple("wait_for_url", {"pattern", "snapshot_id", "timeout_ms"}, {"pattern", "snapshot_id"}), False, True),
+        ("browser_wait_for_text", "wait_for_text", "Wait for visible text and return a new snapshot_id.", {"text": _STRING, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["text", "snapshot_id"], _handle_simple("wait_for_text", {"text", "snapshot_id", "timeout_ms"}, {"text", "snapshot_id"}), False, True),
+        ("browser_wait_for_ref", "wait_for_ref", "Wait only for the original backend node represented by ref; it does not migrate after framework rerendering.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["ref", "snapshot_id"], _handle_simple("wait_for_ref", {"ref", "snapshot_id", "timeout_ms"}, {"ref", "snapshot_id"}), False, True),
+        ("browser_wait_for_load_state", "wait_for_load_state", "Wait for a load state and return a new snapshot_id.", {"state": {"type": "string", "enum": ["domcontentloaded", "load", "networkidle"]}, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT}, ["state", "snapshot_id"], _handle_simple("wait_for_load_state", {"state", "snapshot_id", "timeout_ms"}, {"state", "snapshot_id"}), False, True),
+        ("browser_get_text", "get_text", "Read text for a ref without changing the snapshot.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "max_chars": {"type": "integer", "minimum": 1}}, ["ref", "snapshot_id"], _handle_simple("get_text", {"ref", "snapshot_id", "max_chars"}, {"ref", "snapshot_id"}), False, False),
+        ("browser_find_in_page", "find_in_page", "Find visible text without scrolling or changing the snapshot.", {"query": _STRING, "snapshot_id": _SNAPSHOT, "max_results": {"type": "integer", "minimum": 1}}, ["query", "snapshot_id"], _handle_simple("find_in_page", {"query", "snapshot_id", "max_results"}, {"query", "snapshot_id"}), False, False),
     ])
     for name, method, description in (("links", "extract_links", "Extract structured links without changing the snapshot."), ("tables", "extract_tables", "Extract structured tables without changing the snapshot."), ("forms", "extract_forms", "Extract structured forms without changing the snapshot.")):
-        operations.append((f"browser_extract_{name}", method, description, {"snapshot_id": _SNAPSHOT, "max_items": {"type": "integer", "minimum": 1}}, ["snapshot_id"], _handle_simple(method, {"snapshot_id", "max_items"}, {"snapshot_id"}), False))
+        operations.append((f"browser_extract_{name}", method, description, {"snapshot_id": _SNAPSHOT, "max_items": {"type": "integer", "minimum": 1}}, ["snapshot_id"], _handle_simple(method, {"snapshot_id", "max_items"}, {"snapshot_id"}), False, False))
     operations.extend([
-        ("browser_extract_metadata", "extract_metadata", "Extract page metadata without changing the snapshot.", {"snapshot_id": _SNAPSHOT}, ["snapshot_id"], _handle_simple("extract_metadata", {"snapshot_id"}, {"snapshot_id"}), False),
-        ("browser_collect_paginated", "collect_paginated", "Follow explicit next-page controls within a finite budget; this changes the snapshot.", {"snapshot_id": _SNAPSHOT, "extract_kind": {"type": "string", "enum": ["links", "tables", "forms", "metadata"]}, "max_pages": {"type": "integer", "minimum": 1}, "max_items": {"type": "integer", "minimum": 1}, "max_text_chars": {"type": "integer", "minimum": 1}, "same_origin": {"type": "boolean", "default": True}, "timeout_ms": _TIMEOUT}, ["snapshot_id", "extract_kind"], _handle_simple("collect_paginated", {"snapshot_id", "extract_kind", "max_pages", "max_items", "max_text_chars", "same_origin", "timeout_ms"}, {"snapshot_id", "extract_kind"}), False),
-        ("browser_list_pages", "list_pages", "List browser tabs/pages without changing a snapshot.", {}, [], _handle_simple("list_pages", set(), set()), False),
-        ("browser_switch_page", "switch_page", "Switch to a registered page and return its new snapshot_id.", {"page_id": _STRING}, ["page_id"], _handle_simple("switch_page", {"page_id"}, {"page_id"}), False),
-        ("browser_close_page", "close_page", "Close a registered page and return a new current-page snapshot when available.", {"page_id": _STRING}, ["page_id"], _handle_simple("close_page", {"page_id"}, {"page_id"}), False),
-        ("browser_screenshot", "screenshot", "Save a page PNG to browser/screenshot without changing snapshot_id; use artifact.agent_path for later file delivery.", {"snapshot_id": _SNAPSHOT, "full_page": {"type": "boolean", "default": False}}, ["snapshot_id"], _handle_simple("screenshot", {"snapshot_id", "full_page"}, {"snapshot_id"}), False),
-        ("browser_screenshot_element", "screenshot_element", "Save a visible element PNG to browser/screenshot without scrolling or changing snapshot_id; use artifact.agent_path for later file delivery.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("screenshot_element", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), False),
-        ("browser_download", "download", "Click a download ref and save it to browser/download; the artifact.agent_path identifies the file for later delivery.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT, "event_timeout_ms": _TIMEOUT, "completion_timeout_ms": _TIMEOUT}, ["ref", "snapshot_id"], _handle_simple("download", {"ref", "snapshot_id", "timeout_ms", "event_timeout_ms", "completion_timeout_ms"}, {"ref", "snapshot_id"}), False),
-        ("browser_list_artifacts", "list_artifacts", "List safe browser artifact metadata, including agent_path when the file is available to the session workspace.", {}, [], _handle_simple("list_artifacts", set(), set()), False),
-        ("browser_get_artifact", "get_artifact", "Get safe metadata and agent_path for one browser artifact.", {"artifact_id": _STRING}, ["artifact_id"], _handle_simple("get_artifact", {"artifact_id"}, {"artifact_id"}), False),
+        ("browser_extract_metadata", "extract_metadata", "Extract page metadata without changing the snapshot.", {"snapshot_id": _SNAPSHOT}, ["snapshot_id"], _handle_simple("extract_metadata", {"snapshot_id"}, {"snapshot_id"}), False, False),
+        ("browser_collect_paginated", "collect_paginated", "Follow explicit next-page controls within a finite budget; this changes the snapshot.", {"snapshot_id": _SNAPSHOT, "extract_kind": {"type": "string", "enum": ["links", "tables", "forms", "metadata"]}, "max_pages": {"type": "integer", "minimum": 1}, "max_items": {"type": "integer", "minimum": 1}, "max_text_chars": {"type": "integer", "minimum": 1}, "same_origin": {"type": "boolean", "default": True}, "timeout_ms": _TIMEOUT}, ["snapshot_id", "extract_kind"], _handle_simple("collect_paginated", {"snapshot_id", "extract_kind", "max_pages", "max_items", "max_text_chars", "same_origin", "timeout_ms"}, {"snapshot_id", "extract_kind"}), False, True),
+        ("browser_list_pages", "list_pages", "List browser tabs/pages without changing a snapshot.", {}, [], _handle_simple("list_pages", set(), set()), False, False),
+        ("browser_switch_page", "switch_page", "Switch to a registered page and return its new snapshot_id.", {"page_id": _STRING}, ["page_id"], _handle_simple("switch_page", {"page_id"}, {"page_id"}), False, False),
+        ("browser_close_page", "close_page", "Close a registered page and return a new current-page snapshot when available.", {"page_id": _STRING}, ["page_id"], _handle_simple("close_page", {"page_id"}, {"page_id"}), False, False),
+        ("browser_screenshot", "screenshot", "Save a page PNG to browser/screenshot without changing snapshot_id; use artifact.agent_path for later file delivery.", {"snapshot_id": _SNAPSHOT, "full_page": {"type": "boolean", "default": False}}, ["snapshot_id"], _handle_simple("screenshot", {"snapshot_id", "full_page"}, {"snapshot_id"}), False, False),
+        ("browser_screenshot_element", "screenshot_element", "Save a visible element PNG to browser/screenshot without scrolling or changing snapshot_id; use artifact.agent_path for later file delivery.", {"ref": _REF, "snapshot_id": _SNAPSHOT}, ["ref", "snapshot_id"], _handle_simple("screenshot_element", {"ref", "snapshot_id"}, {"ref", "snapshot_id"}), False, False),
+        ("browser_download", "download", "Click a download ref and save it to browser/download; the artifact.agent_path identifies the file for later delivery.", {"ref": _REF, "snapshot_id": _SNAPSHOT, "timeout_ms": _TIMEOUT, "event_timeout_ms": _TIMEOUT, "completion_timeout_ms": _TIMEOUT}, ["ref", "snapshot_id"], _handle_simple("download", {"ref", "snapshot_id", "timeout_ms", "event_timeout_ms", "completion_timeout_ms"}, {"ref", "snapshot_id"}), False, True),
+        ("browser_list_artifacts", "list_artifacts", "List safe browser artifact metadata, including agent_path when the file is available to the session workspace.", {}, [], _handle_simple("list_artifacts", set(), set()), False, False),
+        ("browser_get_artifact", "get_artifact", "Get safe metadata and agent_path for one browser artifact.", {"artifact_id": _STRING}, ["artifact_id"], _handle_simple("get_artifact", {"artifact_id"}, {"artifact_id"}), False, False),
     ])
-    for name, method, description, props, required, handler, retry_safe in operations:
-        registry.register(name=name, toolset="browser", schema=_schema(name, description, props, required), handler=handler, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="none", risk_level="low" if method in _LOW_RISK_READ_METHODS else "medium", default_enabled_environments=(), retry_safe=retry_safe, unknown_on_crash=True)
-    registry.register(name="browser_upload_files", toolset="browser", schema=_schema("browser_upload_files", "Upload workspace files to a file-input ref after one-time approval.", {"ref": _REF, "paths": {"oneOf": [_STRING, {"type": "array", "minItems": 1, "items": _STRING}]}, "snapshot_id": _SNAPSHOT}, ["ref", "paths", "snapshot_id"]), handler=handle_browser_upload_files, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
-    registry.register(name="browser_console", toolset="browser", schema=_schema("browser_console", "Run JavaScript in the current page after one-time approval; it may change page state.", {"expression": _STRING, "snapshot_id": _SNAPSHOT, "max_chars": {"type": "integer", "minimum": 1}}, ["expression", "snapshot_id"]), handler=handle_browser_console, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
+    for name, method, description, props, required, handler, retry_safe, supports_cancellation in operations:
+        registry.register(name=name, toolset="browser", schema=_schema(name, description, props, required), handler=handler, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="none", risk_level="low" if method in _LOW_RISK_READ_METHODS else "medium", default_enabled_environments=(), retry_safe=retry_safe, unknown_on_crash=True, supports_cancellation=supports_cancellation)
+    registry.register(name="browser_upload_files", toolset="browser", schema=_schema("browser_upload_files", "Upload workspace files to a file-input ref after one-time approval.", {"ref": _REF, "paths": {"oneOf": [_STRING, {"type": "array", "minItems": 1, "items": _STRING}]}, "snapshot_id": _SNAPSHOT}, ["ref", "paths", "snapshot_id"]), handler=handle_browser_upload_files, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True, supports_cancellation=True)
+    registry.register(name="browser_console", toolset="browser", schema=_schema("browser_console", "Run JavaScript in the current page after one-time approval; it may change page state.", {"expression": _STRING, "snapshot_id": _SNAPSHOT, "max_chars": {"type": "integer", "minimum": 1}}, ["expression", "snapshot_id"]), handler=handle_browser_console, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True, supports_cancellation=True)
     registry.register(name="browser_delete_artifact", toolset="browser", schema=_schema("browser_delete_artifact", "Delete one browser artifact after one-time approval.", {"artifact_id": _STRING}, ["artifact_id"]), handler=handle_browser_delete_artifact, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="medium", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
     registry.register(name="browser_cleanup_artifacts", toolset="browser", schema=_schema("browser_cleanup_artifacts", "Delete all current-session browser artifacts after one-time approval.", {}, []), handler=handle_browser_cleanup_artifacts, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
-    registry.register(name="browser_analyze_page", toolset="browser", schema=_schema("browser_analyze_page", "Capture the current page, then send that exact screenshot to the configured external model after one-time approval.", {"snapshot_id": _SNAPSHOT, "prompt": _STRING, "full_page": {"type": "boolean", "default": False}, "timeout_ms": _TIMEOUT}, ["snapshot_id", "prompt"]), handler=handle_browser_analyze_page, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True)
+    registry.register(name="browser_analyze_page", toolset="browser", schema=_schema("browser_analyze_page", "Capture the current page, then send that exact screenshot to the configured external model after one-time approval.", {"snapshot_id": _SNAPSHOT, "prompt": _STRING, "full_page": {"type": "boolean", "default": False}, "timeout_ms": _TIMEOUT}, ["snapshot_id", "prompt"]), handler=handle_browser_analyze_page, execution_environments=("cli", "gateway"), unattended_allowed=False, approval_mode="interactive_or_remote", risk_level="high", default_enabled_environments=(), retry_safe=False, unknown_on_crash=True, supports_cancellation=True)

@@ -80,6 +80,16 @@ def _error(error_type: str, error: str, **extra: Any) -> str:
     )
 
 
+def _cancelled_result(*, execution_state: str) -> str:
+    """返回 browser 工具约定的协作式取消结果。"""
+    return _error(
+        "cancelled",
+        "browser operation was cancelled",
+        fatal=True,
+        execution_state=execution_state,
+    )
+
+
 @dataclass(slots=True)
 class _WorkItem:
     """一条只在所属 worker 线程执行的方法调用。"""
@@ -88,6 +98,8 @@ class _WorkItem:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
     future: Future[str]
+    cancel_event: threading.Event
+    inject_cancel_event: bool
 
 
 class BrowserWorker:
@@ -237,12 +249,16 @@ class BrowserWorker:
         method: str,
         *args: Any,
         timeout: float | None = None,
+        cancel_checker=None,
         **kwargs: Any,
     ) -> str:
         """串行执行 BrowserSession 公开方法，不把 Playwright 交给线程池。"""
         if not isinstance(method, str) or not method or method.startswith("_"):
             return _error("invalid_args", "browser method is invalid")
+        if callable(cancel_checker) and cancel_checker():
+            return _cancelled_result(execution_state="not_started")
         future: Future[str] = Future()
+        cancel_event = threading.Event()
         effective_timeout = self._operation_timeout_seconds if timeout is None else timeout
         try:
             effective_timeout = _positive_seconds(
@@ -259,22 +275,49 @@ class BrowserWorker:
                 )
             self._queued += 1
             self._last_used = monotonic()
-            self._queue.put(_WorkItem(method, args, dict(kwargs), future))
-        try:
-            return future.result(timeout=effective_timeout)
-        except FutureTimeoutError:
-            self._invalidate(
-                "browser_worker_timeout",
-                "browser operation timed out",
+            self._queue.put(
+                _WorkItem(
+                    method,
+                    args,
+                    dict(kwargs),
+                    future,
+                    cancel_event,
+                    callable(cancel_checker),
+                )
             )
-            self._close_async()
-            return _error(
-                "browser_worker_timeout",
-                "browser operation timed out; its outcome is unknown",
-                execution_state="unknown",
-            )
-        except Exception:
-            return _error("browser_worker_failed", "browser worker failed")
+        deadline = monotonic() + effective_timeout
+        cancellation_requested = False
+        while True:
+            if future.done():
+                try:
+                    return future.result()
+                except Exception:
+                    return _error("browser_worker_failed", "browser worker failed")
+            if (
+                not cancellation_requested
+                and callable(cancel_checker)
+                and cancel_checker()
+            ):
+                cancel_event.set()
+                cancellation_requested = True
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                self._invalidate(
+                    "browser_worker_timeout",
+                    "browser operation timed out",
+                )
+                self._close_async()
+                return _error(
+                    "browser_worker_timeout",
+                    "browser operation timed out; its outcome is unknown",
+                    execution_state="unknown",
+                )
+            try:
+                return future.result(timeout=min(0.1, remaining))
+            except FutureTimeoutError:
+                continue
+            except Exception:
+                return _error("browser_worker_failed", "browser worker failed")
 
     def close(self) -> None:
         """请求线程完成已有任务后关闭浏览器；重复调用安全。"""
@@ -338,7 +381,10 @@ class BrowserWorker:
                     if target is None or not callable(target):
                         result = _error("unsupported_browser_operation", "browser operation is unavailable")
                     else:
-                        result = target(*item.args, **item.kwargs)
+                        call_kwargs = dict(item.kwargs)
+                        if item.inject_cancel_event:
+                            call_kwargs["_cancel_event"] = item.cancel_event
+                        result = target(*item.args, **call_kwargs)
                         if not isinstance(result, str):
                             result = _error("browser_worker_failed", "browser operation returned an invalid result")
                 except Exception:

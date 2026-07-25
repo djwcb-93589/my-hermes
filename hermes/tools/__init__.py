@@ -149,6 +149,8 @@ class ToolRegistry:
         supports_cancellation: bool = False,
     ) -> None:
         """注册一次工具及其跨入口运行策略。"""
+        if not isinstance(supports_cancellation, bool):
+            raise ValueError("supports_cancellation must be a boolean")
         normalized_retry_safe = bool(retry_safe)
         normalized_unknown_on_crash = (
             not normalized_retry_safe
@@ -191,7 +193,7 @@ class ToolRegistry:
             retry_safe=normalized_retry_safe,
             unknown_on_crash=normalized_unknown_on_crash,
             status_check=status_check,
-            supports_cancellation=bool(supports_cancellation),
+            supports_cancellation=supports_cancellation,
         )
 
     def get_entry(self, name: str) -> ToolEntry | None:

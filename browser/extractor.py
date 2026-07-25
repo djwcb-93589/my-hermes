@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Any
@@ -599,6 +600,7 @@ class PageExtractor:
         extract_kind: str,
         budget: BrowseBudget,
         same_origin: bool,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """在固定预算内提取当前页并跟随明确的下一页链接或按钮。"""
         if not isinstance(extract_kind, str):
@@ -620,7 +622,18 @@ class PageExtractor:
         used_fallback = False
         dialogs: list[dict[str, Any]] = []
 
+        def cancelled(*, execution_state: str = "cancelled") -> dict[str, Any]:
+            return {
+                "cancelled": True,
+                "execution_state": execution_state,
+                "items": items,
+                "pages_visited": len(visited_urls),
+                "snapshot_id": current_snapshot_id,
+            }
+
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled()
             if monotonic() >= deadline:
                 stop_reason = "timeout"
                 truncated = True
@@ -642,6 +655,8 @@ class PageExtractor:
                 remaining_items,
                 budget.max_text_chars - text_chars,
             )
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled()
             fingerprint = json.dumps(
                 page_items, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
@@ -701,16 +716,26 @@ class PageExtractor:
                 if same_origin and not _same_origin(first_origin, next_url):
                     stop_reason = "no_next_page"
                     break
+                if cancel_event is not None and cancel_event.is_set():
+                    return cancelled()
                 remaining_ms = max(1, int((deadline - monotonic()) * 1000))
-                navigation = self._session._p9_navigate_locked(next_url, remaining_ms)
+                navigation = self._session._p9_navigate_locked(
+                    next_url,
+                    remaining_ms,
+                    _cancel_event=cancel_event,
+                )
             elif next_page.get("kind") == "button":
                 index = next_page.get("index")
                 if not isinstance(index, int) or index < 0:
                     stop_reason = "no_next_page"
                     break
+                if cancel_event is not None and cancel_event.is_set():
+                    return cancelled()
                 remaining_ms = max(1, int((deadline - monotonic()) * 1000))
                 navigation = self._session._p9_click_next_button_locked(
-                    index, remaining_ms
+                    index,
+                    remaining_ms,
+                    _cancel_event=cancel_event,
                 )
             else:
                 stop_reason = "no_next_page"
@@ -721,6 +746,14 @@ class PageExtractor:
                 stop_reason = "navigation_failed"
                 truncated = True
                 break
+            if navigation_payload.get("error_type") == "cancelled":
+                return cancelled(
+                    execution_state=(
+                        "unknown"
+                        if navigation_payload.get("execution_state") == "unknown"
+                        else "cancelled"
+                    )
+                )
             next_snapshot_id = navigation_payload.get("snapshot_id")
             returned_event_type = navigation_payload.get("event_type")
             if isinstance(returned_event_type, str):

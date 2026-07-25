@@ -162,6 +162,10 @@ class _Artifact:
     source_url: str
 
 
+class _BrowserOperationCancelled(Exception):
+    """标记已在安全检查点发现的协作式取消。"""
+
+
 class BrowserSession:
     """单浏览器实例的同步包装。
 
@@ -234,6 +238,49 @@ class BrowserSession:
         self._active_dialog_policy: tuple[str, str | None] | None = None
         self._next_dialog_policy: tuple[str, str | None] | None = None
         self._last_dialog_event: dict[str, str] | None = None
+
+    @staticmethod
+    def _cancel_requested(cancel_event: threading.Event | None) -> bool:
+        """仅接受运行时创建的单次取消事件。"""
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _cancelled_result_locked(self, *, execution_state: str) -> str:
+        """返回不继续创建快照或执行后续页面操作的标准取消结果。"""
+        message = "browser operation was cancelled"
+        if execution_state == "unknown":
+            message += "; its outcome may be unknown"
+        return json.dumps(
+            {
+                "ok": False,
+                "error_type": "cancelled",
+                "fatal": True,
+                "execution_state": execution_state,
+                "error": message,
+            },
+            ensure_ascii=False,
+        )
+
+    def _raise_if_cancelled_locked(
+        self,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        """让多步骤动作在发出下一步前停止。"""
+        if self._cancel_requested(cancel_event):
+            raise _BrowserOperationCancelled()
+
+    def _wait_for_cancelable_delay_locked(
+        self,
+        delay_ms: int,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        """把逐字输入的延迟分成短等待，避免长 delay 吞掉取消请求。"""
+        deadline = monotonic() + delay_ms / 1000.0
+        while True:
+            self._raise_if_cancelled_locked(cancel_event)
+            remaining_ms = int((deadline - monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return
+            self._page.wait_for_timeout(min(50, remaining_ms))
 
     def __enter__(self) -> "BrowserSession":
         self.start()
@@ -1003,19 +1050,26 @@ class BrowserSession:
 
     # --- 读取操作 ---
 
-    def navigate(self, url: str) -> str:
+    def navigate(
+        self,
+        url: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """打开 URL 并返回带 ``snapshot_id`` 的观察结果 JSON。
 
         会等待 ``load`` 事件 + 一小段网络空闲,避免拿到 AJAX 半截页面。
         snapshot 内 ref 从 e1 起重新编号。
         """
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
                 return no_page_error
             return self._execute_with_dialog_policy_locked(
-                lambda: self._navigate_locked(url)
+                lambda: self._navigate_locked(url, _cancel_event=_cancel_event)
             )
 
     def _navigate_locked(
@@ -1026,6 +1080,7 @@ class BrowserSession:
         settle_navigation: bool = True,
         post_navigation_wait_ms: int = 500,
         event_collection_timeout_ms: int = 250,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """执行导航并返回统一观察结果；调用方已完成页面可用性检查。"""
         previous_url = self._page.url
@@ -1038,10 +1093,15 @@ class BrowserSession:
             if navigation_timeout_ms is not None:
                 goto_kwargs["timeout"] = navigation_timeout_ms
             self._page.goto(_normalize_url(url), **goto_kwargs)
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             # 给 AJAX 一点喘息时间;不用 networkidle --对长轮询站点会一直等。
             if post_navigation_wait_ms > 0:
                 self._page.wait_for_timeout(post_navigation_wait_ms)
-            self._wait_for_url_settle_locked()
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
+            if self._wait_for_url_settle_locked(_cancel_event=_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             return self._finalize_interaction_locked(
                 previous_url,
                 previous_position,
@@ -1067,17 +1127,21 @@ class BrowserSession:
         self,
         *,
         timeout_ms: int = 1000,
-    ) -> None:
+        _cancel_event: threading.Event | None = None,
+    ) -> bool:
         """在有限窗口内收集服务端或脚本重定向，避免过早返回过渡地址。"""
         deadline = monotonic() + max(0, timeout_ms) / 1000.0
         while monotonic() < deadline:
+            if self._cancel_requested(_cancel_event):
+                return True
             try:
                 remaining_ms = int((deadline - monotonic()) * 1000)
                 self._page.wait_for_timeout(min(50, max(1, remaining_ms)))
                 # 读取 URL 本身能及时暴露页面关闭；最终观察仍在收尾阶段生成。
                 _ = self._page.url
             except Exception:
-                return
+                return False
+        return self._cancel_requested(_cancel_event)
 
     def snapshot(self, snapshot_id: str | None = None) -> str:
         """对当前 page 取观察结果；提供旧 ``snapshot_id`` 时先确认它仍有效。"""
@@ -1255,7 +1319,13 @@ class BrowserSession:
                 pass
         return refs
 
-    def _p9_navigate_locked(self, url: str, timeout_ms: int) -> str:
+    def _p9_navigate_locked(
+        self,
+        url: str,
+        timeout_ms: int,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """分页专用 URL 跟随，复用导航、对话框和快照收尾规则。"""
         if (
             isinstance(timeout_ms, bool)
@@ -1263,6 +1333,8 @@ class BrowserSession:
             or timeout_ms <= 0
         ):
             return _err("invalid_args", "分页导航 timeout_ms 必须是正整数")
+        if self._cancel_requested(_cancel_event):
+            return self._cancelled_result_locked(execution_state="not_started")
         return self._execute_with_dialog_policy_locked(
             lambda: self._navigate_locked(
                 url,
@@ -1270,6 +1342,7 @@ class BrowserSession:
                 settle_navigation=False,
                 post_navigation_wait_ms=min(200, timeout_ms),
                 event_collection_timeout_ms=min(250, timeout_ms),
+                _cancel_event=_cancel_event,
             )
         )
 
@@ -1342,9 +1415,12 @@ class BrowserSession:
         previous_content_marker: str,
         before_pages: set[str],
         deadline: float,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """在分页剩余预算内等待导航或 DOM 真正变化，而非固定短暂停顿。"""
         while True:
+            if self._cancel_requested(_cancel_event):
+                return "cancelled"
             if any(page_id not in before_pages for page_id in self._pages):
                 return "popup"
             if self._page is None or self._page.is_closed():
@@ -1376,7 +1452,13 @@ class BrowserSession:
             except Exception as exc:
                 return "page_closed" if self._is_permanent_browser_error(exc) else "failed"
 
-    def _p9_click_next_button_locked(self, index: int, timeout_ms: int) -> str:
+    def _p9_click_next_button_locked(
+        self,
+        index: int,
+        timeout_ms: int,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """只点击分页区域中的明确下一页按钮，并等到页面确实发生变化。"""
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:
             return _err("invalid_args", "下一页按钮索引无效")
@@ -1388,6 +1470,8 @@ class BrowserSession:
             return _err("invalid_args", "分页点击 timeout_ms 必须是正整数")
 
         def click_next() -> str:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             before_pages = set(self._pages)
             original_page_id = self._current_page_id
             previous_url = self._page.url
@@ -1431,13 +1515,18 @@ class BrowserSession:
                         original_page_id, before_pages
                     )
                 return result
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             change = self._p9_wait_for_button_change_locked(
                 previous_url,
                 previous_marker,
                 previous_content_marker,
                 before_pages,
                 deadline,
+                _cancel_event=_cancel_event,
             )
+            if change == "cancelled":
+                return self._cancelled_result_locked(execution_state="unknown")
             if change == "popup":
                 return self._p9_popup_failure_locked(original_page_id, before_pages)
             if change == "page_closed":
@@ -1568,9 +1657,12 @@ class BrowserSession:
         max_text_chars: int = 100_000,
         same_origin: bool = True,
         timeout_ms: int | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """在固定预算内提取并跟随明确下一页控件；自动翻页会换发快照。"""
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -1592,6 +1684,7 @@ class BrowserSession:
                     extract_kind=extract_kind,
                     budget=budget,
                     same_origin=same_origin,
+                    cancel_event=_cancel_event,
                 )
             except Exception as exc:
                 if isinstance(exc, ExtractionError):
@@ -1604,6 +1697,11 @@ class BrowserSession:
             if not isinstance(payload, dict):
                 return self._current_observation_error_locked(
                     "extract_failed", "分页收集返回了无效结果"
+                )
+            if payload.get("cancelled") is True:
+                state = payload.get("execution_state")
+                return self._cancelled_result_locked(
+                    execution_state=state if state in {"cancelled", "unknown"} else "cancelled"
                 )
             observation = self._current_observation_locked()
             if (
@@ -1744,6 +1842,7 @@ class BrowserSession:
         *,
         timeout_ms: int | None,
         expected_type: str | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """在会话安全边界内解析来源，再委托独立服务层请求模型。"""
         raw_sources = self._media_sources_argument(sources)
@@ -1755,12 +1854,16 @@ class BrowserSession:
             isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0
         ):
             return _err("invalid_args", "timeout_ms 必须是正整数")
+        if self._cancel_requested(_cancel_event):
+            return self._cancelled_result_locked(execution_state="not_started")
         resolved_sources: list[MediaSource] = []
         for source in raw_sources:
             resolved = self._media_source_locked(source)
             if isinstance(resolved, str):
                 return resolved
             resolved_sources.append(resolved)
+        if self._cancel_requested(_cancel_event):
+            return self._cancelled_result_locked(execution_state="not_started")
         try:
             analysis = self._analyzer_locked().analyze(
                 resolved_sources,
@@ -1773,6 +1876,8 @@ class BrowserSession:
         except Exception as exc:
             # 供应商实现异常不能泄露请求体、授权头或媒体内容。
             return _err("model_request_failed", f"多模态模型请求出现未预期错误: {exc.__class__.__name__}")
+        if self._cancel_requested(_cancel_event):
+            return self._cancelled_result_locked(execution_state="unknown")
         return self._analysis_payload_locked(analysis)
 
     def analyze_media(
@@ -1792,12 +1897,18 @@ class BrowserSession:
         source: str | Path,
         prompt: str,
         timeout_ms: int | None = None,
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """只接受图片来源的 ``analyze_media`` 简化入口。"""
         with self._lock:
             self._assert_owner_thread()
             return self._analyze_media_locked(
-                source, prompt, timeout_ms=timeout_ms, expected_type="image"
+                source,
+                prompt,
+                timeout_ms=timeout_ms,
+                expected_type="image",
+                _cancel_event=_cancel_event,
             )
 
     def analyze_audio(
@@ -1820,6 +1931,7 @@ class BrowserSession:
         *,
         full_page: bool = False,
         timeout_ms: int | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """截图当前页面并分析该截图；页面快照本身不会因分析而失效。"""
         if not isinstance(full_page, bool):
@@ -1831,6 +1943,8 @@ class BrowserSession:
         ):
             return _err("invalid_args", "timeout_ms 必须是正整数")
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -1838,7 +1952,11 @@ class BrowserSession:
             stale_error = self._validate_snapshot_locked(snapshot_id)
             if stale_error is not None:
                 return stale_error
-            screenshot_result = self.screenshot(snapshot_id, full_page=full_page)
+            screenshot_result = self.screenshot(
+                snapshot_id,
+                full_page=full_page,
+                _cancel_event=_cancel_event,
+            )
             try:
                 screenshot_payload = json.loads(screenshot_result)
             except (TypeError, json.JSONDecodeError):
@@ -1853,11 +1971,14 @@ class BrowserSession:
             )
             if not isinstance(artifact_id, str) or not artifact_id:
                 return _err("screenshot_failed", "页面截图未登记为会话产物")
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             result = self._analyze_media_locked(
                 artifact_id,
                 prompt,
                 timeout_ms=timeout_ms,
                 expected_type="image",
+                _cancel_event=_cancel_event,
             )
             page_fields = {
                 key: screenshot_payload[key]
@@ -2077,9 +2198,16 @@ class BrowserSession:
     # back / forward / reload / scroll 虽然不针对特定元素，但仍会改变当前
     # 页面。它们也必须携带 snapshot_id，避免晚到请求作用于新页面。
 
-    def back(self, snapshot_id: str) -> str:
+    def back(
+        self,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """回退一页，并统一消费本次对话框策略。"""
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -2088,10 +2216,15 @@ class BrowserSession:
             if stale_error is not None:
                 return stale_error
             return self._execute_with_dialog_policy_locked(
-                lambda: self._back_locked(snapshot_id)
+                lambda: self._back_locked(snapshot_id, _cancel_event=_cancel_event)
             )
 
-    def _back_locked(self, snapshot_id: str) -> str:
+    def _back_locked(
+        self,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """回退到上一页。没有工具可用的历史时保持当前页面不变。"""
         with self._lock:
             self._require_started_locked()
@@ -2125,6 +2258,8 @@ class BrowserSession:
                         previous_marker, before_pages,
                     )
                 )
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             if self._position_marker_locked() == previous_position:
                 result = self._finalize_interaction_locked(
                     previous_url, previous_position, "back", False, before_pages,
@@ -2145,9 +2280,16 @@ class BrowserSession:
                 )
             )
 
-    def forward(self, snapshot_id: str) -> str:
+    def forward(
+        self,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """前进一页，并统一消费本次对话框策略。"""
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -2156,10 +2298,15 @@ class BrowserSession:
             if stale_error is not None:
                 return stale_error
             return self._execute_with_dialog_policy_locked(
-                lambda: self._forward_locked(snapshot_id)
+                lambda: self._forward_locked(snapshot_id, _cancel_event=_cancel_event)
             )
 
-    def _forward_locked(self, snapshot_id: str) -> str:
+    def _forward_locked(
+        self,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """前进到下一页。没有历史时返回 ``no_history`` 错误,页面状态不变。"""
         with self._lock:
             self._require_started_locked()
@@ -2193,6 +2340,8 @@ class BrowserSession:
                         previous_marker, before_pages,
                     )
                 )
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             if self._position_marker_locked() == previous_position:
                 result = self._finalize_interaction_locked(
                     previous_url, previous_position, "forward", False, before_pages,
@@ -2213,9 +2362,16 @@ class BrowserSession:
                 )
             )
 
-    def reload(self, snapshot_id: str) -> str:
+    def reload(
+        self,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """重新加载当前页，并统一消费本次对话框策略。"""
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -2224,10 +2380,15 @@ class BrowserSession:
             if stale_error is not None:
                 return stale_error
             return self._execute_with_dialog_policy_locked(
-                lambda: self._reload_locked(snapshot_id)
+                lambda: self._reload_locked(snapshot_id, _cancel_event=_cancel_event)
             )
 
-    def _reload_locked(self, snapshot_id: str) -> str:
+    def _reload_locked(
+        self,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """重新加载当前页。返回新快照。"""
         with self._lock:
             self._require_started_locked()
@@ -2251,6 +2412,8 @@ class BrowserSession:
                         previous_marker, before_pages,
                     )
                 )
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             return self._finish_dialog_operation_locked(
                 self._finalize_interaction_locked(
                     previous_url, previous_position, "reload", False, before_pages,
@@ -2327,18 +2490,20 @@ class BrowserSession:
         *,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """等待当前 URL 匹配 glob ``pattern``，例如 ``"**/search*"``。"""
         if not isinstance(pattern, str) or not pattern.strip():
             return _err("invalid_args", "pattern 必须是非空字符串")
-        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        effective_cancel_event = _cancel_event if _cancel_event is not None else cancel_event
+        options_error = self._validate_wait_options(timeout_ms, effective_cancel_event)
         if options_error is not None:
             return options_error
         with self._lock:
             return self._wait_with_condition_locked(
                 snapshot_id=snapshot_id,
                 timeout_ms=timeout_ms,
-                cancel_event=cancel_event,
+                cancel_event=effective_cancel_event,
                 condition=lambda: fnmatchcase(self._page.url, pattern),
                 description=f"URL 匹配 {pattern!r}",
             )
@@ -2350,11 +2515,13 @@ class BrowserSession:
         *,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """等待页面出现可见的 ``text``。"""
         if not isinstance(text, str) or not text.strip():
             return _err("invalid_args", "text 必须是非空字符串")
-        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        effective_cancel_event = _cancel_event if _cancel_event is not None else cancel_event
+        options_error = self._validate_wait_options(timeout_ms, effective_cancel_event)
         if options_error is not None:
             return options_error
 
@@ -2369,7 +2536,7 @@ class BrowserSession:
             return self._wait_with_condition_locked(
                 snapshot_id=snapshot_id,
                 timeout_ms=timeout_ms,
-                cancel_event=cancel_event,
+                cancel_event=effective_cancel_event,
                 condition=text_is_visible,
                 description=f"可见文本 {text!r}",
             )
@@ -2381,6 +2548,7 @@ class BrowserSession:
         *,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """等待指定快照中的 ``ref`` 对应的原 backend DOM 节点变为可见。
 
@@ -2389,7 +2557,8 @@ class BrowserSession:
         """
         if not isinstance(ref, str) or not ref.strip():
             return _err("invalid_args", "ref 必须是非空字符串")
-        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        effective_cancel_event = _cancel_event if _cancel_event is not None else cancel_event
+        options_error = self._validate_wait_options(timeout_ms, effective_cancel_event)
         if options_error is not None:
             return options_error
         with self._lock:
@@ -2410,7 +2579,7 @@ class BrowserSession:
             return self._wait_with_condition_locked(
                 snapshot_id=snapshot_id,
                 timeout_ms=timeout_ms,
-                cancel_event=cancel_event,
+                cancel_event=effective_cancel_event,
                 condition=ref_is_visible,
                 description=f"元素 {ref}",
             )
@@ -2422,6 +2591,7 @@ class BrowserSession:
         *,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """等待 ``domcontentloaded``、``load`` 或 ``networkidle`` 状态。"""
         normalized_state = state.lower().strip() if isinstance(state, str) else ""
@@ -2430,14 +2600,15 @@ class BrowserSession:
                 "invalid_args",
                 "state 必须是 domcontentloaded、load 或 networkidle",
             )
-        options_error = self._validate_wait_options(timeout_ms, cancel_event)
+        effective_cancel_event = _cancel_event if _cancel_event is not None else cancel_event
+        options_error = self._validate_wait_options(timeout_ms, effective_cancel_event)
         if options_error is not None:
             return options_error
         with self._lock:
             return self._wait_with_condition_locked(
                 snapshot_id=snapshot_id,
                 timeout_ms=timeout_ms,
-                cancel_event=cancel_event,
+                cancel_event=effective_cancel_event,
                 condition=lambda: self._is_load_state_ready_locked(normalized_state),
                 description=f"加载状态 {normalized_state}",
             )
@@ -2472,6 +2643,8 @@ class BrowserSession:
         description: str,
     ) -> str:
         """在已持锁的会话中轮询条件，并统一处理成功、超时和取消。"""
+        if self._cancel_requested(cancel_event):
+            return self._cancelled_result_locked(execution_state="not_started")
         self._require_started_locked()
         stale_error = self._validate_snapshot_locked(snapshot_id)
         if stale_error is not None:
@@ -2509,15 +2682,8 @@ class BrowserSession:
         self._invalidate_snapshot_locked()
         deadline = monotonic() + resolved_timeout / 1000
         while True:
-            if cancel_event is not None and cancel_event.is_set():
-                return self._finish_wait_locked(
-                    "wait_cancelled",
-                    f"等待{description}已取消",
-                    previous_url,
-                    previous_position,
-                    previous_marker,
-                    before_pages,
-                )
+            if self._cancel_requested(cancel_event):
+                return self._cancelled_result_locked(execution_state="cancelled")
             try:
                 if condition():
                     return self._finish_wait_locked(
@@ -2559,15 +2725,8 @@ class BrowserSession:
                     previous_marker,
                     before_pages,
                 )
-            if cancel_event is not None and cancel_event.is_set():
-                return self._finish_wait_locked(
-                    "wait_cancelled",
-                    f"等待{description}已取消",
-                    previous_url,
-                    previous_position,
-                    previous_marker,
-                    before_pages,
-                )
+            if self._cancel_requested(cancel_event):
+                return self._cancelled_result_locked(execution_state="cancelled")
             # 使用短轮询保持取消响应；同步 API 在这里阻塞的是 BrowserSession 所在线程。
             try:
                 self._page.wait_for_timeout(min(100, remaining_ms))
@@ -2901,6 +3060,8 @@ class BrowserSession:
         expression: str,
         snapshot_id: str,
         max_chars: int = 5000,
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """执行 JavaScript，并让它遵守与其他页面操作相同的对话框规则。"""
         if not isinstance(expression, str) or not expression.strip():
@@ -2912,12 +3073,19 @@ class BrowserSession:
         ):
             return _err("invalid_args", f"max_chars 必须是正整数,收到: {max_chars!r}")
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             stale_error = self._validate_snapshot_locked(snapshot_id)
             if stale_error is not None:
                 return stale_error
             return self._execute_with_dialog_policy_locked(
-                lambda: self._console_locked(expression, snapshot_id, max_chars)
+                lambda: self._console_locked(
+                    expression,
+                    snapshot_id,
+                    max_chars,
+                    _cancel_event=_cancel_event,
+                )
             )
 
     def _console_locked(
@@ -2925,6 +3093,8 @@ class BrowserSession:
         expression: str,
         snapshot_id: str,
         max_chars: int = 5000,
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """在页面里执行任意 JavaScript 表达式,返回序列化结果。
 
@@ -2953,6 +3123,8 @@ class BrowserSession:
             return _err("invalid_args", f"max_chars 必须是正整数,收到: {max_chars!r}")
 
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             stale_error = self._validate_snapshot_locked(snapshot_id)
             if stale_error is not None:
@@ -2984,6 +3156,8 @@ class BrowserSession:
                         record_navigation=True,
                     )
                 )
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             # page.evaluate 返回的是 Python 对象(str/dict/None 等),
             # 因为 JS 侧已经序列化成 {ok, result/error} 结构。
             if not isinstance(call_result, dict):
@@ -3048,6 +3222,8 @@ class BrowserSession:
         ref: str,
         paths: str | Path | list[str | Path],
         snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """向当前快照中的 ``<input type=file>`` 选择工作区内的文件。"""
         if not isinstance(ref, str) or not ref:
@@ -3056,6 +3232,8 @@ class BrowserSession:
         if not isinstance(raw_paths, list) or not raw_paths:
             return _err("invalid_path", "paths 必须是单个路径或非空路径列表")
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -3115,6 +3293,7 @@ class BrowserSession:
                 lambda: target.locator.set_input_files([str(path) for path in resolved_paths]),
                 targets=[target],
                 error_mapper=self._upload_error_type,
+                _cancel_event=_cancel_event,
             )
             metadata = [
                 {"filename": path.name, "size_bytes": path.stat().st_size}
@@ -3137,6 +3316,7 @@ class BrowserSession:
         *,
         event_timeout_ms: int | None = None,
         completion_timeout_ms: int | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """点击下载并保存为会话产物。
 
@@ -3165,6 +3345,8 @@ class BrowserSession:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 return _err("invalid_args", f"{name} 必须是正整数")
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -3177,7 +3359,10 @@ class BrowserSession:
                 return self._p7_ref_error_with_observation_locked(target)
             return self._execute_with_dialog_policy_locked(
                 lambda: self._download_locked(
-                    target, event_timeout, completion_timeout
+                    target,
+                    event_timeout,
+                    completion_timeout,
+                    _cancel_event=_cancel_event,
                 )
             )
 
@@ -3186,6 +3371,8 @@ class BrowserSession:
         target: _NativeTarget,
         event_timeout_ms: int,
         completion_timeout_ms: int,
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """按事件阶段和完成阶段的独立截止规则保存下载产物。"""
         before_pages = set(self._pages)
@@ -3197,15 +3384,21 @@ class BrowserSession:
         download_url: str | None = None
         failure: str | None = None
         try:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             with self._page.expect_download(timeout=event_timeout_ms) as download_info:
                 target.locator.click()
             browser_download = download_info.value
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             suggested_filename = browser_download.suggested_filename
             download_url = browser_download.url
             completion_deadline = monotonic() + completion_timeout_ms / 1000
             # sync API 没有可传入的下载完成/保存超时，且对象不能跨线程调用。
             # 因此只能在阻塞调用返回后检查截止时间，并删除迟到的本地产物。
             failure = browser_download.failure()
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             if monotonic() > completion_deadline:
                 result = self._interaction_failure_with_observation_locked(
                     "download_timeout",
@@ -3241,6 +3434,8 @@ class BrowserSession:
             filename = self._safe_artifact_filename_locked(
                 suggested_filename, prefix="download"
             )
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             try:
                 artifact = self._publish_artifact_locked(
                     "download",
@@ -3291,6 +3486,8 @@ class BrowserSession:
                     failure="completion_timeout",
                     completed=False,
                 )
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="unknown")
             result = self._finalize_interaction_locked(
                 previous_url,
                 previous_position,
@@ -3327,11 +3524,19 @@ class BrowserSession:
         finally:
             self._clear_native_markers_locked([target])
 
-    def screenshot(self, snapshot_id: str, *, full_page: bool = False) -> str:
+    def screenshot(
+        self,
+        snapshot_id: str,
+        *,
+        full_page: bool = False,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """保存当前页面 PNG 截图；这是一项纯读取操作，不会失效快照。"""
         if not isinstance(full_page, bool):
             return _err("invalid_args", "full_page 必须是布尔值")
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -3353,6 +3558,8 @@ class BrowserSession:
                     page_id=self._current_page_id,
                     source_url=self._page.url,
                 )
+                if self._cancel_requested(_cancel_event):
+                    return self._cancelled_result_locked(execution_state="unknown")
                 observation = self._current_observation_locked()
                 if observation is None:
                     return _err("screenshot_failed", "页面截图完成后原快照已不可用")
@@ -3608,8 +3815,14 @@ class BrowserSession:
     # --- 完整交互(P6) ---
     # 以下定义覆盖早期的 JS 交互实现：先把 backend DOM 节点临时标记为唯一属性，
     # 再交给 Playwright Locator 完成真实用户交互和可操作性检查。
-    def click(self, ref: str, snapshot_id: str) -> str:
-        return self._native_ref_action(ref, snapshot_id, "click", lambda locator: locator.click())
+    def click(
+        self,
+        ref: str,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
+        return self._native_ref_action(ref, snapshot_id, "click", lambda locator: locator.click(), _cancel_event=_cancel_event)
 
     def hover(self, ref: str, snapshot_id: str) -> str:
         return self._native_ref_action(ref, snapshot_id, "hover", lambda locator: locator.hover())
@@ -3632,6 +3845,7 @@ class BrowserSession:
         *,
         mode: str = "fill",
         delay_ms: int = 0,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         """输入文本。mode 为 fill(一次写入)或 type(逐字符输入)。"""
         if not isinstance(text, str):
@@ -3647,17 +3861,35 @@ class BrowserSession:
             if mode == "fill":
                 if clear:
                     locator.fill(text)
-                else:
-                    locator.press("End")
-                    locator.press_sequentially(text, delay=delay_ms)
-                return
-            if clear:
+                    return
+                locator.press("End")
+            elif clear:
                 locator.fill("")
-            locator.press_sequentially(text, delay=delay_ms)
+            for index, character in enumerate(text):
+                self._raise_if_cancelled_locked(_cancel_event)
+                locator.press_sequentially(character)
+                if index + 1 < len(text) and delay_ms:
+                    self._wait_for_cancelable_delay_locked(
+                        delay_ms,
+                        _cancel_event,
+                    )
 
-        return self._native_ref_action(ref, snapshot_id, "type", action)
+        return self._native_ref_action(
+            ref,
+            snapshot_id,
+            "type",
+            action,
+            _cancel_event=_cancel_event,
+        )
 
-    def select(self, ref: str, value: str | list[str], snapshot_id: str) -> str:
+    def select(
+        self,
+        ref: str,
+        value: str | list[str],
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """选择单个或多个 option；每项先按 value 匹配，再回退按可见文字匹配。"""
         if isinstance(value, str):
             values = [value]
@@ -3679,16 +3911,29 @@ class BrowserSession:
                 )
                 if not value_not_found:
                     raise
+                self._raise_if_cancelled_locked(_cancel_event)
                 locator.select_option(label=values)
 
-        return self._native_ref_action(ref, snapshot_id, "select", action)
+        return self._native_ref_action(
+            ref,
+            snapshot_id,
+            "select",
+            action,
+            _cancel_event=_cancel_event,
+        )
 
-    def press(self, key: str, snapshot_id: str) -> str:
+    def press(
+        self,
+        key: str,
+        snapshot_id: str,
+        *,
+        _cancel_event: threading.Event | None = None,
+    ) -> str:
         """向当前页面发送键盘按键或快捷键组合，例如 Control+L。"""
         if not isinstance(key, str) or not key.strip():
             return _err("invalid_args", "key 必须是非空字符串")
         with self._lock:
-            return self._native_page_action(snapshot_id, "keyboard", lambda: self._page.keyboard.press(key))
+            return self._native_page_action(snapshot_id, "keyboard", lambda: self._page.keyboard.press(key), _cancel_event=_cancel_event)
 
     def keyboard_shortcut(self, key: str, snapshot_id: str) -> str:
         """页面级键盘快捷键的语义别名。"""
@@ -3727,10 +3972,14 @@ class BrowserSession:
         snapshot_id: str,
         name: str,
         action: Callable[[Any], None],
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         if not isinstance(ref, str) or not ref:
             return _err("invalid_ref", "ref 必须是非空字符串")
         with self._lock:
+            if self._cancel_requested(_cancel_event):
+                return self._cancelled_result_locked(execution_state="not_started")
             self._require_started_locked()
             no_page_error = self._require_current_page_locked()
             if no_page_error is not None:
@@ -3742,7 +3991,10 @@ class BrowserSession:
             if isinstance(target, str):
                 return target
             return self._run_native_action_locked(
-                name, lambda: action(target.locator), targets=[target]
+                name,
+                lambda: action(target.locator),
+                targets=[target],
+                _cancel_event=_cancel_event,
             )
 
     def _native_page_action(
@@ -3750,6 +4002,8 @@ class BrowserSession:
         snapshot_id: str,
         name: str,
         action: Callable[[], None],
+        *,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         self._require_started_locked()
         no_page_error = self._require_current_page_locked()
@@ -3758,7 +4012,13 @@ class BrowserSession:
         stale_error = self._validate_snapshot_locked(snapshot_id)
         if stale_error is not None:
             return stale_error
-        return self._run_native_action_locked(name, action)
+        if self._cancel_requested(_cancel_event):
+            return self._cancelled_result_locked(execution_state="not_started")
+        return self._run_native_action_locked(
+            name,
+            action,
+            _cancel_event=_cancel_event,
+        )
 
     def _locator_for_ref_locked(self, ref: str) -> _NativeTarget | str:
         """为当前快照的 backend DOM 节点创建只供本次操作使用的 Locator。"""
@@ -3867,10 +4127,15 @@ class BrowserSession:
         *,
         targets: list[_NativeTarget] | None = None,
         error_mapper: Callable[[Exception], str] | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         return self._execute_with_dialog_policy_locked(
             lambda: self._run_native_action_core_locked(
-                name, action, targets=targets, error_mapper=error_mapper
+                name,
+                action,
+                targets=targets,
+                error_mapper=error_mapper,
+                _cancel_event=_cancel_event,
             )
         )
 
@@ -3881,15 +4146,25 @@ class BrowserSession:
         *,
         targets: list[_NativeTarget] | None = None,
         error_mapper: Callable[[Exception], str] | None = None,
+        _cancel_event: threading.Event | None = None,
     ) -> str:
         before_pages = set(self._pages)
         previous_url = self._page.url
         previous_position = self._position_marker_locked()
         previous_marker = self._dom_marker_locked()
         # 原生动作一旦发出，旧 ref 不能再被后续请求使用。
+        if self._cancel_requested(_cancel_event):
+            return self._cancelled_result_locked(execution_state="not_started")
         self._invalidate_snapshot_locked()
+        action_started = False
         try:
+            action_started = True
             action()
+            self._raise_if_cancelled_locked(_cancel_event)
+        except _BrowserOperationCancelled:
+            result = self._cancelled_result_locked(
+                execution_state="unknown" if action_started else "not_started"
+            )
         except Exception as exc:
             result = self._interaction_failure_with_observation_locked(
                 error_mapper(exc) if error_mapper is not None else self._classify_interaction_error(exc),
