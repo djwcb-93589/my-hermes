@@ -77,6 +77,17 @@ class CLIStreamRenderer:
             and self._last_completed_content == final_response
         )
 
+    def discard_current_response(self) -> None:
+        """标记当前已显示正文失效，避免把取消前的片段当作最终回答。"""
+        attempt_id = self._current_attempt_id
+        attempt = self._attempts.get(attempt_id) if attempt_id is not None else None
+        if attempt is not None and attempt.displayed:
+            self.ensure_line_break()
+            print("[本次响应已停止，以上内容不会保存]", flush=True)
+            attempt.line_terminated = True
+        self._last_completed_attempt_id = None
+        self._last_completed_content = ""
+
     @staticmethod
     def _display_text_delta(attempt: _AttemptDisplay, text: str) -> None:
         if not text:

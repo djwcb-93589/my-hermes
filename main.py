@@ -43,6 +43,7 @@ def cli_loop() -> None:
         cli_input=CLIInput(),
         post_user_input=events.post_user_input,
         post_shutdown=events.post_shutdown,
+        post_cancel_request=events.post_cancel_request,
     )
     worker = CLIWorker(
         stream_sink=events.post_stream_event,

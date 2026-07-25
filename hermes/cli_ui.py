@@ -34,6 +34,36 @@ class CLIInput:
 
     def __init__(self) -> None:
         self._session = PromptSession() if _is_interactive_terminal() else None
+        self._interrupt_callback: Callable[[], None] | None = None
+        self._interrupt_lock = threading.Lock()
+        self._programmatic_cancel = threading.Event()
+
+    def set_interrupt_callback(self, callback: Callable[[], None]) -> None:
+        """设置由输入线程检测到 Ctrl+C 时使用的线程安全通知入口。"""
+        with self._interrupt_lock:
+            self._interrupt_callback = callback
+
+    def cancel_current_input(self) -> bool:
+        """从 controller 线程安全地取消当前 prompt_toolkit 输入编辑。"""
+        if self._session is None:
+            return False
+        app = getattr(self._session, "app", None)
+        loop = getattr(app, "loop", None)
+        if app is None or loop is None or not loop.is_running():
+            return False
+
+        self._programmatic_cancel.set()
+
+        def interrupt_prompt() -> None:
+            if app.is_running:
+                app.exit(exception=KeyboardInterrupt)
+
+        try:
+            loop.call_soon_threadsafe(interrupt_prompt)
+        except RuntimeError:
+            self._programmatic_cancel.clear()
+            return False
+        return True
 
     def prompt(self) -> str:
         """读取一条用户输入；Ctrl+C 仅取消本次输入并重新提示。"""
@@ -43,9 +73,18 @@ class CLIInput:
                     return self._session.prompt(PROMPT_TEXT)
                 return input(PROMPT_TEXT)
             except KeyboardInterrupt:
+                if not self._programmatic_cancel.is_set():
+                    self._notify_interrupt()
+                self._programmatic_cancel.clear()
                 print()
             except EOFError:
                 return ""
+
+    def _notify_interrupt(self) -> None:
+        with self._interrupt_lock:
+            callback = self._interrupt_callback
+        if callback is not None:
+            callback()
 
 
 class CLIUI:
@@ -57,10 +96,12 @@ class CLIUI:
         cli_input: CLIInput,
         post_user_input: Callable[[str], None],
         post_shutdown: Callable[[], None],
+        post_cancel_request: Callable[[], None],
     ) -> None:
         self._cli_input = cli_input
         self._post_user_input = post_user_input
         self._post_shutdown = post_shutdown
+        cli_input.set_interrupt_callback(post_cancel_request)
         self._renderer = CLIStreamRenderer()
         self._stop_input = threading.Event()
         self._allow_next_input = threading.Event()
@@ -83,6 +124,10 @@ class CLIUI:
         """阻止输入线程在当前事件完成后继续请求新输入。"""
         self._stop_input.set()
         self._allow_next_input.set()
+
+    def cancel_current_input(self) -> None:
+        """请求输入组件清除当前正在编辑的文本，不直接访问其内部 Buffer。"""
+        self._cli_input.cancel_current_input()
 
     def begin_stream_request(self) -> None:
         """为下一次模型请求重置流式正文显示状态。"""
@@ -139,6 +184,8 @@ class CLIUI:
         if result.get("status") == "awaiting_approval":
             self._show_approval_prompt(result)
             return
+        if result.get("status") == "cancelled":
+            self._renderer.discard_current_response()
         final_response = str(result.get("final_response", ""))
         if not self._renderer.was_final_response_streamed(final_response):
             self.show_message(final_response)

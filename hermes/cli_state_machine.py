@@ -6,7 +6,7 @@ from collections import deque
 import json
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Protocol
 
@@ -85,6 +85,7 @@ class CLIWorkerTask:
     approval_request: dict | None = None
     approval_scope: str = "once"
     current_session_id: str | None = None
+    cancel_event: threading.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class CLIEventType(str, Enum):
     USER_INPUT = "user_input"
     WORKER_RESULT = "worker_result"
     STREAM_EVENT = "stream_event"
+    CANCEL_REQUEST = "cancel_request"
     SHUTDOWN = "shutdown"
 
 
@@ -117,6 +119,7 @@ class CLIEvent:
     user_input: str = ""
     worker_result: CLIWorkerResult | None = None
     stream_event: object | None = None
+    input_was_cancelled: bool = False
 
     @classmethod
     def user_input_event(cls, user_input: str) -> "CLIEvent":
@@ -133,6 +136,17 @@ class CLIEvent:
     @classmethod
     def shutdown_event(cls) -> "CLIEvent":
         return cls(event_type=CLIEventType.SHUTDOWN)
+
+    @classmethod
+    def cancel_request_event(
+        cls,
+        *,
+        input_was_cancelled: bool = False,
+    ) -> "CLIEvent":
+        return cls(
+            event_type=CLIEventType.CANCEL_REQUEST,
+            input_was_cancelled=input_was_cancelled,
+        )
 
 
 class CLIEventQueue:
@@ -158,6 +172,9 @@ class CLIEventQueue:
 
     def post_shutdown(self) -> None:
         self.put(CLIEvent.shutdown_event())
+
+    def post_cancel_request(self) -> None:
+        self.put(CLIEvent.cancel_request_event(input_was_cancelled=True))
 
 
 class CLIWorker:
@@ -278,6 +295,9 @@ class CLIWorker:
                 session_id,
                 task.cached_prompt,
                 session_key=session_id,
+                cancel_checker=(
+                    task.cancel_event.is_set if task.cancel_event is not None else None
+                ),
                 tool_policy=task.tool_policy,
                 stream_sink=self._stream_sink,
             )
@@ -319,6 +339,9 @@ class CLIWorker:
                 session_id=task.session_id,
                 request=task.approval_request,
                 scope=task.approval_scope,
+                cancel_checker=(
+                    task.cancel_event.is_set if task.cancel_event is not None else None
+                ),
             )
         except (RuntimeError, TypeError, ValueError) as exc:
             return CLIWorkerResult(
@@ -333,6 +356,9 @@ class CLIWorker:
             task.session_id,
             task.cached_prompt,
             session_key=task.session_id,
+            cancel_checker=(
+                task.cancel_event.is_set if task.cancel_event is not None else None
+            ),
             resume_from_history=True,
             tool_policy=task.tool_policy,
             stream_sink=self._stream_sink,
@@ -384,6 +410,8 @@ class CLIControllerUI(Protocol):
 
     def stop_input(self) -> None: ...
 
+    def cancel_current_input(self) -> None: ...
+
 
 class CLIController:
     """串行处理 CLI 事件，并独占会话、审批和普通消息队列状态。"""
@@ -408,18 +436,22 @@ class CLIController:
         self._message_queue = CLIMessageQueue()
         self._running = False
         self._shutting_down = False
+        self._current_cancel_event: threading.Event | None = None
 
     def run(self) -> None:
         """等待输入或 worker 通知；不使用轮询或定时唤醒。"""
-        while not self._shutting_down:
+        while True:
             try:
                 event = self._events.get()
             except KeyboardInterrupt:
-                # Ctrl+C 不取消运行中的任务；输入线程会继续等待下一条文本。
+                # Ctrl+C 与 /stop 使用同一协作式取消入口。
+                self._handle_cancel_request(announce_idle=False, clear_input=True)
                 continue
             self._handle_event(event)
             if event.event_type == CLIEventType.USER_INPUT and not self._shutting_down:
                 self._ui.allow_next_input()
+            if self._shutting_down and not self._running:
+                return
 
     def _handle_event(self, event: CLIEvent) -> None:
         if event.event_type == CLIEventType.USER_INPUT:
@@ -429,8 +461,20 @@ class CLIController:
             self._handle_worker_results()
             return
         if event.event_type == CLIEventType.STREAM_EVENT:
-            if event.stream_event is not None:
+            if (
+                event.stream_event is not None
+                and (
+                    self._current_cancel_event is None
+                    or not self._current_cancel_event.is_set()
+                )
+            ):
                 self._ui.handle_stream_event(event.stream_event)
+            return
+        if event.event_type == CLIEventType.CANCEL_REQUEST:
+            self._handle_cancel_request(
+                announce_idle=False,
+                clear_input=not event.input_was_cancelled,
+            )
             return
         if event.event_type == CLIEventType.SHUTDOWN:
             self._begin_shutdown()
@@ -455,6 +499,9 @@ class CLIController:
         command = "" if literal_input else command.lower()
         if command in {"/quit", "/exit"}:
             self._begin_shutdown()
+            return
+        if command == "/stop":
+            self._handle_cancel_request(announce_idle=True, clear_input=True)
             return
 
         if command in {"/sessions", "/resume", "/new"} and (
@@ -561,16 +608,23 @@ class CLIController:
     def _submit_task(self, task: CLIWorkerTask, *, begins_stream: bool = False) -> bool:
         if self._shutting_down or self._running:
             return False
+        cancel_event = (
+            threading.Event() if task.kind in {"conversation", "approve"} else None
+        )
+        if cancel_event is not None:
+            task = replace(task, cancel_event=cancel_event)
         if begins_stream:
             self._ui.begin_stream_request()
         if not self._worker.submit(task):
             return False
         self._running = True
+        self._current_cancel_event = cancel_event
         return True
 
     def _handle_worker_results(self) -> None:
         for result in self._worker.drain_results():
             self._running = False
+            self._current_cancel_event = None
             self._apply_worker_result(result)
             self._ui.show_worker_result(result)
             self._submit_next_queued_message()
@@ -621,4 +675,37 @@ class CLIController:
         cleared = self._message_queue.clear()
         if cleared:
             self._ui.show_message(f"discarded {cleared} queued message(s)")
+        self._request_current_cancellation()
         self._ui.stop_input()
+
+    def _handle_cancel_request(
+        self,
+        *,
+        announce_idle: bool,
+        clear_input: bool,
+    ) -> None:
+        if self._pending_approval is not None and not self._running:
+            if clear_input:
+                self._ui.cancel_current_input()
+            self._ui.show_message(
+                "当前任务正在等待审批，没有运行中的操作。\n请使用 /deny 拒绝审批。"
+            )
+            return
+        if not self._running or self._current_cancel_event is None:
+            if clear_input:
+                self._ui.cancel_current_input()
+            if announce_idle:
+                self._ui.show_message("当前没有正在运行的任务。")
+            return
+        if self._current_cancel_event.is_set():
+            if announce_idle:
+                self._ui.show_message("当前任务已经请求停止。")
+            return
+        self._current_cancel_event.set()
+        if clear_input:
+            self._ui.cancel_current_input()
+        self._ui.show_message("已请求停止当前任务")
+
+    def _request_current_cancellation(self) -> None:
+        if self._current_cancel_event is not None:
+            self._current_cancel_event.set()
