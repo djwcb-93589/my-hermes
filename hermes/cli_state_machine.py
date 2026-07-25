@@ -7,7 +7,8 @@ import json
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Callable
+from enum import Enum
+from typing import Callable, Protocol
 
 from hermes.cli_approval import execute_cli_approval
 from hermes.config import DB_PATH
@@ -99,17 +100,77 @@ class CLIWorkerResult:
     error: str | None = None
 
 
+class CLIEventType(str, Enum):
+    """CLI 内部事件的来源类型。"""
+
+    USER_INPUT = "user_input"
+    WORKER_RESULT = "worker_result"
+    STREAM_EVENT = "stream_event"
+    SHUTDOWN = "shutdown"
+
+
+@dataclass(frozen=True)
+class CLIEvent:
+    """交给 CLI controller 串行处理的一项输入或后台通知。"""
+
+    event_type: CLIEventType
+    user_input: str = ""
+    worker_result: CLIWorkerResult | None = None
+    stream_event: object | None = None
+
+    @classmethod
+    def user_input_event(cls, user_input: str) -> "CLIEvent":
+        return cls(event_type=CLIEventType.USER_INPUT, user_input=user_input)
+
+    @classmethod
+    def worker_result_event(cls, result: CLIWorkerResult) -> "CLIEvent":
+        return cls(event_type=CLIEventType.WORKER_RESULT, worker_result=result)
+
+    @classmethod
+    def stream_event_event(cls, stream_event: object) -> "CLIEvent":
+        return cls(event_type=CLIEventType.STREAM_EVENT, stream_event=stream_event)
+
+    @classmethod
+    def shutdown_event(cls) -> "CLIEvent":
+        return cls(event_type=CLIEventType.SHUTDOWN)
+
+
+class CLIEventQueue:
+    """连接 CLI UI、controller 和 worker 的线程安全事件队列。"""
+
+    def __init__(self) -> None:
+        self._events: queue.Queue[CLIEvent] = queue.Queue()
+
+    def put(self, event: CLIEvent) -> None:
+        self._events.put(event)
+
+    def get(self) -> CLIEvent:
+        return self._events.get()
+
+    def post_user_input(self, user_input: str) -> None:
+        self.put(CLIEvent.user_input_event(user_input))
+
+    def post_worker_result(self, result: CLIWorkerResult) -> None:
+        self.put(CLIEvent.worker_result_event(result))
+
+    def post_stream_event(self, stream_event: object) -> None:
+        self.put(CLIEvent.stream_event_event(stream_event))
+
+    def post_shutdown(self) -> None:
+        self.put(CLIEvent.shutdown_event())
+
+
 class CLIWorker:
     """串行执行 CLI 工作，并让每项数据库工作在线程内独占连接。"""
 
     def __init__(
         self,
         *,
-        renderer,
-        on_result: Callable[[CLIWorkerResult], None],
+        stream_sink: Callable[[object], None] | None,
+        publish_result: Callable[[CLIWorkerResult], None],
     ) -> None:
-        self._renderer = renderer
-        self._on_result = on_result
+        self._stream_sink = stream_sink
+        self._publish_result = publish_result
         self._tasks: queue.Queue[CLIWorkerTask | None] = queue.Queue()
         self._results: queue.Queue[CLIWorkerResult] = queue.Queue()
         self._lock = threading.Lock()
@@ -178,7 +239,7 @@ class CLIWorker:
                 )
             self._results.put(result)
             try:
-                self._on_result(result)
+                self._publish_result(result)
             except Exception:
                 pass
 
@@ -210,7 +271,6 @@ class CLIWorker:
 
     def _run_conversation_task(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
         session_id = task.session_id or create_session(conn)
-        self._renderer.begin_request()
         try:
             result = run_conversation(
                 task.user_input,
@@ -219,7 +279,7 @@ class CLIWorker:
                 task.cached_prompt,
                 session_key=session_id,
                 tool_policy=task.tool_policy,
-                stream_sink=self._renderer.handle_event,
+                stream_sink=self._stream_sink,
             )
         except Exception as exc:
             return CLIWorkerResult(
@@ -267,7 +327,6 @@ class CLIWorker:
                 error=f"approval execution failed: {exc}",
             )
 
-        self._renderer.begin_request()
         result = run_conversation(
             "",
             conn,
@@ -276,7 +335,7 @@ class CLIWorker:
             session_key=task.session_id,
             resume_from_history=True,
             tool_policy=task.tool_policy,
-            stream_sink=self._renderer.handle_event,
+            stream_sink=self._stream_sink,
         )
         return CLIWorkerResult(
             kind=task.kind,
@@ -308,3 +367,258 @@ class CLIWorker:
                 error="approval result could not be recorded",
             )
         return CLIWorkerResult(kind=task.kind, session_id=task.session_id)
+
+
+class CLIControllerUI(Protocol):
+    """controller 需要的终端显示与输入协调能力。"""
+
+    def begin_stream_request(self) -> None: ...
+
+    def handle_stream_event(self, event: object) -> None: ...
+
+    def show_worker_result(self, result: CLIWorkerResult) -> None: ...
+
+    def show_message(self, message: str) -> None: ...
+
+    def allow_next_input(self) -> None: ...
+
+    def stop_input(self) -> None: ...
+
+
+class CLIController:
+    """串行处理 CLI 事件，并独占会话、审批和普通消息队列状态。"""
+
+    def __init__(
+        self,
+        *,
+        events: CLIEventQueue,
+        worker: CLIWorker,
+        ui: CLIControllerUI,
+        cached_prompt: str,
+        tool_policy: object,
+    ) -> None:
+        self._events = events
+        self._worker = worker
+        self._ui = ui
+        self._cached_prompt = cached_prompt
+        self._tool_policy = tool_policy
+        self._session_id: str | None = None
+        self._pending_approval: dict | None = None
+        self._session_choices: dict[str, str] = {}
+        self._message_queue = CLIMessageQueue()
+        self._running = False
+        self._shutting_down = False
+
+    def run(self) -> None:
+        """等待输入或 worker 通知；不使用轮询或定时唤醒。"""
+        while not self._shutting_down:
+            try:
+                event = self._events.get()
+            except KeyboardInterrupt:
+                # Ctrl+C 不取消运行中的任务；输入线程会继续等待下一条文本。
+                continue
+            self._handle_event(event)
+            if event.event_type == CLIEventType.USER_INPUT and not self._shutting_down:
+                self._ui.allow_next_input()
+
+    def _handle_event(self, event: CLIEvent) -> None:
+        if event.event_type == CLIEventType.USER_INPUT:
+            self._handle_user_input(event.user_input)
+            return
+        if event.event_type == CLIEventType.WORKER_RESULT:
+            self._handle_worker_results()
+            return
+        if event.event_type == CLIEventType.STREAM_EVENT:
+            if event.stream_event is not None:
+                self._ui.handle_stream_event(event.stream_event)
+            return
+        if event.event_type == CLIEventType.SHUTDOWN:
+            self._begin_shutdown()
+
+    def _handle_user_input(self, raw_user_input: str) -> None:
+        stripped_user_input = raw_user_input.lstrip()
+        literal_input = (
+            raw_user_input.startswith("//") or raw_user_input[:1].isspace()
+        )
+        user_input = (
+            stripped_user_input[1:]
+            if literal_input and stripped_user_input.startswith("//")
+            else raw_user_input.strip()
+        )
+        if not user_input or (
+            not literal_input and user_input.lower() in ("quit", "exit")
+        ):
+            self._begin_shutdown()
+            return
+
+        command, _, command_argument = user_input.partition(" ")
+        command = "" if literal_input else command.lower()
+        if command in {"/quit", "/exit"}:
+            self._begin_shutdown()
+            return
+
+        if command in {"/sessions", "/resume", "/new"} and (
+            self._running or not self._message_queue.is_empty()
+        ):
+            self._ui.show_message(
+                "cannot change sessions while agent is running or messages are queued."
+            )
+            return
+
+        if self._pending_approval is not None:
+            self._handle_pending_approval(command, command_argument)
+            return
+
+        if command in {"/approve", "/deny"}:
+            self._ui.show_message("no approval is pending")
+            return
+
+        if command == "/resume":
+            selection = command_argument.strip()
+            task = (
+                CLIWorkerTask(
+                    kind="list_sessions",
+                    current_session_id=self._session_id,
+                )
+                if not selection
+                else CLIWorkerTask(
+                    kind="resume",
+                    session_id=self._session_choices.get(selection, selection),
+                )
+            )
+            self._submit_task(task)
+            return
+        if command == "/new":
+            self._session_id = None
+            self._ui.show_message("new session will start with your next message")
+            return
+        if command == "/sessions":
+            self._submit_task(
+                CLIWorkerTask(
+                    kind="list_sessions",
+                    current_session_id=self._session_id,
+                )
+            )
+            return
+        if command.startswith("/"):
+            self._ui.show_message(f"unknown command: {command}")
+            return
+
+        self._submit_or_queue_message(user_input)
+
+    def _handle_pending_approval(self, command: str, argument: str) -> None:
+        if self._running:
+            self._ui.show_message("agent is running; approval is still pending.")
+            return
+        if command == "/deny":
+            task = CLIWorkerTask(
+                kind="deny",
+                session_id=self._session_id,
+                approval_request=self._pending_approval,
+            )
+        elif command == "/approve":
+            task = CLIWorkerTask(
+                kind="approve",
+                session_id=self._session_id,
+                cached_prompt=self._cached_prompt,
+                tool_policy=self._tool_policy,
+                approval_request=self._pending_approval,
+                approval_scope=argument.strip().lower() or "once",
+            )
+        else:
+            self._ui.show_message("enter /approve [once|session] or /deny")
+            return
+        if self._session_id is None or not self._submit_task(task, begins_stream=True):
+            self._ui.show_message("agent is running; approval is still pending.")
+
+    def _submit_or_queue_message(self, user_input: str) -> None:
+        if self._running or not self._message_queue.is_empty():
+            if self._message_queue.enqueue(user_input):
+                self._ui.show_message("message queued.")
+            else:
+                self._ui.show_message(
+                    f"message queue is full (limit: {self._message_queue.limit})."
+                )
+            return
+        task = self._conversation_task(user_input)
+        if not self._submit_task(task, begins_stream=True):
+            if self._message_queue.enqueue(user_input):
+                self._ui.show_message("message queued.")
+            else:
+                self._ui.show_message(
+                    f"message queue is full (limit: {self._message_queue.limit})."
+                )
+
+    def _conversation_task(self, user_input: str) -> CLIWorkerTask:
+        return CLIWorkerTask(
+            kind="conversation",
+            session_id=self._session_id,
+            user_input=user_input,
+            cached_prompt=self._cached_prompt,
+            tool_policy=self._tool_policy,
+        )
+
+    def _submit_task(self, task: CLIWorkerTask, *, begins_stream: bool = False) -> bool:
+        if self._shutting_down or self._running:
+            return False
+        if begins_stream:
+            self._ui.begin_stream_request()
+        if not self._worker.submit(task):
+            return False
+        self._running = True
+        return True
+
+    def _handle_worker_results(self) -> None:
+        for result in self._worker.drain_results():
+            self._running = False
+            self._apply_worker_result(result)
+            self._ui.show_worker_result(result)
+            self._submit_next_queued_message()
+
+    def _apply_worker_result(self, result: CLIWorkerResult) -> None:
+        if result.kind == "list_sessions":
+            if result.error is None:
+                self._session_choices = {
+                    str(index): str(session["session_id"])
+                    for index, session in enumerate(result.sessions, start=1)
+                }
+            return
+        if result.kind == "resume":
+            if result.error is None:
+                self._session_id = result.session_id
+            return
+        if result.session_id is not None:
+            self._session_id = result.session_id
+        if result.kind == "deny" and result.error is None:
+            self._pending_approval = None
+            return
+        conversation_result = result.conversation_result
+        if not isinstance(conversation_result, dict):
+            return
+        if conversation_result.get("status") == "awaiting_approval":
+            request = conversation_result.get("approval_request")
+            self._pending_approval = request if isinstance(request, dict) else None
+        else:
+            self._pending_approval = None
+
+    def _submit_next_queued_message(self) -> None:
+        if (
+            self._shutting_down
+            or self._running
+            or self._pending_approval is not None
+        ):
+            return
+        user_input = self._message_queue.peek()
+        if user_input is None:
+            return
+        if self._submit_task(self._conversation_task(user_input), begins_stream=True):
+            self._message_queue.dequeue()
+
+    def _begin_shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        cleared = self._message_queue.clear()
+        if cleared:
+            self._ui.show_message(f"discarded {cleared} queued message(s)")
+        self._ui.stop_input()
