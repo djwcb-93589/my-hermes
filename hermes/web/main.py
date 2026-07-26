@@ -9,11 +9,16 @@ from pathlib import Path
 import yaml
 
 
-def _web_db_path() -> str | None:
-    """只读取启动配置中的数据库路径，避免导入会创建模型客户端的配置模块。"""
+def _hermes_home() -> Path:
+    """解析 profile 根目录，不导入完整配置模块。"""
     project_root = Path(__file__).resolve().parents[2]
-    hermes_home = Path(os.getenv("HERMES_HOME") or project_root)
-    profile_env = _profile_env(hermes_home)
+    return Path(os.getenv("HERMES_HOME") or project_root)
+
+
+def _web_db_path(profile_env: dict[str, str] | None = None) -> str | None:
+    """只读取启动配置中的数据库路径，避免导入会创建模型客户端的配置模块。"""
+    hermes_home = _hermes_home()
+    profile_env = profile_env if profile_env is not None else _profile_env(hermes_home)
     configured_path = os.getenv("DB_PATH")
     if not configured_path:
         configured_path = profile_env.get("DB_PATH")
@@ -86,9 +91,21 @@ def main() -> None:
         ) from exc
 
     from hermes.web.app import create_app
+    from hermes.web.control_service import CronControlService
     from hermes.web.read_service import ReadService
+    from hermes.web.security import ControlAuthenticator
 
-    app = create_app(ReadService(_web_db_path()))
+    hermes_home = _hermes_home()
+    profile_env = _profile_env(hermes_home)
+    db_path = _web_db_path(profile_env)
+    control_token = os.getenv("HERMES_WEB_CONTROL_TOKEN") or profile_env.get(
+        "HERMES_WEB_CONTROL_TOKEN"
+    )
+    app = create_app(
+        ReadService(db_path),
+        CronControlService(db_path),
+        ControlAuthenticator.from_token(control_token),
+    )
 
     # 关闭访问日志，避免把查询参数或会话标识写入日志。
     uvicorn.run(

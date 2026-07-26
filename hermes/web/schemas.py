@@ -128,3 +128,20 @@ class ToolsetListResponse(BaseModel):
 
     items: list[ToolsetSummary]
     tool_details_available: bool
+
+
+class CronControlResponse(BaseModel):
+    """暂停或恢复 Cron 任务后的最小控制确认。"""
+
+    job_id: str
+    action: str
+    status: str
+
+
+class CronRunRequestResponse(BaseModel):
+    """已持久化的手动运行请求，不代表任务已开始执行。"""
+
+    job_id: str
+    action: str
+    status: str
+    run_id: str
