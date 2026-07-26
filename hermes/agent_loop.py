@@ -55,6 +55,8 @@ class AgentLoopResult:
     fatal: bool = False
     retryable: bool = True
     approval_request: dict | None = None
+    tool_batches: int = 0
+    tool_call_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +662,8 @@ class AgentLoop:
         # 运行期状态(每次 run() 重置)
         self.iterations = 0
         self.tools_used: list[str] = []
+        self.tool_batches = 0
+        self.tool_call_count = 0
         # 工具错误计数:按 (tool_name, error_type) 累计连续失败次数。
         # 工具成功调用后清掉该 tool_name 的所有计数,避免历史错误干扰。
         self._tool_error_counts: dict[tuple[str, str], int] = {}
@@ -668,6 +672,10 @@ class AgentLoop:
 
     def _is_cancelled(self) -> bool:
         return self.cancel_checker is not None and bool(self.cancel_checker())
+
+    def _record_tool_batch(self, tool_calls) -> None:
+        self.tool_batches += 1
+        self.tool_call_count += len(tool_calls)
 
     def _cancel_result(self, messages: list[dict]) -> "AgentLoopResult":
         return self._result(
@@ -803,6 +811,8 @@ class AgentLoop:
         顶层 try/except 兜底:任何未预期异常都包装成 internal_error,
         不让原始异常(openai client / sqlite3 / json)冒到最外层。
         """
+        self.tool_batches = 0
+        self.tool_call_count = 0
         try:
             return self._run_inner(user_message)
         except Exception as exc:
@@ -816,6 +826,8 @@ class AgentLoop:
         messages = self.init_messages(user_message)
         self.iterations = 0
         self.tools_used = []
+        self.tool_batches = 0
+        self.tool_call_count = 0
 
         for iteration in range(self.max_iterations):
             # 1) iteration 开始前检查取消
@@ -944,6 +956,7 @@ class AgentLoop:
                 # 3) tool 调用前检查取消
                 if self._is_cancelled():
                     return self._cancel_result(messages)
+                self._record_tool_batch(assistant_msg.tool_calls)
                 try:
                     tool_messages, tool_error = self.process_tool_calls(
                         assistant_msg.tool_calls, messages
@@ -1315,6 +1328,8 @@ class AgentLoop:
             ok=ok, status=status, summary=summary,
             messages=messages, iterations=self.iterations,
             tools_used=list(self.tools_used),
+            tool_batches=self.tool_batches,
+            tool_call_count=self.tool_call_count,
             error=error, error_type=error_type,
             fatal=fatal, retryable=retryable,
             approval_request=approval_request,
@@ -1363,6 +1378,8 @@ class AsyncAgentLoop(AgentLoop):
 
     async def run(self, user_message: str) -> AgentLoopResult:
         """异步跑一次完整循环,Task 取消必须原样向上传播。"""
+        self.tool_batches = 0
+        self.tool_call_count = 0
         try:
             return await self._run_inner(user_message)
         except asyncio.CancelledError:
@@ -1377,6 +1394,8 @@ class AsyncAgentLoop(AgentLoop):
         messages = self.init_messages(user_message)
         self.iterations = 0
         self.tools_used = []
+        self.tool_batches = 0
+        self.tool_call_count = 0
 
         for iteration in range(self.max_iterations):
             if self._is_cancelled():
@@ -1500,6 +1519,7 @@ class AsyncAgentLoop(AgentLoop):
                 self.on_tool_dispatch_start()
                 if self._is_cancelled():
                     return self._cancel_result(messages)
+                self._record_tool_batch(assistant_msg.tool_calls)
                 try:
                     tool_messages, tool_error = await self.process_tool_calls(
                         assistant_msg.tool_calls, messages,

@@ -86,6 +86,8 @@ def _result(
     *,
     iterations: int = 0,
     tools_used: list[str] | None = None,
+    tool_batches: int = 0,
+    tool_call_count: int = 0,
     child_session_key: str = "",
     error: str | None = None,
 ) -> str:
@@ -96,6 +98,8 @@ def _result(
         "summary": summary,
         "iterations": iterations,
         "tools_used": tools_used or [],
+        "tool_batches": tool_batches,
+        "tool_call_count": tool_call_count,
         "child_session_key": child_session_key,
         "error": error,
     }, ensure_ascii=False)
@@ -253,6 +257,7 @@ def run_delegate_child(
             return {
                 "ok": False, "status": "invalid_args",
                 "summary": "", "iterations": 0, "tools_used": [],
+                "tool_batches": 0, "tool_call_count": 0,
                 "error": (f"no usable tools after applying child restrictions; "
                           f"toolsets={toolsets!r}"),
             }
@@ -278,6 +283,8 @@ def run_delegate_child(
             "summary": result.summary,
             "iterations": result.iterations,
             "tools_used": list(result.tools_used),
+            "tool_batches": result.tool_batches,
+            "tool_call_count": result.tool_call_count,
             "error": result.error,
         }
     except Exception as exc:
@@ -286,6 +293,7 @@ def run_delegate_child(
         return {
             "ok": False, "status": "tool_error",
             "summary": "", "iterations": 0, "tools_used": [],
+            "tool_batches": 0, "tool_call_count": 0,
             "error": repr(exc),
         }
     finally:

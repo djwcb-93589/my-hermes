@@ -40,6 +40,8 @@ class DelegateJob:
     summary: str = ""
     iterations: int = 0
     tools_used: list[str] = field(default_factory=list)
+    tool_batches: int = 0
+    tool_call_count: int = 0
     error: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -84,6 +86,8 @@ class DelegateJobManager:
                 "finished_at": job.finished_at,
                 "iterations": job.iterations,
                 "tools_used": list(job.tools_used),
+                "tool_batches": job.tool_batches,
+                "tool_call_count": job.tool_call_count,
                 "error": job.error,
             }
 
@@ -117,6 +121,8 @@ class DelegateJobManager:
                 "summary": job.summary,
                 "iterations": job.iterations,
                 "tools_used": list(job.tools_used),
+                "tool_batches": job.tool_batches,
+                "tool_call_count": job.tool_call_count,
                 "child_session_key": job.child_session_key,
                 "error": job.error,
             }
@@ -230,6 +236,8 @@ class DelegateJobManager:
                 job.summary = result.get("summary", "") or ""
                 job.iterations = int(result.get("iterations", 0) or 0)
                 job.tools_used = list(result.get("tools_used", []) or [])
+                job.tool_batches = int(result.get("tool_batches", 0) or 0)
+                job.tool_call_count = int(result.get("tool_call_count", 0) or 0)
                 job.error = result.get("error")
                 # 保留 child AgentLoop 的原始状态,不粗暴归并
                 child_status = result.get("status")

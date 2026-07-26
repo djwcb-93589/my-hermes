@@ -780,6 +780,8 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
         "fatal": result.fatal,
         "retryable": result.retryable,
         "approval_request": result.approval_request,
+        "tool_batches": result.tool_batches,
+        "tool_call_count": result.tool_call_count,
     }
 
 

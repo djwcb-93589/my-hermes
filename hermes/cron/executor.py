@@ -86,6 +86,8 @@ class CronExecutionResult:
     iterations: int
     tools_used: tuple[str, ...]
     artifacts: tuple[dict, ...]
+    tool_batches: int = 0
+    tool_call_count: int = 0
     error_type: str | None = None
     error: str | None = None
     timed_out: bool = False
@@ -570,6 +572,8 @@ class CronExecutor:
                 iterations=loop_result.iterations,
                 tools_used=tuple(loop_result.tools_used),
                 artifacts=tuple(artifacts),
+                tool_batches=loop_result.tool_batches,
+                tool_call_count=loop_result.tool_call_count,
                 error_type=error_type,
                 error=final_error,
                 timed_out=error_type == "timeout",
