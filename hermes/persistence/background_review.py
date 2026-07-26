@@ -140,6 +140,25 @@ def get_background_review_state(
     return _state_from_row(row)
 
 
+def background_review_claim_is_valid(
+    conn: sqlite3.Connection,
+    session_id: str,
+    claim_token: str,
+) -> bool:
+    """只读确认指定领取凭证是否仍属于当前会话状态。"""
+    _require_session_id(session_id)
+    if not isinstance(claim_token, str) or not claim_token:
+        raise DBError("background review claim_token must be a non-empty string")
+    row = conn.execute(
+        """
+        SELECT 1 FROM background_review_state
+        WHERE session_id=? AND claim_token=?
+        """,
+        (session_id, claim_token),
+    ).fetchone()
+    return row is not None
+
+
 def record_background_review_progress(
     conn: sqlite3.Connection,
     session_id: str,

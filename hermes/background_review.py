@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import threading
@@ -11,11 +12,19 @@ from dataclasses import dataclass
 from hermes.agent_loop import AgentLoop
 from hermes.config import DB_PATH, MODEL, MODEL_MAX_OUTPUT_TOKENS, client as _default_client
 from hermes.persistence.background_review import (
+    background_review_claim_is_valid,
     complete_background_review_claim,
     fail_background_review_claim,
 )
 from hermes.persistence.schema import init_db
-from hermes.tools import ExecutionEnvironment, ToolPolicy, registry, register_all
+from hermes.tools import (
+    ApprovalMode,
+    ExecutionEnvironment,
+    ToolPolicy,
+    ToolRiskLevel,
+    registry,
+    register_all,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -89,6 +98,13 @@ class ReviewAgentLoop(AgentLoop):
 
     def dispatch_one(self, tool_call):
         """拒绝不在本次动态解析能力边界内的工具调用。"""
+        if self._is_cancelled():
+            tool_name = self._tool_call_name(tool_call)
+            return (
+                f"(error: tool '{tool_name}' cancelled because review claim expired)",
+                "cancelled",
+                "background review claim expired before tool dispatch",
+            )
         tool_name = self._tool_call_name(tool_call)
         if tool_name not in self.allowed_tool_names:
             return (
@@ -97,6 +113,36 @@ class ReviewAgentLoop(AgentLoop):
                 f"disabled tool invoked in background review: {tool_name!r}",
             )
         return super().dispatch_one(tool_call)
+
+    def _classify_tool_error(
+        self,
+        output: str,
+        err_status: str | None,
+    ) -> tuple[bool, str]:
+        """把后台记忆工具的明确错误全部提升为本次审视失败。"""
+        fatal, error_type = super()._classify_tool_error(output, err_status)
+        if fatal:
+            return fatal, error_type
+        if err_status:
+            return True, error_type or err_status
+
+        payload = None
+        if isinstance(output, str):
+            try:
+                payload = json.loads(output)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(payload, dict):
+            payload_error_type = payload.get("error_type")
+            if (
+                payload.get("ok") is False
+                or "error" in payload
+                or bool(payload_error_type)
+            ):
+                return True, str(payload_error_type or "tool_error")
+        if isinstance(output, str) and output.lstrip().lower().startswith("(error:"):
+            return True, "tool_error"
+        return False, error_type
 
 
 class BackgroundReviewExecutor:
@@ -118,6 +164,7 @@ class BackgroundReviewExecutor:
         self.registry = tool_registry
         self._lock = threading.Lock()
         self._active_jobs = 0
+        register_all(self.registry)
 
     def submit(
         self,
@@ -192,11 +239,13 @@ class BackgroundReviewExecutor:
         conn = None
         try:
             conn = init_db(self.db_path)
-            register_all()
             resolution = self.registry.resolve(
                 ToolPolicy(
                     ExecutionEnvironment.BACKGROUND_REVIEW,
                     enabled_toolsets=frozenset({"memory"}),
+                    unattended=True,
+                    allowed_approval_modes=frozenset({ApprovalMode.NONE.value}),
+                    max_risk_level=ToolRiskLevel.MEDIUM,
                 )
             )
             if not resolution.definitions:
@@ -213,6 +262,9 @@ class BackgroundReviewExecutor:
                 client=self.client,
                 session_key=claim["session_id"],
                 model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
+                cancel_checker=lambda: not background_review_claim_is_valid(
+                    conn, claim["session_id"], claim["claim_token"]
+                ),
             )
             result = loop.run("")
             if result.ok and result.status == "completed":

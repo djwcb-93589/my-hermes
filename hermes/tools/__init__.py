@@ -309,8 +309,9 @@ class ToolRegistry:
 registry = ToolRegistry()
 
 
-def register_all() -> None:
+def register_all(target_registry: ToolRegistry | None = None) -> None:
     """导入并注册所有工具；重复调用不会改变最终注册表。"""
+    target = registry if target_registry is None else target_registry
     from hermes.tools.terminal import register as _terminal
     from hermes.tools.file import register as _file
     from hermes.tools.memory import register as _memory
@@ -321,12 +322,12 @@ def register_all() -> None:
     from hermes.tools.browser import register as _browser
     from hermes.cron.tool import register as _cron
 
-    _terminal(registry)
-    _file(registry)
-    _memory(registry)
-    _skill(registry)
-    _delegate(registry)
-    _gateway_send_file(registry)
-    _media(registry)
-    _browser(registry)
-    _cron(registry)
+    _terminal(target)
+    _file(target)
+    _memory(target)
+    _skill(target)
+    _delegate(target)
+    _gateway_send_file(target)
+    _media(target)
+    _browser(target)
+    _cron(target)
