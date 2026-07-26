@@ -9,7 +9,7 @@ import math
 import threading
 from dataclasses import dataclass
 
-from hermes.agent_loop import AgentLoop
+from hermes.agent_loop import AgentLoop, _short_error
 from hermes.config import DB_PATH, MODEL, MODEL_MAX_OUTPUT_TOKENS, client as _default_client
 from hermes.persistence.background_review import (
     background_review_claim_is_valid,
@@ -143,6 +143,72 @@ class ReviewAgentLoop(AgentLoop):
         if isinstance(output, str) and output.lstrip().lower().startswith("(error:"):
             return True, "tool_error"
         return False, error_type
+
+    def process_tool_calls(
+        self,
+        tool_calls,
+        messages,
+    ):
+        """按顺序处理审视工具；首个明确错误后仅补齐协议消息。"""
+        tool_messages: list[dict] = []
+        fatal_detail: str | None = None
+        fatal_error_type: str | None = None
+        skip_remaining = False
+
+        for tool_call in tool_calls:
+            tool_name = self._tool_call_name(tool_call)
+            if skip_remaining:
+                output = "(error: skipped because an earlier background review tool failed)"
+            else:
+                try:
+                    output, err_status, err_detail = self.dispatch_one(tool_call)
+                except Exception as exc:
+                    short = _short_error(exc)
+                    output = f"(error: tool {tool_name} failed: {short})"
+                    err_status = "dispatch"
+                    err_detail = (
+                        f"tool {tool_name!r} dispatch raised: {short}"
+                    )
+
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            }
+            messages.append(tool_msg)
+            tool_messages.append(tool_msg)
+            self.on_tool_message(tool_call, tool_msg, output)
+
+            if skip_remaining:
+                continue
+            if tool_name not in self.tools_used:
+                self.tools_used.append(tool_name)
+
+            fatal, error_type = self._classify_tool_error(output, err_status)
+            if fatal:
+                fatal_detail = (
+                    err_detail
+                    or f"fatal tool error ({error_type}) in {tool_name!r}"
+                )
+                fatal_error_type = error_type or "tool_error"
+                skip_remaining = True
+                continue
+
+            if not error_type and not err_status:
+                self._clear_tool_error_counts(tool_name)
+
+        if fatal_detail is not None:
+            return tool_messages, self._result(
+                ok=False,
+                status="tool_error",
+                summary=self.last_assistant_text(messages),
+                messages=messages,
+                error=fatal_detail,
+                error_type=fatal_error_type or "tool_error",
+                fatal=True,
+                retryable=False,
+            )
+        return tool_messages, None
 
 
 class BackgroundReviewExecutor:
