@@ -233,10 +233,21 @@ def claim_due_background_review(
     claim_ttl_seconds = _require_positive_number(
         claim_ttl_seconds, "claim_ttl_seconds"
     )
-    if memory_interval == 0 and skill_interval == 0:
-        return None
     timestamp = _timestamp(now)
     with _immediate_transaction(conn):
+        try:
+            conn.execute(
+                """
+                INSERT INTO background_review_state (session_id, updated_at)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, timestamp),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DBError(f"background review state creation failed: {exc}") from exc
+        if memory_interval == 0 and skill_interval == 0:
+            return None
         state = get_background_review_state(conn, session_id)
         if state is None:
             return None
@@ -263,7 +274,8 @@ def claim_due_background_review(
             """
             UPDATE background_review_state
             SET claim_token=?, claim_memory_upto=?, claim_skill_upto=?,
-                claim_started_at=?, last_attempt_at=?, last_error=NULL, updated_at=?
+                claim_started_at=?, retry_after=NULL, last_attempt_at=?,
+                last_error=NULL, updated_at=?
             WHERE session_id=?
             """,
             (

@@ -15,6 +15,7 @@ class ExecutionEnvironment(str, Enum):
     GATEWAY = "gateway"
     CRON = "cron"
     DELEGATE = "delegate"
+    BACKGROUND_REVIEW = "background_review"
 
 
 class ApprovalMode(str, Enum):
