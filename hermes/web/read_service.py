@@ -29,6 +29,7 @@ from hermes.web.schemas import (
     MessageDetail,
     SessionDetailResponse,
     SessionListResponse,
+    SessionSummary,
     SkillListResponse,
     SkillSummary,
     StatusResponse,
