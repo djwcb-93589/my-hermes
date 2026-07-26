@@ -324,6 +324,11 @@ def _validate_background_review_config(config: dict) -> None:
                 f"background_review.{field_name} must be a non-negative integer"
             )
         review[field_name] = value
+    if review["skill_interval"] != 0:
+        raise ValueError(
+            "background_review.skill_interval must remain 0 "
+            "until skill review is supported"
+        )
 
     for field_name in ("claim_ttl_seconds", "retry_cooldown_seconds"):
         value = review.get(field_name, defaults[field_name])
