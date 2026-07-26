@@ -309,7 +309,15 @@ def mark_background_review_handled(
     if not memory and not skills:
         raise DBError("background review must handle memory or skills")
     timestamp = _timestamp(now)
-    with transaction(conn):
+    with _immediate_transaction(conn):
+        state = get_background_review_state(conn, session_id)
+        if state is None:
+            raise DBError("background review state not found")
+        invalidate_claim = (
+            (memory and state["review_memory"])
+            or (skills and state["review_skills"])
+        )
+        clear_attempt_state = memory or invalidate_claim
         changed = conn.execute(
             """
             UPDATE background_review_state
@@ -320,10 +328,40 @@ def mark_background_review_handled(
                     ELSE memory_reviewed_message_id END,
                 skill_reviewed_total=CASE
                     WHEN ? THEN skill_tool_batch_total ELSE skill_reviewed_total END,
+                claim_token=CASE WHEN ? THEN NULL ELSE claim_token END,
+                claim_memory_upto=CASE
+                    WHEN ? THEN NULL ELSE claim_memory_upto END,
+                claim_memory_message_upto=CASE
+                    WHEN ? THEN NULL ELSE claim_memory_message_upto END,
+                claim_skill_upto=CASE
+                    WHEN ? THEN NULL ELSE claim_skill_upto END,
+                claim_started_at=CASE
+                    WHEN ? THEN NULL ELSE claim_started_at END,
+                retry_memory_upto=CASE
+                    WHEN ? THEN NULL ELSE retry_memory_upto END,
+                retry_memory_message_upto=CASE
+                    WHEN ? THEN NULL ELSE retry_memory_message_upto END,
+                retry_after=CASE WHEN ? THEN NULL ELSE retry_after END,
+                last_error=CASE WHEN ? THEN NULL ELSE last_error END,
                 updated_at=?
             WHERE session_id=?
             """,
-            (int(memory), int(memory), int(skills), timestamp, session_id),
+            (
+                int(memory),
+                int(memory),
+                int(skills),
+                int(invalidate_claim),
+                int(invalidate_claim),
+                int(invalidate_claim),
+                int(invalidate_claim),
+                int(invalidate_claim),
+                int(memory),
+                int(memory),
+                int(clear_attempt_state),
+                int(clear_attempt_state),
+                timestamp,
+                session_id,
+            ),
         ).rowcount
         if changed != 1:
             raise DBError("background review state not found")
@@ -376,31 +414,41 @@ def claim_due_background_review(
         ):
             return None
 
-        retry_memory = state["retry_memory"]
-        review_memory = memory_interval > 0 and (
-            retry_memory or state["memory_pending"] >= memory_interval
-        )
-        review_skills = (
-            skill_interval > 0 and state["skill_pending"] >= skill_interval
-        )
+        expired_claim = state["inflight"]
+        if expired_claim:
+            review_memory = state["review_memory"]
+            review_skills = state["review_skills"]
+            memory_upto = state["claim_memory_upto"]
+            memory_message_upto = state["claim_memory_message_upto"]
+            skill_upto = state["claim_skill_upto"]
+        else:
+            retry_memory = state["retry_memory"]
+            review_memory = memory_interval > 0 and (
+                retry_memory or state["memory_pending"] >= memory_interval
+            )
+            review_skills = (
+                skill_interval > 0 and state["skill_pending"] >= skill_interval
+            )
+            if retry_memory:
+                memory_upto = state["retry_memory_upto"]
+                memory_message_upto = state["retry_memory_message_upto"]
+            elif review_memory:
+                memory_upto = state["memory_turn_total"]
+                memory_message_upto = state["memory_message_total_upto"]
+            else:
+                memory_upto = None
+                memory_message_upto = None
+            skill_upto = (
+                state["skill_tool_batch_total"] if review_skills else None
+            )
         if not review_memory and not review_skills:
             return None
 
         claim_token = str(uuid.uuid4())
-        if retry_memory:
-            memory_upto = state["retry_memory_upto"]
-            memory_message_upto = state["retry_memory_message_upto"]
-        elif review_memory:
-            memory_upto = state["memory_turn_total"]
-            memory_message_upto = state["memory_message_total_upto"]
-        else:
-            memory_upto = None
-            memory_message_upto = None
         if review_memory and (
             memory_message_upto <= state["memory_reviewed_message_id"]
         ):
             raise DBError("background review memory claim has no message window")
-        skill_upto = state["skill_tool_batch_total"] if review_skills else None
         changed = conn.execute(
             """
             UPDATE background_review_state
