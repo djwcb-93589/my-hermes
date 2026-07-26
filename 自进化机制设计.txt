@@ -1,0 +1,4 @@
+1.memory和skill使用两套计数，但是触发review时都是输入完整的上下文（hermes-agent也是这么做的）：比如第一轮review第一条到第十条对话，第二轮触发时review第一到第二十条对话
+2.systemprompt存有记忆，但是还是可能出现写入含义相同但是表述不同的记忆的情况（完全一致的记忆在写记忆时会被阻止）。
+3.hermes-agent兜底：记忆满的时候会自动合并
+4.my-hermes改进：做增量review + 实时读取memory（后续可以加入检索，现在是全量读取） + llm判断是否重复，是否需要写入

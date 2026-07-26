@@ -26,6 +26,7 @@ from hermes.persistence.core import (
     create_session,
     ensure_session,
     get_gateway_visible_session_messages,
+    get_last_session_message_id,
     get_session_messages,
     list_cli_sessions,
     list_model_call_events,

@@ -26,6 +26,7 @@ from hermes.persistence.background_review import (
     fail_background_review_claim,
     record_background_review_progress,
 )
+from hermes.persistence.core import get_last_session_message_id
 from hermes.persistence.schema import init_db
 from hermes.tools import (
     ApprovalMode,
@@ -292,11 +293,29 @@ class BackgroundReviewCoordinator:
         """记录一次已启动前台循环，并在完整成功后尽力提交后台审视。"""
         if not self._enabled():
             return
+        memory_turns = 0
+        memory_message_upto = None
+        if result.ok and result.status == "completed":
+            try:
+                memory_message_upto = get_last_session_message_id(conn, session_id)
+            except Exception as exc:
+                logger.warning(
+                    "background review could not read foreground message boundary: %s",
+                    type(exc).__name__,
+                )
+            else:
+                if memory_message_upto is None:
+                    logger.warning(
+                        "background review skipped memory progress without messages"
+                    )
+                else:
+                    memory_turns = 1
         try:
             record_background_review_progress(
                 conn,
                 session_id,
-                memory_turns=0 if resume_from_history else 1,
+                memory_turns=memory_turns,
+                memory_message_upto=memory_message_upto,
                 skill_tool_batches=result.tool_batches,
             )
         except Exception as exc:
@@ -380,13 +399,36 @@ class BackgroundReviewCoordinator:
         """异步入口遵守 Gateway 持久化边界，且不阻塞事件循环提交快照。"""
         if not self._enabled():
             return
+        memory_turns = 0
+        memory_message_upto = None
+        if result.ok and result.status == "completed":
+            try:
+                memory_message_upto = await self._persist_async(
+                    persistence_call,
+                    conn,
+                    get_last_session_message_id,
+                    session_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "background review could not read foreground message boundary: %s",
+                    type(exc).__name__,
+                )
+            else:
+                if memory_message_upto is None:
+                    logger.warning(
+                        "background review skipped memory progress without messages"
+                    )
+                else:
+                    memory_turns = 1
         try:
             await self._persist_async(
                 persistence_call,
                 conn,
                 record_background_review_progress,
                 session_id,
-                memory_turns=0 if resume_from_history else 1,
+                memory_turns=memory_turns,
+                memory_message_upto=memory_message_upto,
                 skill_tool_batches=result.tool_batches,
             )
         except Exception as exc:

@@ -14,14 +14,20 @@ def create_schema(conn: sqlite3.Connection) -> None:
 
             memory_turn_total INTEGER NOT NULL DEFAULT 0,
             memory_reviewed_total INTEGER NOT NULL DEFAULT 0,
+            memory_message_total_upto INTEGER NOT NULL DEFAULT 0,
+            memory_reviewed_message_id INTEGER NOT NULL DEFAULT 0,
 
             skill_tool_batch_total INTEGER NOT NULL DEFAULT 0,
             skill_reviewed_total INTEGER NOT NULL DEFAULT 0,
 
             claim_token TEXT,
             claim_memory_upto INTEGER,
+            claim_memory_message_upto INTEGER,
             claim_skill_upto INTEGER,
             claim_started_at REAL,
+
+            retry_memory_upto INTEGER,
+            retry_memory_message_upto INTEGER,
 
             retry_after REAL,
             last_attempt_at REAL,
@@ -36,6 +42,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             CHECK(memory_turn_total >= 0),
             CHECK(memory_reviewed_total >= 0),
             CHECK(memory_reviewed_total <= memory_turn_total),
+            CHECK(memory_message_total_upto >= 0),
+            CHECK(memory_reviewed_message_id >= 0),
+            CHECK(memory_reviewed_message_id <= memory_message_total_upto),
 
             CHECK(skill_tool_batch_total >= 0),
             CHECK(skill_reviewed_total >= 0),
@@ -50,6 +59,40 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ),
 
             CHECK(
+                claim_memory_message_upto IS NULL
+                OR (
+                    claim_memory_message_upto >= 0
+                    AND claim_memory_message_upto <= memory_message_total_upto
+                )
+            ),
+
+            CHECK(
+                (claim_memory_upto IS NULL)
+                = (claim_memory_message_upto IS NULL)
+            ),
+
+            CHECK(
+                retry_memory_upto IS NULL
+                OR (
+                    retry_memory_upto >= 0
+                    AND retry_memory_upto <= memory_turn_total
+                )
+            ),
+
+            CHECK(
+                retry_memory_message_upto IS NULL
+                OR (
+                    retry_memory_message_upto >= 0
+                    AND retry_memory_message_upto <= memory_message_total_upto
+                )
+            ),
+
+            CHECK(
+                (retry_memory_upto IS NULL)
+                = (retry_memory_message_upto IS NULL)
+            ),
+
+            CHECK(
                 claim_skill_upto IS NULL
                 OR (
                     claim_skill_upto >= 0
@@ -61,6 +104,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 (
                     claim_token IS NULL
                     AND claim_memory_upto IS NULL
+                    AND claim_memory_message_upto IS NULL
                     AND claim_skill_upto IS NULL
                     AND claim_started_at IS NULL
                 )

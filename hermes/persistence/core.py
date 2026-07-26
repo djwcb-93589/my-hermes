@@ -257,6 +257,20 @@ def get_session_messages(
     return messages
 
 
+def get_last_session_message_id(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> int | None:
+    """返回会话最后一条已持久化消息的数据库 ID。"""
+    row = conn.execute(
+        "SELECT MAX(id) FROM messages WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
 get_messages = get_session_messages
 
 

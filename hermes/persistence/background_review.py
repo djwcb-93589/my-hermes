@@ -12,8 +12,10 @@ from .database import DBError, _immediate_transaction, transaction
 
 _STATE_COLUMNS = (
     "session_id, memory_turn_total, memory_reviewed_total, "
+    "memory_message_total_upto, memory_reviewed_message_id, "
     "skill_tool_batch_total, skill_reviewed_total, claim_token, "
-    "claim_memory_upto, claim_skill_upto, claim_started_at, retry_after, "
+    "claim_memory_upto, claim_memory_message_upto, claim_skill_upto, "
+    "claim_started_at, retry_memory_upto, retry_memory_message_upto, retry_after, "
     "last_attempt_at, last_success_at, last_error, updated_at"
 )
 
@@ -55,13 +57,17 @@ def _state_from_row(row) -> dict | None:
     values = dict(zip(_STATE_COLUMNS.split(", "), row))
     integer_fields = (
         "memory_turn_total", "memory_reviewed_total",
+        "memory_message_total_upto", "memory_reviewed_message_id",
         "skill_tool_batch_total", "skill_reviewed_total",
     )
     for field_name in integer_fields:
         value = values[field_name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise DBError(f"background review state has invalid {field_name}")
-    for field_name in ("claim_memory_upto", "claim_skill_upto"):
+    for field_name in (
+        "claim_memory_upto", "claim_memory_message_upto", "claim_skill_upto",
+        "retry_memory_upto", "retry_memory_message_upto",
+    ):
         value = values[field_name]
         if value is not None and (
             isinstance(value, bool) or not isinstance(value, int) or value < 0
@@ -69,6 +75,11 @@ def _state_from_row(row) -> dict | None:
             raise DBError(f"background review state has invalid {field_name}")
     if values["memory_reviewed_total"] > values["memory_turn_total"]:
         raise DBError("background review memory waterline exceeds total")
+    if (
+        values["memory_reviewed_message_id"]
+        > values["memory_message_total_upto"]
+    ):
+        raise DBError("background review memory message waterline exceeds total")
     if values["skill_reviewed_total"] > values["skill_tool_batch_total"]:
         raise DBError("background review skill waterline exceeds total")
     if (
@@ -77,10 +88,34 @@ def _state_from_row(row) -> dict | None:
     ):
         raise DBError("background review memory claim exceeds total")
     if (
+        values["claim_memory_message_upto"] is not None
+        and values["claim_memory_message_upto"]
+        > values["memory_message_total_upto"]
+    ):
+        raise DBError("background review memory message claim exceeds total")
+    if (
         values["claim_skill_upto"] is not None
         and values["claim_skill_upto"] > values["skill_tool_batch_total"]
     ):
         raise DBError("background review skill claim exceeds total")
+    if (
+        values["retry_memory_upto"] is not None
+        and (
+            values["retry_memory_upto"] < values["memory_reviewed_total"]
+            or values["retry_memory_upto"] > values["memory_turn_total"]
+        )
+    ):
+        raise DBError("background review memory retry exceeds waterlines")
+    if (
+        values["retry_memory_message_upto"] is not None
+        and (
+            values["retry_memory_message_upto"]
+            < values["memory_reviewed_message_id"]
+            or values["retry_memory_message_upto"]
+            > values["memory_message_total_upto"]
+        )
+    ):
+        raise DBError("background review memory message retry exceeds waterlines")
     for field_name in (
         "claim_started_at", "retry_after", "last_attempt_at",
         "last_success_at", "updated_at",
@@ -101,7 +136,10 @@ def _state_from_row(row) -> dict | None:
     claim_token = values["claim_token"]
     if claim_token is None and any(
         values[field_name] is not None
-        for field_name in ("claim_memory_upto", "claim_skill_upto", "claim_started_at")
+        for field_name in (
+            "claim_memory_upto", "claim_memory_message_upto",
+            "claim_skill_upto", "claim_started_at",
+        )
     ):
         raise DBError("background review state has inconsistent claim fields")
     if claim_token is not None:
@@ -112,6 +150,20 @@ def _state_from_row(row) -> dict | None:
             and values["claim_skill_upto"] is None
         ):
             raise DBError("background review state has inconsistent claim fields")
+    if (
+        values["claim_memory_upto"] is None
+    ) != (values["claim_memory_message_upto"] is None):
+        raise DBError("background review state has incomplete memory claim window")
+    if (
+        values["retry_memory_upto"] is None
+    ) != (values["retry_memory_message_upto"] is None):
+        raise DBError("background review state has incomplete memory retry window")
+    if values["claim_memory_upto"] is not None and (
+        values["claim_memory_upto"] < values["memory_reviewed_total"]
+        or values["claim_memory_message_upto"]
+        < values["memory_reviewed_message_id"]
+    ):
+        raise DBError("background review memory claim is behind reviewed waterlines")
 
     memory_pending = values["memory_turn_total"] - values["memory_reviewed_total"]
     skill_pending = values["skill_tool_batch_total"] - values["skill_reviewed_total"]
@@ -122,6 +174,7 @@ def _state_from_row(row) -> dict | None:
         skill_pending=skill_pending,
         review_memory=values["claim_memory_upto"] is not None,
         review_skills=values["claim_skill_upto"] is not None,
+        retry_memory=values["retry_memory_upto"] is not None,
         inflight=claim_token is not None,
     )
     return values
@@ -164,32 +217,75 @@ def record_background_review_progress(
     session_id: str,
     *,
     memory_turns: int = 0,
+    memory_message_upto: int | None = None,
     skill_tool_batches: int = 0,
     now: float | None = None,
 ) -> dict:
     """原子累加会话新产生的轮次与工具批次。"""
     _require_session_id(session_id)
     memory_turns = _require_non_negative_integer(memory_turns, "memory_turns")
+    if memory_turns > 0:
+        if (
+            isinstance(memory_message_upto, bool)
+            or not isinstance(memory_message_upto, int)
+            or memory_message_upto <= 0
+        ):
+            raise DBError(
+                "background review memory_message_upto must be a positive integer"
+            )
+    elif memory_message_upto is not None:
+        raise DBError(
+            "background review memory_message_upto requires positive memory_turns"
+        )
     skill_tool_batches = _require_non_negative_integer(
         skill_tool_batches, "skill_tool_batches"
     )
     timestamp = _timestamp(now)
     with transaction(conn):
+        state = get_background_review_state(conn, session_id)
+        if (
+            memory_turns > 0
+            and state is not None
+            and memory_message_upto < state["memory_message_total_upto"]
+        ):
+            raise DBError("background review memory message boundary moved backwards")
         try:
-            conn.execute(
-                """
-                INSERT INTO background_review_state (
-                    session_id, memory_turn_total, skill_tool_batch_total, updated_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    memory_turn_total=background_review_state.memory_turn_total
-                        + excluded.memory_turn_total,
-                    skill_tool_batch_total=background_review_state.skill_tool_batch_total
-                        + excluded.skill_tool_batch_total,
-                    updated_at=excluded.updated_at
-                """,
-                (session_id, memory_turns, skill_tool_batches, timestamp),
-            )
+            if state is None:
+                conn.execute(
+                    """
+                    INSERT INTO background_review_state (
+                        session_id, memory_turn_total, memory_message_total_upto,
+                        skill_tool_batch_total, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        memory_turns,
+                        memory_message_upto or 0,
+                        skill_tool_batches,
+                        timestamp,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE background_review_state
+                    SET memory_turn_total=memory_turn_total + ?,
+                        memory_message_total_upto=CASE
+                            WHEN ? > 0 THEN ? ELSE memory_message_total_upto END,
+                        skill_tool_batch_total=skill_tool_batch_total + ?,
+                        updated_at=?
+                    WHERE session_id=?
+                    """,
+                    (
+                        memory_turns,
+                        memory_turns,
+                        memory_message_upto or 0,
+                        skill_tool_batches,
+                        timestamp,
+                        session_id,
+                    ),
+                )
         except sqlite3.IntegrityError as exc:
             raise DBError(f"background review progress update failed: {exc}") from exc
         state = get_background_review_state(conn, session_id)
@@ -219,12 +315,15 @@ def mark_background_review_handled(
             UPDATE background_review_state
             SET memory_reviewed_total=CASE
                     WHEN ? THEN memory_turn_total ELSE memory_reviewed_total END,
+                memory_reviewed_message_id=CASE
+                    WHEN ? THEN memory_message_total_upto
+                    ELSE memory_reviewed_message_id END,
                 skill_reviewed_total=CASE
                     WHEN ? THEN skill_tool_batch_total ELSE skill_reviewed_total END,
                 updated_at=?
             WHERE session_id=?
             """,
-            (int(memory), int(skills), timestamp, session_id),
+            (int(memory), int(memory), int(skills), timestamp, session_id),
         ).rowcount
         if changed != 1:
             raise DBError("background review state not found")
@@ -277,8 +376,9 @@ def claim_due_background_review(
         ):
             return None
 
-        review_memory = (
-            memory_interval > 0 and state["memory_pending"] >= memory_interval
+        retry_memory = state["retry_memory"]
+        review_memory = memory_interval > 0 and (
+            retry_memory or state["memory_pending"] >= memory_interval
         )
         review_skills = (
             skill_interval > 0 and state["skill_pending"] >= skill_interval
@@ -287,19 +387,32 @@ def claim_due_background_review(
             return None
 
         claim_token = str(uuid.uuid4())
-        memory_upto = state["memory_turn_total"] if review_memory else None
+        if retry_memory:
+            memory_upto = state["retry_memory_upto"]
+            memory_message_upto = state["retry_memory_message_upto"]
+        elif review_memory:
+            memory_upto = state["memory_turn_total"]
+            memory_message_upto = state["memory_message_total_upto"]
+        else:
+            memory_upto = None
+            memory_message_upto = None
+        if review_memory and (
+            memory_message_upto <= state["memory_reviewed_message_id"]
+        ):
+            raise DBError("background review memory claim has no message window")
         skill_upto = state["skill_tool_batch_total"] if review_skills else None
         changed = conn.execute(
             """
             UPDATE background_review_state
-            SET claim_token=?, claim_memory_upto=?, claim_skill_upto=?,
+            SET claim_token=?, claim_memory_upto=?, claim_memory_message_upto=?,
+                claim_skill_upto=?,
                 claim_started_at=?, retry_after=NULL, last_attempt_at=?,
                 last_error=NULL, updated_at=?
             WHERE session_id=?
             """,
             (
-                claim_token, memory_upto, skill_upto, timestamp, timestamp,
-                timestamp, session_id,
+                claim_token, memory_upto, memory_message_upto, skill_upto,
+                timestamp, timestamp, timestamp, session_id,
             ),
         ).rowcount
         if changed != 1:
@@ -310,6 +423,10 @@ def claim_due_background_review(
         "review_memory": review_memory,
         "review_skills": review_skills,
         "memory_upto": memory_upto,
+        "memory_message_after": (
+            state["memory_reviewed_message_id"] if review_memory else None
+        ),
+        "memory_message_upto": memory_message_upto,
         "skill_upto": skill_upto,
     }
 
@@ -334,12 +451,20 @@ def complete_background_review_claim(
                     memory_reviewed_total,
                     COALESCE(claim_memory_upto, memory_reviewed_total)
                 ),
+                memory_reviewed_message_id=MAX(
+                    memory_reviewed_message_id,
+                    COALESCE(
+                        claim_memory_message_upto, memory_reviewed_message_id
+                    )
+                ),
                 skill_reviewed_total=MAX(
                     skill_reviewed_total,
                     COALESCE(claim_skill_upto, skill_reviewed_total)
                 ),
-                claim_token=NULL, claim_memory_upto=NULL, claim_skill_upto=NULL,
-                claim_started_at=NULL, retry_after=NULL, last_success_at=?,
+                claim_token=NULL, claim_memory_upto=NULL,
+                claim_memory_message_upto=NULL, claim_skill_upto=NULL,
+                claim_started_at=NULL, retry_memory_upto=NULL,
+                retry_memory_message_upto=NULL, retry_after=NULL, last_success_at=?,
                 last_error=NULL, updated_at=?
             WHERE session_id=? AND claim_token=?
             """,
@@ -371,7 +496,10 @@ def fail_background_review_claim(
         changed = conn.execute(
             """
             UPDATE background_review_state
-            SET claim_token=NULL, claim_memory_upto=NULL, claim_skill_upto=NULL,
+            SET retry_memory_upto=claim_memory_upto,
+                retry_memory_message_upto=claim_memory_message_upto,
+                claim_token=NULL, claim_memory_upto=NULL,
+                claim_memory_message_upto=NULL, claim_skill_upto=NULL,
                 claim_started_at=NULL, retry_after=?, last_error=?, updated_at=?
             WHERE session_id=? AND claim_token=?
             """,
