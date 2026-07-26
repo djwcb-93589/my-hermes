@@ -519,8 +519,17 @@ class BackgroundReviewExecutor:
         claim: dict,
     ) -> bool:
         """提交已领取的记忆审视任务，并立即返回。"""
-        if not self._valid_claim(claim):
-            logger.warning("background review rejected an invalid claim")
+        if not self._valid_claim_identity(claim):
+            logger.warning("background review rejected an invalid claim identity")
+            return False
+        if not self._valid_memory_review_claim(claim):
+            logger.warning(
+                "background review rejected an invalid or unsupported claim"
+            )
+            self._fail_claim_safely(
+                claim,
+                "invalid_or_unsupported_background_review_claim",
+            )
             return False
         rejected_for_capacity = False
         with self._lock:
@@ -553,18 +562,28 @@ class BackgroundReviewExecutor:
         return True
 
     @staticmethod
-    def _valid_claim(claim: dict) -> bool:
+    def _valid_claim_identity(claim: object) -> bool:
+        """校验能够安全释放领取所需的最小身份信息。"""
         if not isinstance(claim, dict):
             return False
-        memory_message_after = claim.get("memory_message_after")
-        memory_message_upto = claim.get("memory_message_upto")
-        memory_upto = claim.get("memory_upto")
         return (
             isinstance(claim.get("session_id"), str)
             and bool(claim["session_id"].strip())
             and isinstance(claim.get("claim_token"), str)
             and bool(claim["claim_token"])
-            and claim.get("review_memory") is True
+        )
+
+    @staticmethod
+    def _valid_memory_review_claim(claim: object) -> bool:
+        """校验当前 P2 Memory Review 能够执行的完整领取协议。"""
+        if not BackgroundReviewExecutor._valid_claim_identity(claim):
+            return False
+        assert isinstance(claim, dict)
+        memory_message_after = claim.get("memory_message_after")
+        memory_message_upto = claim.get("memory_message_upto")
+        memory_upto = claim.get("memory_upto")
+        return (
+            claim.get("review_memory") is True
             and claim.get("review_skills") is False
             and not isinstance(memory_message_after, bool)
             and isinstance(memory_message_after, int)
