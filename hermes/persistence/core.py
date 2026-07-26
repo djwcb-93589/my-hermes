@@ -242,10 +242,56 @@ def get_session_messages(
         (session_id,),
     ).fetchall()
 
+    return _deserialize_message_rows(rows)
+
+
+def get_session_messages_in_id_range(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    after_message_id: int,
+    upto_message_id: int,
+) -> list[dict]:
+    """读取会话内固定消息 ID 窗口，并确认窗口末端完整存在。"""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise InvalidMessageError("session_id is required")
+    if (
+        isinstance(after_message_id, bool)
+        or not isinstance(after_message_id, int)
+        or after_message_id < 0
+    ):
+        raise InvalidMessageError("after_message_id must be a non-negative integer")
+    if (
+        isinstance(upto_message_id, bool)
+        or not isinstance(upto_message_id, int)
+        or upto_message_id <= 0
+    ):
+        raise InvalidMessageError("upto_message_id must be a positive integer")
+    if upto_message_id <= after_message_id:
+        raise InvalidMessageError(
+            "upto_message_id must be greater than after_message_id"
+        )
+
+    rows = conn.execute(
+        """
+        SELECT id, role, content, tool_calls, tool_call_id, reasoning_content
+        FROM messages
+        WHERE session_id = ? AND id > ? AND id <= ?
+        ORDER BY id
+        """,
+        (session_id, after_message_id, upto_message_id),
+    ).fetchall()
+    if not rows or int(rows[-1][0]) != upto_message_id:
+        raise InvalidMessageError("background review message window is incomplete")
+
+    return _deserialize_message_rows([row[1:] for row in rows])
+
+
+def _deserialize_message_rows(rows) -> list[dict]:
+    """将消息查询行还原为公共消息字典。"""
     messages: list[dict] = []
     for role, content, tool_calls_json, tool_call_id, reasoning_content in rows:
         msg: dict = {"role": role, "content": content or ""}
-        # tool_calls 反序列化(集中处理)
         calls = _deserialize_tool_calls(tool_calls_json)
         if calls:
             msg["tool_calls"] = calls

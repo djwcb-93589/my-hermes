@@ -26,7 +26,10 @@ from hermes.persistence.background_review import (
     fail_background_review_claim,
     record_background_review_progress,
 )
-from hermes.persistence.core import get_last_session_message_id
+from hermes.persistence.core import (
+    get_last_session_message_id,
+    get_session_messages_in_id_range,
+)
 from hermes.persistence.schema import init_db
 from hermes.tools import (
     ApprovalMode,
@@ -42,14 +45,18 @@ logger = logging.getLogger(__name__)
 
 
 REVIEW_SYSTEM_PROMPT = (
-    "You review a completed conversation for stable information worth retaining "
-    "across future conversations. Use only the tools provided to inspect existing "
-    "information and perform any appropriate permitted operation. Focus on stable "
-    "user preferences, long-term context, explicit behavioral requirements, and "
-    "facts likely to remain useful later. Do not retain temporary task progress, "
-    "one-off requests, easily rediscovered information, tool-output details, or "
-    "unconfirmed inferences. If nothing is worth retaining, reply exactly: "
-    "Nothing to save"
+    "You review only the newly added dialog since the last completed review, not "
+    "the full conversation. Earlier dialog was already handled: do not invent or "
+    "re-extract information from it. Use only the provided memory tools. Before "
+    "creating, replacing, or deleting persisted memory, inspect the current live "
+    "stored memory through those tools. Compare it with existing user information "
+    "and long-term memory to avoid semantic duplicates. If the information is "
+    "already present, do not write it; if it supplements or corrects existing "
+    "information, update it instead of creating a duplicate. Retain only stable "
+    "preferences, context, explicit requirements, and facts likely to be useful "
+    "later. Do not retain temporary task progress, one-off requests, easily "
+    "rediscovered information, tool-output details, or unconfirmed inferences. "
+    "If nothing is worth retaining, reply exactly: Nothing to save"
 )
 
 
@@ -338,11 +345,7 @@ class BackgroundReviewCoordinator:
         if claim is None:
             return
         try:
-            messages_snapshot = copy.deepcopy(result.messages)
-            self._get_executor().submit(
-                claim=claim,
-                messages_snapshot=messages_snapshot,
-            )
+            self._get_executor().submit(claim=claim)
         except Exception as exc:
             logger.warning(
                 "background review could not submit foreground claim: %s",
@@ -459,14 +462,10 @@ class BackgroundReviewCoordinator:
         if claim is None:
             return
         try:
-            def copy_and_submit() -> bool:
-                messages_snapshot = copy.deepcopy(result.messages)
-                return self._get_executor().submit(
-                    claim=claim,
-                    messages_snapshot=messages_snapshot,
-                )
+            def submit_claim() -> bool:
+                return self._get_executor().submit(claim=claim)
 
-            await asyncio.to_thread(copy_and_submit)
+            await asyncio.to_thread(submit_claim)
         except Exception as exc:
             logger.warning(
                 "background review could not submit foreground claim: %s",
@@ -518,28 +517,10 @@ class BackgroundReviewExecutor:
         self,
         *,
         claim: dict,
-        messages_snapshot: list[dict],
     ) -> bool:
         """提交已领取的记忆审视任务，并立即返回。"""
         if not self._valid_claim(claim):
             logger.warning("background review rejected an invalid claim")
-            return False
-        if not isinstance(messages_snapshot, list):
-            logger.warning("background review rejected an invalid snapshot")
-            self._fail_claim_safely(claim, "invalid_messages_snapshot")
-            return False
-        try:
-            snapshot = copy.deepcopy(messages_snapshot)
-        except Exception as exc:
-            logger.warning(
-                "background review could not copy snapshot: %s",
-                type(exc).__name__,
-            )
-            self._fail_claim_safely(claim, "snapshot_copy_failed")
-            return False
-        if not claim["review_memory"] or claim["review_skills"]:
-            logger.warning("background review received an unsupported claim type")
-            self._fail_claim_safely(claim, "unsupported_review_claim")
             return False
         rejected_for_capacity = False
         with self._lock:
@@ -553,7 +534,7 @@ class BackgroundReviewExecutor:
             return False
         worker = threading.Thread(
             target=self._run_worker,
-            args=(dict(claim), snapshot),
+            args=(dict(claim),),
             name=f"background-review-{claim['session_id']}",
             daemon=True,
         )
@@ -573,20 +554,65 @@ class BackgroundReviewExecutor:
 
     @staticmethod
     def _valid_claim(claim: dict) -> bool:
+        if not isinstance(claim, dict):
+            return False
+        memory_message_after = claim.get("memory_message_after")
+        memory_message_upto = claim.get("memory_message_upto")
+        memory_upto = claim.get("memory_upto")
         return (
-            isinstance(claim, dict)
-            and isinstance(claim.get("session_id"), str)
-            and bool(claim["session_id"])
+            isinstance(claim.get("session_id"), str)
+            and bool(claim["session_id"].strip())
             and isinstance(claim.get("claim_token"), str)
             and bool(claim["claim_token"])
-            and isinstance(claim.get("review_memory"), bool)
-            and isinstance(claim.get("review_skills"), bool)
+            and claim.get("review_memory") is True
+            and claim.get("review_skills") is False
+            and not isinstance(memory_message_after, bool)
+            and isinstance(memory_message_after, int)
+            and memory_message_after >= 0
+            and not isinstance(memory_message_upto, bool)
+            and isinstance(memory_message_upto, int)
+            and memory_message_upto > memory_message_after
+            and not isinstance(memory_upto, bool)
+            and isinstance(memory_upto, int)
+            and memory_upto >= 0
         )
 
-    def _run_worker(self, claim: dict, messages_snapshot: list[dict]) -> None:
+    def _run_worker(self, claim: dict) -> None:
         conn = None
         try:
             conn = init_db(self.db_path)
+            if not background_review_claim_is_valid(
+                conn,
+                claim["session_id"],
+                claim["claim_token"],
+            ):
+                logger.debug("background review worker lost its claim before loading")
+                return
+            try:
+                messages_snapshot = get_session_messages_in_id_range(
+                    conn,
+                    claim["session_id"],
+                    after_message_id=claim["memory_message_after"],
+                    upto_message_id=claim["memory_message_upto"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "background review could not load message window: %s",
+                    type(exc).__name__,
+                )
+                self._fail_claim(
+                    conn,
+                    claim,
+                    "background_review_message_window_load_failed",
+                )
+                return
+            if not background_review_claim_is_valid(
+                conn,
+                claim["session_id"],
+                claim["claim_token"],
+            ):
+                logger.debug("background review worker lost its claim after loading")
+                return
             resolution = self.registry.resolve(
                 ToolPolicy(
                     ExecutionEnvironment.BACKGROUND_REVIEW,
