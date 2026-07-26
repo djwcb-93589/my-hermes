@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -69,7 +70,12 @@ class CronControlService:
         idempotency_key: str | None,
     ) -> CronRunRequestResponse:
         key = self._idempotency_key(idempotency_key)
-        run_id = str(uuid.uuid5(_RUN_ID_NAMESPACE, f"{job_id}:{key}"))
+        identity = json.dumps(
+            [job_id, key],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        run_id = str(uuid.uuid5(_RUN_ID_NAMESPACE, identity))
         try:
             with self._connection() as conn:
                 run = request_manual_run(conn, job_id, run_id)
