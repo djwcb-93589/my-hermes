@@ -12,10 +12,10 @@ from hermes.web.routes import catalog, cron, sessions, status
 from hermes.web.schemas import ErrorResponse
 
 
-def create_app() -> FastAPI:
+def create_app(read_service: ReadService | None = None) -> FastAPI:
     """创建没有后台任务、没有认证副作用的只读应用。"""
     application = FastAPI(title="MyHermes Dashboard API")
-    application.state.read_service = ReadService()
+    application.state.read_service = read_service or ReadService()
 
     # 未来认证应添加在此处的应用级 middleware，而不是分散到每条路由。
     application.add_middleware(
