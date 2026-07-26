@@ -395,6 +395,8 @@ def handle_delegate(args, **kwargs) -> str:
             r["ok"], r["status"], r["summary"],
             iterations=r["iterations"],
             tools_used=r["tools_used"],
+            tool_batches=r["tool_batches"],
+            tool_call_count=r["tool_call_count"],
             child_session_key=child_session_key,
             error=r["error"],
         )
