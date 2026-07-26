@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
 
@@ -25,6 +26,7 @@ from hermes.agent_loop import (
     AsyncAgentLoop,
     _sanitize_error_message,
 )
+from hermes.background_review import get_background_review_coordinator
 from hermes.config import (
     client,
     create_async_client,
@@ -51,6 +53,9 @@ from hermes.errors import (
 )
 from hermes.tokens import compress, compress_async, estimate_tokens
 from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
+
+
+logger = logging.getLogger(__name__)
 
 
 def _disabled_tool_result(tool_name: str) -> tuple[str, str, str]:
@@ -813,6 +818,7 @@ def run_conversation(
     *,
     resume_from_history: bool = False,
     stream_sink=None,
+    background_review_coordinator=None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -864,7 +870,25 @@ def run_conversation(
     result: AgentLoopResult = loop.run(user_message)
 
     # 同步 / 异步入口使用同一映射,避免两条链路返回格式漂移。
-    return _conversation_result_response(result)
+    response = _conversation_result_response(result)
+    try:
+        coordinator = (
+            background_review_coordinator
+            if background_review_coordinator is not None
+            else get_background_review_coordinator()
+        )
+        coordinator.after_foreground_result(
+            conn,
+            session_id,
+            result,
+            resume_from_history=resume_from_history,
+        )
+    except Exception as exc:
+        logger.warning(
+            "background review coordination failed after foreground run: %s",
+            type(exc).__name__,
+        )
+    return response
 
 
 async def run_conversation_async(
@@ -885,6 +909,7 @@ async def run_conversation_async(
     enabled_toolsets: list[str] | None = None,
     tool_context: dict | None = None,
     tool_policy: ToolPolicy | None = None,
+    background_review_coordinator=None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。
 
@@ -982,6 +1007,24 @@ async def run_conversation_async(
         response = _conversation_result_response(result)
         if result.status == "awaiting_approval":
             response["agent_state"] = loop.export_resume_state()
+        try:
+            coordinator = (
+                background_review_coordinator
+                if background_review_coordinator is not None
+                else get_background_review_coordinator()
+            )
+            await coordinator.after_foreground_result_async(
+                conn,
+                session_id,
+                result,
+                resume_from_history=resume_from_history,
+                persistence_call=persistence_call,
+            )
+        except Exception as exc:
+            logger.warning(
+                "background review coordination failed after foreground run: %s",
+                type(exc).__name__,
+            )
         return response
     finally:
         if loop is not None:

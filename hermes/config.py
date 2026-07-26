@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import math
+from types import MappingProxyType
 
 import yaml
 from openai import AsyncOpenAI, OpenAI
@@ -60,6 +61,15 @@ DEFAULT_CONFIG = {
     },
     "terminal": {
         "docker_mounts": [],
+    },
+    "background_review": {
+        "enabled": False,
+        "memory_interval": 3,
+        "skill_interval": 0,
+        "claim_ttl_seconds": 1800,
+        "retry_cooldown_seconds": 60,
+        "max_iterations": 8,
+        "max_concurrent_jobs": 1,
     },
 }
 
@@ -292,6 +302,56 @@ def _validate_terminal_backend_config(config: dict) -> None:
     terminal["docker_mounts"] = normalized_mounts
 
 
+def _validate_background_review_config(config: dict) -> None:
+    """补齐并校验后台审视配置，默认关闭以避免意外模型调用。"""
+    review = config.get("background_review")
+    if review is None:
+        review = {}
+        config["background_review"] = review
+    if not isinstance(review, dict):
+        raise ValueError("background_review must be a mapping")
+
+    defaults = DEFAULT_CONFIG["background_review"]
+    enabled = review.get("enabled", defaults["enabled"])
+    if not isinstance(enabled, bool):
+        raise ValueError("background_review.enabled must be a boolean")
+    review["enabled"] = enabled
+
+    for field_name in ("memory_interval", "skill_interval"):
+        value = review.get(field_name, defaults[field_name])
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"background_review.{field_name} must be a non-negative integer"
+            )
+        review[field_name] = value
+
+    for field_name in ("claim_ttl_seconds", "retry_cooldown_seconds"):
+        value = review.get(field_name, defaults[field_name])
+        if isinstance(value, bool):
+            raise ValueError(f"background_review.{field_name} must be a number")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"background_review.{field_name} must be a number"
+            ) from exc
+        if not math.isfinite(normalized) or normalized < 0:
+            raise ValueError(
+                f"background_review.{field_name} must be non-negative"
+            )
+        if field_name == "claim_ttl_seconds" and normalized == 0:
+            raise ValueError("background_review.claim_ttl_seconds must be positive")
+        review[field_name] = normalized
+
+    for field_name in ("max_iterations", "max_concurrent_jobs"):
+        value = review.get(field_name, defaults[field_name])
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"background_review.{field_name} must be a positive integer"
+            )
+        review[field_name] = value
+
+
 def _validate_browser_config(config: dict) -> None:
     """补齐并校验浏览器运行时配置，避免工具调用时才暴露配置错误。"""
     browser = config.get("browser")
@@ -381,6 +441,7 @@ def load_config(config_path=None) -> dict:
     config = _expand_env_vars(config)
     _validate_filesystem_security_config(config)
     _validate_terminal_backend_config(config)
+    _validate_background_review_config(config)
     _validate_browser_config(config)
     return config
 
@@ -423,6 +484,7 @@ _config = load_config(CONFIG_PATH)
 
 # 仅供 Hermes 入口和 Browser 工具适配层读取；browser 包本身不反向依赖 Hermes。
 BROWSER_CONFIG = dict(_config["browser"])
+BACKGROUND_REVIEW_CONFIG = MappingProxyType(dict(_config["background_review"]))
 
 PATH_ACCESS_POLICY = PathAccessPolicy(
     _config["security"]["filesystem"]["denied_paths"],

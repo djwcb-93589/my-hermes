@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import json
 import logging
 import math
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from hermes.agent_loop import AgentLoop, _short_error
-from hermes.config import DB_PATH, MODEL, MODEL_MAX_OUTPUT_TOKENS, client as _default_client
+from hermes.agent_loop import AgentLoop, AgentLoopResult, _short_error
+from hermes.config import (
+    BACKGROUND_REVIEW_CONFIG,
+    DB_PATH,
+    MODEL,
+    MODEL_MAX_OUTPUT_TOKENS,
+    client as _default_client,
+)
 from hermes.persistence.background_review import (
     background_review_claim_is_valid,
+    claim_due_background_review,
     complete_background_review_claim,
     fail_background_review_claim,
+    record_background_review_progress,
 )
 from hermes.persistence.schema import init_db
 from hermes.tools import (
@@ -209,6 +219,236 @@ class ReviewAgentLoop(AgentLoop):
                 retryable=False,
             )
         return tool_messages, None
+
+
+class BackgroundReviewCoordinator:
+    """在前台结果与后台审视执行器之间协调进度和任务领取。"""
+
+    def __init__(
+        self,
+        config: Mapping[str, object] = BACKGROUND_REVIEW_CONFIG,
+        *,
+        executor: "BackgroundReviewExecutor | None" = None,
+    ):
+        self.config = config
+        self._executor = executor
+        self._executor_lock = threading.Lock()
+
+    def _get_executor(self) -> "BackgroundReviewExecutor":
+        """按需创建进程内唯一的默认执行器。"""
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = BackgroundReviewExecutor(
+                    BackgroundReviewConfig(
+                        max_iterations=self.config["max_iterations"],
+                        retry_cooldown_seconds=self.config[
+                            "retry_cooldown_seconds"
+                        ],
+                        max_concurrent_jobs=self.config[
+                            "max_concurrent_jobs"
+                        ],
+                    )
+                )
+            return self._executor
+
+    def _enabled(self) -> bool:
+        return self.config["enabled"] is True
+
+    def _claim(self, conn, session_id: str):
+        return claim_due_background_review(
+            conn,
+            session_id,
+            memory_interval=self.config["memory_interval"],
+            skill_interval=self.config["skill_interval"],
+            claim_ttl_seconds=self.config["claim_ttl_seconds"],
+        )
+
+    def _fail_submission(self, conn, claim: dict, error: str) -> None:
+        """仅在提交异常时释放仍属于当前前台调用的 claim。"""
+        try:
+            released = fail_background_review_claim(
+                conn,
+                claim["session_id"],
+                claim["claim_token"],
+                error=error,
+                retry_cooldown_seconds=self.config["retry_cooldown_seconds"],
+            )
+            if not released:
+                logger.debug("background review submission lost its claim")
+        except Exception as exc:
+            logger.warning(
+                "background review could not release submission claim: %s",
+                type(exc).__name__,
+            )
+
+    def after_foreground_result(
+        self,
+        conn,
+        session_id: str,
+        result: AgentLoopResult,
+        *,
+        resume_from_history: bool,
+    ) -> None:
+        """记录一次已启动前台循环，并在完整成功后尽力提交后台审视。"""
+        if not self._enabled():
+            return
+        try:
+            record_background_review_progress(
+                conn,
+                session_id,
+                memory_turns=0 if resume_from_history else 1,
+                skill_tool_batches=result.tool_batches,
+            )
+        except Exception as exc:
+            logger.warning(
+                "background review could not record foreground progress: %s",
+                type(exc).__name__,
+            )
+            return
+
+        if not (result.ok and result.status == "completed"):
+            return
+        try:
+            claim = self._claim(conn, session_id)
+        except Exception as exc:
+            logger.warning(
+                "background review could not claim foreground progress: %s",
+                type(exc).__name__,
+            )
+            return
+        if claim is None:
+            return
+        try:
+            messages_snapshot = copy.deepcopy(result.messages)
+            self._get_executor().submit(
+                claim=claim,
+                messages_snapshot=messages_snapshot,
+            )
+        except Exception as exc:
+            logger.warning(
+                "background review could not submit foreground claim: %s",
+                type(exc).__name__,
+            )
+            self._fail_submission(conn, claim, "background_review_submit_failed")
+
+    async def _persist_async(
+        self,
+        persistence_call,
+        conn,
+        operation,
+        *args,
+        **kwargs,
+    ):
+        if persistence_call is not None:
+            return await persistence_call(operation, *args, **kwargs)
+        return operation(conn, *args, **kwargs)
+
+    async def _fail_submission_async(
+        self,
+        persistence_call,
+        conn,
+        claim: dict,
+        error: str,
+    ) -> None:
+        try:
+            released = await self._persist_async(
+                persistence_call,
+                conn,
+                fail_background_review_claim,
+                claim["session_id"],
+                claim["claim_token"],
+                error=error,
+                retry_cooldown_seconds=self.config["retry_cooldown_seconds"],
+            )
+            if not released:
+                logger.debug("background review submission lost its claim")
+        except Exception as exc:
+            logger.warning(
+                "background review could not release submission claim: %s",
+                type(exc).__name__,
+            )
+
+    async def after_foreground_result_async(
+        self,
+        conn,
+        session_id: str,
+        result: AgentLoopResult,
+        *,
+        resume_from_history: bool,
+        persistence_call=None,
+    ) -> None:
+        """异步入口遵守 Gateway 持久化边界，且不阻塞事件循环提交快照。"""
+        if not self._enabled():
+            return
+        try:
+            await self._persist_async(
+                persistence_call,
+                conn,
+                record_background_review_progress,
+                session_id,
+                memory_turns=0 if resume_from_history else 1,
+                skill_tool_batches=result.tool_batches,
+            )
+        except Exception as exc:
+            logger.warning(
+                "background review could not record foreground progress: %s",
+                type(exc).__name__,
+            )
+            return
+
+        if not (result.ok and result.status == "completed"):
+            return
+        try:
+            claim = await self._persist_async(
+                persistence_call,
+                conn,
+                claim_due_background_review,
+                session_id,
+                memory_interval=self.config["memory_interval"],
+                skill_interval=self.config["skill_interval"],
+                claim_ttl_seconds=self.config["claim_ttl_seconds"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "background review could not claim foreground progress: %s",
+                type(exc).__name__,
+            )
+            return
+        if claim is None:
+            return
+        try:
+            def copy_and_submit() -> bool:
+                messages_snapshot = copy.deepcopy(result.messages)
+                return self._get_executor().submit(
+                    claim=claim,
+                    messages_snapshot=messages_snapshot,
+                )
+
+            await asyncio.to_thread(copy_and_submit)
+        except Exception as exc:
+            logger.warning(
+                "background review could not submit foreground claim: %s",
+                type(exc).__name__,
+            )
+            await self._fail_submission_async(
+                persistence_call,
+                conn,
+                claim,
+                "background_review_submit_failed",
+            )
+
+
+_coordinator_lock = threading.Lock()
+_background_review_coordinator: BackgroundReviewCoordinator | None = None
+
+
+def get_background_review_coordinator() -> BackgroundReviewCoordinator:
+    """返回进程共享的惰性后台审视协调器。"""
+    global _background_review_coordinator
+    with _coordinator_lock:
+        if _background_review_coordinator is None:
+            _background_review_coordinator = BackgroundReviewCoordinator()
+        return _background_review_coordinator
 
 
 class BackgroundReviewExecutor:
