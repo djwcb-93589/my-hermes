@@ -7,7 +7,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
-from hermes.redaction import redact_explicit_secrets
+from hermes.review.evidence import (
+    compact_tool_argument_value,
+    compact_tool_arguments,
+    is_explicit_tool_error as _is_explicit_tool_error,
+    is_internal_user_message as _is_internal_user_message,
+    normalize_evidence_text as _normalize_text,
+    truncate_evidence_text as _truncate_text,
+)
 
 
 _MAX_REVIEW_EVIDENCE_TEXT = 16_000
@@ -17,75 +24,6 @@ _MAX_TOOL_ARGUMENTS_TEXT = 600
 _MAX_TOOL_RESULT_TEXT = 700
 _MAX_ENTRY_TEXT = 1_500
 _TRUNCATED_MARKER = "[truncated]"
-_SENSITIVE_ARGUMENT_KEYS = frozenset({
-    "api_key",
-    "apikey",
-    "authorization",
-    "captcha",
-    "credential",
-    "credentials",
-    "otp",
-    "one_time_code",
-    "onetimecode",
-    "passcode",
-    "passwd",
-    "password",
-    "secret",
-    "sms_code",
-    "smscode",
-    "token",
-    "verificationcode",
-    "verification_code",
-    "verify_code",
-    "验证码",
-    "口令",
-    "密码",
-})
-_TOOL_OMITTED_ARGUMENT_PATHS = {
-    "browser_type": frozenset({("text",)}),
-    "browser_console": frozenset({("expression",)}),
-    "memory": frozenset({("content",), ("old_text",)}),
-    "skill_manage": frozenset({("body",)}),
-}
-_FILE_CONTENT_ARGUMENTS = frozenset({"content", "find", "replace"})
-_FILE_CONTENT_ACTIONS = frozenset({"write", "append", "replace"})
-_GENERIC_CONTENT_ARGUMENTS = frozenset({"body", "content", "text"})
-_KNOWN_INTERNAL_USER_CONTENTS = frozenset({
-    "please continue from where you left off.",
-    "[continue]",
-    "<continue>",
-    "[approval_resume]",
-    "[approval-resume]",
-})
-_KNOWN_INTERNAL_USER_PREFIXES = (
-    "[CONTEXT COMPACTION]",
-    "[APPROVAL RESUME]",
-    "[APPROVAL_RESUME]",
-    "[BACKGROUND REVIEW]",
-    "[REVIEW INSTRUCTION]",
-)
-_INTERNAL_METADATA_VALUES = frozenset({
-    "approval-resume",
-    "approval_resume",
-    "background-review",
-    "background_review",
-    "context-compaction",
-    "context_compaction",
-    "continuation",
-    "framework",
-    "internal",
-    "review",
-    "system",
-})
-_INTERNAL_METADATA_KEYS = (
-    "gateway_internal_task",
-    "message_source",
-    "message_type",
-    "origin",
-    "source",
-    "task_kind",
-    "type",
-)
 _PRESERVED_RESULT_KEYS = (
     "ok",
     "status",
@@ -148,259 +86,11 @@ class _ForegroundTaskEvidence:
     tool_events: list[_ToolEvent] = field(default_factory=list)
 
 
-def _truncate_text(text: str, *, limit: int) -> str:
-    """按字符上限裁剪文本，并显式说明证据不完整。"""
-    if len(text) <= limit:
-        return text
-    marker = f"\n{_TRUNCATED_MARKER}"
-    if limit <= len(marker):
-        return marker[:limit]
-    return f"{text[:limit - len(marker)].rstrip()}{marker}"
-
-
-def _normalize_text(value: object, *, limit: int) -> str:
-    """把证据转成脱敏文本，省略二进制并限制单条长度。"""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
-        except (TypeError, ValueError):
-            text = str(value)
-    if "\x00" in text:
-        return "[binary content omitted]"
-    text = redact_explicit_secrets(text).strip()
-    return _truncate_text(text, limit=limit)
-
-
-def _metadata_indicates_internal(message: Mapping) -> bool:
-    """优先使用消息已有元数据识别框架生成内容。"""
-    candidates: list[Mapping] = [message]
-    for container_key in ("metadata", "_meta"):
-        nested = message.get(container_key)
-        if isinstance(nested, Mapping):
-            candidates.append(nested)
-
-    for candidate in candidates:
-        for flag_key in (
-            "framework_generated",
-            "internal",
-            "is_internal",
-            "synthetic",
-        ):
-            if candidate.get(flag_key) is True:
-                return True
-        for metadata_key in _INTERNAL_METADATA_KEYS:
-            value = candidate.get(metadata_key)
-            if not isinstance(value, str):
-                continue
-            normalized = value.strip().lower().replace(" ", "_")
-            if normalized in _INTERNAL_METADATA_VALUES:
-                return True
-    return False
-
-
-def _is_internal_user_message(message: Mapping, content: str) -> bool:
-    """集中识别 continuation、审批恢复和其他框架 user 协议消息。"""
-    if _metadata_indicates_internal(message):
-        return True
-    stripped = content.strip()
-    if not stripped:
-        return True
-    if stripped.lower() in _KNOWN_INTERNAL_USER_CONTENTS:
-        return True
-    upper_content = stripped.upper()
-    if any(
-        upper_content.startswith(prefix)
-        for prefix in _KNOWN_INTERNAL_USER_PREFIXES
-    ):
-        return True
-    try:
-        payload = json.loads(stripped)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(payload, Mapping):
-        return False
-    if _metadata_indicates_internal(payload):
-        return True
-    return (
-        payload.get("approval_required") is True
-        and isinstance(payload.get("approval_request"), Mapping)
-    )
-
-
-def _is_explicit_tool_error(content: str) -> bool:
-    """只把工具明确返回的错误状态归为工具错误。"""
-    if content.lstrip().lower().startswith("(error:"):
-        return True
-    try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
-        return False
-    return isinstance(payload, dict) and (
-        payload.get("ok") is False
-        or "error" in payload
-        or bool(payload.get("error_type"))
-    )
-
-
-def _normalized_argument_key(key: object) -> str:
-    """统一参数键格式，只用于选择省略规则，不识别秘密值。"""
-    return str(key).strip().lower().replace("-", "_")
-
-
-def _is_sensitive_argument_key(key: object) -> bool:
-    """按明确的凭据字段名无条件隐藏参数值。"""
-    normalized = _normalized_argument_key(key)
-    if normalized in _SENSITIVE_ARGUMENT_KEYS:
-        return True
-    return (
-        normalized.endswith("_password")
-        or normalized.endswith("_secret")
-        or normalized.endswith("_token")
-        or normalized.endswith("_verification_code")
-    )
-
-
-def _omitted_value_summary(value: object, *, label: str) -> str:
-    """仅说明敏感或大段参数存在，并保留可核对的字符数量。"""
-    if isinstance(value, str):
-        return f"[{label} omitted; chars={len(value)}]"
-    return f"[{label} omitted]"
-
-
-def _tool_argument_override(
-    tool_name: str,
-    path: tuple[str, ...],
-    value: object,
-    root_arguments: Mapping,
-) -> str | None:
-    """集中应用按工具名和参数路径定义的省略、摘要规则。"""
-    normalized_tool = tool_name.strip().lower()
-    if path and _is_sensitive_argument_key(path[-1]):
-        return "[secret omitted]"
-
-    configured_paths = _TOOL_OMITTED_ARGUMENT_PATHS.get(
-        normalized_tool,
-        frozenset(),
-    )
-    if path in configured_paths:
-        if normalized_tool == "browser_type":
-            return "[input omitted]"
-        if normalized_tool == "browser_console":
-            return _omitted_value_summary(value, label="code")
-        return _omitted_value_summary(value, label="content")
-
-    if normalized_tool == "file" and len(path) == 1:
-        action = str(root_arguments.get("action", "")).strip().lower()
-        if action in _FILE_CONTENT_ACTIONS and path[0] in _FILE_CONTENT_ARGUMENTS:
-            return _omitted_value_summary(value, label="file content")
-
-    if normalized_tool == "terminal" and path == ("command",):
-        return _truncate_text(
-            redact_explicit_secrets(str(value)),
-            limit=360,
-        )
-
-    tools_with_explicit_rules = (
-        set(_TOOL_OMITTED_ARGUMENT_PATHS)
-        | {"file", "terminal"}
-    )
-    if (
-        normalized_tool not in tools_with_explicit_rules
-        and path
-        and path[-1] in _GENERIC_CONTENT_ARGUMENTS
-    ):
-        return _omitted_value_summary(value, label="content")
-    return None
-
-
-def _compact_value(
-    value: object,
-    *,
-    tool_name: str,
-    path: tuple[str, ...] = (),
-    root_arguments: Mapping,
-    depth: int = 0,
-) -> object:
-    """按工具规则压缩参数，并对未知工具使用保守的通用限制。"""
-    override = _tool_argument_override(
-        tool_name,
-        path,
-        value,
-        root_arguments,
-    )
-    if override is not None:
-        return override
-    if depth >= 2:
-        return "[nested value omitted]"
-    if isinstance(value, Mapping):
-        compact: dict[str, object] = {}
-        for index, (child_key, child_value) in enumerate(value.items()):
-            if index >= 12:
-                compact[_TRUNCATED_MARKER] = True
-                break
-            compact[str(child_key)] = _compact_value(
-                child_value,
-                tool_name=tool_name,
-                path=path + (_normalized_argument_key(child_key),),
-                root_arguments=root_arguments,
-                depth=depth + 1,
-            )
-        return compact
-    if isinstance(value, (list, tuple)):
-        compact_items = [
-            _compact_value(
-                item,
-                tool_name=tool_name,
-                path=path + (str(index),),
-                root_arguments=root_arguments,
-                depth=depth + 1,
-            )
-            for index, item in enumerate(value[:6])
-        ]
-        if len(value) > 6:
-            compact_items.append(_TRUNCATED_MARKER)
-        return compact_items
-    if isinstance(value, str):
-        return _truncate_text(
-            redact_explicit_secrets(value),
-            limit=240,
-        )
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return _truncate_text(str(value), limit=240)
-
-
 def _compact_tool_arguments(tool_name: str, arguments: object) -> str:
-    """保留工具目标和动作，省略输入框原值及大段可执行内容。"""
-    if isinstance(arguments, str):
-        try:
-            payload = json.loads(arguments)
-        except (TypeError, ValueError):
-            return _normalize_text(
-                arguments,
-                limit=_MAX_TOOL_ARGUMENTS_TEXT,
-            )
-    else:
-        payload = arguments
-    if not isinstance(payload, Mapping):
-        return _normalize_text(payload, limit=_MAX_TOOL_ARGUMENTS_TEXT)
-
-    compact_value = _compact_value(
-        payload,
-        tool_name=tool_name,
-        root_arguments=payload,
-    )
-    if not isinstance(compact_value, Mapping):
-        return _normalize_text(
-            compact_value,
-            limit=_MAX_TOOL_ARGUMENTS_TEXT,
-        )
-    return _normalize_text(
-        dict(compact_value),
+    """使用共享安全规则压缩 Memory Review 的工具参数。"""
+    return compact_tool_arguments(
+        tool_name,
+        arguments,
         limit=_MAX_TOOL_ARGUMENTS_TEXT,
     )
 
@@ -416,9 +106,7 @@ def _compact_tool_result(content: object) -> str:
             raw = json.dumps(content, ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError):
             raw = str(content)
-    if "\x00" in raw:
-        return "[binary content omitted]"
-    raw = redact_explicit_secrets(raw).strip()
+    raw = _normalize_text(raw, limit=max(len(raw), _MAX_TOOL_RESULT_TEXT))
     if not raw:
         return ""
     try:
@@ -428,17 +116,16 @@ def _compact_tool_result(content: object) -> str:
     if not isinstance(payload, Mapping):
         return _normalize_text(payload, limit=_MAX_TOOL_RESULT_TEXT)
 
+    safe_payload = compact_tool_argument_value("unknown_result", payload)
+    if not isinstance(safe_payload, Mapping):
+        return _normalize_text(safe_payload, limit=_MAX_TOOL_RESULT_TEXT)
+
     compact: dict[str, object] = {}
     for key in _PRESERVED_RESULT_KEYS:
-        if key in payload:
-            compact[key] = _compact_value(
-                payload[key],
-                tool_name="unknown_result",
-                path=(_normalized_argument_key(key),),
-                root_arguments=payload,
-            )
+        if key in safe_payload:
+            compact[key] = safe_payload[key]
     for key in _OBSERVATION_RESULT_KEYS:
-        value = payload.get(key)
+        value = safe_payload.get(key)
         if value in (None, "", [], {}):
             continue
         compact[key] = _normalize_text(value, limit=420)
