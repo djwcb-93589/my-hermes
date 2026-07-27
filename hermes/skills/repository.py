@@ -361,7 +361,11 @@ class SkillRepository:
                     if not target.is_file():
                         return {"ok": False, "error_type": "invalid_path", "error": "relative_path is not a file", "name": name}
                     current = target.read_text(encoding="utf-8")
-                    if expected_revision is not None and hashlib.sha256(current.encode("utf-8")).hexdigest() != expected_revision:
+                    if (
+                        expected_revision is None
+                        or hashlib.sha256(current.encode("utf-8")).hexdigest()
+                        != expected_revision
+                    ):
                         return self._revision_conflict(name)
                 elif expected_revision is not None:
                     return self._revision_conflict(name)

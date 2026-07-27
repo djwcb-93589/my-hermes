@@ -97,13 +97,14 @@ def handle_skill_manage(args, **kwargs):
                 "error_type": "invalid_args",
                 "error": f"{key} must be a string",
             })
-    if actor == "background_review" and action in {
-        "edit",
-        "patch",
-        "write_file",
-        "remove_file",
-    }:
-        for key in ("expected_revision", "expected_governance_revision"):
+    if actor == "background_review":
+        required_options = {
+            "edit": ("expected_revision", "expected_governance_revision"),
+            "patch": ("expected_revision", "expected_governance_revision"),
+            "write_file": ("expected_governance_revision",),
+            "remove_file": ("expected_revision", "expected_governance_revision"),
+        }
+        for key in required_options.get(action, ()):
             if not isinstance(options.get(key), str) or not options[key].strip():
                 return _json({
                     "ok": False,
@@ -215,11 +216,11 @@ def register(registry):
                     },
                     "expected_revision": {
                         "type": "string",
-                        "description": "optional expected content revision",
+                        "description": "edit/patch: SKILL.md revision; write_file/remove_file: target support-file revision; omit for write_file creation",
                     },
                     "expected_governance_revision": {
                         "type": "string",
-                        "description": "optional expected governance revision",
+                        "description": "optional expected governance revision; required for background_review mutations",
                     },
                 },
                 "required": ["action", "name"],
