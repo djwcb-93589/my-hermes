@@ -550,13 +550,17 @@ def record_skill_review_progress(
             or message_upto <= 0
         ):
             raise DBError("background review message_upto must be a positive integer")
-    elif message_upto is not None:
-        raise DBError("background review message_upto requires tool_batches")
+    elif message_upto is not None and (
+        isinstance(message_upto, bool)
+        or not isinstance(message_upto, int)
+        or message_upto <= 0
+    ):
+        raise DBError("background review message_upto must be a positive integer")
     timestamp = _timestamp(now)
     with transaction(conn):
         state = get_skill_review_state(conn, session_id)
         if (
-            tool_batches > 0
+            message_upto is not None
             and state is not None
             and message_upto < state["message_total_upto"]
         ):
@@ -577,14 +581,14 @@ def record_skill_review_progress(
                     UPDATE skill_review_state
                     SET tool_batch_total=tool_batch_total + ?,
                         message_total_upto=CASE
-                            WHEN ? > 0 THEN ? ELSE message_total_upto END,
+                            WHEN ? IS NOT NULL THEN ? ELSE message_total_upto END,
                         updated_at=?
                     WHERE session_id=?
                     """,
                     (
                         tool_batches,
-                        tool_batches,
-                        message_upto or 0,
+                        message_upto,
+                        message_upto,
                         timestamp,
                         session_id,
                     ),

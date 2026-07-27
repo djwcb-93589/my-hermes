@@ -263,6 +263,11 @@ class ToolRegistry:
                 supports_cancellation=entry.supports_cancellation,
             )
 
+        conflicts = self._tools.keys() & validated_registry._tools.keys()
+        if conflicts:
+            names = ", ".join(sorted(conflicts))
+            raise ValueError(f"tool registry merge has name conflicts: {names}")
+
         merged_tools = dict(self._tools)
         merged_tools.update(validated_registry._tools)
         self._tools = merged_tools
