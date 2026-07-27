@@ -81,6 +81,7 @@ _MAX_REVIEW_EVIDENCE_TEXT = 100_000
 _TRUNCATED_MARKER = "[truncated]"
 _MAX_PRIMARY_ERRORS_PER_TASK = 3
 _MAX_PRIMARY_TRANSITIONS_PER_TASK = 4
+_MAX_CORE_SKELETON_TEXT = 420
 
 _STAGE_USER = 0
 _STAGE_LOADED_SKILL = 1
@@ -109,6 +110,8 @@ class _EvidenceEntry:
     text: str
     stage: int
     dedup_key: str = ""
+    compact_text: str = ""
+    target_transition: bool = False
 
 
 @dataclass
@@ -123,7 +126,7 @@ class _ToolEvidence:
     call_id: str
     result: str = ""
     error: bool = False
-    transition: bool = False
+    target_transition: bool = False
 
 
 @dataclass
@@ -169,33 +172,34 @@ def _parse_arguments(arguments: object) -> Mapping | None:
 
 
 def _tool_target_signature(event: _ToolEvidence) -> tuple[object, ...]:
-    """提取会体现工具、URL、操作或资源目标变化的稳定签名。"""
+    """提取 URL、查询、路径或操作目标，不把工具名称当成目标。"""
     payload = _parse_arguments(event.raw_arguments)
     if payload is None:
-        return (event.name,)
+        return ()
     target_keys = (
         "action",
         "url",
         "query",
-        "name",
-        "relative_path",
         "path",
+        "relative_path",
     )
     targets = tuple(
         (key, str(payload[key]))
         for key in target_keys
         if payload.get(key) not in (None, "")
     )
-    return (event.name, targets)
+    return targets
 
 
 def _mark_strategy_transitions(task: _ForegroundTaskEvidence) -> None:
-    """标记工具、URL、操作或资源目标发生变化的节点。"""
+    """只标记 URL、查询、路径或操作目标发生变化的工具事件。"""
     previous_signature: tuple[object, ...] | None = None
     for event in task.tool_events:
         signature = _tool_target_signature(event)
+        if not signature:
+            continue
         if previous_signature is not None and signature != previous_signature:
-            event.transition = True
+            event.target_transition = True
         previous_signature = signature
 
 
@@ -340,6 +344,54 @@ def _format_tool_event(event: _ToolEvidence) -> str:
     )
 
 
+def _tool_target_summary(event: _ToolEvidence) -> str:
+    """保留核心骨架需要的 URL、查询、路径和操作目标摘要。"""
+    payload = _parse_arguments(event.raw_arguments)
+    if payload is None:
+        return ""
+    target_keys = (
+        "action",
+        "url",
+        "query",
+        "path",
+        "relative_path",
+    )
+    targets = {
+        key: payload[key]
+        for key in target_keys
+        if payload.get(key) not in (None, "")
+    }
+    if not targets:
+        return ""
+    return compact_tool_arguments(
+        event.name,
+        targets,
+        limit=170,
+    )
+
+
+def _format_compact_tool_event(event: _ToolEvidence) -> str:
+    """紧凑保留工具名、明确目标和结果，供核心骨架预留预算。"""
+    parts = [f"Tool: {event.name}"]
+    target_summary = _tool_target_summary(event)
+    if target_summary:
+        parts.append(f"Target: {target_summary}")
+    elif event.arguments:
+        parts.append(
+            "Parameters: "
+            + truncate_evidence_text(event.arguments, limit=120)
+        )
+    if event.result:
+        parts.append(
+            "Observed result: "
+            + truncate_evidence_text(event.result, limit=220)
+        )
+    return truncate_evidence_text(
+        "\n".join(parts),
+        limit=_MAX_CORE_SKELETON_TEXT,
+    )
+
+
 def _loaded_skill_name(event: _ToolEvidence) -> str:
     """从 skill_view 参数中读取已实际查看的 Skill 名称。"""
     if event.name != "skill_view":
@@ -400,7 +452,7 @@ def _collect_entries(
                 stage = _STAGE_ERROR
             elif event is last_non_error_observation:
                 stage = _STAGE_LATER_RESULT
-            elif event.transition:
+            elif event.target_transition:
                 stage = _STAGE_TRANSITION
             else:
                 stage = _STAGE_OTHER
@@ -420,6 +472,8 @@ def _collect_entries(
                     text=text,
                     stage=stage,
                     dedup_key=dedup_key,
+                    compact_text=_format_compact_tool_event(event),
+                    target_transition=event.target_transition,
                 )
             )
     return entries
@@ -518,13 +572,34 @@ def _task_skeleton_entries(
         representative_index = spread[1] if len(spread) > 1 else spread[0]
         selected.append(error_entries[representative_index])
 
-    transition_entries = [
+    assistant_decisions = [
         entry
         for entry in task_entries
-        if entry.stage == _STAGE_TRANSITION
+        if entry.source is _EvidenceSource.ASSISTANT_DECISION
     ]
-    if transition_entries:
-        selected.append(transition_entries[-1])
+    last_assistant_decision = (
+        assistant_decisions[-1]
+        if assistant_decisions
+        else None
+    )
+    if last_assistant_decision is not None:
+        selected.append(last_assistant_decision)
+
+    target_transition_entries = [
+        entry
+        for entry in task_entries
+        if entry.target_transition
+    ]
+    if target_transition_entries:
+        if last_assistant_decision is not None:
+            following_target_changes = [
+                entry
+                for entry in target_transition_entries
+                if entry.order > last_assistant_decision.order
+            ]
+            if following_target_changes:
+                selected.append(following_target_changes[0])
+        selected.append(target_transition_entries[-1])
 
     later_result_entries = [
         entry
@@ -555,16 +630,18 @@ def _skeleton_priority(entry: _EvidenceEntry) -> tuple[int, int]:
     """在极紧预算下先保住工具任务的目标、切换和后续观察。"""
     if entry.source is _EvidenceSource.USER_MESSAGE:
         rank = 0
-    elif entry.stage == _STAGE_TRANSITION:
+    elif entry.source is _EvidenceSource.ASSISTANT_DECISION:
         rank = 1
-    elif entry.stage == _STAGE_LATER_RESULT:
+    elif entry.target_transition:
         rank = 2
-    elif entry.stage == _STAGE_LOADED_SKILL:
+    elif entry.stage == _STAGE_LATER_RESULT:
         rank = 3
-    elif entry.source is _EvidenceSource.TOOL_ERROR:
+    elif entry.stage == _STAGE_LOADED_SKILL:
         rank = 4
-    else:
+    elif entry.source is _EvidenceSource.TOOL_ERROR:
         rank = 5
+    else:
+        rank = 6
     return (rank, entry.order)
 
 
@@ -580,6 +657,66 @@ def _round_robin_queues(
     return ordered
 
 
+def _is_core_skeleton_entry(entry: _EvidenceEntry) -> bool:
+    """判断条目是否属于工具任务必须优先保留的核心骨架。"""
+    return (
+        entry.source is _EvidenceSource.USER_MESSAGE
+        or entry.source is _EvidenceSource.ASSISTANT_DECISION
+        or entry.target_transition
+        or entry.stage == _STAGE_LATER_RESULT
+    )
+
+
+def _task_skeleton_orders(
+    entries: list[_EvidenceEntry],
+) -> tuple[list[_EvidenceEntry], list[_EvidenceEntry]]:
+    """分别生成工具任务核心骨架和其余任务级骨架的轮转顺序。"""
+    task_indexes = sorted({entry.task_index for entry in entries})
+    skeletons = {
+        task_index: _task_skeleton_entries(task_index, entries)
+        for task_index in task_indexes
+    }
+    tool_task_indexes = {
+        entry.task_index
+        for entry in entries
+        if entry.source in {
+            _EvidenceSource.TOOL_OBSERVATION,
+            _EvidenceSource.TOOL_ERROR,
+        }
+    }
+    core_queues = {
+        task_index: sorted(
+            (
+                entry
+                for entry in skeletons[task_index]
+                if _is_core_skeleton_entry(entry)
+            ),
+            key=_skeleton_priority,
+        )
+        for task_index in task_indexes
+        if task_index in tool_task_indexes
+    }
+    supplemental_queues = {
+        task_index: sorted(
+            (
+                entry
+                for entry in skeletons[task_index]
+                if not _is_core_skeleton_entry(entry)
+            ),
+            key=_skeleton_priority,
+        )
+        for task_index in task_indexes
+        if task_index in tool_task_indexes
+    }
+    for task_index in task_indexes:
+        if task_index not in tool_task_indexes:
+            supplemental_queues[task_index] = skeletons[task_index]
+    return (
+        _round_robin_queues(core_queues),
+        _round_robin_queues(supplemental_queues),
+    )
+
+
 def _limit_primary_stage(
     entries: list[_EvidenceEntry],
     *,
@@ -593,35 +730,10 @@ def _limit_primary_stage(
 def _selection_order(entries: list[_EvidenceEntry]) -> list[_EvidenceEntry]:
     """先轮转选择任务骨架，再按原阶段优先级补充其余证据。"""
     unique = _deduplicate_entries(entries)
-    task_indexes = sorted({entry.task_index for entry in unique})
-    skeletons = {
-        task_index: _task_skeleton_entries(task_index, unique)
-        for task_index in task_indexes
-    }
-    tool_task_indexes = {
-        entry.task_index
-        for entry in unique
-        if entry.source in {
-            _EvidenceSource.TOOL_OBSERVATION,
-            _EvidenceSource.TOOL_ERROR,
-        }
-    }
-
-    tool_skeleton_queues = {
-        task_index: sorted(
-            skeletons[task_index],
-            key=_skeleton_priority,
-        )
-        for task_index in task_indexes
-        if task_index in tool_task_indexes
-    }
-    chat_skeleton_queues = {
-        task_index: skeletons[task_index]
-        for task_index in task_indexes
-        if task_index not in tool_task_indexes
-    }
-    skeleton_order = _round_robin_queues(tool_skeleton_queues)
-    skeleton_order.extend(_round_robin_queues(chat_skeleton_queues))
+    core_skeleton_order, supplemental_skeleton_order = (
+        _task_skeleton_orders(unique)
+    )
+    skeleton_order = core_skeleton_order + supplemental_skeleton_order
     skeleton_identities = {
         _entry_identity(entry)
         for entry in skeleton_order
@@ -697,6 +809,16 @@ def _evidence_prefix() -> str:
     )
 
 
+def _compact_core_entry_text(
+    entry: _EvidenceEntry,
+    *,
+    limit: int,
+) -> str:
+    """按核心骨架专用上限保留目标、工具和结果摘要。"""
+    text = entry.compact_text or entry.text
+    return truncate_evidence_text(text, limit=max(1, limit))
+
+
 def _render_evidence(
     tasks: list[_ForegroundTaskEvidence],
     entries: list[_EvidenceEntry],
@@ -717,7 +839,38 @@ def _render_evidence(
     )
     chosen: list[tuple[_EvidenceEntry, str]] = []
     omitted = False
-    for entry in _selection_order(entries):
+    selection_order = _selection_order(entries)
+    unique = _deduplicate_entries(entries)
+    core_skeleton_order, _ = _task_skeleton_orders(unique)
+    core_identities = {
+        _entry_identity(entry)
+        for entry in core_skeleton_order
+    }
+    core_label_cost = sum(
+        len(entry.source.value) + 6
+        for entry in core_skeleton_order
+    )
+    core_text_remaining = max(0, remaining - core_label_cost)
+    for index, entry in enumerate(core_skeleton_order):
+        entries_left = len(core_skeleton_order) - index
+        fair_limit = (
+            core_text_remaining // entries_left
+            if entries_left
+            else 0
+        )
+        text = _compact_core_entry_text(
+            entry,
+            limit=min(_MAX_CORE_SKELETON_TEXT, fair_limit),
+        )
+        if text != entry.text:
+            omitted = True
+        chosen.append((entry, text))
+        core_text_remaining -= len(text)
+        remaining -= len(entry.source.value) + 6 + len(text)
+
+    for entry in selection_order:
+        if _entry_identity(entry) in core_identities:
+            continue
         label_cost = len(entry.source.value) + 6
         available_text = remaining - label_cost
         if available_text <= 0:
