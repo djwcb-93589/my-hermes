@@ -14,28 +14,28 @@ class ReviewAgentLoop(AgentLoop):
     def __init__(
         self,
         *,
-        review_messages: list[dict] | None = None,
-        messages_snapshot: list[dict] | None = None,
+        review_messages: list[dict],
         review_instruction: str,
-        allowed_tool_names,
+        allowed_tool_names: frozenset[str],
         **kwargs,
     ):
-        if review_messages is not None and messages_snapshot is not None:
-            raise ValueError(
-                "review_messages and messages_snapshot cannot both be provided"
-            )
-        if review_messages is None:
-            review_messages = messages_snapshot
         if not isinstance(review_messages, list):
             raise ValueError("review_messages must be a list")
-        if not isinstance(review_instruction, str) or not review_instruction:
+        if not isinstance(review_instruction, str) or not review_instruction.strip():
             raise ValueError("review_instruction must be a non-empty string")
+        if isinstance(allowed_tool_names, str):
+            raise ValueError("allowed_tool_names must not be a string")
         try:
             normalized_tool_names = frozenset(allowed_tool_names)
         except TypeError as exc:
+            raise ValueError("allowed_tool_names must be iterable") from exc
+        if any(
+            not isinstance(tool_name, str) or not tool_name.strip()
+            for tool_name in normalized_tool_names
+        ):
             raise ValueError(
-                "allowed_tool_names must be convertible to a frozenset"
-            ) from exc
+                "allowed_tool_names must contain non-empty strings"
+            )
 
         super().__init__(**kwargs)
         self._review_messages = copy.deepcopy(review_messages)
@@ -58,14 +58,14 @@ class ReviewAgentLoop(AgentLoop):
             return (
                 f"(error: tool '{tool_name}' cancelled because review claim expired)",
                 "cancelled",
-                "background review claim expired before tool dispatch",
+                "review claim expired before tool dispatch",
             )
         tool_name = self._tool_call_name(tool_call)
         if tool_name not in self.allowed_tool_names:
             return (
                 f"(error: tool '{tool_name}' is disabled in this review)",
                 "disabled",
-                f"disabled tool invoked in background review: {tool_name!r}",
+                f"disabled tool invoked in review: {tool_name!r}",
             )
         return super().dispatch_one(tool_call)
 
@@ -113,7 +113,7 @@ class ReviewAgentLoop(AgentLoop):
         for tool_call in tool_calls:
             tool_name = self._tool_call_name(tool_call)
             if skip_remaining:
-                output = "(error: skipped because an earlier background review tool failed)"
+                output = "(error: skipped because an earlier review tool failed)"
             else:
                 try:
                     output, err_status, err_detail = self.dispatch_one(tool_call)

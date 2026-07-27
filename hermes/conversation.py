@@ -26,7 +26,7 @@ from hermes.agent_loop import (
     AsyncAgentLoop,
     _sanitize_error_message,
 )
-from hermes.background_review import get_background_review_coordinator
+from hermes.review.runtime import get_background_review_coordinator
 from hermes.config import (
     client,
     create_async_client,

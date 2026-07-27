@@ -6,7 +6,11 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from hermes.tools import ToolPolicy
 
 
 class ReviewKind(str, Enum):
@@ -25,6 +29,13 @@ class ReviewClaim:
     token: str
     payload: Mapping[str, object]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "payload",
+            MappingProxyType(dict(self.payload)),
+        )
+
 
 @dataclass(frozen=True)
 class ForegroundReviewEvent:
@@ -42,7 +53,7 @@ class ReviewRunSpec:
     messages: list[dict]
     system_prompt: str
     instruction: str
-    tool_policy: object
+    tool_policy: "ToolPolicy"
     max_iterations: int
 
 
