@@ -1,39 +1,36 @@
-"""Memory Review 与既有持久化接口之间的适配层。"""
+"""Skill Review 与其独立持久化接口之间的适配层。"""
 
 from __future__ import annotations
 
 import sqlite3
 
 from hermes.persistence.background_review import (
-    background_review_claim_is_valid,
-    claim_due_background_review,
-    complete_background_review_claim,
-    fail_background_review_claim,
-    record_background_review_progress,
-)
-from hermes.persistence.core import (
-    get_last_session_message_id,
-    get_session_messages_in_id_range,
+    claim_due_skill_review,
+    complete_skill_review_claim,
+    fail_skill_review_claim,
+    get_last_skill_review_message_id,
+    load_skill_review_messages,
+    record_skill_review_progress,
+    skill_review_claim_is_valid,
 )
 
 
-class MemoryReviewStore:
-    """只调用既有持久化公共接口的 Memory Review 存储适配器。"""
+class SkillReviewStore:
+    """只封装 Skill Review 的持久化操作，不负责启动审视任务。"""
 
     def record_progress(
         self,
         conn: sqlite3.Connection,
         session_id: str,
         *,
-        completed_turns: int,
+        tool_batches: int,
         message_upto: int | None,
     ) -> None:
-        record_background_review_progress(
+        record_skill_review_progress(
             conn,
             session_id,
-            memory_turns=completed_turns,
-            memory_message_upto=message_upto,
-            skill_tool_batches=0,
+            tool_batches=tool_batches,
+            message_upto=message_upto,
         )
 
     def claim_due(
@@ -41,14 +38,13 @@ class MemoryReviewStore:
         conn: sqlite3.Connection,
         session_id: str,
         *,
-        memory_interval: int,
+        skill_interval: int,
         claim_ttl_seconds: float,
     ) -> dict | None:
-        return claim_due_background_review(
+        return claim_due_skill_review(
             conn,
             session_id,
-            memory_interval=memory_interval,
-            skill_interval=0,
+            skill_interval=skill_interval,
             claim_ttl_seconds=claim_ttl_seconds,
         )
 
@@ -60,7 +56,7 @@ class MemoryReviewStore:
         after_message_id: int,
         upto_message_id: int,
     ) -> list[dict]:
-        return get_session_messages_in_id_range(
+        return load_skill_review_messages(
             conn,
             session_id,
             after_message_id=after_message_id,
@@ -72,7 +68,7 @@ class MemoryReviewStore:
         conn: sqlite3.Connection,
         session_id: str,
     ) -> int | None:
-        return get_last_session_message_id(conn, session_id)
+        return get_last_skill_review_message_id(conn, session_id)
 
     def claim_is_valid(
         self,
@@ -80,7 +76,7 @@ class MemoryReviewStore:
         session_id: str,
         token: str,
     ) -> bool:
-        return background_review_claim_is_valid(conn, session_id, token)
+        return skill_review_claim_is_valid(conn, session_id, token)
 
     def complete(
         self,
@@ -88,7 +84,7 @@ class MemoryReviewStore:
         session_id: str,
         token: str,
     ) -> bool:
-        return complete_background_review_claim(conn, session_id, token)
+        return complete_skill_review_claim(conn, session_id, token)
 
     def fail(
         self,
@@ -99,7 +95,7 @@ class MemoryReviewStore:
         error: str,
         retry_cooldown_seconds: float,
     ) -> bool:
-        return fail_background_review_claim(
+        return fail_skill_review_claim(
             conn,
             session_id,
             token,

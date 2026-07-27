@@ -428,7 +428,7 @@ _background_review_coordinator: BackgroundReviewCoordinator | None = None
 def _build_default_coordinator() -> BackgroundReviewCoordinator:
     """显式装配当前唯一启用的 Memory Review Driver。"""
     from hermes.review.memory import MemoryReviewDriver
-    from hermes.review.store import MemoryReviewStore
+    from hermes.review.memory_store import MemoryReviewStore
 
     config = BackgroundReviewConfig(
         max_iterations=BACKGROUND_REVIEW_CONFIG["max_iterations"],

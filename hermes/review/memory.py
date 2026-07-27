@@ -11,7 +11,7 @@ from hermes.review.contracts import (
     ReviewKind,
     ReviewRunSpec,
 )
-from hermes.review.store import MemoryReviewStore
+from hermes.review.memory_store import MemoryReviewStore
 from hermes.tools import (
     ApprovalMode,
     ExecutionEnvironment,
