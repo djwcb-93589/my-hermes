@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -28,12 +29,22 @@ from typing import Callable
 
 from hermes.approval import build_approval_deferred
 from hermes.config import client as _default_client
+from hermes.hooks import (
+    AsyncHookRegistry,
+    HookContext,
+    HookEvent,
+    HookEventName,
+    SyncHookRegistry,
+)
 from hermes.model_streaming import (
     ModelTurnResult,
     StreamEvent,
     SynchronousStreamAccumulator,
 )
 from hermes.redaction import redact_explicit_secrets
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -640,6 +651,7 @@ class AgentLoop:
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
         stream_sink: "Callable[[StreamEvent], None] | None" = None,
+        hook_registry: SyncHookRegistry | None = None,
     ):
         self.model = model
         self.max_iterations = max_iterations
@@ -659,11 +671,18 @@ class AgentLoop:
         # 默认 None = 不检查。后台 delegate 用它实现 cancel。
         self.cancel_checker = cancel_checker
         self.stream_sink = stream_sink
+        if hook_registry is not None and not isinstance(
+            hook_registry,
+            SyncHookRegistry,
+        ):
+            raise TypeError("hook_registry must be a SyncHookRegistry")
+        self.hook_registry = hook_registry
         # 运行期状态(每次 run() 重置)
         self.iterations = 0
         self.tools_used: list[str] = []
         self.tool_batches = 0
         self.tool_call_count = 0
+        self._tool_observations: list[dict[str, object]] = []
         # 工具错误计数:按 (tool_name, error_type) 累计连续失败次数。
         # 工具成功调用后清掉该 tool_name 的所有计数,避免历史错误干扰。
         self._tool_error_counts: dict[tuple[str, str], int] = {}
@@ -676,6 +695,118 @@ class AgentLoop:
     def _record_tool_batch(self, tool_calls) -> None:
         self.tool_batches += 1
         self.tool_call_count += len(tool_calls)
+
+    def _record_tool_observation(
+        self,
+        tool_call,
+        *,
+        error_type: str | None,
+        duration_ms: int,
+    ) -> None:
+        """保存持久化完成后才会分发的工具观察摘要。"""
+        tool_name = self._tool_call_name(tool_call)
+        self._tool_observations.append(
+            {
+                "tool_name": tool_name,
+                "tool_call_id": str(getattr(tool_call, "id", "")),
+                "success": error_type is None,
+                "error_type": error_type,
+                "duration_ms": max(0, int(duration_ms)),
+            }
+        )
+
+    @staticmethod
+    def _hook_token_usage(response) -> dict[str, int]:
+        """提取可安全暴露的模型 token 统计，不保留原始响应对象。"""
+        usage = _object_value(response, "usage")
+        values = {
+            "prompt_tokens": _optional_int(_object_value(usage, "prompt_tokens")),
+            "completion_tokens": _optional_int(
+                _object_value(usage, "completion_tokens")
+            ),
+            "total_tokens": _optional_int(_object_value(usage, "total_tokens")),
+        }
+        return {
+            name: value
+            for name, value in values.items()
+            if value is not None
+        }
+
+    def _emit_post_llm_call(
+        self,
+        *,
+        response,
+        assistant_msg,
+        finish_reason: str | None,
+        duration_ms: int,
+    ) -> None:
+        """在 assistant 消息完成既有持久化后分发只读模型观察事件。"""
+        registry = self.hook_registry
+        if not isinstance(registry, SyncHookRegistry):
+            return
+        payload: dict[str, object] = {
+            "finish_reason": None if finish_reason is None else str(finish_reason),
+            "has_text": bool(_object_value(assistant_msg, "content")),
+            "tool_call_count": len(_object_value(assistant_msg, "tool_calls") or ()),
+            "duration_ms": max(0, int(duration_ms)),
+        }
+        token_usage = self._hook_token_usage(response)
+        if token_usage:
+            payload["token_usage"] = token_usage
+        self._emit_sync_hook(
+            HookEventName.POST_LLM_CALL,
+            HookContext(
+                invocation_id=f"llm:{self.iterations}",
+                payload=payload,
+            ),
+        )
+
+    def _emit_post_tool_calls(self) -> None:
+        """在整批工具消息持久化后按原工具顺序分发观察事件。"""
+        registry = self.hook_registry
+        if not isinstance(registry, SyncHookRegistry):
+            self._tool_observations = []
+            return
+        observations = self._tool_observations
+        self._tool_observations = []
+        for observation in observations:
+            self._emit_sync_hook(
+                HookEventName.POST_TOOL_CALL,
+                HookContext(payload=observation),
+            )
+
+    def _emit_run_end(self, result: "AgentLoopResult") -> None:
+        """在结果生成后、返回调用方前分发只读运行结束事件。"""
+        registry = self.hook_registry
+        if not isinstance(registry, SyncHookRegistry):
+            return
+        self._emit_sync_hook(
+            HookEventName.RUN_END,
+            HookContext(
+                payload={
+                    "status": result.status,
+                    "stop_reason": result.error_type or result.status,
+                    "iterations": result.iterations,
+                    "tool_call_count": result.tool_call_count,
+                    "has_final_reply": bool(result.summary),
+                }
+            ),
+        )
+
+    def _emit_sync_hook(
+        self,
+        event_name: HookEventName,
+        context: HookContext,
+    ) -> None:
+        """隔离观察 Hook 基础设施自身的意外错误。"""
+        registry = self.hook_registry
+        if not isinstance(registry, SyncHookRegistry):
+            return
+        try:
+            # Registry 已自行隔离单个 Plugin 回调异常与超时结果。
+            registry.emit(HookEvent(name=event_name.value, context=context))
+        except Exception:
+            logger.exception("Hook dispatch setup failed: event=%s", event_name.value)
 
     def _cancel_result(self, messages: list[dict]) -> "AgentLoopResult":
         return self._result(
@@ -814,13 +945,15 @@ class AgentLoop:
         self.tool_batches = 0
         self.tool_call_count = 0
         try:
-            return self._run_inner(user_message)
+            result = self._run_inner(user_message)
         except Exception as exc:
             # 内部 _run_inner 已经处理了 model / persistence / tool 等已知
             # 异常,真到这里说明是未预期 bug,统一标 internal_error
-            return self._internal_error_result(
+            result = self._internal_error_result(
                 messages=[], error=f"unhandled exception: {exc!r}",
             )
+        self._emit_run_end(result)
+        return result
 
     def _run_inner(self, user_message: str) -> AgentLoopResult:
         messages = self.init_messages(user_message)
@@ -828,6 +961,7 @@ class AgentLoop:
         self.tools_used = []
         self.tool_batches = 0
         self.tool_call_count = 0
+        self._tool_observations = []
 
         for iteration in range(self.max_iterations):
             # 1) iteration 开始前检查取消
@@ -878,12 +1012,16 @@ class AgentLoop:
                     if finish_reason == "length"
                     else "empty_model_response"
                 )
+            model_duration_ms = max(
+                0,
+                int((time.perf_counter() - call_started) * 1000),
+            )
             self._emit_model_call_event(
                 _model_call_event(
                     iteration=self.iterations,
                     model=call_model,
                     model_role=call_model_role,
-                    latency_ms=(time.perf_counter() - call_started) * 1000,
+                    latency_ms=model_duration_ms,
                     outcome=outcome,
                     response=response,
                     assistant_msg=assistant_msg,
@@ -921,6 +1059,12 @@ class AgentLoop:
                                 messages,
                                 repr(exc),
                             )
+                        self._emit_post_llm_call(
+                            response=response,
+                            assistant_msg=assistant_msg,
+                            finish_reason=finish_reason,
+                            duration_ms=model_duration_ms,
+                        )
                         cont_msg = self.continuation_message()
                         messages.append(cont_msg)
                         try:
@@ -969,6 +1113,13 @@ class AgentLoop:
                 except Exception as exc:
                     # DB 写入失败:assistant + tool_messages 整组未落盘,停止 loop
                     return self._persistence_error_result(messages, repr(exc))
+                self._emit_post_llm_call(
+                    response=response,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                    duration_ms=model_duration_ms,
+                )
+                self._emit_post_tool_calls()
                 if tool_error is not None:
                     return tool_error
                 continue
@@ -979,6 +1130,12 @@ class AgentLoop:
                     self.on_assistant_message(msg_dict, response)
                 except Exception as exc:
                     return self._persistence_error_result(messages, repr(exc))
+                self._emit_post_llm_call(
+                    response=response,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                    duration_ms=model_duration_ms,
+                )
                 cont_msg = self.continuation_message()
                 messages.append(cont_msg)
                 try:
@@ -991,6 +1148,12 @@ class AgentLoop:
                 self.on_final_assistant_message(msg_dict, response)
             except Exception as exc:
                 return self._persistence_error_result(messages, repr(exc))
+            self._emit_post_llm_call(
+                response=response,
+                assistant_msg=assistant_msg,
+                finish_reason=finish_reason,
+                duration_ms=model_duration_ms,
+            )
             return self._result(
                 ok=True, status="completed",
                 summary=assistant_msg.content or "",
@@ -1028,6 +1191,7 @@ class AgentLoop:
         fatal_error_type: str | None = None
         approval_request: dict | None = None
         for tc in tool_calls:
+            tool_started = time.perf_counter()
             if approval_request is not None:
                 output = build_approval_deferred()
                 err_status = None
@@ -1057,15 +1221,29 @@ class AgentLoop:
 
             # 已经决定终止,后续 tool_call 仍生成 tool_msg 让 batch 持久化完整
             if fatal_detail is not None:
+                self._record_tool_observation(
+                    tc,
+                    error_type=err_status or "prior_tool_failure",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
                 continue
 
             pending = _extract_approval_request(output, tc)
             if pending is not None:
+                self._record_tool_observation(
+                    tc,
+                    error_type="approval_required",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
                 approval_request = pending
                 continue
 
             fatal, err_type = self._classify_tool_error(output, err_status)
-
+            self._record_tool_observation(
+                tc,
+                error_type=(err_type or err_status or None),
+                duration_ms=(time.perf_counter() - tool_started) * 1000,
+            )
             if fatal:
                 # safety / 权限 / 路径逃逸 / cancelled / persistence:必须终止
                 fatal_detail = (
@@ -1361,7 +1539,13 @@ class AsyncAgentLoop(AgentLoop):
         model_kwargs: dict | None = None,
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
+        hook_registry: AsyncHookRegistry | None = None,
     ):
+        if hook_registry is not None and not isinstance(
+            hook_registry,
+            AsyncHookRegistry,
+        ):
+            raise TypeError("hook_registry must be an AsyncHookRegistry")
         super().__init__(
             model=model,
             max_iterations=max_iterations,
@@ -1374,21 +1558,109 @@ class AsyncAgentLoop(AgentLoop):
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
             tool_context=tool_context,
+            hook_registry=None,
         )
+        self.hook_registry = hook_registry
 
     async def run(self, user_message: str) -> AgentLoopResult:
         """异步跑一次完整循环,Task 取消必须原样向上传播。"""
         self.tool_batches = 0
         self.tool_call_count = 0
         try:
-            return await self._run_inner(user_message)
+            result = await self._run_inner(user_message)
         except asyncio.CancelledError:
             # 真正取消模型 HTTP 请求依赖 CancelledError 继续传到 Runner。
             raise
         except Exception as exc:
-            return self._internal_error_result(
+            result = self._internal_error_result(
                 messages=[], error=f"unhandled exception: {exc!r}",
             )
+        return await self._finalize_run_result(result)
+
+    async def _finalize_run_result(
+        self,
+        result: AgentLoopResult,
+    ) -> AgentLoopResult:
+        """在异步结果即将返回时分发 run_end 观察事件。"""
+        await self._emit_run_end_async(result)
+        return result
+
+    async def _emit_post_llm_call_async(
+        self,
+        *,
+        response,
+        assistant_msg,
+        finish_reason: str | None,
+        duration_ms: int,
+    ) -> None:
+        """在 assistant 消息完成既有持久化后分发异步模型观察事件。"""
+        registry = self.hook_registry
+        if not isinstance(registry, AsyncHookRegistry):
+            return
+        payload: dict[str, object] = {
+            "finish_reason": None if finish_reason is None else str(finish_reason),
+            "has_text": bool(_object_value(assistant_msg, "content")),
+            "tool_call_count": len(_object_value(assistant_msg, "tool_calls") or ()),
+            "duration_ms": max(0, int(duration_ms)),
+        }
+        token_usage = self._hook_token_usage(response)
+        if token_usage:
+            payload["token_usage"] = token_usage
+        await self._emit_async_hook(
+            HookEventName.POST_LLM_CALL,
+            HookContext(
+                invocation_id=f"llm:{self.iterations}",
+                payload=payload,
+            ),
+        )
+
+    async def _emit_post_tool_calls_async(self) -> None:
+        """在整批工具消息持久化后按原工具顺序分发异步观察事件。"""
+        registry = self.hook_registry
+        if not isinstance(registry, AsyncHookRegistry):
+            self._tool_observations = []
+            return
+        observations = self._tool_observations
+        self._tool_observations = []
+        for observation in observations:
+            await self._emit_async_hook(
+                HookEventName.POST_TOOL_CALL,
+                HookContext(payload=observation),
+            )
+
+    async def _emit_run_end_async(self, result: AgentLoopResult) -> None:
+        """在异步结果生成后、返回调用方前分发 run_end 事件。"""
+        registry = self.hook_registry
+        if not isinstance(registry, AsyncHookRegistry):
+            return
+        await self._emit_async_hook(
+            HookEventName.RUN_END,
+            HookContext(
+                payload={
+                    "status": result.status,
+                    "stop_reason": result.error_type or result.status,
+                    "iterations": result.iterations,
+                    "tool_call_count": result.tool_call_count,
+                    "has_final_reply": bool(result.summary),
+                }
+            ),
+        )
+
+    async def _emit_async_hook(
+        self,
+        event_name: HookEventName,
+        context: HookContext,
+    ) -> None:
+        """隔离观察回调失败，同时保留 AgentLoop 外部取消语义。"""
+        registry = self.hook_registry
+        if not isinstance(registry, AsyncHookRegistry):
+            return
+        try:
+            await registry.emit(HookEvent(name=event_name.value, context=context))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Hook dispatch failed: event=%s", event_name.value)
 
     async def _run_inner(self, user_message: str) -> AgentLoopResult:
         messages = self.init_messages(user_message)
@@ -1396,6 +1668,7 @@ class AsyncAgentLoop(AgentLoop):
         self.tools_used = []
         self.tool_batches = 0
         self.tool_call_count = 0
+        self._tool_observations = []
 
         for iteration in range(self.max_iterations):
             if self._is_cancelled():
@@ -1442,12 +1715,16 @@ class AsyncAgentLoop(AgentLoop):
                     if finish_reason == "length"
                     else "empty_model_response"
                 )
+            model_duration_ms = max(
+                0,
+                int((time.perf_counter() - call_started) * 1000),
+            )
             await self._emit_model_call_event_async(
                 _model_call_event(
                     iteration=self.iterations,
                     model=call_model,
                     model_role=call_model_role,
-                    latency_ms=(time.perf_counter() - call_started) * 1000,
+                    latency_ms=model_duration_ms,
                     outcome=outcome,
                     response=response,
                     assistant_msg=assistant_msg,
@@ -1485,6 +1762,12 @@ class AsyncAgentLoop(AgentLoop):
                                 messages,
                                 repr(exc),
                             )
+                        await self._emit_post_llm_call_async(
+                            response=response,
+                            assistant_msg=assistant_msg,
+                            finish_reason=finish_reason,
+                            duration_ms=model_duration_ms,
+                        )
                         cont_msg = self.continuation_message()
                         messages.append(cont_msg)
                         try:
@@ -1536,6 +1819,13 @@ class AsyncAgentLoop(AgentLoop):
                     raise
                 except Exception as exc:
                     return self._persistence_error_result(messages, repr(exc))
+                await self._emit_post_llm_call_async(
+                    response=response,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                    duration_ms=model_duration_ms,
+                )
+                await self._emit_post_tool_calls_async()
                 if tool_error is not None:
                     return tool_error
                 continue
@@ -1547,6 +1837,12 @@ class AsyncAgentLoop(AgentLoop):
                     raise
                 except Exception as exc:
                     return self._persistence_error_result(messages, repr(exc))
+                await self._emit_post_llm_call_async(
+                    response=response,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                    duration_ms=model_duration_ms,
+                )
                 cont_msg = self.continuation_message()
                 messages.append(cont_msg)
                 try:
@@ -1563,6 +1859,12 @@ class AsyncAgentLoop(AgentLoop):
                 raise
             except Exception as exc:
                 return self._persistence_error_result(messages, repr(exc))
+            await self._emit_post_llm_call_async(
+                response=response,
+                assistant_msg=assistant_msg,
+                finish_reason=finish_reason,
+                duration_ms=model_duration_ms,
+            )
             return self._result(
                 ok=True, status="completed",
                 summary=assistant_msg.content or "",
@@ -1586,6 +1888,7 @@ class AsyncAgentLoop(AgentLoop):
         fatal_error_type: str | None = None
         approval_request: dict | None = None
         for tc in tool_calls:
+            tool_started = time.perf_counter()
             if approval_request is not None:
                 output = build_approval_deferred()
                 err_status = None
@@ -1615,14 +1918,29 @@ class AsyncAgentLoop(AgentLoop):
             await self.on_tool_message(tc, tool_msg, output)
 
             if fatal_detail is not None:
+                self._record_tool_observation(
+                    tc,
+                    error_type=err_status or "prior_tool_failure",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
                 continue
 
             pending = _extract_approval_request(output, tc)
             if pending is not None:
+                self._record_tool_observation(
+                    tc,
+                    error_type="approval_required",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
                 approval_request = pending
                 continue
 
             fatal, err_type = self._classify_tool_error(output, err_status)
+            self._record_tool_observation(
+                tc,
+                error_type=(err_type or err_status or None),
+                duration_ms=(time.perf_counter() - tool_started) * 1000,
+            )
             if fatal:
                 fatal_detail = (
                     err_detail

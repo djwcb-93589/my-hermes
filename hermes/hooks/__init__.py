@@ -11,6 +11,7 @@ from .contracts import (
     HookRegistration,
     HookRegistrationError,
 )
+from .events import HookEventName
 from .registry import HookRegistry, SyncHookRegistry
 
 
@@ -20,6 +21,7 @@ __all__ = [
     "HookContext",
     "HookDispatchResult",
     "HookEvent",
+    "HookEventName",
     "HookInvocationResult",
     "HookName",
     "HookRegistration",

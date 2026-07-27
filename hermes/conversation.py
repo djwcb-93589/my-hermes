@@ -51,6 +51,7 @@ from hermes.errors import (
     switch_to_async_fallback,
     switch_to_fallback,
 )
+from hermes.hooks import AsyncHookRegistry, SyncHookRegistry
 from hermes.tokens import compress, compress_async, estimate_tokens
 from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
 
@@ -283,6 +284,7 @@ class ConversationAgentLoop(AgentLoop):
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
         stream_sink=None,
+        hook_registry: SyncHookRegistry | None = None,
     ):
         super().__init__(
             model=model,
@@ -296,6 +298,7 @@ class ConversationAgentLoop(AgentLoop):
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             stream_sink=stream_sink,
+            hook_registry=hook_registry,
         )
         # 主会话专有状态
         self.conn = conn
@@ -500,6 +503,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         resume_state: dict | None = None,
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
+        hook_registry: AsyncHookRegistry | None = None,
     ):
         super().__init__(
             model=model,
@@ -512,6 +516,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
             tool_context=tool_context,
+            hook_registry=hook_registry,
         )
         self.conn = conn
         self.db_session_id = db_session_id
@@ -578,14 +583,16 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
             "active_model": self.model,
         }
 
-    async def run(self, user_message: str) -> AgentLoopResult:
-        """恢复审批后的循环时，将前一段工具统计合并进逻辑任务总数。"""
-        result = await super().run(user_message)
+    async def _finalize_run_result(
+        self,
+        result: AgentLoopResult,
+    ) -> AgentLoopResult:
+        """合并审批恢复统计后，再分发最终 run_end 观察事件。"""
         self.tool_batches += self._tool_batches_used_before
         self.tool_call_count += self._tool_call_count_used_before
         result.tool_batches = self.tool_batches
         result.tool_call_count = self.tool_call_count
-        return result
+        return await super()._finalize_run_result(result)
 
     async def pre_model_call(self, messages: list[dict]) -> list[dict]:
         if estimate_tokens(messages) >= self.compression_threshold:
@@ -842,6 +849,7 @@ def run_conversation(
     resume_from_history: bool = False,
     stream_sink=None,
     background_review_coordinator=None,
+    hook_registry: SyncHookRegistry | None = None,
 ) -> dict:
     """主会话 agent 入口。委托给 ConversationAgentLoop。
 
@@ -889,6 +897,7 @@ def run_conversation(
         allowed_tool_names=allowed_tool_names,
         tool_context=tool_context,
         stream_sink=stream_sink,
+        hook_registry=hook_registry,
     )
     result: AgentLoopResult = loop.run(user_message)
 
@@ -932,6 +941,7 @@ async def run_conversation_async(
     tool_context: dict | None = None,
     tool_policy: ToolPolicy | None = None,
     background_review_coordinator=None,
+    hook_registry: AsyncHookRegistry | None = None,
 ) -> dict:
     """Gateway 异步主会话入口,返回格式与 ``run_conversation`` 一致。
 
@@ -1020,6 +1030,7 @@ async def run_conversation_async(
                 resume_state=normalized_resume_state,
                 allowed_tool_names=allowed_tool_names,
                 tool_context=tool_context,
+                hook_registry=hook_registry,
             )
         except RuntimeError:
             return _approval_resume_error_response(

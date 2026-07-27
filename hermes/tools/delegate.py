@@ -28,6 +28,7 @@ from hermes.config import (
     client as _default_client,
 )
 from hermes.delegate_jobs import get_delegate_job_manager
+from hermes.hooks import SyncHookRegistry
 from hermes.tools import (
     ExecutionEnvironment,
     ToolPolicy,
@@ -244,6 +245,7 @@ def run_delegate_child(
     child_session_key: str,
     cancel_checker: Callable[[], bool] | None = None,
     tool_context: dict | None = None,
+    hook_registry: SyncHookRegistry | None = None,
 ) -> dict:
     """跑一个子 agent 任务,返回 dict(不是 JSON)。
 
@@ -274,6 +276,7 @@ def run_delegate_child(
             model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
             cancel_checker=cancel_checker,
             tool_context=tool_context,
+            hook_registry=hook_registry,
         )
         # goal 作为 user message 传入;system prompt 只描述角色 / 约束
         result = loop.run(goal)

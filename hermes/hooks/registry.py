@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from threading import RLock
@@ -133,6 +134,12 @@ class SyncHookRegistry(_HookRegistryBase):
         if timeout_seconds is not None:
             raise HookRegistrationError(
                 "SyncHookRegistry does not support timeout_seconds"
+            )
+        if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+            getattr(callback, "__call__", None)
+        ):
+            raise HookRegistrationError(
+                "SyncHookRegistry does not support async hook callbacks"
             )
         return super().register(
             event_name,
