@@ -118,9 +118,9 @@ class SkillGovernance:
             return {"ok": True}
         if actor is SkillActor.SYSTEM:
             return {"ok": True}
-        if action not in {"create", "edit", "patch", "delete", "adopt", "pin", "unpin"}:
+        if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file", "adopt", "pin", "unpin"}:
             return {"ok": False, "error_type": "permission_denied", "error": f"unsupported governance action: {action!r}"}
-        if action in {"edit", "patch", "delete"} and descriptor.pinned:
+        if action in {"edit", "patch", "delete", "write_file", "remove_file"} and descriptor.pinned:
             return {"ok": False, "error_type": "permission_denied", "error": "pinned skills must be unpinned before modification"}
         if actor is SkillActor.BACKGROUND_REVIEW:
             if action in {"adopt", "pin", "unpin", "create"}:

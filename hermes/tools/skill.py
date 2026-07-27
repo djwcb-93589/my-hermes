@@ -39,6 +39,13 @@ def render_skills_section() -> str | None:
 
 
 def handle_skill_view(args, **kwargs):
+    relative_path = args.get("relative_path")
+    if relative_path:
+        return _json(_service().read_support_file(
+            args.get("name", ""),
+            relative_path,
+            actor=kwargs.get("skill_actor", "foreground"),
+        ))
     return _json(_service().view_skill(
         args.get("name", ""),
         actor=kwargs.get("skill_actor", "foreground"),
@@ -51,7 +58,7 @@ def handle_skill_list(args, **kwargs):
 
 
 def handle_skill_manage(args, **kwargs):
-    allowed_options = {"description", "version", "platforms", "metadata", "body", "old_text", "new_text"}
+    allowed_options = {"description", "version", "platforms", "metadata", "body", "old_text", "new_text", "relative_path", "content"}
     options = {key: value for key, value in args.items() if key in allowed_options}
     return _json(_service().manage_skill(
         args.get("action", ""),
@@ -80,6 +87,10 @@ def register(registry):
                     "name": {
                         "type": "string",
                         "description": "skill name; must match [A-Za-z0-9_-]+",
+                    },
+                    "relative_path": {
+                        "type": "string",
+                        "description": "optional support file path under references/, templates/, scripts/, or assets/",
                     },
                 },
                 "required": ["name"],
@@ -116,7 +127,7 @@ def register(registry):
         schema={
             "name": "skill_manage",
             "description": (
-                "Create / edit / delete / patch a skill. Names must match "
+                "Create / edit / delete / patch a skill, or write / remove an allowed support file. Names must match "
                 "[A-Za-z0-9_-]+; path traversal is rejected. Writes are "
                 "serialized via a per-skill operation lock and applied atomically."
             ),
@@ -125,7 +136,7 @@ def register(registry):
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "edit", "delete", "patch"],
+                        "enum": ["create", "edit", "delete", "patch", "write_file", "remove_file"],
                     },
                     "name": {"type": "string"},
                     "description": {"type": "string"},
@@ -143,6 +154,14 @@ def register(registry):
                     "new_text": {
                         "type": "string",
                         "description": "patch: replacement text",
+                    },
+                    "relative_path": {
+                        "type": "string",
+                        "description": "write_file/remove_file: allowed support-file relative path",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "write_file: full UTF-8 text content",
                     },
                 },
                 "required": ["action", "name"],
