@@ -97,6 +97,19 @@ def handle_skill_manage(args, **kwargs):
                 "error_type": "invalid_args",
                 "error": f"{key} must be a string",
             })
+    if actor == "background_review" and action in {
+        "edit",
+        "patch",
+        "write_file",
+        "remove_file",
+    }:
+        for key in ("expected_revision", "expected_governance_revision"):
+            if not isinstance(options.get(key), str) or not options[key].strip():
+                return _json({
+                    "ok": False,
+                    "error_type": "invalid_args",
+                    "error": f"{key} is required for background review",
+                })
     return _json(_service().manage_skill(
         action,
         args.get("name", ""),

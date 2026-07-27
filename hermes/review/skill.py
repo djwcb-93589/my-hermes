@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping
 
+from hermes.redaction import redact_explicit_secrets
 from hermes.review.contracts import (
     ForegroundReviewEvent,
     ReviewClaim,
@@ -44,28 +44,15 @@ SKILL_REVIEW_INSTRUCTION = (
 
 _MAX_EVIDENCE_TEXT = 1_600
 _MAX_TOOL_RESULT_TEXT = 1_000
-_SENSITIVE_VALUE_RE = re.compile(
-    r"(?i)(?P<prefix>\b(?:api[_-]?key|token|password|secret)\b"
-    r"\s*[:=]\s*['\"]?)(?P<value>[^\s,;\"'\]}]+)"
-)
-_BEARER_VALUE_RE = re.compile(
-    r"(?i)(?P<prefix>authorization\s*[:=]\s*bearer\s+)"
-    r"(?P<value>[^\s,;\"'\]}]+)"
-)
-_RAW_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{6,}")
-
-
-def _redact_sensitive_text(text: str) -> str:
-    """在不依赖具体工具模块的前提下移除明确凭证值。"""
-    text = _BEARER_VALUE_RE.sub(
-        lambda match: f"{match.group('prefix')}<secret>",
-        text,
-    )
-    text = _SENSITIVE_VALUE_RE.sub(
-        lambda match: f"{match.group('prefix')}<secret>",
-        text,
-    )
-    return _RAW_KEY_RE.sub("<secret>", text)
+_MAX_REVIEW_EVIDENCE_TEXT = 12_000
+_SECTION_BUDGETS = {
+    "user": 2_300,
+    "errors": 2_400,
+    "skill_view": 1_800,
+    "final": 2_400,
+    "calls": 1_200,
+    "success": 900,
+}
 
 
 def _summarize_text(value: object, *, limit: int) -> str:
@@ -81,7 +68,7 @@ def _summarize_text(value: object, *, limit: int) -> str:
             text = str(value)
     if "\x00" in text:
         return "[binary content omitted]"
-    text = _redact_sensitive_text(text).strip()
+    text = redact_explicit_secrets(text).strip()
     if len(text) <= limit:
         return text
     return f"{text[:limit].rstrip()}\n[truncated]"
@@ -123,11 +110,38 @@ def _unique_entries(entries: list[str]) -> list[str]:
     return list(dict.fromkeys(entries))
 
 
+def _truncate_evidence(text: str, *, limit: int) -> str:
+    """按字符预算确定性截断证据，并保留明确标记。"""
+    if len(text) <= limit:
+        return text
+    marker = "\n[truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return f"{text[:limit - len(marker)].rstrip()}{marker}"
+
+
+def _format_evidence_section(
+    title: str,
+    entries: list[str],
+    *,
+    budget: int,
+) -> str:
+    """在固定预算内输出一组同优先级证据。"""
+    if not entries:
+        return ""
+    section = f"\n{title}:\n" + "\n".join(
+        f"- {entry}" for entry in _unique_entries(entries)
+    )
+    return _truncate_evidence(section, limit=budget)
+
+
 def _build_review_messages(messages: list[dict]) -> list[dict]:
     """把固定窗口按角色和工具证据整理为单个确定性审视输入。"""
     user_entries: list[str] = []
-    assistant_entries: list[str] = []
-    tool_entries: list[str] = []
+    final_results: list[str] = []
+    skill_view_entries: list[str] = []
+    key_tool_calls: list[str] = []
+    successful_tool_results: list[str] = []
     tool_errors: list[str] = []
     loaded_skill_names: set[str] = set()
     call_names: dict[str, str] = {}
@@ -143,9 +157,11 @@ def _build_review_messages(messages: list[dict]) -> list[dict]:
         if role == "user" and content:
             user_entries.append(content)
         elif role == "assistant":
-            if content:
-                assistant_entries.append(content)
             tool_calls = message.get("tool_calls")
+            if content and not tool_calls:
+                final_results.append(
+                    _summarize_text(content, limit=_MAX_TOOL_RESULT_TEXT)
+                )
             if isinstance(tool_calls, list):
                 for tool_call in tool_calls:
                     name, arguments, call_id = _tool_call_details(tool_call)
@@ -159,11 +175,19 @@ def _build_review_messages(messages: list[dict]) -> list[dict]:
                         if isinstance(parsed_arguments, dict):
                             skill_name = parsed_arguments.get("name")
                             if isinstance(skill_name, str) and skill_name:
-                                loaded_skill_names.add(skill_name)
+                                loaded_skill_names.add(
+                                    _summarize_text(
+                                        skill_name,
+                                        limit=_MAX_TOOL_RESULT_TEXT,
+                                    )
+                                )
                     details = f"Tool call: {name}"
                     if arguments:
                         details = f"{details}\nParameters: {arguments}"
-                    tool_entries.append(details)
+                    if name == "skill_view":
+                        skill_view_entries.append(details)
+                    else:
+                        key_tool_calls.append(details)
         elif role == "tool":
             call_id = str(message.get("tool_call_id", ""))
             tool_name = call_names.get(call_id, "unknown")
@@ -177,27 +201,56 @@ def _build_review_messages(messages: list[dict]) -> list[dict]:
             if _is_tool_error(result):
                 tool_errors.append(entry)
             else:
-                tool_entries.append(entry)
+                successful_tool_results.append(entry)
 
-    lines = ["Fixed-window Skill Review evidence:"]
-    if user_entries:
-        lines.append("\nUser goals and corrections:")
-        lines.extend(f"- {entry}" for entry in _unique_entries(user_entries))
-    if tool_entries:
-        lines.append("\nKey tool calls, parameters, and results:")
-        lines.extend(f"- {entry}" for entry in _unique_entries(tool_entries))
-    if tool_errors:
-        lines.append("\nTool errors and failure reasons:")
-        lines.extend(f"- {entry}" for entry in _unique_entries(tool_errors))
-    if loaded_skill_names:
-        lines.append("\nSkills loaded in this window:")
-        lines.extend(f"- {name}" for name in sorted(loaded_skill_names))
-    if assistant_entries:
-        lines.append("\nFinal result from this window:")
-        lines.append(assistant_entries[-1])
-    else:
-        lines.append("\nFinal result from this window:\n[no textual final result]")
-    return [{"role": "user", "content": "\n".join(lines)}]
+    skill_view_entries.extend(
+        f"Loaded Skill: {name}" for name in sorted(loaded_skill_names)
+    )
+    if not final_results:
+        final_results.append("[no textual final result]")
+
+    sections = (
+        (
+            "User goals and corrections",
+            user_entries,
+            _SECTION_BUDGETS["user"],
+        ),
+        (
+            "Tool errors and failure reasons",
+            tool_errors,
+            _SECTION_BUDGETS["errors"],
+        ),
+        (
+            "skill_view calls and loaded Skills",
+            skill_view_entries,
+            _SECTION_BUDGETS["skill_view"],
+        ),
+        (
+            "Final results from this window",
+            final_results,
+            _SECTION_BUDGETS["final"],
+        ),
+        (
+            "Key tool calls and parameters",
+            key_tool_calls,
+            _SECTION_BUDGETS["calls"],
+        ),
+        (
+            "Successful tool output",
+            successful_tool_results,
+            _SECTION_BUDGETS["success"],
+        ),
+    )
+    parts = ["Fixed-window Skill Review evidence:"]
+    for title, entries, budget in sections:
+        section = _format_evidence_section(title, entries, budget=budget)
+        if section:
+            parts.append(section)
+    evidence = _truncate_evidence(
+        "\n".join(parts),
+        limit=_MAX_REVIEW_EVIDENCE_TEXT,
+    )
+    return [{"role": "user", "content": evidence}]
 
 
 class SkillReviewDriver:

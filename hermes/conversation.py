@@ -81,6 +81,8 @@ def _normalize_async_resume_state(value: dict | None) -> dict:
         "iterations_used": 0,
         "retry_count": 0,
         "continuation_count": 0,
+        "tool_batches_used": 0,
+        "tool_call_count_used": 0,
         "using_fallback": False,
         "active_model": "",
     }
@@ -88,7 +90,13 @@ def _normalize_async_resume_state(value: dict | None) -> dict:
         if not isinstance(value, dict):
             raise ValueError("approval resume state must contain an object")
         state.update(value)
-    for field in ("iterations_used", "retry_count", "continuation_count"):
+    for field in (
+        "iterations_used",
+        "retry_count",
+        "continuation_count",
+        "tool_batches_used",
+        "tool_call_count_used",
+    ):
         raw = state.get(field)
         if isinstance(raw, bool):
             raise ValueError(f"approval resume state {field} is invalid")
@@ -514,6 +522,10 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self.resume_from_history = resume_from_history
         restored_state = _normalize_async_resume_state(resume_state)
         self._iterations_used_before = restored_state["iterations_used"]
+        self._tool_batches_used_before = restored_state["tool_batches_used"]
+        self._tool_call_count_used_before = restored_state[
+            "tool_call_count_used"
+        ]
         self._retry_count = restored_state["retry_count"]
         self._continuation_count = restored_state["continuation_count"]
         self._using_fallback = restored_state["using_fallback"]
@@ -558,11 +570,22 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         """导出下一次审批恢复需要的最小可序列化状态。"""
         return {
             "iterations_used": self._iterations_used_before + self.iterations,
+            "tool_batches_used": self.tool_batches,
+            "tool_call_count_used": self.tool_call_count,
             "retry_count": self._retry_count,
             "continuation_count": self._continuation_count,
             "using_fallback": self._using_fallback,
             "active_model": self.model,
         }
+
+    async def run(self, user_message: str) -> AgentLoopResult:
+        """恢复审批后的循环时，将前一段工具统计合并进逻辑任务总数。"""
+        result = await super().run(user_message)
+        self.tool_batches += self._tool_batches_used_before
+        self.tool_call_count += self._tool_call_count_used_before
+        result.tool_batches = self.tool_batches
+        result.tool_call_count = self.tool_call_count
+        return result
 
     async def pre_model_call(self, messages: list[dict]) -> list[dict]:
         if estimate_tokens(messages) >= self.compression_threshold:
