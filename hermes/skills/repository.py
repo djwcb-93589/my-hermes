@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
 import re
 import shutil
+import uuid
 from pathlib import Path
 
 import yaml
@@ -17,6 +20,7 @@ from hermes.config import HERMES_HOME
 SKILLS_DIR = HERMES_HOME / "skills"
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ALLOWED_FM_FIELDS = {"name", "description", "version", "platforms", "metadata"}
+_GOVERNANCE_FILE = ".myhermes.json"
 
 
 class SkillRepository:
@@ -58,6 +62,10 @@ class SkillRepository:
         self._skill_lock_target(name).parent.mkdir(parents=True, exist_ok=True)
         with file_lock(self._skill_lock_target(name)):
             yield
+
+    @staticmethod
+    def _governance_payload(record: dict) -> str:
+        return json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
     @staticmethod
     def _split_frontmatter(text: str) -> tuple[str, str] | None:
@@ -146,13 +154,73 @@ class SkillRepository:
                 "platforms": metadata.get("platforms"), "metadata": metadata.get("metadata"),
                 "body": body, "content": text}
 
+    def get_skill_revision(self, name: str) -> dict:
+        """读取完整 SKILL.md 内容并返回其稳定摘要。"""
+        skill_dir, reason = self._resolve_skill_dir(name)
+        if skill_dir is None:
+            return {"ok": False, "error_type": "invalid_name", "error": reason}
+        skill_file = skill_dir / "SKILL.md"
+        if not skill_file.exists():
+            return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+        try:
+            text = skill_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error_type": "io_error", "error": str(exc), "name": name}
+        return {"ok": True, "revision": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
+    def load_governance_record(self, name: str) -> dict:
+        """读取治理 sidecar；缺失时显式标记为 legacy，绝不自动写入。"""
+        skill_dir, reason = self._resolve_skill_dir(name)
+        if skill_dir is None:
+            return {"ok": False, "error_type": "invalid_name", "error": reason}
+        skill_file = skill_dir / "SKILL.md"
+        if not skill_file.exists():
+            return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+        sidecar = skill_dir / _GOVERNANCE_FILE
+        if not sidecar.exists():
+            return {"ok": True, "record": None, "legacy": True}
+        try:
+            record = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error_type": "governance_invalid", "error": f"invalid governance record: {exc}", "name": name}
+        if not isinstance(record, dict):
+            return {"ok": False, "error_type": "governance_invalid", "error": "governance record must be an object", "name": name}
+        return {"ok": True, "record": record, "legacy": False}
+
+    def write_governance_record(self, name: str, record: dict) -> dict:
+        """在统一 Skill 操作锁内原子写入治理 sidecar。"""
+        skill_dir, reason = self._resolve_skill_dir(name)
+        if skill_dir is None:
+            return {"ok": False, "error_type": "invalid_name", "error": reason}
+        try:
+            payload = self._governance_payload(record)
+            self.skills_dir.mkdir(parents=True, exist_ok=True)
+            with self._skill_operation_lock(name):
+                skill_dir, reason = self._resolve_skill_dir(name)
+                if skill_dir is None:
+                    return {"ok": False, "error_type": "invalid_name", "error": reason}
+                skill_file = skill_dir / "SKILL.md"
+                if not skill_file.exists():
+                    return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+                atomic_write_text(skill_dir / _GOVERNANCE_FILE, payload)
+        except LockTimeout:
+            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill operation lock"}
+        except (OSError, TypeError, ValueError) as exc:
+            return {"ok": False, "error_type": "io_error", "error": str(exc)}
+        return {"ok": True, "name": name}
+
     def create(self, name: str, **kwargs) -> dict:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
+        governance_record = kwargs.pop("governance_record", None)
+        if not isinstance(governance_record, dict):
+            return {"ok": False, "error_type": "invalid_args", "error": "governance_record is required for create"}
         content = self._render_skill(name, kwargs.get("body", ""), description=kwargs.get("description", ""),
                                      version=kwargs.get("version"), platforms=kwargs.get("platforms"), metadata=kwargs.get("metadata"))
+        temp_dir: Path | None = None
         try:
+            governance_payload = self._governance_payload(governance_record)
             self.skills_dir.mkdir(parents=True, exist_ok=True)
             with self._skill_operation_lock(name):
                 skill_dir, reason = self._resolve_skill_dir(name)
@@ -161,12 +229,19 @@ class SkillRepository:
                 skill_file = skill_dir / "SKILL.md"
                 if skill_dir.exists() or skill_file.exists():
                     return {"ok": False, "error_type": "exists", "error": f"skill {name!r} was created concurrently", "name": name}
-                skill_dir.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(skill_file, content)
+                temp_dir = self.skills_dir / f".tmp-{name}-{uuid.uuid4().hex}"
+                temp_dir.mkdir()
+                atomic_write_text(temp_dir / "SKILL.md", content)
+                atomic_write_text(temp_dir / _GOVERNANCE_FILE, governance_payload)
+                os.replace(temp_dir, skill_dir)
+                temp_dir = None
         except LockTimeout:
-            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill file lock"}
-        except OSError as exc:
+            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill operation lock"}
+        except (OSError, TypeError, ValueError) as exc:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
+        finally:
+            if temp_dir is not None and temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
         return {"ok": True, "name": name, "action": "create", "size": len(content)}
 
     def edit(self, name: str, **kwargs) -> dict:
@@ -193,7 +268,7 @@ class SkillRepository:
                     metadata=kwargs.get("metadata") if kwargs.get("metadata") is not None else metadata.get("metadata"))
                 atomic_write_text(skill_file, content)
         except LockTimeout:
-            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill file lock"}
+            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill operation lock"}
         except OSError as exc:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
         return {"ok": True, "name": name, "action": "edit", "size": len(content)}
@@ -225,7 +300,7 @@ class SkillRepository:
                 content = text.replace(old_text, new_text, 1)
                 atomic_write_text(skill_file, content)
         except LockTimeout:
-            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill file lock"}
+            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill operation lock"}
         except OSError as exc:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
         return {"ok": True, "name": name, "action": "patch", "size": len(content)}
@@ -248,6 +323,8 @@ class SkillRepository:
                 if real_target.parent != real_root:
                     return {"ok": False, "error_type": "forbidden", "error": "target is not a direct child of skills root"}
                 shutil.rmtree(skill_dir)
+        except LockTimeout:
+            return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill operation lock"}
         except OSError as exc:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
         return {"ok": True, "name": name, "action": "delete"}
