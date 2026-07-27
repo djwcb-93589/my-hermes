@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import threading
+from collections import deque
 from dataclasses import dataclass
 
 from hermes.agent_loop import AgentLoopResult
@@ -37,6 +38,7 @@ class BackgroundReviewConfig:
     max_iterations: int = 8
     retry_cooldown_seconds: float = 60.0
     max_concurrent_jobs: int = 1
+    max_pending_jobs: int = 32
 
     def __post_init__(self) -> None:
         if (
@@ -59,6 +61,12 @@ class BackgroundReviewConfig:
             or self.max_concurrent_jobs <= 0
         ):
             raise ValueError("max_concurrent_jobs must be a positive integer")
+        if (
+            isinstance(self.max_pending_jobs, bool)
+            or not isinstance(self.max_pending_jobs, int)
+            or self.max_pending_jobs < 0
+        ):
+            raise ValueError("max_pending_jobs must be a non-negative integer")
 
 
 class BackgroundReviewCoordinator:
@@ -262,6 +270,8 @@ class BackgroundReviewExecutor:
         self.registry = tool_registry
         self._lock = threading.Lock()
         self._active_jobs = 0
+        self._pending_jobs: deque[ReviewClaim] = deque()
+        self._scheduled_claims: set[tuple[str, str]] = set()
         register_all(self.registry)
 
     def submit(self, *, claim: ReviewClaim) -> bool:
@@ -281,32 +291,39 @@ class BackgroundReviewExecutor:
                 "invalid_or_unsupported_review_claim",
             )
             return False
-        rejected_for_capacity = False
+        claim_key = self._claim_key(claim)
+        start_immediately = False
+        queue_full = False
         with self._lock:
-            if self._active_jobs >= self.config.max_concurrent_jobs:
-                rejected_for_capacity = True
-            else:
+            if claim_key in self._scheduled_claims:
+                logger.debug("background review claim is already scheduled")
+                return True
+            if self._pending_jobs:
+                if len(self._pending_jobs) < self.config.max_pending_jobs:
+                    self._pending_jobs.append(claim)
+                    self._scheduled_claims.add(claim_key)
+                    logger.debug("background review claim queued")
+                    return True
+                queue_full = True
+            elif self._active_jobs < self.config.max_concurrent_jobs:
                 self._active_jobs += 1
-        if rejected_for_capacity:
-            logger.warning("background review concurrency limit reached")
-            self._fail_claim_safely(driver, claim, "review_concurrency_limit")
+                self._scheduled_claims.add(claim_key)
+                start_immediately = True
+            elif len(self._pending_jobs) < self.config.max_pending_jobs:
+                self._pending_jobs.append(claim)
+                self._scheduled_claims.add(claim_key)
+                logger.debug("background review claim queued")
+                return True
+            else:
+                queue_full = True
+        if queue_full:
+            logger.warning("background review queue is full")
+            self._fail_claim_safely(driver, claim, "review_queue_full")
             return False
-        worker = threading.Thread(
-            target=self._run_worker,
-            args=(driver, claim),
-            name=f"background-review-{claim.session_id}",
-            daemon=True,
-        )
-        try:
-            worker.start()
-        except Exception as exc:
-            with self._lock:
-                self._active_jobs -= 1
-            logger.warning(
-                "background review worker could not start: %s",
-                type(exc).__name__,
-            )
-            self._fail_claim_safely(driver, claim, "review_worker_start_failed")
+        if not start_immediately:
+            return False
+        if not self._start_reserved_worker(driver, claim):
+            self._start_next_pending_job()
             return False
         logger.debug("background review submitted")
         return True
@@ -321,6 +338,94 @@ class BackgroundReviewExecutor:
             and isinstance(claim.token, str)
             and bool(claim.token)
         )
+
+    @staticmethod
+    def _claim_key(claim: ReviewClaim) -> tuple[str, str]:
+        """构造进程内调度去重所需的稳定 claim 身份。"""
+        return claim.session_id, claim.token
+
+    def _release_reserved_claim(self, claim: ReviewClaim) -> None:
+        """释放已经占用的并发槽位，不执行数据库操作。"""
+        with self._lock:
+            claim_key = self._claim_key(claim)
+            if claim_key not in self._scheduled_claims:
+                return
+            self._active_jobs -= 1
+            self._scheduled_claims.discard(claim_key)
+
+    def _start_reserved_worker(
+        self,
+        driver: ReviewDriver,
+        claim: ReviewClaim,
+    ) -> bool:
+        """启动已预留并发槽位的 worker；失败时只释放当前 claim。"""
+        worker = threading.Thread(
+            target=self._run_worker,
+            args=(driver, claim),
+            name=f"background-review-{claim.session_id}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:
+            self._release_reserved_claim(claim)
+            logger.warning(
+                "background review worker could not start: %s",
+                type(exc).__name__,
+            )
+            self._fail_claim_safely(driver, claim, "review_worker_start_failed")
+            return False
+        return True
+
+    def _reserve_next_pending_claim(self) -> ReviewClaim | None:
+        """按 FIFO 顺序取出下一项，并在锁内预留一个并发槽位。"""
+        with self._lock:
+            if (
+                self._active_jobs >= self.config.max_concurrent_jobs
+                or not self._pending_jobs
+            ):
+                return None
+            claim = self._pending_jobs.popleft()
+            self._active_jobs += 1
+            return claim
+
+    def _claim_is_still_valid(
+        self,
+        driver: ReviewDriver,
+        claim: ReviewClaim,
+    ) -> bool:
+        """在队列等待后用独立连接确认 claim 未失效。"""
+        conn = None
+        try:
+            conn = init_db(self.db_path)
+            return driver.claim_is_valid(conn, claim)
+        except Exception as exc:
+            logger.warning(
+                "background review could not validate queued claim: %s",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _start_next_pending_job(self) -> None:
+        """启动最早的有效等待任务；失效任务不会阻塞后续 claim。"""
+        while True:
+            claim = self._reserve_next_pending_claim()
+            if claim is None:
+                return
+            driver = self.driver_registry.get(claim.kind)
+            if driver is None:
+                logger.warning("background review dropped a queued claim with no driver")
+                self._release_reserved_claim(claim)
+                continue
+            if not self._claim_is_still_valid(driver, claim):
+                logger.debug("background review dropped an invalid queued claim")
+                self._release_reserved_claim(claim)
+                continue
+            if self._start_reserved_worker(driver, claim):
+                return
 
     def _run_worker(self, driver: ReviewDriver, claim: ReviewClaim) -> None:
         conn = None
@@ -383,8 +488,8 @@ class BackgroundReviewExecutor:
         finally:
             if conn is not None:
                 conn.close()
-            with self._lock:
-                self._active_jobs -= 1
+            self._release_reserved_claim(claim)
+            self._start_next_pending_job()
 
     def _fail_claim(
         self,
@@ -427,7 +532,7 @@ _background_review_coordinator: BackgroundReviewCoordinator | None = None
 
 
 def _build_default_coordinator() -> BackgroundReviewCoordinator:
-    """显式装配当前唯一启用的 Memory Review Driver。"""
+    """显式装配默认启用的 Review Driver。"""
     from hermes.review.memory import MemoryReviewDriver
     from hermes.review.memory_store import MemoryReviewStore
 
@@ -437,6 +542,7 @@ def _build_default_coordinator() -> BackgroundReviewCoordinator:
             "retry_cooldown_seconds"
         ],
         max_concurrent_jobs=BACKGROUND_REVIEW_CONFIG["max_concurrent_jobs"],
+        max_pending_jobs=BACKGROUND_REVIEW_CONFIG["max_pending_jobs"],
     )
     driver_registry = ReviewDriverRegistry()
     memory_driver = MemoryReviewDriver(
@@ -447,6 +553,30 @@ def _build_default_coordinator() -> BackgroundReviewCoordinator:
         max_iterations=config.max_iterations,
     )
     driver_registry.register(memory_driver)
+    if BACKGROUND_REVIEW_CONFIG["skill_tool_batch_interval"] > 0:
+        try:
+            from hermes.review.skill import SkillReviewDriver
+            from hermes.review.skill_store import SkillReviewStore
+
+            driver_registry.register(
+                SkillReviewDriver(
+                    store=SkillReviewStore(),
+                    skill_tool_batch_interval=BACKGROUND_REVIEW_CONFIG[
+                        "skill_tool_batch_interval"
+                    ],
+                    claim_ttl_seconds=BACKGROUND_REVIEW_CONFIG[
+                        "claim_ttl_seconds"
+                    ],
+                    retry_cooldown_seconds=config.retry_cooldown_seconds,
+                    max_iterations=config.max_iterations,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skill Review driver unavailable; Skill Review was skipped: %s",
+                type(exc).__name__,
+                exc_info=True,
+            )
     executor = BackgroundReviewExecutor(
         driver_registry=driver_registry,
         config=config,

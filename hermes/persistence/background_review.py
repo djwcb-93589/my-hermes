@@ -605,13 +605,16 @@ def claim_due_skill_review(
     conn: sqlite3.Connection,
     session_id: str,
     *,
-    skill_interval: int,
+    skill_tool_batch_interval: int,
     claim_ttl_seconds: float,
     now: float | None = None,
 ) -> dict | None:
     """领取到期的固定 Skill Review 消息窗口。"""
     _require_session_id(session_id)
-    skill_interval = _require_non_negative_integer(skill_interval, "skill_interval")
+    skill_tool_batch_interval = _require_non_negative_integer(
+        skill_tool_batch_interval,
+        "skill_tool_batch_interval",
+    )
     claim_ttl_seconds = _require_positive_number(
         claim_ttl_seconds,
         "claim_ttl_seconds",
@@ -629,7 +632,7 @@ def claim_due_skill_review(
             )
         except sqlite3.IntegrityError as exc:
             raise DBError(f"skill review state creation failed: {exc}") from exc
-        if skill_interval == 0:
+        if skill_tool_batch_interval == 0:
             return None
         state = get_skill_review_state(conn, session_id)
         if state is None:
@@ -644,7 +647,7 @@ def claim_due_skill_review(
         elif state["retry"]:
             tool_batch_upto = state["retry_tool_batch_upto"]
             message_upto = state["retry_message_upto"]
-        elif state["pending"] >= skill_interval:
+        elif state["pending"] >= skill_tool_batch_interval:
             tool_batch_upto = state["tool_batch_total"]
             message_upto = state["message_total_upto"]
         else:

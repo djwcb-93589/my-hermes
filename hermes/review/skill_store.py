@@ -38,13 +38,13 @@ class SkillReviewStore:
         conn: sqlite3.Connection,
         session_id: str,
         *,
-        skill_interval: int,
+        skill_tool_batch_interval: int,
         claim_ttl_seconds: float,
     ) -> dict | None:
         return claim_due_skill_review(
             conn,
             session_id,
-            skill_interval=skill_interval,
+            skill_tool_batch_interval=skill_tool_batch_interval,
             claim_ttl_seconds=claim_ttl_seconds,
         )
 

@@ -262,13 +262,13 @@ class SkillReviewDriver:
         self,
         *,
         store: SkillReviewStore,
-        skill_interval: int,
+        skill_tool_batch_interval: int,
         claim_ttl_seconds: float,
         retry_cooldown_seconds: float,
         max_iterations: int,
     ):
         self.store = store
-        self.skill_interval = skill_interval
+        self.skill_tool_batch_interval = skill_tool_batch_interval
         self.claim_ttl_seconds = claim_ttl_seconds
         self.retry_cooldown_seconds = retry_cooldown_seconds
         self.max_iterations = max_iterations
@@ -291,7 +291,7 @@ class SkillReviewDriver:
         raw_claim = self.store.claim_due(
             conn,
             session_id,
-            skill_interval=self.skill_interval,
+            skill_tool_batch_interval=self.skill_tool_batch_interval,
             claim_ttl_seconds=self.claim_ttl_seconds,
         )
         if raw_claim is None:

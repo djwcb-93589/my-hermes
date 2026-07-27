@@ -65,11 +65,12 @@ DEFAULT_CONFIG = {
     "background_review": {
         "enabled": False,
         "memory_interval": 3,
-        "skill_interval": 0,
+        "skill_tool_batch_interval": 0,
         "claim_ttl_seconds": 1800,
         "retry_cooldown_seconds": 60,
         "max_iterations": 8,
         "max_concurrent_jobs": 1,
+        "max_pending_jobs": 32,
     },
 }
 
@@ -317,19 +318,13 @@ def _validate_background_review_config(config: dict) -> None:
         raise ValueError("background_review.enabled must be a boolean")
     review["enabled"] = enabled
 
-    for field_name in ("memory_interval", "skill_interval"):
+    for field_name in ("memory_interval", "skill_tool_batch_interval"):
         value = review.get(field_name, defaults[field_name])
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(
                 f"background_review.{field_name} must be a non-negative integer"
             )
         review[field_name] = value
-    if review["skill_interval"] != 0:
-        raise ValueError(
-            "background_review.skill_interval must remain 0 "
-            "until skill review is supported"
-        )
-
     for field_name in ("claim_ttl_seconds", "retry_cooldown_seconds"):
         value = review.get(field_name, defaults[field_name])
         if isinstance(value, bool):
@@ -355,6 +350,20 @@ def _validate_background_review_config(config: dict) -> None:
                 f"background_review.{field_name} must be a positive integer"
             )
         review[field_name] = value
+
+    max_pending_jobs = review.get(
+        "max_pending_jobs",
+        defaults["max_pending_jobs"],
+    )
+    if (
+        isinstance(max_pending_jobs, bool)
+        or not isinstance(max_pending_jobs, int)
+        or max_pending_jobs < 0
+    ):
+        raise ValueError(
+            "background_review.max_pending_jobs must be a non-negative integer"
+        )
+    review["max_pending_jobs"] = max_pending_jobs
 
 
 def _validate_browser_config(config: dict) -> None:
