@@ -125,7 +125,7 @@ def register(registry):
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "edit", "delete", "patch", "adopt", "release", "pin", "unpin"],
+                        "enum": ["create", "edit", "delete", "patch"],
                     },
                     "name": {"type": "string"},
                     "description": {"type": "string"},

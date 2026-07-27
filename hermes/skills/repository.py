@@ -21,6 +21,7 @@ SKILLS_DIR = HERMES_HOME / "skills"
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ALLOWED_FM_FIELDS = {"name", "description", "version", "platforms", "metadata"}
 _GOVERNANCE_FILE = ".myhermes.json"
+_LEGACY_GOVERNANCE_REVISION = "legacy"
 
 
 class SkillRepository:
@@ -124,7 +125,8 @@ class SkillRepository:
             metadata, _, error = self.parse_frontmatter_safe(text)
             entry = {"name": metadata.get("name", skill_dir.name) if not error else skill_dir.name,
                      "description": metadata.get("description", "") if not error else "",
-                     "relative_path": f"skills/{skill_dir.name}"}
+                     "relative_path": f"skills/{skill_dir.name}",
+                     "revision": hashlib.sha256(text.encode("utf-8")).hexdigest()}
             if error:
                 entry["error"] = error
             else:
@@ -152,21 +154,32 @@ class SkillRepository:
         return {"ok": True, "name": metadata.get("name", name), "relative_path": f"skills/{name}",
                 "description": metadata.get("description", ""), "version": metadata.get("version"),
                 "platforms": metadata.get("platforms"), "metadata": metadata.get("metadata"),
-                "body": body, "content": text}
+                "body": body, "content": text,
+                "revision": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
-    def get_skill_revision(self, name: str) -> dict:
-        """读取完整 SKILL.md 内容并返回其稳定摘要。"""
+    def resolve_source(self, name: str) -> dict:
+        """根据实际 Skill 位置解析来源，为后续安装来源保留扩展点。"""
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
-        skill_file = skill_dir / "SKILL.md"
-        if not skill_file.exists():
+        if not (skill_dir / "SKILL.md").exists():
             return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+        return {"ok": True, "source": "local"}
+
+    def _read_governance_record(self, skill_dir: Path, name: str) -> dict:
+        sidecar = skill_dir / _GOVERNANCE_FILE
+        if not sidecar.exists():
+            return {"ok": True, "record": None, "legacy": True,
+                    "governance_revision": _LEGACY_GOVERNANCE_REVISION}
         try:
-            text = skill_file.read_text(encoding="utf-8")
-        except OSError as exc:
-            return {"ok": False, "error_type": "io_error", "error": str(exc), "name": name}
-        return {"ok": True, "revision": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+            raw_record = sidecar.read_text(encoding="utf-8")
+            record = json.loads(raw_record)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error_type": "governance_invalid", "error": f"invalid governance record: {exc}", "name": name}
+        if not isinstance(record, dict):
+            return {"ok": False, "error_type": "governance_invalid", "error": "governance record must be an object", "name": name}
+        return {"ok": True, "record": record, "legacy": False,
+                "governance_revision": hashlib.sha256(raw_record.encode("utf-8")).hexdigest()}
 
     def load_governance_record(self, name: str) -> dict:
         """读取治理 sidecar；缺失时显式标记为 legacy，绝不自动写入。"""
@@ -176,18 +189,9 @@ class SkillRepository:
         skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
-        sidecar = skill_dir / _GOVERNANCE_FILE
-        if not sidecar.exists():
-            return {"ok": True, "record": None, "legacy": True}
-        try:
-            record = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            return {"ok": False, "error_type": "governance_invalid", "error": f"invalid governance record: {exc}", "name": name}
-        if not isinstance(record, dict):
-            return {"ok": False, "error_type": "governance_invalid", "error": "governance record must be an object", "name": name}
-        return {"ok": True, "record": record, "legacy": False}
+        return self._read_governance_record(skill_dir, name)
 
-    def write_governance_record(self, name: str, record: dict) -> dict:
+    def write_governance_record(self, name: str, record: dict, *, expected_governance_revision: str) -> dict:
         """在统一 Skill 操作锁内原子写入治理 sidecar。"""
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
@@ -202,6 +206,12 @@ class SkillRepository:
                 skill_file = skill_dir / "SKILL.md"
                 if not skill_file.exists():
                     return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+                current = self._read_governance_record(skill_dir, name)
+                if not current.get("ok"):
+                    return current
+                if current["governance_revision"] != expected_governance_revision:
+                    return {"ok": False, "error_type": "governance_conflict",
+                            "error": "governance record changed concurrently", "name": name}
                 atomic_write_text(skill_dir / _GOVERNANCE_FILE, payload)
         except LockTimeout:
             return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill operation lock"}
@@ -244,7 +254,7 @@ class SkillRepository:
                 shutil.rmtree(temp_dir, ignore_errors=True)
         return {"ok": True, "name": name, "action": "create", "size": len(content)}
 
-    def edit(self, name: str, **kwargs) -> dict:
+    def edit(self, name: str, *, expected_governance_revision: str, **kwargs) -> dict:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
@@ -257,6 +267,12 @@ class SkillRepository:
                 skill_file = skill_dir / "SKILL.md"
                 if not skill_file.exists():
                     return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+                current = self._read_governance_record(skill_dir, name)
+                if not current.get("ok"):
+                    return current
+                if current["governance_revision"] != expected_governance_revision:
+                    return {"ok": False, "error_type": "governance_conflict",
+                            "error": "governance record changed concurrently", "name": name}
                 text = skill_file.read_text(encoding="utf-8")
                 metadata, old_body, error = self.parse_frontmatter_safe(text)
                 if error:
@@ -273,7 +289,7 @@ class SkillRepository:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
         return {"ok": True, "name": name, "action": "edit", "size": len(content)}
 
-    def patch(self, name: str, **kwargs) -> dict:
+    def patch(self, name: str, *, expected_governance_revision: str, **kwargs) -> dict:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
@@ -291,6 +307,12 @@ class SkillRepository:
                 skill_file = skill_dir / "SKILL.md"
                 if not skill_file.exists():
                     return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+                current = self._read_governance_record(skill_dir, name)
+                if not current.get("ok"):
+                    return current
+                if current["governance_revision"] != expected_governance_revision:
+                    return {"ok": False, "error_type": "governance_conflict",
+                            "error": "governance record changed concurrently", "name": name}
                 text = skill_file.read_text(encoding="utf-8")
                 count = text.count(old_text)
                 if count == 0:
@@ -305,7 +327,7 @@ class SkillRepository:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
         return {"ok": True, "name": name, "action": "patch", "size": len(content)}
 
-    def delete(self, name: str) -> dict:
+    def delete(self, name: str, *, expected_governance_revision: str) -> dict:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
@@ -317,6 +339,12 @@ class SkillRepository:
                     return {"ok": False, "error_type": "invalid_name", "error": reason}
                 if not skill_dir.exists():
                     return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+                current = self._read_governance_record(skill_dir, name)
+                if not current.get("ok"):
+                    return current
+                if current["governance_revision"] != expected_governance_revision:
+                    return {"ok": False, "error_type": "governance_conflict",
+                            "error": "governance record changed concurrently", "name": name}
                 real_target, real_root = skill_dir.resolve(), self.skills_dir.resolve()
                 if real_target == real_root:
                     return {"ok": False, "error_type": "forbidden", "error": "cannot delete skills root directory"}

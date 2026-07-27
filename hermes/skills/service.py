@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from hermes.skill_security import get_skill_trust_state, scan_skill_content
-from .governance import SkillActor, SkillDescriptor, SkillGovernance, SkillOwner, SkillSource
+from .governance import SkillActor, SkillDescriptor, SkillGovernance, SkillManagedBy, SkillSource
 from .repository import SkillRepository
 
 
@@ -32,14 +32,21 @@ class SkillService:
         return {
             "skill_id": descriptor.skill_id,
             "source": descriptor.source.value,
-            "owner": descriptor.owner.value,
+            "managed_by": descriptor.managed_by.value,
             "pinned": descriptor.pinned,
             "revision": descriptor.revision,
             "can_curate": self.governance.can_curate(descriptor),
         }
 
-    def _describe_authorized(self, name: str, actor: SkillActor, action: str) -> SkillDescriptor | dict:
-        descriptor = self.governance.describe(name)
+    def _describe_authorized(
+        self,
+        name: str,
+        actor: SkillActor,
+        action: str,
+        *,
+        revision: str,
+    ) -> SkillDescriptor | dict:
+        descriptor = self.governance.describe(name, revision=revision)
         if isinstance(descriptor, dict):
             return descriptor
         authorization = self.governance.authorize(descriptor=descriptor, actor=actor, action=action)
@@ -54,7 +61,7 @@ class SkillService:
         skills = self.repository.discover()
         for skill in skills:
             directory_name = skill["relative_path"].rsplit("/", 1)[-1]
-            descriptor = self.governance.describe(directory_name)
+            descriptor = self.governance.describe(directory_name, revision=skill["revision"])
             if isinstance(descriptor, dict):
                 skill["governance_error"] = descriptor.get("error", "governance record is invalid")
                 continue
@@ -72,7 +79,7 @@ class SkillService:
         payload = self.repository.load(name)
         if not payload.get("ok"):
             return payload
-        descriptor = self._describe_authorized(name, resolved_actor, "read")
+        descriptor = self._describe_authorized(name, resolved_actor, "read", revision=payload["revision"])
         governance_error = None
         if isinstance(descriptor, dict):
             if resolved_actor is not SkillActor.FOREGROUND or descriptor.get("error_type") != "governance_invalid":
@@ -106,7 +113,7 @@ class SkillService:
             key: payload[key]
             for key in (
                 "name", "relative_path", "risk", "trusted", "trust_stale", "skill_id",
-                "source", "owner", "pinned", "revision", "can_curate",
+                "source", "managed_by", "pinned", "revision", "can_curate",
             )
             if key in payload
         }
@@ -151,24 +158,28 @@ class SkillService:
                 governance_record=self.governance.creation_record(resolved_actor),
                 **kwargs,
             )
-        if action in {"adopt", "release", "pin", "unpin"}:
-            return getattr(self, f"{action}_skill")(name, actor=resolved_actor)
         if action not in {"edit", "patch", "delete"}:
             return {"ok": False, "error_type": "unknown_action", "error": f"unknown action: {action!r}"}
-        descriptor = self._describe_authorized(name, resolved_actor, action)
+        payload = self.repository.load(name)
+        if not payload.get("ok"):
+            return payload
+        descriptor = self._describe_authorized(name, resolved_actor, action, revision=payload["revision"])
         if isinstance(descriptor, dict):
             return descriptor
         if action == "edit":
-            return self.repository.edit(name, **kwargs)
+            return self.repository.edit(name, expected_governance_revision=descriptor.governance_revision, **kwargs)
         if action == "patch":
-            return self.repository.patch(name, **kwargs)
-        return self.repository.delete(name)
+            return self.repository.patch(name, expected_governance_revision=descriptor.governance_revision, **kwargs)
+        return self.repository.delete(name, expected_governance_revision=descriptor.governance_revision)
 
     def _change_governance(self, name: str, *, actor: SkillActor | str, action: str) -> dict:
         resolved_actor = self._actor(actor)
         if isinstance(resolved_actor, dict):
             return resolved_actor
-        descriptor = self._describe_authorized(name, resolved_actor, action)
+        payload = self.repository.load(name)
+        if not payload.get("ok"):
+            return payload
+        descriptor = self._describe_authorized(name, resolved_actor, action, revision=payload["revision"])
         if isinstance(descriptor, dict):
             return descriptor
         record_result = self.governance.load_record(name)
@@ -178,18 +189,12 @@ class SkillService:
         if action == "adopt":
             if descriptor.source is not SkillSource.LOCAL:
                 return {"ok": False, "error_type": "permission_denied", "error": "only local skills can be adopted", "name": name}
-            if descriptor.owner is SkillOwner.CURATOR:
+            if descriptor.managed_by is SkillManagedBy.CURATOR:
                 return {"ok": True, "name": name, "action": action, **self._descriptor_fields(descriptor)}
-            if descriptor.owner is not SkillOwner.USER:
+            if descriptor.managed_by is not SkillManagedBy.USER:
                 return {"ok": False, "error_type": "permission_denied", "error": "only user-owned skills can be adopted", "name": name}
-            record["owner"] = SkillOwner.CURATOR.value
+            record["managed_by"] = SkillManagedBy.CURATOR.value
             record["adopted_by"] = resolved_actor.value
-        elif action == "release":
-            if descriptor.owner is SkillOwner.USER:
-                return {"ok": True, "name": name, "action": action, **self._descriptor_fields(descriptor)}
-            if descriptor.owner is not SkillOwner.CURATOR:
-                return {"ok": False, "error_type": "permission_denied", "error": "only curator-owned skills can be released", "name": name}
-            record["owner"] = SkillOwner.USER.value
         elif action == "pin":
             if descriptor.pinned:
                 return {"ok": True, "name": name, "action": action, **self._descriptor_fields(descriptor)}
@@ -198,19 +203,20 @@ class SkillService:
             if not descriptor.pinned:
                 return {"ok": True, "name": name, "action": action, **self._descriptor_fields(descriptor)}
             record["pinned"] = False
-        result = self.repository.write_governance_record(name, record)
+        result = self.repository.write_governance_record(
+            name,
+            record,
+            expected_governance_revision=descriptor.governance_revision,
+        )
         if not result.get("ok"):
             return result
-        updated = self.governance.describe(name)
+        updated = self.governance.describe(name, revision=payload["revision"])
         if isinstance(updated, dict):
             return updated
         return {"ok": True, "name": name, "action": action, **self._descriptor_fields(updated)}
 
     def adopt_skill(self, name: str, *, actor: SkillActor | str = SkillActor.FOREGROUND) -> dict:
         return self._change_governance(name, actor=actor, action="adopt")
-
-    def release_skill(self, name: str, *, actor: SkillActor | str = SkillActor.FOREGROUND) -> dict:
-        return self._change_governance(name, actor=actor, action="release")
 
     def pin_skill(self, name: str, *, actor: SkillActor | str = SkillActor.FOREGROUND) -> dict:
         return self._change_governance(name, actor=actor, action="pin")
