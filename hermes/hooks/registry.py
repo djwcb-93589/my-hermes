@@ -69,7 +69,10 @@ class _HookRegistryBase:
         timeout_seconds: float | None = None,
     ) -> HookRegistration:
         """注册一个 Hook；同一事件中禁止重复回调或重复标识。"""
-        normalized_event_name = normalize_hook_name(event_name)
+        try:
+            normalized_event_name = normalize_hook_name(event_name)
+        except (TypeError, ValueError) as exc:
+            raise HookRegistrationError(str(exc)) from exc
         if not callable(callback):
             raise HookRegistrationError("hook callback must be callable")
         normalized_hook_id = _normalize_hook_id(
@@ -117,6 +120,25 @@ class _HookRegistryBase:
 
 class SyncHookRegistry(_HookRegistryBase):
     """按注册顺序同步执行回调，并隔离单个 Hook 的失败。"""
+
+    def register(
+        self,
+        event_name: HookName,
+        callback: HookCallback,
+        *,
+        hook_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> HookRegistration:
+        """注册同步 Hook；同步执行不提供不可可靠终止的超时机制。"""
+        if timeout_seconds is not None:
+            raise HookRegistrationError(
+                "SyncHookRegistry does not support timeout_seconds"
+            )
+        return super().register(
+            event_name,
+            callback,
+            hook_id=hook_id,
+        )
 
     def emit(self, event: HookEvent) -> HookDispatchResult:
         """分发事件；未注册回调时返回空的结构化结果。"""

@@ -115,7 +115,11 @@ class AsyncHookRegistry(_HookRegistryBase):
 
     @staticmethod
     async def _invoke(callback, context: HookContext) -> object:
-        """在线程中运行普通函数，并在当前事件循环中等待协程结果。"""
+        """在线程中运行普通函数，并在当前事件循环中等待协程结果。
+
+        同步函数超时时只会停止等待，无法强制终止已经在线程中运行的函数。
+        """
+        # 超时仅取消当前等待；线程中的同步函数仍可能继续执行。
         value = await asyncio.to_thread(callback, context)
         if inspect.isawaitable(value):
             return await value

@@ -18,26 +18,90 @@ def normalize_hook_name(value: object) -> HookName:
     return value.strip()
 
 
+_SAFE_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _freeze_value(
+    value: object,
+    *,
+    path: str,
+    ancestors: set[int],
+) -> object:
+    """递归复制安全值，并将所有可变容器转换为不可变结构。"""
+    if type(value) in _SAFE_SCALAR_TYPES:
+        return value
+
+    value_type = type(value)
+    if value_type not in (dict, list, set, tuple, frozenset):
+        raise TypeError(
+            f"{path} contains unsupported value type: "
+            f"{value_type.__name__}"
+        )
+
+    value_id = id(value)
+    if value_id in ancestors:
+        raise TypeError(f"{path} must not contain cyclic containers")
+    ancestors.add(value_id)
+    try:
+        if value_type is dict:
+            frozen_mapping: dict[str, object] = {}
+            for key, nested_value in value.items():
+                if type(key) is not str:
+                    raise TypeError(f"{path} mapping keys must be strings")
+                frozen_mapping[key] = _freeze_value(
+                    nested_value,
+                    path=f"{path}.{key}",
+                    ancestors=ancestors,
+                )
+            return MappingProxyType(frozen_mapping)
+        if value_type in (list, tuple):
+            return tuple(
+                _freeze_value(
+                    nested_value,
+                    path=f"{path}[{index}]",
+                    ancestors=ancestors,
+                )
+                for index, nested_value in enumerate(value)
+            )
+        return frozenset(
+            _freeze_value(
+                nested_value,
+                path=f"{path}{{item}}",
+                ancestors=ancestors,
+            )
+            for nested_value in value
+        )
+    finally:
+        ancestors.remove(value_id)
+
+
 def _freeze_mapping(
     value: Mapping[str, object],
     *,
     field_name: str,
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{field_name} must be a mapping")
-    return MappingProxyType(dict(value))
+    """冻结顶层上下文映射，并拒绝非内建安全容器。"""
+    if type(value) is not dict:
+        raise TypeError(f"{field_name} must be a dict")
+    frozen = _freeze_value(
+        value,
+        path=field_name,
+        ancestors=set(),
+    )
+    assert isinstance(frozen, Mapping)
+    return frozen
 
 
 @dataclass(frozen=True, slots=True)
 class HookContext:
-    """传给 Hook 的只读、与业务实现解耦的上下文数据。"""
+    """传给 Hook 的只读上下文，只接受安全的递归基础数据。"""
 
     invocation_id: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     payload: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """复制映射，避免 Hook 通过上下文修改调用方的顶层数据。"""
+        """深度冻结输入，避免 Hook 修改调用方提供的任意嵌套容器。"""
         if self.invocation_id is not None and not isinstance(
             self.invocation_id, str
         ):
@@ -104,4 +168,3 @@ class HookDispatchResult:
 
 class HookRegistrationError(ValueError):
     """Hook 注册输入无效或与既有注册冲突时抛出。"""
-
