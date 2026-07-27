@@ -8,6 +8,7 @@ from .contracts import (
     ReviewRunSpec,
 )
 from .loop import ReviewAgentLoop
+from .registry import ReviewDriverRegistry
 from .runtime import get_background_review_coordinator
 
 
@@ -16,6 +17,7 @@ __all__ = [
     "ReviewAgentLoop",
     "ReviewClaim",
     "ReviewDriver",
+    "ReviewDriverRegistry",
     "ReviewKind",
     "ReviewRunSpec",
     "get_background_review_coordinator",
