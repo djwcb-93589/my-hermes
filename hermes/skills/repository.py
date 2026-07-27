@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -46,6 +47,17 @@ class SkillRepository:
         if target_real.parent != root_real:
             return None, "name must be a direct child of skills root"
         return target_real, ""
+
+    def _skill_lock_target(self, name: str) -> Path:
+        """返回操作锁目标，file_lock 会生成 ``.locks/<name>.lock``。"""
+        return self.skills_dir / ".locks" / name
+
+    @contextlib.contextmanager
+    def _skill_operation_lock(self, name: str):
+        """为同一个 Skill 的全部写操作提供唯一的跨进程锁。"""
+        self._skill_lock_target(name).parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(self._skill_lock_target(name)):
+            yield
 
     @staticmethod
     def _split_frontmatter(text: str) -> tuple[str, str] | None:
@@ -138,17 +150,18 @@ class SkillRepository:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
-        skill_file = skill_dir / "SKILL.md"
-        if skill_file.exists():
-            return {"ok": False, "error_type": "exists", "error": f"skill {name!r} already exists", "name": name}
         content = self._render_skill(name, kwargs.get("body", ""), description=kwargs.get("description", ""),
                                      version=kwargs.get("version"), platforms=kwargs.get("platforms"), metadata=kwargs.get("metadata"))
         try:
             self.skills_dir.mkdir(parents=True, exist_ok=True)
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            with file_lock(skill_file):
-                if skill_file.exists():
+            with self._skill_operation_lock(name):
+                skill_dir, reason = self._resolve_skill_dir(name)
+                if skill_dir is None:
+                    return {"ok": False, "error_type": "invalid_name", "error": reason}
+                skill_file = skill_dir / "SKILL.md"
+                if skill_dir.exists() or skill_file.exists():
                     return {"ok": False, "error_type": "exists", "error": f"skill {name!r} was created concurrently", "name": name}
+                skill_dir.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(skill_file, content)
         except LockTimeout:
             return {"ok": False, "error_type": "lock_timeout", "error": "could not acquire skill file lock"}
@@ -160,11 +173,15 @@ class SkillRepository:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
-        skill_file = skill_dir / "SKILL.md"
-        if not skill_file.exists():
-            return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
         try:
-            with file_lock(skill_file):
+            self.skills_dir.mkdir(parents=True, exist_ok=True)
+            with self._skill_operation_lock(name):
+                skill_dir, reason = self._resolve_skill_dir(name)
+                if skill_dir is None:
+                    return {"ok": False, "error_type": "invalid_name", "error": reason}
+                skill_file = skill_dir / "SKILL.md"
+                if not skill_file.exists():
+                    return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
                 text = skill_file.read_text(encoding="utf-8")
                 metadata, old_body, error = self.parse_frontmatter_safe(text)
                 if error:
@@ -185,16 +202,20 @@ class SkillRepository:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
-        skill_file = skill_dir / "SKILL.md"
-        if not skill_file.exists():
-            return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
         old_text, new_text = kwargs.get("old_text", ""), kwargs.get("new_text", "")
         if not old_text:
             return {"ok": False, "error_type": "invalid_args", "error": "old_text is required for patch"}
         if new_text == old_text:
             return {"ok": False, "error_type": "invalid_args", "error": "new_text must differ from old_text"}
         try:
-            with file_lock(skill_file):
+            self.skills_dir.mkdir(parents=True, exist_ok=True)
+            with self._skill_operation_lock(name):
+                skill_dir, reason = self._resolve_skill_dir(name)
+                if skill_dir is None:
+                    return {"ok": False, "error_type": "invalid_name", "error": reason}
+                skill_file = skill_dir / "SKILL.md"
+                if not skill_file.exists():
+                    return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
                 text = skill_file.read_text(encoding="utf-8")
                 count = text.count(old_text)
                 if count == 0:
@@ -213,15 +234,20 @@ class SkillRepository:
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return {"ok": False, "error_type": "invalid_name", "error": reason}
-        if not skill_dir.exists():
-            return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
-        real_target, real_root = skill_dir.resolve(), self.skills_dir.resolve()
-        if real_target == real_root:
-            return {"ok": False, "error_type": "forbidden", "error": "cannot delete skills root directory"}
-        if real_target.parent != real_root:
-            return {"ok": False, "error_type": "forbidden", "error": "target is not a direct child of skills root"}
         try:
-            shutil.rmtree(skill_dir)
+            self.skills_dir.mkdir(parents=True, exist_ok=True)
+            with self._skill_operation_lock(name):
+                skill_dir, reason = self._resolve_skill_dir(name)
+                if skill_dir is None:
+                    return {"ok": False, "error_type": "invalid_name", "error": reason}
+                if not skill_dir.exists():
+                    return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
+                real_target, real_root = skill_dir.resolve(), self.skills_dir.resolve()
+                if real_target == real_root:
+                    return {"ok": False, "error_type": "forbidden", "error": "cannot delete skills root directory"}
+                if real_target.parent != real_root:
+                    return {"ok": False, "error_type": "forbidden", "error": "target is not a direct child of skills root"}
+                shutil.rmtree(skill_dir)
         except OSError as exc:
             return {"ok": False, "error_type": "io_error", "error": str(exc)}
         return {"ok": True, "name": name, "action": "delete"}

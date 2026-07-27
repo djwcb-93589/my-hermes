@@ -44,12 +44,15 @@ class SkillService:
         return payload
 
     def manage_skill(self, action: str, name: str, **kwargs) -> dict:
-        operations = {"create": self.repository.create, "edit": self.repository.edit,
-                      "delete": self.repository.delete, "patch": self.repository.patch}
-        operation = operations.get(action)
-        if operation is None:
-            return {"ok": False, "error_type": "unknown_action", "error": f"unknown action: {action!r}"}
-        return operation(name, **kwargs)
+        if action == "create":
+            return self.repository.create(name, **kwargs)
+        if action == "edit":
+            return self.repository.edit(name, **kwargs)
+        if action == "patch":
+            return self.repository.patch(name, **kwargs)
+        if action == "delete":
+            return self.repository.delete(name)
+        return {"ok": False, "error_type": "unknown_action", "error": f"unknown action: {action!r}"}
 
     def render_skills_section(self) -> str | None:
         skills = self.repository.discover()
