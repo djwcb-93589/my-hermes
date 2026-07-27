@@ -76,7 +76,7 @@ def _freeze_value(
 
 
 def _freeze_mapping(
-    value: Mapping[str, object],
+    value: dict[str, object],
     *,
     field_name: str,
 ) -> Mapping[str, object]:
@@ -97,8 +97,8 @@ class HookContext:
     """传给 Hook 的只读上下文，只接受安全的递归基础数据。"""
 
     invocation_id: str | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
-    payload: Mapping[str, object] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
+    payload: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """深度冻结输入，避免 Hook 修改调用方提供的任意嵌套容器。"""

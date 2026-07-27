@@ -55,17 +55,30 @@ class AsyncHookRegistry(_HookRegistryBase):
             raise TypeError("event must be a HookEvent")
         results: list[HookInvocationResult] = []
         for registration in self._registrations_for(event):
+            task = asyncio.create_task(
+                self._invoke(registration.callback, event.context)
+            )
             try:
-                invocation = self._invoke(registration.callback, event.context)
-                value = (
-                    await asyncio.wait_for(
-                        invocation,
-                        timeout=registration.timeout_seconds,
-                    )
-                    if registration.timeout_seconds is not None
-                    else await invocation
+                done, _ = await asyncio.wait(
+                    (task,),
+                    timeout=registration.timeout_seconds,
                 )
-            except TimeoutError:
+            except asyncio.CancelledError:
+                task.cancel()
+                self._observe_detached_task(
+                    task,
+                    event_name=event.name,
+                    hook_id=registration.hook_id,
+                )
+                raise
+
+            if task not in done:
+                task.cancel()
+                self._observe_detached_task(
+                    task,
+                    event_name=event.name,
+                    hook_id=registration.hook_id,
+                )
                 logger.warning(
                     "Hook timed out: event=%s hook_id=%s timeout_seconds=%s",
                     event.name,
@@ -79,6 +92,27 @@ class AsyncHookRegistry(_HookRegistryBase):
                         error_type="TimeoutError",
                         timed_out=True,
                         error_message="hook execution timed out",
+                    )
+                )
+                continue
+
+            try:
+                value = task.result()
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    task.cancel()
+                    self._observe_detached_task(
+                        task,
+                        event_name=event.name,
+                        hook_id=registration.hook_id,
+                    )
+                    raise
+                results.append(
+                    HookInvocationResult(
+                        hook_id=registration.hook_id,
+                        success=False,
+                        error_type="CancelledError",
+                        error_message="hook task was cancelled",
                     )
                 )
             except Exception as exc:
@@ -112,6 +146,28 @@ class AsyncHookRegistry(_HookRegistryBase):
     ) -> HookDispatchResult:
         """使用事件名称和上下文分发的异步便捷入口。"""
         return await self.emit(HookEvent(name=event_name, context=context))
+
+    @staticmethod
+    def _observe_detached_task(
+        task: asyncio.Task[object],
+        *,
+        event_name: HookName,
+        hook_id: str,
+    ) -> None:
+        """消费超时或外部取消后脱离分发流程的 Task 结果。"""
+        def consume_result(completed_task: asyncio.Task[object]) -> None:
+            try:
+                completed_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception(
+                    "Detached Hook task failed: event=%s hook_id=%s",
+                    event_name,
+                    hook_id,
+                )
+
+        task.add_done_callback(consume_result)
 
     @staticmethod
     async def _invoke(callback, context: HookContext) -> object:

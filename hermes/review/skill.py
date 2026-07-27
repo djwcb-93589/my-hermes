@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from hermes.redaction import redact_explicit_secrets
 from hermes.review.contracts import (
@@ -41,22 +42,52 @@ SKILL_REVIEW_INSTRUCTION = (
     "that support file revision as expected_revision together with "
     "expected_governance_revision. Never overwrite a user-managed, system, "
     "external, or pinned Skill. You may only create, edit, patch, write_file, or "
-    "remove_file. If this evidence has insufficient reusable value, reply exactly: "
-    "Nothing to improve."
+    "remove_file. A tool result with ok=true only proves that the tool operation "
+    "completed; it does not prove that the attempted strategy achieved the user's "
+    "goal. When an assistant final report conflicts with recorded tool calls, tool "
+    "results, or later execution decisions, treat the verifiable tool trace as "
+    "authoritative. If this evidence has insufficient reusable value, reply "
+    "exactly: Nothing to improve."
 )
 
 
 _MAX_EVIDENCE_TEXT = 1_600
 _MAX_TOOL_RESULT_TEXT = 1_000
-_MAX_REVIEW_EVIDENCE_TEXT = 12_000
+_MAX_TOOL_EVENT_TEXT = 850
+_MAX_EXECUTION_NOTE_TEXT = 500
+_MAX_REVIEW_EVIDENCE_TEXT = 20_000
 _SECTION_BUDGETS = {
-    "user": 2_300,
-    "errors": 2_400,
-    "skill_view": 1_800,
-    "final": 2_400,
-    "calls": 1_200,
-    "success": 900,
+    "user": 2_400,
+    "errors": 2_800,
+    "decisions": 3_200,
+    "skill_view": 2_000,
+    "final": 2_800,
+    "calls": 3_200,
+    "success": 2_000,
 }
+
+
+@dataclass(frozen=True)
+class _EvidenceEntry:
+    """带任务位置和选择优先级的确定性证据条目。"""
+
+    task_index: int
+    order: int
+    text: str
+    priority: int = 0
+
+
+@dataclass
+class _ToolEvidence:
+    """把一次工具调用与当时的判断及对应结果绑定在一起。"""
+
+    task_index: int
+    order: int
+    name: str
+    arguments: str
+    assistant_note: str
+    call_id: str
+    result: str = ""
 
 
 def _summarize_text(value: object, *, limit: int) -> str:
@@ -109,9 +140,16 @@ def _is_tool_error(content: str) -> bool:
     )
 
 
-def _unique_entries(entries: list[str]) -> list[str]:
+def _unique_entries(entries: list[_EvidenceEntry]) -> list[_EvidenceEntry]:
     """保留首次出现的证据，裁剪重复日志。"""
-    return list(dict.fromkeys(entries))
+    unique: list[_EvidenceEntry] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.text in seen:
+            continue
+        seen.add(entry.text)
+        unique.append(entry)
+    return unique
 
 
 def _truncate_evidence(text: str, *, limit: int) -> str:
@@ -124,53 +162,182 @@ def _truncate_evidence(text: str, *, limit: int) -> str:
     return f"{text[:limit - len(marker)].rstrip()}{marker}"
 
 
+def _spread_indices(size: int) -> list[int]:
+    """按首、尾、中间的顺序覆盖一组证据，避免只保留最早内容。"""
+    if size <= 0:
+        return []
+    pending: list[tuple[int, int]] = [(0, size - 1)]
+    selected: list[int] = []
+    seen: set[int] = set()
+    while pending:
+        start, end = pending.pop(0)
+        if start > end:
+            continue
+        middle = (start + end + 1) // 2
+        for index in (start, end, middle):
+            if index not in seen:
+                seen.add(index)
+                selected.append(index)
+        if start + 1 <= middle - 1:
+            pending.append((start + 1, middle - 1))
+        if middle + 1 <= end - 1:
+            pending.append((middle + 1, end - 1))
+    return selected
+
+
+def _selection_order(entries: list[_EvidenceEntry]) -> list[_EvidenceEntry]:
+    """先分散保留高价值证据，再在各前台任务之间轮转选择。"""
+    unique = _unique_entries(entries)
+    selected: list[_EvidenceEntry] = []
+    selected_orders: set[int] = set()
+
+    priorities = sorted(
+        {entry.priority for entry in unique if entry.priority > 0},
+        reverse=True,
+    )
+    for priority in priorities:
+        candidates = [entry for entry in unique if entry.priority == priority]
+        for index in _spread_indices(len(candidates)):
+            entry = candidates[index]
+            selected.append(entry)
+            selected_orders.add(entry.order)
+
+    by_task: dict[int, list[_EvidenceEntry]] = {}
+    for entry in unique:
+        if entry.order in selected_orders:
+            continue
+        by_task.setdefault(entry.task_index, []).append(entry)
+    task_queues = {
+        task_index: [entries[index] for index in _spread_indices(len(entries))]
+        for task_index, entries in by_task.items()
+    }
+    while any(task_queues.values()):
+        for task_index in sorted(task_queues):
+            queue = task_queues[task_index]
+            if queue:
+                selected.append(queue.pop(0))
+    return selected
+
+
 def _format_evidence_section(
     title: str,
-    entries: list[str],
+    entries: list[_EvidenceEntry],
     *,
     budget: int,
+    entry_limit: int = _MAX_EVIDENCE_TEXT,
 ) -> str:
-    """在固定预算内输出一组同优先级证据。"""
+    """在固定预算内跨任务分散选择证据，并保留明确裁剪标记。"""
     if not entries:
         return ""
-    section = f"\n{title}:\n" + "\n".join(
-        f"- {entry}" for entry in _unique_entries(entries)
-    )
-    return _truncate_evidence(section, limit=budget)
+    candidates = _selection_order(entries)
+    header = f"\n{title}:\n"
+    marker = "- [truncated]"
+    rendered = [
+        _truncate_evidence(entry.text, limit=entry_limit)
+        for entry in candidates
+    ]
+    full_length = len(header) + sum(len(text) + 3 for text in rendered)
+    remaining = budget - len(header)
+    if remaining <= 0:
+        return _truncate_evidence(header, limit=budget)
+    truncated = full_length > budget
+    if truncated:
+        remaining -= len(marker) + 1
+
+    chosen: list[tuple[_EvidenceEntry, str]] = []
+    for entry, text in zip(candidates, rendered):
+        cost = len(text) + 3
+        if cost <= remaining:
+            chosen.append((entry, text))
+            remaining -= cost
+    chosen.sort(key=lambda item: item[0].order)
+    lines = [f"- {text}" for _, text in chosen]
+    if truncated:
+        lines.append(marker)
+    return f"{header}{chr(10).join(lines)}"
+
+
+def _tool_event_priority(event: _ToolEvidence) -> int:
+    """优先保留会改变访问目标或包含明确资源位置的调用。"""
+    arguments = event.arguments.lower()
+    if '"url"' in arguments or "http://" in arguments or "https://" in arguments:
+        return 2
+    return 0
+
+
+def _format_tool_event(event: _ToolEvidence) -> str:
+    """把工具前判断、调用和结果组合成可核对的证据链。"""
+    parts: list[str] = []
+    if event.assistant_note:
+        parts.append(f"Assistant decision: {event.assistant_note}")
+    parts.append(f"Tool call: {event.name}")
+    if event.arguments:
+        parts.append(f"Parameters: {event.arguments}")
+    if event.result:
+        parts.append(f"Result: {event.result}")
+    return "\n".join(parts)
 
 
 def _build_review_messages(messages: list[dict]) -> list[dict]:
     """把固定窗口按角色和工具证据整理为单个确定性审视输入。"""
-    user_entries: list[str] = []
-    final_results: list[str] = []
-    skill_view_entries: list[str] = []
-    key_tool_calls: list[str] = []
-    successful_tool_results: list[str] = []
-    tool_errors: list[str] = []
+    user_entries: list[_EvidenceEntry] = []
+    final_results: list[_EvidenceEntry] = []
+    execution_notes: list[_EvidenceEntry] = []
+    skill_view_entries: list[_EvidenceEntry] = []
+    key_tool_calls: list[_EvidenceEntry] = []
+    successful_tool_results: list[_EvidenceEntry] = []
+    tool_errors: list[_EvidenceEntry] = []
     loaded_skill_names: set[str] = set()
-    call_names: dict[str, str] = {}
+    tool_events: list[_ToolEvidence] = []
+    events_by_call_id: dict[str, _ToolEvidence] = {}
+    task_index = -1
+    order = 0
 
     for message in messages:
         if not isinstance(message, Mapping):
             continue
         role = message.get("role")
+        if role == "user":
+            task_index += 1
+        current_task = max(task_index, 0)
         content = _summarize_text(
             message.get("content", ""),
             limit=_MAX_EVIDENCE_TEXT,
         )
         if role == "user" and content:
-            user_entries.append(content)
+            user_entries.append(
+                _EvidenceEntry(current_task, order, content)
+            )
+            order += 1
         elif role == "assistant":
             tool_calls = message.get("tool_calls")
             if content and not tool_calls:
                 final_results.append(
-                    _summarize_text(content, limit=_MAX_TOOL_RESULT_TEXT)
+                    _EvidenceEntry(
+                        current_task,
+                        order,
+                        _summarize_text(
+                            content,
+                            limit=_MAX_TOOL_RESULT_TEXT,
+                        ),
+                    )
                 )
+                order += 1
+            elif content:
+                execution_notes.append(
+                    _EvidenceEntry(
+                        current_task,
+                        order,
+                        _summarize_text(
+                            content,
+                            limit=_MAX_EXECUTION_NOTE_TEXT,
+                        ),
+                    )
+                )
+                order += 1
             if isinstance(tool_calls, list):
-                for tool_call in tool_calls:
+                for call_index, tool_call in enumerate(tool_calls):
                     name, arguments, call_id = _tool_call_details(tool_call)
-                    if call_id:
-                        call_names[call_id] = name
                     if name == "skill_view":
                         try:
                             parsed_arguments = json.loads(arguments)
@@ -185,33 +352,83 @@ def _build_review_messages(messages: list[dict]) -> list[dict]:
                                         limit=_MAX_TOOL_RESULT_TEXT,
                                     )
                                 )
-                    details = f"Tool call: {name}"
-                    if arguments:
-                        details = f"{details}\nParameters: {arguments}"
-                    if name == "skill_view":
-                        skill_view_entries.append(details)
-                    else:
-                        key_tool_calls.append(details)
+                    event = _ToolEvidence(
+                        task_index=current_task,
+                        order=order,
+                        name=name,
+                        arguments=arguments,
+                        assistant_note=(
+                            _summarize_text(
+                                content,
+                                limit=_MAX_EXECUTION_NOTE_TEXT,
+                            )
+                            if call_index == 0
+                            else ""
+                        ),
+                        call_id=call_id,
+                    )
+                    tool_events.append(event)
+                    if call_id:
+                        events_by_call_id[call_id] = event
+                    order += 1
         elif role == "tool":
             call_id = str(message.get("tool_call_id", ""))
-            tool_name = call_names.get(call_id, "unknown")
             result = _summarize_text(
                 message.get("content", ""),
                 limit=_MAX_TOOL_RESULT_TEXT,
             )
             if not result:
                 continue
-            entry = f"Tool result: {tool_name}\n{result}"
-            if _is_tool_error(result):
-                tool_errors.append(entry)
+            event = events_by_call_id.get(call_id)
+            if event is not None:
+                event.result = result
             else:
-                successful_tool_results.append(entry)
+                tool_events.append(
+                    _ToolEvidence(
+                        task_index=current_task,
+                        order=order,
+                        name="unknown",
+                        arguments="",
+                        assistant_note="",
+                        call_id=call_id,
+                        result=result,
+                    )
+                )
+                order += 1
 
-    skill_view_entries.extend(
-        f"Loaded Skill: {name}" for name in sorted(loaded_skill_names)
-    )
+    for event in tool_events:
+        details = _format_tool_event(event)
+        entry = _EvidenceEntry(
+            event.task_index,
+            event.order,
+            details,
+            priority=_tool_event_priority(event),
+        )
+        if event.name == "skill_view":
+            skill_view_entries.append(entry)
+        elif event.result and _is_tool_error(event.result):
+            tool_errors.append(entry)
+        else:
+            key_tool_calls.append(entry)
+            if event.result:
+                successful_tool_results.append(
+                    _EvidenceEntry(
+                        event.task_index,
+                        event.order,
+                        f"Tool result: {event.name}\n{event.result}",
+                        priority=_tool_event_priority(event),
+                    )
+                )
+
+    for name in sorted(loaded_skill_names):
+        skill_view_entries.append(
+            _EvidenceEntry(0, order, f"Loaded Skill: {name}", priority=1)
+        )
+        order += 1
     if not final_results:
-        final_results.append("[no textual final result]")
+        final_results.append(
+            _EvidenceEntry(0, order, "[no textual final result]")
+        )
 
     sections = (
         (
@@ -225,12 +442,17 @@ def _build_review_messages(messages: list[dict]) -> list[dict]:
             _SECTION_BUDGETS["errors"],
         ),
         (
+            "Execution decisions and strategy transitions",
+            execution_notes,
+            _SECTION_BUDGETS["decisions"],
+        ),
+        (
             "skill_view calls and loaded Skills",
             skill_view_entries,
             _SECTION_BUDGETS["skill_view"],
         ),
         (
-            "Final results from this window",
+            "Assistant final reports (verify against tool evidence)",
             final_results,
             _SECTION_BUDGETS["final"],
         ),
@@ -247,7 +469,21 @@ def _build_review_messages(messages: list[dict]) -> list[dict]:
     )
     parts = ["Fixed-window Skill Review evidence:"]
     for title, entries, budget in sections:
-        section = _format_evidence_section(title, entries, budget=budget)
+        entry_limit = (
+            _MAX_TOOL_EVENT_TEXT
+            if title in {
+                "Tool errors and failure reasons",
+                "skill_view calls and loaded Skills",
+                "Key tool calls and parameters",
+            }
+            else _MAX_EVIDENCE_TEXT
+        )
+        section = _format_evidence_section(
+            title,
+            entries,
+            budget=budget,
+            entry_limit=entry_limit,
+        )
         if section:
             parts.append(section)
     evidence = _truncate_evidence(
