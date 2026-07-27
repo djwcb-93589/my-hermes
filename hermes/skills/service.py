@@ -10,6 +10,9 @@ from .governance import SkillActor, SkillDescriptor, SkillGovernance, SkillManag
 from .repository import SkillRepository
 
 
+_CONTENT_MISSING = object()
+
+
 class SkillService:
     """唯一业务入口：组合 Repository、Governance 和读取安全策略。"""
 
@@ -59,7 +62,7 @@ class SkillService:
         payload = self.repository.load(name)
         if not payload.get("ok"):
             return payload
-        if expected_revision is not None and payload["revision"] != expected_revision:
+        if action in {"edit", "patch", "delete"} and expected_revision is not None and payload["revision"] != expected_revision:
             return self._revision_conflict(name)
         descriptor = self.governance.describe(name, revision=payload["revision"])
         if isinstance(descriptor, dict):
@@ -197,8 +200,10 @@ class SkillService:
         return self._content_operation(name, actor=actor, action="delete", expected_revision=expected_revision,
                                        expected_governance_revision=expected_governance_revision)
 
-    def write_support_file(self, name: str, relative_path: str, content: str, *, actor: SkillActor | str = SkillActor.FOREGROUND,
+    def write_support_file(self, name: str, relative_path: str, content: object = _CONTENT_MISSING, *, actor: SkillActor | str = SkillActor.FOREGROUND,
                            expected_revision: str | None = None, expected_governance_revision: str | None = None) -> dict:
+        if content is _CONTENT_MISSING:
+            return {"ok": False, "error_type": "invalid_args", "error": "content is required for write_file", "name": name}
         return self._content_operation(name, actor=actor, action="write_file", relative_path=relative_path, content=content,
                                        expected_revision=expected_revision, expected_governance_revision=expected_governance_revision)
 
@@ -241,7 +246,9 @@ class SkillService:
                                      expected_revision=kwargs.get("expected_revision"),
                                      expected_governance_revision=kwargs.get("expected_governance_revision"))
         if action == "write_file":
-            return self.write_support_file(name, kwargs.get("relative_path", ""), kwargs.get("content", ""), actor=actor,
+            if "content" not in kwargs:
+                return {"ok": False, "error_type": "invalid_args", "error": "content is required for write_file", "name": name}
+            return self.write_support_file(name, kwargs.get("relative_path", ""), kwargs["content"], actor=actor,
                                            expected_revision=kwargs.get("expected_revision"),
                                            expected_governance_revision=kwargs.get("expected_governance_revision"))
         if action == "remove_file":

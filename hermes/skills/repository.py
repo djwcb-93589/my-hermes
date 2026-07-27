@@ -72,12 +72,23 @@ class SkillRepository:
             return None, "relative_path must start with an allowed support directory"
         if any(part in _PROTECTED_SKILL_FILES or part == ".locks" for part in parts):
             return None, "relative_path targets a protected skill file"
-        target = (skill_dir / Path(*parts)).resolve()
+        top_directory = skill_dir / parts[0]
+        current = skill_dir
+        for part in parts:
+            current = current / part
+            # 已存在的任何组件（包括损坏链接）都不允许是符号链接。
+            if current.is_symlink():
+                return None, "relative_path must not traverse symbolic links"
+        target = skill_dir / Path(*parts)
         try:
-            target.relative_to(skill_dir)
+            target_real = target.resolve()
+            top_real = top_directory.resolve()
+            target_real.relative_to(top_real)
         except ValueError:
-            return None, "resolved path escapes skill directory"
-        return target, ""
+            return None, "resolved path escapes the requested support directory"
+        except (OSError, RuntimeError):
+            return None, "relative_path could not be resolved safely"
+        return target_real, ""
 
     def _skill_lock_target(self, name: str) -> Path:
         """返回操作锁目标，file_lock 会生成 ``.locks/<name>.lock``。"""
