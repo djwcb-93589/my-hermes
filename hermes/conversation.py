@@ -881,7 +881,6 @@ def run_conversation(
             conn,
             session_id,
             result,
-            resume_from_history=resume_from_history,
         )
     except Exception as exc:
         logger.warning(
@@ -1017,7 +1016,6 @@ async def run_conversation_async(
                 conn,
                 session_id,
                 result,
-                resume_from_history=resume_from_history,
                 persistence_call=persistence_call,
             )
         except Exception as exc:

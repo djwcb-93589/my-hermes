@@ -98,8 +98,6 @@ class BackgroundReviewCoordinator:
         conn,
         session_id: str,
         result: AgentLoopResult,
-        *,
-        resume_from_history: bool,
     ) -> None:
         """记录前台事件，并在完成时尽力提交后台审视。"""
         if not self.enabled:
@@ -186,7 +184,6 @@ class BackgroundReviewCoordinator:
         session_id: str,
         result: AgentLoopResult,
         *,
-        resume_from_history: bool,
         persistence_call=None,
     ) -> None:
         """通过 Gateway 的持久化边界记录并提交后台审视。"""

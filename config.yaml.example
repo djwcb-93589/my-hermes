@@ -45,6 +45,29 @@ memory:
   # USER.md 最多读取并注入系统提示的字符数。
   user_char_limit: 2000
 
+# 后台 Memory Review 配置；默认关闭，避免产生额外模型调用。
+background_review:
+  # 是否启用后台 Memory Review；开启后会产生额外模型调用。
+  enabled: false
+
+  # 每完成多少个前台任务触发一次 Memory Review；0 表示关闭。
+  memory_interval: 3
+
+  # Skill Review 尚未接入时必须保持为 0。
+  skill_interval: 0
+
+  # 后台任务领取凭证的有效时间，单位为秒。
+  claim_ttl_seconds: 1800
+
+  # Review 失败后的重试冷却时间，单位为秒。
+  retry_cooldown_seconds: 60
+
+  # 单次 Review AgentLoop 的最大循环次数。
+  max_iterations: 8
+
+  # 同时运行的后台 Review 任务数量上限。
+  max_concurrent_jobs: 1
+
 # 模型可控 File/Terminal 操作使用的统一安全策略。
 security:
   # 文件系统硬拒绝策略；不限制框架自身的内部持久化文件。
