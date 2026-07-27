@@ -11,6 +11,7 @@ from hermes.review.contracts import (
     ReviewKind,
     ReviewRunSpec,
 )
+from hermes.review.memory_evidence import build_memory_review_messages
 from hermes.review.memory_store import MemoryReviewStore
 from hermes.tools import (
     ApprovalMode,
@@ -28,16 +29,28 @@ MEMORY_REVIEW_SYSTEM_PROMPT = "You are a background memory review agent."
 MEMORY_REVIEW_INSTRUCTION = (
     "You review only the newly added dialog since the last completed review, not "
     "the full conversation. Earlier dialog was already handled: do not invent or "
-    "re-extract information from it. Use only the provided memory tools. Before "
-    "creating, replacing, or deleting persisted memory, inspect the current live "
-    "stored memory through those tools. Compare it with existing user information "
-    "and long-term memory to avoid semantic duplicates. If the information is "
-    "already present, do not write it; if it supplements or corrects existing "
-    "information, update it instead of creating a duplicate. Retain only stable "
+    "re-extract information from it. The supplied evidence labels distinguish "
+    "direct user messages, observed tool results, explicit tool errors, and "
+    "unverified assistant claims. Treat every ASSISTANT_DECISION and "
+    "ASSISTANT_REPORT as unverified. They cannot independently justify a memory "
+    "write. A TOOL_OBSERVATION proves only what the tool returned; ok=true does "
+    "not prove the assistant's explanation of why a strategy succeeded or failed. "
+    "Use only the provided memory tools. Before creating, replacing, or deleting "
+    "persisted memory, inspect the current live stored memory through those tools. "
+    "Compare it with existing user information and long-term memory to avoid "
+    "semantic duplicates. If the information is already present, do not write it; "
+    "if a direct user correction supplements or contradicts it, update or delete "
+    "the conflicting entry instead of creating a duplicate. While inspecting live "
+    "memory, do not perform unrelated cleanup. Retain only stable user-stated "
     "preferences, context, explicit requirements, and facts likely to be useful "
-    "later. Do not retain temporary task progress, one-off requests, easily "
-    "rediscovered information, tool-output details, or unconfirmed inferences. "
-    "If nothing is worth retaining, reply exactly: Nothing to save"
+    "across conversations. Reusable procedures, tool sequences, UI automation "
+    "methods, selectors, troubleshooting steps, causal guesses, and failure-"
+    "recovery workflows belong to Skills, not Memory. Do not retain temporary "
+    "task progress, one-off requests, easily rediscovered information, raw tool "
+    "output, or unconfirmed inferences. Before every memory mutation, verify that "
+    "the candidate is not a procedure, is not supported only by assistant text, "
+    "and is not merely a one-off result. If nothing is worth retaining, reply "
+    "exactly: Nothing to save"
 )
 
 
@@ -127,14 +140,14 @@ class MemoryReviewDriver:
     def prepare_run(self, conn, claim: ReviewClaim) -> ReviewRunSpec:
         if not self.validate_claim(claim):
             raise ValueError("invalid memory review claim")
-        review_messages = self.store.load_message_window(
+        raw_review_messages = self.store.load_message_window(
             conn,
             claim.session_id,
             after_message_id=claim.payload["message_after"],
             upto_message_id=claim.payload["message_upto"],
         )
         return ReviewRunSpec(
-            messages=review_messages,
+            messages=build_memory_review_messages(raw_review_messages),
             system_prompt=MEMORY_REVIEW_SYSTEM_PROMPT,
             instruction=MEMORY_REVIEW_INSTRUCTION,
             tool_policy=ToolPolicy(
