@@ -8,6 +8,7 @@ import math
 import threading
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 
 from hermes.agent_loop import AgentLoopResult
 from hermes.config import (
@@ -22,6 +23,7 @@ from hermes.review.contracts import (
     ForegroundReviewEvent,
     ReviewClaim,
     ReviewDriver,
+    ReviewKind,
 )
 from hermes.review.loop import ReviewAgentLoop
 from hermes.review.registry import ReviewDriverRegistry
@@ -29,6 +31,14 @@ from hermes.tools import registry, register_all
 
 
 logger = logging.getLogger(__name__)
+
+
+class _QueuedClaimValidation(Enum):
+    """队列任务在启动前的 claim 校验结果。"""
+
+    VALID = "valid"
+    INVALID = "invalid"
+    VALIDATION_ERROR = "validation_error"
 
 
 @dataclass(frozen=True)
@@ -271,7 +281,7 @@ class BackgroundReviewExecutor:
         self._lock = threading.Lock()
         self._active_jobs = 0
         self._pending_jobs: deque[ReviewClaim] = deque()
-        self._scheduled_claims: set[tuple[str, str]] = set()
+        self._scheduled_claims: set[tuple[ReviewKind, str, str]] = set()
         register_all(self.registry)
 
     def submit(self, *, claim: ReviewClaim) -> bool:
@@ -340,9 +350,9 @@ class BackgroundReviewExecutor:
         )
 
     @staticmethod
-    def _claim_key(claim: ReviewClaim) -> tuple[str, str]:
+    def _claim_key(claim: ReviewClaim) -> tuple[ReviewKind, str, str]:
         """构造进程内调度去重所需的稳定 claim 身份。"""
-        return claim.session_id, claim.token
+        return claim.kind, claim.session_id, claim.token
 
     def _release_reserved_claim(self, claim: ReviewClaim) -> None:
         """释放已经占用的并发槽位，不执行数据库操作。"""
@@ -389,22 +399,25 @@ class BackgroundReviewExecutor:
             self._active_jobs += 1
             return claim
 
-    def _claim_is_still_valid(
+    def _validate_queued_claim(
         self,
         driver: ReviewDriver,
         claim: ReviewClaim,
-    ) -> bool:
+    ) -> _QueuedClaimValidation:
         """在队列等待后用独立连接确认 claim 未失效。"""
         conn = None
         try:
             conn = init_db(self.db_path)
-            return driver.claim_is_valid(conn, claim)
+            if driver.claim_is_valid(conn, claim):
+                return _QueuedClaimValidation.VALID
+            return _QueuedClaimValidation.INVALID
         except Exception as exc:
             logger.warning(
-                "background review could not validate queued claim: %s",
+                "background review queued claim validation failed: %s",
                 type(exc).__name__,
+                exc_info=True,
             )
-            return False
+            return _QueuedClaimValidation.VALIDATION_ERROR
         finally:
             if conn is not None:
                 conn.close()
@@ -420,9 +433,18 @@ class BackgroundReviewExecutor:
                 logger.warning("background review dropped a queued claim with no driver")
                 self._release_reserved_claim(claim)
                 continue
-            if not self._claim_is_still_valid(driver, claim):
+            validation = self._validate_queued_claim(driver, claim)
+            if validation is _QueuedClaimValidation.INVALID:
                 logger.debug("background review dropped an invalid queued claim")
                 self._release_reserved_claim(claim)
+                continue
+            if validation is _QueuedClaimValidation.VALIDATION_ERROR:
+                self._release_reserved_claim(claim)
+                self._fail_claim_safely(
+                    driver,
+                    claim,
+                    "review_claim_validation_failed",
+                )
                 continue
             if self._start_reserved_worker(driver, claim):
                 return

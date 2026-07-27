@@ -47,7 +47,7 @@ memory:
 
 # 后台 Review 配置；默认关闭，避免产生额外模型调用。
 background_review:
-  # 是否启用后台 Memory Review；开启后会产生额外模型调用。
+  # 是否启用后台 Review；开启后会产生额外模型调用。
   enabled: false
 
   # 每完成多少个前台任务触发一次 Memory Review；0 表示关闭。
