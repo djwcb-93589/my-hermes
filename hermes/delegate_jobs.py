@@ -49,6 +49,9 @@ class DelegateJob:
     cancel_requested: bool = False
     # 内部:worker 线程对象(不暴露给查询接口)
     _thread: threading.Thread | None = None
+    # 内部:仅在本进程内交给子 Agent 的观察 Hook 依赖，不进入任何查询视图。
+    _hook_registry: object | None = None
+    _parent_run_id: str | None = None
 
 
 # 终态集合:worker 跑完后 status 必落在这里之一
@@ -144,6 +147,8 @@ class DelegateJobManager:
         toolsets: list[str],
         parent_session_key: str | None,
         child_session_key: str,
+        hook_registry: object | None = None,
+        parent_run_id: str | None = None,
     ) -> dict:
         """提交后台 job。
 
@@ -173,6 +178,8 @@ class DelegateJobManager:
                 context=context,
                 toolsets=list(toolsets),
                 status="queued",
+                _hook_registry=hook_registry,
+                _parent_run_id=parent_run_id,
             )
             self._jobs[job_id] = job
 

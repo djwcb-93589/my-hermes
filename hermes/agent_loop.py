@@ -35,6 +35,9 @@ from hermes.hooks import (
     HookEvent,
     HookEventName,
     SyncHookRegistry,
+    build_post_llm_call_payload,
+    build_post_tool_call_payload,
+    build_run_end_payload,
 )
 from hermes.model_streaming import (
     ModelTurnResult,
@@ -652,6 +655,7 @@ class AgentLoop:
         tool_context: dict | None = None,
         stream_sink: "Callable[[StreamEvent], None] | None" = None,
         hook_registry: SyncHookRegistry | None = None,
+        parent_run_id: str | None = None,
     ):
         self.model = model
         self.max_iterations = max_iterations
@@ -677,6 +681,13 @@ class AgentLoop:
         ):
             raise TypeError("hook_registry must be a SyncHookRegistry")
         self.hook_registry = hook_registry
+        if parent_run_id is not None and (
+            not isinstance(parent_run_id, str) or not parent_run_id
+        ):
+            raise TypeError("parent_run_id must be a non-empty string or None")
+        # 仅用于将子运行与父运行的观察事件关联，不使用会话或用户标识。
+        self.parent_run_id = parent_run_id
+        self.run_id: str | None = None
         # 运行期状态(每次 run() 重置)
         self.iterations = 0
         self.tools_used: list[str] = []
@@ -700,19 +711,40 @@ class AgentLoop:
         self,
         tool_call,
         *,
+        status: str,
         error_type: str | None,
         duration_ms: int,
     ) -> None:
         """保存持久化完成后才会分发的工具观察摘要。"""
         tool_name = self._tool_call_name(tool_call)
         self._tool_observations.append(
-            {
-                "tool_name": tool_name,
-                "tool_call_id": str(getattr(tool_call, "id", "")),
-                "success": error_type is None,
-                "error_type": error_type,
-                "duration_ms": max(0, int(duration_ms)),
-            }
+            build_post_tool_call_payload(
+                tool_name=tool_name,
+                tool_call_id=str(getattr(tool_call, "id", "")),
+                status=status,
+                error_type=error_type,
+                duration_ms=duration_ms,
+            )
+        )
+
+    def _hook_context(
+        self,
+        *,
+        invocation_suffix: str,
+        payload: dict[str, object],
+    ) -> HookContext:
+        """构造只包含安全运行关联信息的 Hook 上下文。"""
+        run_id = self.run_id
+        if run_id is None:
+            # 所有正式分发都从 run() 内发生；此防御分支避免意外使用会话标识。
+            raise RuntimeError("run_id is not initialized")
+        metadata: dict[str, object] = {"run_id": run_id}
+        if self.parent_run_id is not None:
+            metadata["parent_run_id"] = self.parent_run_id
+        return HookContext(
+            invocation_id=f"{run_id}:{invocation_suffix}",
+            metadata=metadata,
+            payload=payload,
         )
 
     @staticmethod
@@ -744,19 +776,17 @@ class AgentLoop:
         registry = self.hook_registry
         if not isinstance(registry, SyncHookRegistry):
             return
-        payload: dict[str, object] = {
-            "finish_reason": None if finish_reason is None else str(finish_reason),
-            "has_text": bool(_object_value(assistant_msg, "content")),
-            "tool_call_count": len(_object_value(assistant_msg, "tool_calls") or ()),
-            "duration_ms": max(0, int(duration_ms)),
-        }
-        token_usage = self._hook_token_usage(response)
-        if token_usage:
-            payload["token_usage"] = token_usage
+        payload = build_post_llm_call_payload(
+            finish_reason=finish_reason,
+            has_text=bool(_object_value(assistant_msg, "content")),
+            tool_call_count=len(_object_value(assistant_msg, "tool_calls") or ()),
+            token_usage=self._hook_token_usage(response),
+            duration_ms=duration_ms,
+        )
         self._emit_sync_hook(
             HookEventName.POST_LLM_CALL,
-            HookContext(
-                invocation_id=f"llm:{self.iterations}",
+            self._hook_context(
+                invocation_suffix=f"llm:{self.iterations}",
                 payload=payload,
             ),
         )
@@ -772,7 +802,12 @@ class AgentLoop:
         for observation in observations:
             self._emit_sync_hook(
                 HookEventName.POST_TOOL_CALL,
-                HookContext(payload=observation),
+                self._hook_context(
+                    invocation_suffix=(
+                        f"tool:{observation['tool_call_id']}"
+                    ),
+                    payload=observation,
+                ),
             )
 
     def _emit_run_end(self, result: "AgentLoopResult") -> None:
@@ -782,14 +817,15 @@ class AgentLoop:
             return
         self._emit_sync_hook(
             HookEventName.RUN_END,
-            HookContext(
-                payload={
-                    "status": result.status,
-                    "stop_reason": result.error_type or result.status,
-                    "iterations": result.iterations,
-                    "tool_call_count": result.tool_call_count,
-                    "has_final_reply": bool(result.summary),
-                }
+            self._hook_context(
+                invocation_suffix="run_end",
+                payload=build_run_end_payload(
+                    status=result.status,
+                    stop_reason=result.error_type or result.status,
+                    iterations=result.iterations,
+                    tool_call_count=result.tool_call_count,
+                    summary=result.summary,
+                ),
             ),
         )
 
@@ -942,6 +978,7 @@ class AgentLoop:
         顶层 try/except 兜底:任何未预期异常都包装成 internal_error,
         不让原始异常(openai client / sqlite3 / json)冒到最外层。
         """
+        self.run_id = uuid.uuid4().hex
         self.tool_batches = 0
         self.tool_call_count = 0
         try:
@@ -1192,7 +1229,14 @@ class AgentLoop:
         approval_request: dict | None = None
         for tc in tool_calls:
             tool_started = time.perf_counter()
-            if approval_request is not None:
+            skipped_due_to_failure = fatal_detail is not None
+            deferred_for_approval = approval_request is not None
+            if skipped_due_to_failure:
+                # 前序致命错误后不再执行后续调用，但保留完整 batch 供既有流程持久化。
+                output = "(error: skipped because an earlier tool call failed)"
+                err_status = None
+                err_detail = None
+            elif deferred_for_approval:
                 output = build_approval_deferred()
                 err_status = None
                 err_detail = None
@@ -1219,19 +1263,24 @@ class AgentLoop:
             tool_messages.append(tool_msg)
             self.on_tool_message(tc, tool_msg, output)
 
-            # 已经决定终止,后续 tool_call 仍生成 tool_msg 让 batch 持久化完整
-            if fatal_detail is not None:
+            if skipped_due_to_failure:
                 self._record_tool_observation(
                     tc,
-                    error_type=err_status or "prior_tool_failure",
+                    status="skipped",
+                    error_type="prior_tool_failure",
                     duration_ms=(time.perf_counter() - tool_started) * 1000,
                 )
                 continue
 
-            pending = _extract_approval_request(output, tc)
+            pending = (
+                approval_request
+                if deferred_for_approval
+                else _extract_approval_request(output, tc)
+            )
             if pending is not None:
                 self._record_tool_observation(
                     tc,
+                    status="awaiting_approval",
                     error_type="approval_required",
                     duration_ms=(time.perf_counter() - tool_started) * 1000,
                 )
@@ -1241,6 +1290,9 @@ class AgentLoop:
             fatal, err_type = self._classify_tool_error(output, err_status)
             self._record_tool_observation(
                 tc,
+                status=(
+                    "succeeded" if not err_type and not err_status else "failed"
+                ),
                 error_type=(err_type or err_status or None),
                 duration_ms=(time.perf_counter() - tool_started) * 1000,
             )
@@ -1453,6 +1505,14 @@ class AgentLoop:
             tool_context["allowed_tool_names"] = allowed_tool_names
         if self.cancel_checker is not None:
             tool_context["cancel_checker"] = self.cancel_checker
+        if (
+            self._tool_call_name(tool_call) == "delegate_task"
+            and isinstance(self.hook_registry, SyncHookRegistry)
+        ):
+            # 仅供同步 delegate 工具处理器转交子运行，不属于模型可见参数。
+            tool_context["hook_registry"] = self.hook_registry
+            if self.run_id is not None:
+                tool_context["parent_run_id"] = self.run_id
         return dispatch_tool_call(
             tool_call, self.registry,
             session_key=self.session_key,
@@ -1540,6 +1600,7 @@ class AsyncAgentLoop(AgentLoop):
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
         hook_registry: AsyncHookRegistry | None = None,
+        parent_run_id: str | None = None,
     ):
         if hook_registry is not None and not isinstance(
             hook_registry,
@@ -1559,11 +1620,13 @@ class AsyncAgentLoop(AgentLoop):
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             hook_registry=None,
+            parent_run_id=parent_run_id,
         )
         self.hook_registry = hook_registry
 
     async def run(self, user_message: str) -> AgentLoopResult:
         """异步跑一次完整循环,Task 取消必须原样向上传播。"""
+        self.run_id = uuid.uuid4().hex
         self.tool_batches = 0
         self.tool_call_count = 0
         try:
@@ -1597,19 +1660,17 @@ class AsyncAgentLoop(AgentLoop):
         registry = self.hook_registry
         if not isinstance(registry, AsyncHookRegistry):
             return
-        payload: dict[str, object] = {
-            "finish_reason": None if finish_reason is None else str(finish_reason),
-            "has_text": bool(_object_value(assistant_msg, "content")),
-            "tool_call_count": len(_object_value(assistant_msg, "tool_calls") or ()),
-            "duration_ms": max(0, int(duration_ms)),
-        }
-        token_usage = self._hook_token_usage(response)
-        if token_usage:
-            payload["token_usage"] = token_usage
+        payload = build_post_llm_call_payload(
+            finish_reason=finish_reason,
+            has_text=bool(_object_value(assistant_msg, "content")),
+            tool_call_count=len(_object_value(assistant_msg, "tool_calls") or ()),
+            token_usage=self._hook_token_usage(response),
+            duration_ms=duration_ms,
+        )
         await self._emit_async_hook(
             HookEventName.POST_LLM_CALL,
-            HookContext(
-                invocation_id=f"llm:{self.iterations}",
+            self._hook_context(
+                invocation_suffix=f"llm:{self.iterations}",
                 payload=payload,
             ),
         )
@@ -1625,7 +1686,12 @@ class AsyncAgentLoop(AgentLoop):
         for observation in observations:
             await self._emit_async_hook(
                 HookEventName.POST_TOOL_CALL,
-                HookContext(payload=observation),
+                self._hook_context(
+                    invocation_suffix=(
+                        f"tool:{observation['tool_call_id']}"
+                    ),
+                    payload=observation,
+                ),
             )
 
     async def _emit_run_end_async(self, result: AgentLoopResult) -> None:
@@ -1635,14 +1701,15 @@ class AsyncAgentLoop(AgentLoop):
             return
         await self._emit_async_hook(
             HookEventName.RUN_END,
-            HookContext(
-                payload={
-                    "status": result.status,
-                    "stop_reason": result.error_type or result.status,
-                    "iterations": result.iterations,
-                    "tool_call_count": result.tool_call_count,
-                    "has_final_reply": bool(result.summary),
-                }
+            self._hook_context(
+                invocation_suffix="run_end",
+                payload=build_run_end_payload(
+                    status=result.status,
+                    stop_reason=result.error_type or result.status,
+                    iterations=result.iterations,
+                    tool_call_count=result.tool_call_count,
+                    summary=result.summary,
+                ),
             ),
         )
 
@@ -1889,7 +1956,14 @@ class AsyncAgentLoop(AgentLoop):
         approval_request: dict | None = None
         for tc in tool_calls:
             tool_started = time.perf_counter()
-            if approval_request is not None:
+            skipped_due_to_failure = fatal_detail is not None
+            deferred_for_approval = approval_request is not None
+            if skipped_due_to_failure:
+                # 前序致命错误后不再执行后续调用，但保留完整 batch 供既有流程持久化。
+                output = "(error: skipped because an earlier tool call failed)"
+                err_status = None
+                err_detail = None
+            elif deferred_for_approval:
                 output = build_approval_deferred()
                 err_status = None
                 err_detail = None
@@ -1917,18 +1991,24 @@ class AsyncAgentLoop(AgentLoop):
             tool_messages.append(tool_msg)
             await self.on_tool_message(tc, tool_msg, output)
 
-            if fatal_detail is not None:
+            if skipped_due_to_failure:
                 self._record_tool_observation(
                     tc,
-                    error_type=err_status or "prior_tool_failure",
+                    status="skipped",
+                    error_type="prior_tool_failure",
                     duration_ms=(time.perf_counter() - tool_started) * 1000,
                 )
                 continue
 
-            pending = _extract_approval_request(output, tc)
+            pending = (
+                approval_request
+                if deferred_for_approval
+                else _extract_approval_request(output, tc)
+            )
             if pending is not None:
                 self._record_tool_observation(
                     tc,
+                    status="awaiting_approval",
                     error_type="approval_required",
                     duration_ms=(time.perf_counter() - tool_started) * 1000,
                 )
@@ -1938,6 +2018,9 @@ class AsyncAgentLoop(AgentLoop):
             fatal, err_type = self._classify_tool_error(output, err_status)
             self._record_tool_observation(
                 tc,
+                status=(
+                    "succeeded" if not err_type and not err_status else "failed"
+                ),
                 error_type=(err_type or err_status or None),
                 duration_ms=(time.perf_counter() - tool_started) * 1000,
             )

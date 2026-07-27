@@ -246,6 +246,7 @@ def run_delegate_child(
     cancel_checker: Callable[[], bool] | None = None,
     tool_context: dict | None = None,
     hook_registry: SyncHookRegistry | None = None,
+    parent_run_id: str | None = None,
 ) -> dict:
     """跑一个子 agent 任务,返回 dict(不是 JSON)。
 
@@ -277,6 +278,7 @@ def run_delegate_child(
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             hook_registry=hook_registry,
+            parent_run_id=parent_run_id,
         )
         # goal 作为 user message 传入;system prompt 只描述角色 / 约束
         result = loop.run(goal)
@@ -361,6 +363,19 @@ def handle_delegate(args, **kwargs) -> str:
             ),
         )
     parent_session_key = kwargs.get("session_key")
+    # 这两个值仅来自工具运行时上下文，绝不写入模型参数、消息或工具结果。
+    runtime_hook_registry = kwargs.get("hook_registry")
+    hook_registry = (
+        runtime_hook_registry
+        if isinstance(runtime_hook_registry, SyncHookRegistry)
+        else None
+    )
+    runtime_parent_run_id = kwargs.get("parent_run_id")
+    parent_run_id = (
+        runtime_parent_run_id
+        if isinstance(runtime_parent_run_id, str) and runtime_parent_run_id
+        else None
+    )
     child_session_key = f"child-{uuid.uuid4().hex[:12]}"
     child_tool_context = {
         "interactive_approval": kwargs.get(
@@ -393,6 +408,8 @@ def handle_delegate(args, **kwargs) -> str:
             child_session_key,
             cancel_checker=child_cancel_checker,
             tool_context=child_tool_context,
+            hook_registry=hook_registry,
+            parent_run_id=parent_run_id,
         )
         return _result(
             r["ok"], r["status"], r["summary"],
@@ -416,6 +433,12 @@ def handle_delegate(args, **kwargs) -> str:
                 goal, context, toolsets, child_session_key,
                 cancel_checker=lambda: manager.is_cancel_requested(job_id),
                 tool_context=child_tool_context,
+                hook_registry=(
+                    job._hook_registry
+                    if isinstance(job._hook_registry, SyncHookRegistry)
+                    else None
+                ),
+                parent_run_id=job._parent_run_id,
             )
         return runner
 
@@ -426,6 +449,8 @@ def handle_delegate(args, **kwargs) -> str:
         toolsets=toolsets,
         parent_session_key=parent_session_key,
         child_session_key=child_session_key,
+        hook_registry=hook_registry,
+        parent_run_id=parent_run_id,
     )
 
     if not submit_result["ok"]:

@@ -222,6 +222,14 @@ def _dispatch_conversation_tool_call(loop, tool_call):
         dispatch_context["allowed_tool_names"] = allowed_tool_names
         if loop.cancel_checker is not None:
             dispatch_context["cancel_checker"] = loop.cancel_checker
+        # 仅作为工具运行时参数传给同步 delegate，不进入模型参数、持久化消息或 Hook 上下文。
+        if (
+            tool_name == "delegate_task"
+            and isinstance(getattr(loop, "hook_registry", None), SyncHookRegistry)
+        ):
+            dispatch_context["hook_registry"] = loop.hook_registry
+            if loop.run_id is not None:
+                dispatch_context["parent_run_id"] = loop.run_id
         durable_context = dispatch_context.pop("durable_tool_execution", None)
         if durable_context is None:
             output = loop.registry.dispatch(
