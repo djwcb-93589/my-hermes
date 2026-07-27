@@ -404,7 +404,23 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
         from hermes.tools.skill import register as _skill
 
         _skill(skill_registry)
-        target.merge_from(skill_registry)
+        skill_entries = skill_registry._tools
+        existing_skill_entries = {
+            name: target.get_entry(name)
+            for name in skill_entries
+            if target.get_entry(name) is not None
+        }
+        if (
+            len(existing_skill_entries) == len(skill_entries)
+            and all(
+                existing_skill_entries[name] == entry
+                for name, entry in skill_entries.items()
+            )
+        ):
+            # 重复初始化时保留已注册的同一组 Skill 工具，避免误报冲突。
+            pass
+        else:
+            target.merge_from(skill_registry)
     except Exception as exc:
         logger.warning(
             "Skill tools unavailable; Skill capability was skipped: %s",
