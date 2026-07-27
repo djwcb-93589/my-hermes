@@ -86,32 +86,14 @@ class MemoryReviewDriver:
         )
         if raw_claim is None:
             return None
-        if raw_claim.get("review_skills") is True:
-            self.store.fail(
-                conn,
-                raw_claim["session_id"],
-                raw_claim["claim_token"],
-                error="invalid_or_unsupported_memory_review_claim",
-                retry_cooldown_seconds=self.retry_cooldown_seconds,
-            )
-            raise ValueError("memory review claim includes unsupported skill review")
-        if raw_claim.get("review_memory") is not True:
-            self.store.fail(
-                conn,
-                raw_claim["session_id"],
-                raw_claim["claim_token"],
-                error="invalid_or_unsupported_memory_review_claim",
-                retry_cooldown_seconds=self.retry_cooldown_seconds,
-            )
-            raise ValueError("memory review claim is missing memory review")
         return ReviewClaim(
             kind=ReviewKind.MEMORY,
             session_id=raw_claim["session_id"],
             token=raw_claim["claim_token"],
             payload={
-                "turn_upto": raw_claim["memory_upto"],
-                "message_after": raw_claim["memory_message_after"],
-                "message_upto": raw_claim["memory_message_upto"],
+                "turn_upto": raw_claim["turn_upto"],
+                "message_after": raw_claim["message_after"],
+                "message_upto": raw_claim["message_upto"],
             },
         )
 

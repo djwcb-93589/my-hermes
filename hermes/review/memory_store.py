@@ -52,10 +52,9 @@ class MemoryReviewStore:
         return {
             "session_id": claim["session_id"],
             "claim_token": claim["claim_token"],
-            "review_memory": True,
-            "memory_upto": claim["turn_upto"],
-            "memory_message_after": claim["message_after"],
-            "memory_message_upto": claim["message_upto"],
+            "turn_upto": claim["turn_upto"],
+            "message_after": claim["message_after"],
+            "message_upto": claim["message_upto"],
         }
 
     def load_message_window(

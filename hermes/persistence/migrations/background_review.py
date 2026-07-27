@@ -124,15 +124,8 @@ def _migrate_v34_to_v35(conn: sqlite3.Connection) -> None:
             retry_turn_upto,
             retry_message_upto,
             retry_after,
-            CASE
-                WHEN (
-                    claim_token IS NOT NULL
-                    AND claim_memory_upto IS NOT NULL
-                    AND claim_memory_message_upto IS NOT NULL
-                ) OR retry_memory_upto IS NOT NULL
-                THEN last_attempt_at
-            END,
-            NULL,
+            last_attempt_at,
+            last_success_at,
             last_error,
             updated_at
         )
@@ -171,8 +164,15 @@ def _migrate_v34_to_v35(conn: sqlite3.Connection) -> None:
             CASE
                 WHEN retry_memory_upto IS NOT NULL THEN retry_after
             END,
-            last_attempt_at,
-            last_success_at,
+            CASE
+                WHEN (
+                    claim_token IS NOT NULL
+                    AND claim_memory_upto IS NOT NULL
+                    AND claim_memory_message_upto IS NOT NULL
+                ) OR retry_memory_upto IS NOT NULL
+                THEN last_attempt_at
+            END,
+            NULL,
             CASE
                 WHEN retry_memory_upto IS NOT NULL THEN last_error
             END,
