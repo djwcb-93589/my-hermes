@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable
@@ -39,6 +40,9 @@ _TOOL_RISK_RANK = {
     ToolRiskLevel.MEDIUM: 2,
     ToolRiskLevel.HIGH: 3,
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_environment(
@@ -197,6 +201,72 @@ class ToolRegistry:
             supports_cancellation=supports_cancellation,
         )
 
+    def merge_from(self, other_registry: "ToolRegistry") -> None:
+        """校验来源注册表后原子合并其全部工具。"""
+        if not isinstance(other_registry, ToolRegistry):
+            raise TypeError("other_registry must be a ToolRegistry")
+        if other_registry is self:
+            return
+
+        validated_registry = ToolRegistry()
+        for name, entry in other_registry._tools.items():
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(entry, ToolEntry)
+                or entry.name != name
+                or not isinstance(entry.toolset, str)
+                or not entry.toolset.strip()
+                or not isinstance(entry.schema, dict)
+                or not callable(entry.handler)
+                or not isinstance(entry.execution_environments, frozenset)
+                or not all(
+                    isinstance(environment, ExecutionEnvironment)
+                    for environment in entry.execution_environments
+                )
+                or not isinstance(entry.unattended_allowed, bool)
+                or not isinstance(entry.required_trusted_context, frozenset)
+                or not all(
+                    isinstance(context, str)
+                    for context in entry.required_trusted_context
+                )
+                or not isinstance(entry.approval_mode, ApprovalMode)
+                or not isinstance(entry.risk_level, ToolRiskLevel)
+                or not isinstance(entry.default_enabled_environments, frozenset)
+                or not all(
+                    isinstance(environment, ExecutionEnvironment)
+                    for environment in entry.default_enabled_environments
+                )
+                or not isinstance(entry.retry_safe, bool)
+                or not isinstance(entry.unknown_on_crash, bool)
+                or (
+                    entry.status_check is not None
+                    and not callable(entry.status_check)
+                )
+                or not isinstance(entry.supports_cancellation, bool)
+            ):
+                raise ValueError("source registry contains an invalid tool entry")
+            validated_registry.register(
+                entry.name,
+                entry.toolset,
+                entry.schema,
+                entry.handler,
+                execution_environments=entry.execution_environments,
+                unattended_allowed=entry.unattended_allowed,
+                required_trusted_context=entry.required_trusted_context,
+                approval_mode=entry.approval_mode,
+                risk_level=entry.risk_level,
+                default_enabled_environments=entry.default_enabled_environments,
+                retry_safe=entry.retry_safe,
+                unknown_on_crash=entry.unknown_on_crash,
+                status_check=entry.status_check,
+                supports_cancellation=entry.supports_cancellation,
+            )
+
+        merged_tools = dict(self._tools)
+        merged_tools.update(validated_registry._tools)
+        self._tools = merged_tools
+
     def get_entry(self, name: str) -> ToolEntry | None:
         """返回工具注册元数据，执行包装器据此决定恢复策略。"""
         return self._tools.get(name)
@@ -315,7 +385,6 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
     from hermes.tools.terminal import register as _terminal
     from hermes.tools.file import register as _file
     from hermes.tools.memory import register as _memory
-    from hermes.tools.skill import register as _skill
     from hermes.tools.delegate import register as _delegate
     from hermes.tools.gateway_send_file import register as _gateway_send_file
     from hermes.tools.media import register as _media
@@ -325,7 +394,18 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
     _terminal(target)
     _file(target)
     _memory(target)
-    _skill(target)
+    try:
+        skill_registry = ToolRegistry()
+        from hermes.tools.skill import register as _skill
+
+        _skill(skill_registry)
+        target.merge_from(skill_registry)
+    except Exception as exc:
+        logger.warning(
+            "Skill tools unavailable; Skill capability was skipped: %s",
+            type(exc).__name__,
+            exc_info=True,
+        )
     _delegate(target)
     _gateway_send_file(target)
     _media(target)
