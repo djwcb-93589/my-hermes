@@ -55,6 +55,7 @@ class ReviewRunSpec:
     instruction: str
     tool_policy: "ToolPolicy"
     max_iterations: int
+    tool_context: Mapping[str, object]
 
 
 class ReviewDriver(Protocol):

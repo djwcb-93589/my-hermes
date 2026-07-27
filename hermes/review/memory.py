@@ -145,6 +145,7 @@ class MemoryReviewDriver:
                 max_risk_level=ToolRiskLevel.MEDIUM,
             ),
             max_iterations=self.max_iterations,
+            tool_context={},
         )
 
     def complete(self, conn, claim: ReviewClaim) -> bool:

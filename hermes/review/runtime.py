@@ -359,6 +359,7 @@ class BackgroundReviewExecutor:
                 session_key=claim.session_id,
                 model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
                 cancel_checker=lambda: not driver.claim_is_valid(conn, claim),
+                tool_context=run_spec.tool_context,
             )
             result = loop.run("")
             if result.ok and result.status == "completed":

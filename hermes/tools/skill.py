@@ -5,16 +5,20 @@ from __future__ import annotations
 import json
 
 from hermes.config import HERMES_HOME
-from hermes.skills.service import SkillService
 
 
 # 保留此变量以兼容既有调用方和临时目录 monkeypatch。
 SKILLS_DIR = HERMES_HOME / "skills"
-_default_service = SkillService()
+_default_service: SkillService | None = None
 
 
 def _service() -> SkillService:
     """使默认服务在每次调用时读取兼容层的目录覆盖。"""
+    global _default_service
+    if _default_service is None:
+        from hermes.skills.service import SkillService
+
+        _default_service = SkillService()
     _default_service.set_skills_dir(SKILLS_DIR)
     return _default_service
 
@@ -58,12 +62,45 @@ def handle_skill_list(args, **kwargs):
 
 
 def handle_skill_manage(args, **kwargs):
-    allowed_options = {"description", "version", "platforms", "metadata", "body", "old_text", "new_text", "relative_path", "content"}
+    actor = kwargs.get("skill_actor", "foreground")
+    action = args.get("action", "")
+    if actor == "background_review" and action not in {
+        "create",
+        "edit",
+        "patch",
+        "write_file",
+        "remove_file",
+    }:
+        return _json({
+            "ok": False,
+            "error_type": "tool_not_authorized",
+            "error": "background review cannot perform this skill action",
+        })
+    allowed_options = {
+        "description",
+        "version",
+        "platforms",
+        "metadata",
+        "body",
+        "old_text",
+        "new_text",
+        "relative_path",
+        "content",
+        "expected_revision",
+        "expected_governance_revision",
+    }
     options = {key: value for key, value in args.items() if key in allowed_options}
+    for key in ("expected_revision", "expected_governance_revision"):
+        if key in options and not isinstance(options[key], str):
+            return _json({
+                "ok": False,
+                "error_type": "invalid_args",
+                "error": f"{key} must be a string",
+            })
     return _json(_service().manage_skill(
-        args.get("action", ""),
+        action,
         args.get("name", ""),
-        actor=kwargs.get("skill_actor", "foreground"),
+        actor=actor,
         **options,
     ))
 
@@ -97,7 +134,7 @@ def register(registry):
             },
         },
         handler=handle_skill_view,
-        execution_environments=("cli", "gateway", "cron", "delegate"),
+        execution_environments=("cli", "gateway", "cron", "delegate", "background_review"),
         unattended_allowed=True,
         approval_mode="none",
         risk_level="low",
@@ -115,7 +152,7 @@ def register(registry):
             "parameters": {"type": "object", "properties": {}},
         },
         handler=handle_skill_list,
-        execution_environments=("cli", "gateway", "cron", "delegate"),
+        execution_environments=("cli", "gateway", "cron", "delegate", "background_review"),
         unattended_allowed=True,
         approval_mode="none",
         risk_level="low",
@@ -163,12 +200,20 @@ def register(registry):
                         "type": "string",
                         "description": "write_file: full UTF-8 text content",
                     },
+                    "expected_revision": {
+                        "type": "string",
+                        "description": "optional expected content revision",
+                    },
+                    "expected_governance_revision": {
+                        "type": "string",
+                        "description": "optional expected governance revision",
+                    },
                 },
                 "required": ["action", "name"],
             },
         },
         handler=handle_skill_manage,
-        execution_environments=("cli", "gateway", "cron"),
+        execution_environments=("cli", "gateway", "cron", "background_review"),
         unattended_allowed=True,
         approval_mode="none",
         risk_level="medium",
