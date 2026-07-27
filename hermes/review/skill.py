@@ -77,7 +77,7 @@ _MAX_ASSISTANT_TEXT = 900
 _MAX_TOOL_ARGUMENTS_TEXT = 700
 _MAX_TOOL_RESULT_TEXT = 1_000
 _MAX_ENTRY_TEXT = 1_400
-_MAX_REVIEW_EVIDENCE_TEXT = 20_000
+_MAX_REVIEW_EVIDENCE_TEXT = 100_000
 _TRUNCATED_MARKER = "[truncated]"
 _MAX_PRIMARY_ERRORS_PER_TASK = 3
 _MAX_PRIMARY_TRANSITIONS_PER_TASK = 4
@@ -86,7 +86,7 @@ _STAGE_USER = 0
 _STAGE_LOADED_SKILL = 1
 _STAGE_ERROR = 2
 _STAGE_TRANSITION = 3
-_STAGE_LATER_SUCCESS = 4
+_STAGE_LATER_RESULT = 4
 _STAGE_FINAL_REPORT = 5
 _STAGE_OTHER = 6
 
@@ -377,12 +377,16 @@ def _collect_entries(
             )
         entries.extend(task_entries)
 
-        successful_events = [
+        non_error_observations = [
             event
             for event in task.tool_events
             if event.result and not event.error
         ]
-        last_success = successful_events[-1] if successful_events else None
+        last_non_error_observation = (
+            non_error_observations[-1]
+            if non_error_observations
+            else None
+        )
         for event in task.tool_events:
             source = (
                 _EvidenceSource.TOOL_ERROR
@@ -394,8 +398,8 @@ def _collect_entries(
                 stage = _STAGE_LOADED_SKILL
             elif event.error:
                 stage = _STAGE_ERROR
-            elif event is last_success:
-                stage = _STAGE_LATER_SUCCESS
+            elif event is last_non_error_observation:
+                stage = _STAGE_LATER_RESULT
             elif event.transition:
                 stage = _STAGE_TRANSITION
             else:
@@ -462,6 +466,120 @@ def _deduplicate_entries(
     return unique
 
 
+def _entry_identity(
+    entry: _EvidenceEntry,
+) -> tuple[int, int, _EvidenceSource]:
+    """返回不会跨任务合并相似证据的稳定条目标识。"""
+    return (entry.task_index, entry.order, entry.source)
+
+
+def _task_skeleton_entries(
+    task_index: int,
+    entries: list[_EvidenceEntry],
+) -> list[_EvidenceEntry]:
+    """为一个前台任务选择目标、切换、结果和结尾组成的最小骨架。"""
+    task_entries = sorted(
+        (
+            entry
+            for entry in entries
+            if entry.task_index == task_index
+        ),
+        key=lambda entry: entry.order,
+    )
+    if not task_entries:
+        return []
+
+    selected: list[_EvidenceEntry] = []
+    user_entries = [
+        entry
+        for entry in task_entries
+        if entry.source is _EvidenceSource.USER_MESSAGE
+    ]
+    if user_entries:
+        selected.append(user_entries[0])
+        if user_entries[-1] is not user_entries[0]:
+            selected.append(user_entries[-1])
+
+    loaded_skill_entries = [
+        entry
+        for entry in task_entries
+        if entry.stage == _STAGE_LOADED_SKILL
+    ]
+    if loaded_skill_entries:
+        selected.append(loaded_skill_entries[0])
+
+    error_entries = [
+        entry
+        for entry in task_entries
+        if entry.source is _EvidenceSource.TOOL_ERROR
+    ]
+    if error_entries:
+        spread = _spread_indices(len(error_entries))
+        representative_index = spread[1] if len(spread) > 1 else spread[0]
+        selected.append(error_entries[representative_index])
+
+    transition_entries = [
+        entry
+        for entry in task_entries
+        if entry.stage == _STAGE_TRANSITION
+    ]
+    if transition_entries:
+        selected.append(transition_entries[-1])
+
+    later_result_entries = [
+        entry
+        for entry in task_entries
+        if entry.stage == _STAGE_LATER_RESULT
+    ]
+    if later_result_entries:
+        selected.append(later_result_entries[-1])
+
+    report_entries = [
+        entry
+        for entry in task_entries
+        if entry.source is _EvidenceSource.ASSISTANT_REPORT
+    ]
+    if report_entries:
+        selected.append(report_entries[-1])
+
+    unique: dict[
+        tuple[int, int, _EvidenceSource],
+        _EvidenceEntry,
+    ] = {}
+    for entry in selected:
+        unique.setdefault(_entry_identity(entry), entry)
+    return sorted(unique.values(), key=lambda entry: entry.order)
+
+
+def _skeleton_priority(entry: _EvidenceEntry) -> tuple[int, int]:
+    """在极紧预算下先保住工具任务的目标、切换和后续观察。"""
+    if entry.source is _EvidenceSource.USER_MESSAGE:
+        rank = 0
+    elif entry.stage == _STAGE_TRANSITION:
+        rank = 1
+    elif entry.stage == _STAGE_LATER_RESULT:
+        rank = 2
+    elif entry.stage == _STAGE_LOADED_SKILL:
+        rank = 3
+    elif entry.source is _EvidenceSource.TOOL_ERROR:
+        rank = 4
+    else:
+        rank = 5
+    return (rank, entry.order)
+
+
+def _round_robin_queues(
+    queues: dict[int, list[_EvidenceEntry]],
+) -> list[_EvidenceEntry]:
+    """在不同前台任务之间逐条轮转，避免单个任务独占选择顺序。"""
+    ordered: list[_EvidenceEntry] = []
+    while any(queues.values()):
+        for task_index in sorted(queues):
+            if queues[task_index]:
+                ordered.append(queues[task_index].pop(0))
+    return ordered
+
+
 def _limit_primary_stage(
     entries: list[_EvidenceEntry],
     *,
@@ -473,11 +591,50 @@ def _limit_primary_stage(
 
 
 def _selection_order(entries: list[_EvidenceEntry]) -> list[_EvidenceEntry]:
-    """按关键阶段选择，并在各前台任务之间轮转。"""
+    """先轮转选择任务骨架，再按原阶段优先级补充其余证据。"""
     unique = _deduplicate_entries(entries)
+    task_indexes = sorted({entry.task_index for entry in unique})
+    skeletons = {
+        task_index: _task_skeleton_entries(task_index, unique)
+        for task_index in task_indexes
+    }
+    tool_task_indexes = {
+        entry.task_index
+        for entry in unique
+        if entry.source in {
+            _EvidenceSource.TOOL_OBSERVATION,
+            _EvidenceSource.TOOL_ERROR,
+        }
+    }
+
+    tool_skeleton_queues = {
+        task_index: sorted(
+            skeletons[task_index],
+            key=_skeleton_priority,
+        )
+        for task_index in task_indexes
+        if task_index in tool_task_indexes
+    }
+    chat_skeleton_queues = {
+        task_index: skeletons[task_index]
+        for task_index in task_indexes
+        if task_index not in tool_task_indexes
+    }
+    skeleton_order = _round_robin_queues(tool_skeleton_queues)
+    skeleton_order.extend(_round_robin_queues(chat_skeleton_queues))
+    skeleton_identities = {
+        _entry_identity(entry)
+        for entry in skeleton_order
+    }
+    remaining_entries = [
+        entry
+        for entry in unique
+        if _entry_identity(entry) not in skeleton_identities
+    ]
+
     primary: dict[int, dict[int, list[_EvidenceEntry]]] = {}
     deferred: dict[int, list[_EvidenceEntry]] = {}
-    for entry in unique:
+    for entry in remaining_entries:
         primary.setdefault(entry.stage, {}).setdefault(
             entry.task_index,
             [],
@@ -493,15 +650,16 @@ def _selection_order(entries: list[_EvidenceEntry]) -> list[_EvidenceEntry]:
                 limit=limit,
             )
             primary[stage][task_index] = kept
-            deferred.setdefault(task_index, []).extend(overflow)
+            if overflow:
+                deferred.setdefault(task_index, []).extend(overflow)
 
-    for task_entries in deferred.values():
+    for task_index, task_entries in deferred.items():
         primary.setdefault(_STAGE_OTHER, {}).setdefault(
-            task_entries[0].task_index,
+            task_index,
             [],
         ).extend(task_entries)
 
-    ordered: list[_EvidenceEntry] = []
+    ordered = list(skeleton_order)
     for stage in range(_STAGE_USER, _STAGE_OTHER + 1):
         queues = {
             task_index: [
@@ -510,10 +668,7 @@ def _selection_order(entries: list[_EvidenceEntry]) -> list[_EvidenceEntry]:
             ]
             for task_index, task_entries in primary.get(stage, {}).items()
         }
-        while any(queues.values()):
-            for task_index in sorted(queues):
-                if queues[task_index]:
-                    ordered.append(queues[task_index].pop(0))
+        ordered.extend(_round_robin_queues(queues))
     return ordered
 
 
