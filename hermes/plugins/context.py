@@ -1,4 +1,4 @@
-"""Plugin 显式注册观察型 Hook 所需的最小上下文。"""
+"""Plugin 显式注册固定 Hook 所需的最小上下文。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from hermes.hooks import (
     HookRegistrationError,
     SyncHookRegistry,
 )
-from hermes.hooks.events import normalize_observation_event_name
+from hermes.hooks.events import normalize_hook_event_name
 
 
 class PluginContext:
@@ -34,9 +34,9 @@ class PluginContext:
         hook_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> HookRegistration:
-        """向固定观察事件注册回调，注册错误统一为 HookRegistrationError。"""
+        """向固定事件注册回调，注册错误统一为 HookRegistrationError。"""
         try:
-            normalized_event_name = normalize_observation_event_name(event_name)
+            normalized_event_name = normalize_hook_event_name(event_name)
         except ValueError as exc:
             raise HookRegistrationError(str(exc)) from exc
         return self._hook_registry.register(

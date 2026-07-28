@@ -265,6 +265,9 @@ class DelegateJobManager:
         finally:
             with self._lock:
                 job.finished_at = time.time()
+                # 任务终态后立即释放运行时 Hook 引用，查询视图从未暴露它们。
+                job._hook_registry = None
+                job._parent_run_id = None
 
 
 # ---------------------------------------------------------------------------

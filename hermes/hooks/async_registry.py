@@ -15,6 +15,15 @@ from hermes.hooks.contracts import (
     HookName,
     HookRegistration,
 )
+from hermes.hooks.controls import (
+    AddContext,
+    Block,
+    HookControlDispatchResult,
+    build_control_dispatch_result,
+    control_error_message,
+    control_failure_reason,
+    normalize_control_value,
+)
 from hermes.hooks.registry import _HookRegistryBase, _normalize_timeout
 
 
@@ -138,6 +147,128 @@ class AsyncHookRegistry(_HookRegistryBase):
                     )
                 )
         return HookDispatchResult(event=event, results=tuple(results))
+
+    async def emit_control(self, event: HookEvent) -> HookControlDispatchResult:
+        """顺序分发控制 Hook；超时、异常和无效返回值都默认阻止。"""
+        if not isinstance(event, HookEvent):
+            raise TypeError("event must be a HookEvent")
+        results: list[HookInvocationResult] = []
+        added_context: list[str] = []
+        for registration in self._registrations_for(event):
+            task = asyncio.create_task(
+                self._invoke(registration.callback, event.context)
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    (task,),
+                    timeout=registration.timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                task.cancel()
+                self._observe_detached_task(
+                    task,
+                    event_name=event.name,
+                    hook_id=registration.hook_id,
+                )
+                raise
+
+            if task not in done:
+                task.cancel()
+                self._observe_detached_task(
+                    task,
+                    event_name=event.name,
+                    hook_id=registration.hook_id,
+                )
+                logger.warning(
+                    "Control Hook timed out: event=%s hook_id=%s timeout_seconds=%s",
+                    event.name,
+                    registration.hook_id,
+                    registration.timeout_seconds,
+                )
+                results.append(
+                    HookInvocationResult(
+                        hook_id=registration.hook_id,
+                        success=False,
+                        error_type="TimeoutError",
+                        timed_out=True,
+                        error_message="hook execution timed out",
+                    )
+                )
+                return build_control_dispatch_result(
+                    event,
+                    results,
+                    block_reason=control_failure_reason(),
+                    added_context=added_context,
+                )
+
+            try:
+                value = task.result()
+                control_value = normalize_control_value(event, value)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    task.cancel()
+                    self._observe_detached_task(
+                        task,
+                        event_name=event.name,
+                        hook_id=registration.hook_id,
+                    )
+                    raise
+                results.append(
+                    HookInvocationResult(
+                        hook_id=registration.hook_id,
+                        success=False,
+                        error_type="CancelledError",
+                        error_message="hook task was cancelled",
+                    )
+                )
+                return build_control_dispatch_result(
+                    event,
+                    results,
+                    block_reason=control_failure_reason(),
+                    added_context=added_context,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Control Hook failed: event=%s hook_id=%s",
+                    event.name,
+                    registration.hook_id,
+                )
+                results.append(
+                    HookInvocationResult(
+                        hook_id=registration.hook_id,
+                        success=False,
+                        error_type=type(exc).__name__,
+                        error_message=control_error_message(exc),
+                    )
+                )
+                return build_control_dispatch_result(
+                    event,
+                    results,
+                    block_reason=control_failure_reason(),
+                    added_context=added_context,
+                )
+
+            results.append(
+                HookInvocationResult(
+                    hook_id=registration.hook_id,
+                    success=True,
+                    value=control_value,
+                )
+            )
+            if isinstance(control_value, Block):
+                return build_control_dispatch_result(
+                    event,
+                    results,
+                    block_reason=control_value.reason,
+                    added_context=added_context,
+                )
+            if isinstance(control_value, AddContext):
+                added_context.append(control_value.text)
+        return build_control_dispatch_result(
+            event,
+            results,
+            added_context=added_context,
+        )
 
     async def dispatch(
         self,

@@ -18,6 +18,15 @@ from hermes.hooks.contracts import (
     HookRegistrationError,
     normalize_hook_name,
 )
+from hermes.hooks.controls import (
+    AddContext,
+    Block,
+    HookControlDispatchResult,
+    build_control_dispatch_result,
+    control_error_message,
+    control_failure_reason,
+    normalize_control_value,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -178,6 +187,59 @@ class SyncHookRegistry(_HookRegistryBase):
                     )
                 )
         return HookDispatchResult(event=event, results=tuple(results))
+
+    def emit_control(self, event: HookEvent) -> HookControlDispatchResult:
+        """按顺序分发控制 Hook；失败默认阻止，显式 Block 立即短路。"""
+        if not isinstance(event, HookEvent):
+            raise TypeError("event must be a HookEvent")
+        results: list[HookInvocationResult] = []
+        added_context: list[str] = []
+        for registration in self._registrations_for(event):
+            try:
+                value = registration.callback(event.context)
+                control_value = normalize_control_value(event, value)
+            except Exception as exc:
+                logger.exception(
+                    "Control Hook failed: event=%s hook_id=%s",
+                    event.name,
+                    registration.hook_id,
+                )
+                results.append(
+                    HookInvocationResult(
+                        hook_id=registration.hook_id,
+                        success=False,
+                        error_type=type(exc).__name__,
+                        error_message=control_error_message(exc),
+                    )
+                )
+                return build_control_dispatch_result(
+                    event,
+                    results,
+                    block_reason=control_failure_reason(),
+                    added_context=added_context,
+                )
+
+            results.append(
+                HookInvocationResult(
+                    hook_id=registration.hook_id,
+                    success=True,
+                    value=control_value,
+                )
+            )
+            if isinstance(control_value, Block):
+                return build_control_dispatch_result(
+                    event,
+                    results,
+                    block_reason=control_value.reason,
+                    added_context=added_context,
+                )
+            if isinstance(control_value, AddContext):
+                added_context.append(control_value.text)
+        return build_control_dispatch_result(
+            event,
+            results,
+            added_context=added_context,
+        )
 
     def dispatch(
         self,

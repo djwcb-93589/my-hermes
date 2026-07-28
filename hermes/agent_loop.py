@@ -32,6 +32,7 @@ from hermes.config import client as _default_client
 from hermes.hooks import (
     AsyncHookRegistry,
     HookContext,
+    HookControlDispatchResult,
     HookEvent,
     HookEventName,
     SyncHookRegistry,
@@ -45,6 +46,7 @@ from hermes.model_streaming import (
     SynchronousStreamAccumulator,
 )
 from hermes.redaction import redact_explicit_secrets
+from hermes.tokens import estimate_tokens
 
 
 logger = logging.getLogger(__name__)
@@ -747,6 +749,118 @@ class AgentLoop:
             payload=payload,
         )
 
+    def _pre_llm_hook_context(self, messages: list[dict]) -> HookContext:
+        """构造不含消息正文和系统提示词的模型调用控制上下文。"""
+        allowed_tool_names = getattr(self, "allowed_tool_names", None)
+        return self._hook_context(
+            invocation_suffix=f"pre_llm:{self.iterations}",
+            payload={
+                "iteration": self.iterations,
+                "model_role": self._model_role(),
+                "message_count": len(messages),
+                "estimated_tokens": estimate_tokens(messages),
+                "has_tool_definitions": bool(self.tools),
+                "allowed_tool_count": (
+                    len(allowed_tool_names)
+                    if allowed_tool_names is not None
+                    else len(self.tools)
+                ),
+            },
+        )
+
+    def _pre_tool_hook_context(self, tool_call) -> HookContext | None:
+        """在既有工具边界之后构造不含参数值的控制上下文。"""
+        tool_name = self._tool_call_name(tool_call)
+        try:
+            tool_args = json.loads(tool_call.function.arguments)
+        except Exception:
+            return None
+
+        allowed_tool_names = getattr(self, "allowed_tool_names", None)
+        if (
+            (self.blocked_tools and tool_name in self.blocked_tools)
+            or (
+                allowed_tool_names is not None
+                and tool_name not in allowed_tool_names
+            )
+        ):
+            return None
+
+        get_entry = getattr(self.registry, "get_entry", None)
+        entry = get_entry(tool_name) if callable(get_entry) else None
+        if entry is None:
+            return None
+
+        argument_keys = (
+            sorted(str(key) for key in tool_args)
+            if type(tool_args) is dict
+            else []
+        )
+        approval_mode = getattr(getattr(entry, "approval_mode", None), "value", None)
+        risk_level = getattr(getattr(entry, "risk_level", None), "value", None)
+        return self._hook_context(
+            invocation_suffix=f"pre_tool:{getattr(tool_call, 'id', '')}",
+            payload={
+                "tool_name": tool_name,
+                "tool_call_id": str(getattr(tool_call, "id", "")),
+                "argument_keys": argument_keys,
+                "argument_count": len(argument_keys),
+                "approval_mode": (
+                    str(approval_mode) if approval_mode is not None else "unknown"
+                ),
+                "risk_level": (
+                    str(risk_level) if risk_level is not None else "unknown"
+                ),
+                "durable_execution": (
+                    self.tool_context.get("durable_tool_execution") is not None
+                ),
+            },
+        )
+
+    @staticmethod
+    def _temporary_context_messages(contexts: tuple[str, ...]) -> list[dict]:
+        """构造仅供当前模型请求使用、绝不持久化的临时系统消息。"""
+        return [
+            {
+                "role": "system",
+                "content": f"[PLUGIN_TEMPORARY_CONTEXT]\n{text}",
+            }
+            for text in contexts
+        ]
+
+    def _dispatch_pre_llm_control(
+        self,
+        messages: list[dict],
+    ) -> HookControlDispatchResult | None:
+        """同步分发模型调用控制 Hook。"""
+        registry = self.hook_registry
+        if not isinstance(registry, SyncHookRegistry):
+            return None
+        return registry.emit_control(
+            HookEvent(
+                name=HookEventName.PRE_LLM_CALL.value,
+                context=self._pre_llm_hook_context(messages),
+            )
+        )
+
+    def _dispatch_pre_tool_control(
+        self,
+        tool_call,
+    ) -> HookControlDispatchResult | None:
+        """同步分发工具调用控制 Hook，未通过既有边界时不触发。"""
+        registry = self.hook_registry
+        if not isinstance(registry, SyncHookRegistry):
+            return None
+        context = self._pre_tool_hook_context(tool_call)
+        if context is None:
+            return None
+        return registry.emit_control(
+            HookEvent(
+                name=HookEventName.PRE_TOOL_CALL.value,
+                context=context,
+            )
+        )
+
     @staticmethod
     def _hook_token_usage(response) -> dict[str, int]:
         """提取可安全暴露的模型 token 统计，不保留原始响应对象。"""
@@ -1012,12 +1126,38 @@ class AgentLoop:
             if self._is_cancelled():
                 return self._cancel_result(messages)
 
+            pre_llm_control = self._dispatch_pre_llm_control(messages)
+            if pre_llm_control is not None and pre_llm_control.blocked:
+                return self._result(
+                    ok=False,
+                    status="hook_blocked",
+                    summary=self.last_assistant_text(messages),
+                    messages=messages,
+                    error=pre_llm_control.block_reason,
+                    error_type="hook_blocked",
+                    fatal=True,
+                    retryable=False,
+                )
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+            request_messages = (
+                [
+                    *messages,
+                    *self._temporary_context_messages(
+                        pre_llm_control.added_context
+                    ),
+                ]
+                if pre_llm_control is not None
+                and pre_llm_control.added_context
+                else messages
+            )
+
             # 模型调用 —— 走 handle_model_error 决定后续动作
             call_model = str(self.model)
             call_model_role = self._model_role()
             call_started = time.perf_counter()
             try:
-                response = self.call_model(messages)
+                response = self.call_model(request_messages)
             except Exception as exc:
                 self._emit_model_call_event(
                     _model_call_event(
@@ -1229,8 +1369,10 @@ class AgentLoop:
         approval_request: dict | None = None
         for tc in tool_calls:
             tool_started = time.perf_counter()
+            tc_name = self._tool_call_name(tc)
             skipped_due_to_failure = fatal_detail is not None
             deferred_for_approval = approval_request is not None
+            hook_blocked = False
             if skipped_due_to_failure:
                 # 前序致命错误后不再执行后续调用，但保留完整 batch 供既有流程持久化。
                 output = "(error: skipped because an earlier tool call failed)"
@@ -1241,17 +1383,25 @@ class AgentLoop:
                 err_status = None
                 err_detail = None
             else:
-                try:
-                    output, err_status, err_detail = self.dispatch_one(tc)
-                except Exception as exc:
-                    # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
-                    tool_name = self._tool_call_name(tc)
-                    short = _short_error(exc)
-                    output = f"(error: tool {tool_name} failed: {short})"
-                    err_status = "dispatch"
-                    err_detail = f"tool {tool_name!r} dispatch raised: {short}"
+                pre_tool_control = self._dispatch_pre_tool_control(tc)
+                if pre_tool_control is not None and pre_tool_control.blocked:
+                    hook_blocked = True
+                    output = (
+                        f"(error: tool {tc_name} blocked by Hook: "
+                        f"{pre_tool_control.block_reason})"
+                    )
+                    err_status = "hook_blocked"
+                    err_detail = "tool call was blocked by a control Hook"
+                else:
+                    try:
+                        output, err_status, err_detail = self.dispatch_one(tc)
+                    except Exception as exc:
+                        # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
+                        short = _short_error(exc)
+                        output = f"(error: tool {tc_name} failed: {short})"
+                        err_status = "dispatch"
+                        err_detail = f"tool {tc_name!r} dispatch raised: {short}"
 
-            tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
                 self.tools_used.append(tc_name)
             tool_msg = {
@@ -1268,6 +1418,15 @@ class AgentLoop:
                     tc,
                     status="skipped",
                     error_type="prior_tool_failure",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
+                continue
+
+            if hook_blocked:
+                self._record_tool_observation(
+                    tc,
+                    status="blocked",
+                    error_type="hook_blocked",
                     duration_ms=(time.perf_counter() - tool_started) * 1000,
                 )
                 continue
@@ -1624,6 +1783,39 @@ class AsyncAgentLoop(AgentLoop):
         )
         self.hook_registry = hook_registry
 
+    async def _dispatch_pre_llm_control_async(
+        self,
+        messages: list[dict],
+    ) -> HookControlDispatchResult | None:
+        """异步分发模型调用控制 Hook，并保留外部取消语义。"""
+        registry = self.hook_registry
+        if not isinstance(registry, AsyncHookRegistry):
+            return None
+        return await registry.emit_control(
+            HookEvent(
+                name=HookEventName.PRE_LLM_CALL.value,
+                context=self._pre_llm_hook_context(messages),
+            )
+        )
+
+    async def _dispatch_pre_tool_control_async(
+        self,
+        tool_call,
+    ) -> HookControlDispatchResult | None:
+        """异步分发工具调用控制 Hook，未通过既有边界时不触发。"""
+        registry = self.hook_registry
+        if not isinstance(registry, AsyncHookRegistry):
+            return None
+        context = self._pre_tool_hook_context(tool_call)
+        if context is None:
+            return None
+        return await registry.emit_control(
+            HookEvent(
+                name=HookEventName.PRE_TOOL_CALL.value,
+                context=context,
+            )
+        )
+
     async def run(self, user_message: str) -> AgentLoopResult:
         """异步跑一次完整循环,Task 取消必须原样向上传播。"""
         self.run_id = uuid.uuid4().hex
@@ -1747,11 +1939,37 @@ class AsyncAgentLoop(AgentLoop):
             if self._is_cancelled():
                 return self._cancel_result(messages)
 
+            pre_llm_control = await self._dispatch_pre_llm_control_async(messages)
+            if pre_llm_control is not None and pre_llm_control.blocked:
+                return self._result(
+                    ok=False,
+                    status="hook_blocked",
+                    summary=self.last_assistant_text(messages),
+                    messages=messages,
+                    error=pre_llm_control.block_reason,
+                    error_type="hook_blocked",
+                    fatal=True,
+                    retryable=False,
+                )
+            if self._is_cancelled():
+                return self._cancel_result(messages)
+            request_messages = (
+                [
+                    *messages,
+                    *self._temporary_context_messages(
+                        pre_llm_control.added_context
+                    ),
+                ]
+                if pre_llm_control is not None
+                and pre_llm_control.added_context
+                else messages
+            )
+
             call_model = str(self.model)
             call_model_role = self._model_role()
             call_started = time.perf_counter()
             try:
-                response = await self.call_model(messages)
+                response = await self.call_model(request_messages)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1956,8 +2174,10 @@ class AsyncAgentLoop(AgentLoop):
         approval_request: dict | None = None
         for tc in tool_calls:
             tool_started = time.perf_counter()
+            tc_name = self._tool_call_name(tc)
             skipped_due_to_failure = fatal_detail is not None
             deferred_for_approval = approval_request is not None
+            hook_blocked = False
             if skipped_due_to_failure:
                 # 前序致命错误后不再执行后续调用，但保留完整 batch 供既有流程持久化。
                 output = "(error: skipped because an earlier tool call failed)"
@@ -1968,18 +2188,26 @@ class AsyncAgentLoop(AgentLoop):
                 err_status = None
                 err_detail = None
             else:
-                try:
-                    output, err_status, err_detail = await self.dispatch_one(tc)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    tool_name = self._tool_call_name(tc)
-                    short = _short_error(exc)
-                    output = f"(error: tool {tool_name} failed: {short})"
-                    err_status = "dispatch"
-                    err_detail = f"tool {tool_name!r} dispatch raised: {short}"
+                pre_tool_control = await self._dispatch_pre_tool_control_async(tc)
+                if pre_tool_control is not None and pre_tool_control.blocked:
+                    hook_blocked = True
+                    output = (
+                        f"(error: tool {tc_name} blocked by Hook: "
+                        f"{pre_tool_control.block_reason})"
+                    )
+                    err_status = "hook_blocked"
+                    err_detail = "tool call was blocked by a control Hook"
+                else:
+                    try:
+                        output, err_status, err_detail = await self.dispatch_one(tc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        short = _short_error(exc)
+                        output = f"(error: tool {tc_name} failed: {short})"
+                        err_status = "dispatch"
+                        err_detail = f"tool {tc_name!r} dispatch raised: {short}"
 
-            tc_name = self._tool_call_name(tc)
             if tc_name not in self.tools_used:
                 self.tools_used.append(tc_name)
             tool_msg = {
@@ -1996,6 +2224,15 @@ class AsyncAgentLoop(AgentLoop):
                     tc,
                     status="skipped",
                     error_type="prior_tool_failure",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
+                continue
+
+            if hook_blocked:
+                self._record_tool_observation(
+                    tc,
+                    status="blocked",
+                    error_type="hook_blocked",
                     duration_ms=(time.perf_counter() - tool_started) * 1000,
                 )
                 continue

@@ -423,6 +423,9 @@ def handle_delegate(args, **kwargs) -> str:
 
     # ---------- 后台模式 ----------
     manager = get_delegate_job_manager()
+    # runner 只捕获本次任务所需的运行时引用，避免跨模块读取 Job 私有字段。
+    captured_hook_registry = hook_registry
+    captured_parent_run_id = parent_run_id
 
     def runner_factory(job):
         # 闭包绑定 cancel_checker:从 manager 查 job.cancel_requested
@@ -433,12 +436,8 @@ def handle_delegate(args, **kwargs) -> str:
                 goal, context, toolsets, child_session_key,
                 cancel_checker=lambda: manager.is_cancel_requested(job_id),
                 tool_context=child_tool_context,
-                hook_registry=(
-                    job._hook_registry
-                    if isinstance(job._hook_registry, SyncHookRegistry)
-                    else None
-                ),
-                parent_run_id=job._parent_run_id,
+                hook_registry=captured_hook_registry,
+                parent_run_id=captured_parent_run_id,
             )
         return runner
 
