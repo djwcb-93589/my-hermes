@@ -38,6 +38,35 @@ class _StreamOutcome:
     value: object | None = None
 
 
+class _StreamProgress:
+    """在线程之间安全维护最近一次取得模型 chunk 的时间。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_progress_at = time.monotonic()
+
+    def mark_started(self) -> None:
+        """从后台线程开始创建 stream 的时刻重新开始等待窗口。"""
+        now = time.monotonic()
+        with self._lock:
+            self._last_progress_at = now
+
+    def mark_chunk_received(self) -> None:
+        """记录同步 stream 成功返回一个 chunk 的时刻。"""
+        now = time.monotonic()
+        with self._lock:
+            self._last_progress_at = now
+
+    def remaining(self, timeout_seconds: float | None) -> float | None:
+        """返回距离最近一次进展还剩多少等待时间。"""
+        if timeout_seconds is None:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            last_progress_at = self._last_progress_at
+        return timeout_seconds - (now - last_progress_at)
+
+
 class _StreamState:
     """在线程之间安全交接 stream，并把关闭请求限制为一次。"""
 
@@ -228,6 +257,7 @@ def consume_interruptible_stream(
     outcome_queue: queue.Queue[_StreamOutcome] = queue.Queue(maxsize=1)
     stop_event = threading.Event()
     stream_state = _StreamState()
+    stream_progress = _StreamProgress()
     if _is_cancelled(cancel_checker):
         _raise_cancelled(stop_event)
 
@@ -239,11 +269,14 @@ def consume_interruptible_stream(
 
     def worker() -> None:
         try:
+            stream_progress.mark_started()
             stream = stream_factory()
             stream_state.set_stream(stream)
             if stop_event.is_set():
                 return
             for chunk in stream:
+                # 必须在 Queue put 前记录，避免本地背压被误判为模型无进展。
+                stream_progress.mark_chunk_received()
                 if stop_event.is_set():
                     return
                 while not stop_event.is_set():
@@ -269,18 +302,14 @@ def consume_interruptible_stream(
         daemon=True,
     )
     thread.start()
-    deadline = (
-        None
-        if timeout_seconds is None
-        else time.monotonic() + timeout_seconds
-    )
 
     def abort_if_needed() -> None:
         if _is_cancelled(cancel_checker):
             stop_event.set()
             stream_state.request_close()
             raise ModelExecutionCancelled
-        if deadline is not None and time.monotonic() >= deadline:
+        remaining = stream_progress.remaining(timeout_seconds)
+        if remaining is not None and remaining <= 0:
             # 超时边界再次检查取消，保证取消优先级高于超时。
             if _is_cancelled(cancel_checker):
                 stop_event.set()
@@ -291,9 +320,9 @@ def consume_interruptible_stream(
             raise ModelExecutionTimedOut
 
     def remaining_wait() -> float:
-        if deadline is None:
+        remaining = stream_progress.remaining(timeout_seconds)
+        if remaining is None:
             return poll_interval
-        remaining = deadline - time.monotonic()
         if remaining <= 0:
             abort_if_needed()
         return min(poll_interval, remaining)
