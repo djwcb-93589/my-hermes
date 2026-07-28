@@ -29,19 +29,23 @@ async def run_gateway_console():
         f"skipped={plugin_summary.skipped} "
         f"failed={plugin_summary.failed}"
     )
-    runner = GatewayRunner(
-        config=_config,
-        db_path=DB_PATH,
-        hook_registry=hook_registry,
-    )
-    runner.add_adapter(ConsoleAdapter())
+    runner = None
 
     try:
+        runner = GatewayRunner(
+            config=_config,
+            db_path=DB_PATH,
+            hook_registry=hook_registry,
+        )
+        runner.add_adapter(ConsoleAdapter())
         await runner.start()
         while runner.adapters.get("console") and runner.adapters["console"]._running:
             await asyncio.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
-        await runner.stop()
-        plugin_runtime.close()
+        try:
+            if runner is not None:
+                await runner.stop()
+        finally:
+            plugin_runtime.close()

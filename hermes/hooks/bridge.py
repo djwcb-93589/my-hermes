@@ -93,6 +93,7 @@ class SyncControlBridge(SyncHookRegistry):
         }
 
     def _calculate_total_wait(
+        self,
         snapshots: tuple[_AsyncControlSnapshot, ...],
     ) -> float:
         """根据各 Hook 的有效超时计算同步线程可等待的总上限。"""

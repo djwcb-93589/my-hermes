@@ -19,14 +19,10 @@ from hermes.tools import register_all
 
 
 async def run_gateway():
-    """根据配置启动多平台 Gateway。"""
+    """在 Gateway 进程生命周期内创建并释放 Plugin Runtime。"""
     print(f"=== Hermes Gateway ===")
     print(f"Model: {MODEL}")
 
-    # Runner 会按平台配置把同一工具集同时用于 prompt、API schema 和
-    # dispatch 白名单；全局 registry 本身不作为安全边界。
-    # Runner 构造阶段统一校验 Gateway 配置；非法配置会在任何 Adapter
-    # 初始化或 Webhook 监听开始前直接终止启动。
     register_all()
     hook_registry = AsyncHookRegistry()
     plugin_runtime = AsyncPluginRuntime(
@@ -41,11 +37,31 @@ async def run_gateway():
         f"skipped={plugin_summary.skipped} "
         f"failed={plugin_summary.failed}"
     )
+    runtime_state = {"runner": None}
+    try:
+        await _run_gateway_impl(hook_registry, runtime_state)
+    finally:
+        try:
+            runner = runtime_state["runner"]
+            if runner is not None:
+                await runner.stop()
+        finally:
+            plugin_runtime.close()
+            print("  [gateway] stopped")
+
+
+async def _run_gateway_impl(hook_registry, runtime_state) -> None:
+    """构造 Adapter 并运行 Gateway；资源释放统一由外层负责。"""
+    # Runner 会按平台配置把同一工具集同时用于 prompt、API schema 和
+    # dispatch 白名单；全局 registry 本身不作为安全边界。
+    # Runner 构造阶段统一校验 Gateway 配置；非法配置会在任何 Adapter
+    # 初始化或 Webhook 监听开始前直接终止启动。
     runner = GatewayRunner(
         config=_config,
         db_path=DB_PATH,
         hook_registry=hook_registry,
     )
+    runtime_state["runner"] = runner
 
     platforms = _config.get("gateway", {}).get("platforms", {})
 
@@ -185,7 +201,6 @@ async def run_gateway():
 
     if not runner.adapters:
         print("  [gateway] WARNING: no adapters enabled. Check config.yaml.")
-        plugin_runtime.close()
         return
 
     try:
@@ -207,7 +222,3 @@ async def run_gateway():
             await asyncio.sleep(0.5)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
-    finally:
-        await runner.stop()
-        plugin_runtime.close()
-        print("  [gateway] stopped")

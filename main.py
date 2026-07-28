@@ -40,34 +40,36 @@ def cli_loop() -> None:
         plugins_config=_config["plugins"],
     )
     plugin_runtime.load()
-    tool_policy = _cli_tool_policy()
-    enabled_toolsets = sorted(registry.resolve(tool_policy).toolsets)
-    cached_prompt = build_system_prompt(
-        os.getcwd(),
-        enabled_toolsets=enabled_toolsets,
-    )
-    events = CLIEventQueue()
-    cli_ui = CLIUI(
-        cli_input=CLIInput(),
-        post_user_input=events.post_user_input,
-        post_shutdown=events.post_shutdown,
-        post_cancel_request=events.post_cancel_request,
-    )
-    worker = CLIWorker(
-        stream_sink=events.post_stream_event,
-        publish_result=events.post_worker_result,
-        hook_registry=hook_registry,
-    )
-    controller = CLIController(
-        events=events,
-        worker=worker,
-        ui=cli_ui,
-        cached_prompt=cached_prompt,
-        tool_policy=tool_policy,
-    )
+    cli_ui = None
+    worker = None
     worker_started = False
 
     try:
+        tool_policy = _cli_tool_policy()
+        enabled_toolsets = sorted(registry.resolve(tool_policy).toolsets)
+        cached_prompt = build_system_prompt(
+            os.getcwd(),
+            enabled_toolsets=enabled_toolsets,
+        )
+        events = CLIEventQueue()
+        cli_ui = CLIUI(
+            cli_input=CLIInput(),
+            post_user_input=events.post_user_input,
+            post_shutdown=events.post_shutdown,
+            post_cancel_request=events.post_cancel_request,
+        )
+        worker = CLIWorker(
+            stream_sink=events.post_stream_event,
+            publish_result=events.post_worker_result,
+            hook_registry=hook_registry,
+        )
+        controller = CLIController(
+            events=events,
+            worker=worker,
+            ui=cli_ui,
+            cached_prompt=cached_prompt,
+            tool_policy=tool_policy,
+        )
         with patched_cli_stdout():
             cli_ui.show_startup(
                 profile=HERMES_HOME,
@@ -87,8 +89,9 @@ def cli_loop() -> None:
             cli_ui.start_input()
             controller.run()
     finally:
-        cli_ui.stop_input()
-        if worker_started:
+        if cli_ui is not None:
+            cli_ui.stop_input()
+        if worker_started and worker is not None:
             worker.shutdown()
         plugin_runtime.close()
         cleanup_all_session_resources()

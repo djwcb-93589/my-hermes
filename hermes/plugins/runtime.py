@@ -9,7 +9,6 @@ import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Literal
 
 import yaml
@@ -75,8 +74,10 @@ class _PluginTransaction:
         self,
         registry: SyncHookRegistry | AsyncHookRegistry,
         plugin_name: str,
+        module_namespace: str,
     ) -> None:
         self._plugin_name = plugin_name
+        self._module_namespace = module_namespace
         if isinstance(registry, SyncHookRegistry):
             self._staging_registry: SyncHookRegistry | AsyncHookRegistry = (
                 SyncHookRegistry()
@@ -97,13 +98,25 @@ class _PluginTransaction:
         local_hook_id = hook_id
         if local_hook_id is None:
             callback_type = type(callback)
-            module = getattr(callback, "__module__", callback_type.__module__)
-            name = getattr(
+            callback_module = getattr(
+                callback,
+                "__module__",
+                callback_type.__module__,
+            )
+            callback_name = getattr(
                 callback,
                 "__qualname__",
                 getattr(callback, "__name__", callback_type.__qualname__),
             )
-            local_hook_id = f"{module}.{name}"
+            relative_module = _relative_plugin_module_name(
+                callback_module,
+                self._module_namespace,
+            )
+            local_hook_id = (
+                f"{relative_module}.{callback_name}"
+                if relative_module
+                else callback_name
+            )
         if not isinstance(local_hook_id, str) or not local_hook_id.strip():
             raise HookRegistrationError("hook_id must be a non-empty string")
         if ":" in local_hook_id:
@@ -151,7 +164,7 @@ class _PluginRuntimeBase:
             user_plugin_root = HERMES_HOME / "plugins"
         self._user_plugin_root = user_plugin_root.expanduser()
         self._results: tuple[PluginLoadResult, ...] = ()
-        self._modules: dict[str, ModuleType] = {}
+        self._module_namespaces: set[str] = set()
         self._closed = False
 
     @property
@@ -207,10 +220,9 @@ class _PluginRuntimeBase:
         if self._closed:
             return
         self._closed = True
-        for module_name, module in tuple(self._modules.items()):
-            if sys.modules.get(module_name) is module:
-                sys.modules.pop(module_name, None)
-        self._modules.clear()
+        for module_namespace in tuple(self._module_namespaces):
+            _cleanup_plugin_modules(module_namespace)
+        self._module_namespaces.clear()
         self._results = ()
         self._registry = None  # type: ignore[assignment]
 
@@ -277,10 +289,15 @@ class _PluginRuntimeBase:
             register = getattr(module, "register", None)
             if not callable(register):
                 raise PluginManifestError("plugin register must be callable")
-            transaction = _PluginTransaction(self._registry, manifest["name"])
+            transaction = _PluginTransaction(
+                self._registry,
+                manifest["name"],
+                module_name,
+            )
             context = self._context_type(transaction.register)
             outcome = register(context)
             if inspect.isawaitable(outcome):
+                _close_rejected_awaitable(outcome)
                 raise PluginManifestError("plugin register must not be async")
             if tuple(sys.path) != original_sys_path:
                 raise PluginManifestError("plugin must not modify sys.path")
@@ -290,14 +307,14 @@ class _PluginRuntimeBase:
                 sys.path[:] = original_sys_path
             module_name = locals().get("module_name")
             if isinstance(module_name, str):
-                sys.modules.pop(module_name, None)
+                _cleanup_plugin_modules(module_name)
             return _failed_result(
                 candidate.name,
                 None,
                 candidate.source_type,
                 type(exc).__name__,
             )
-        self._modules[module_name] = module
+        self._module_namespaces.add(module_name)
         return PluginLoadResult(
             name=manifest["name"],
             version=manifest["version"],
@@ -386,7 +403,7 @@ def _load_manifest(candidate: _PluginCandidate) -> dict[str, str]:
     return {"name": name, "version": version.strip()}
 
 
-def _load_plugin_module(directory: Path, plugin_name: str) -> tuple[str, ModuleType]:
+def _load_plugin_module(directory: Path, plugin_name: str) -> tuple[str, object]:
     """不修改 sys.path 地加载目录内唯一命名的 Python 包模块。"""
     entrypoint = directory / "__init__.py"
     module_name = f"hermes_plugin_{plugin_name.replace('-', '_')}_{uuid.uuid4().hex}"
@@ -402,9 +419,42 @@ def _load_plugin_module(directory: Path, plugin_name: str) -> tuple[str, ModuleT
     try:
         spec.loader.exec_module(module)
     except Exception:
-        sys.modules.pop(module_name, None)
+        _cleanup_plugin_modules(module_name)
         raise
     return module_name, module
+
+
+def _cleanup_plugin_modules(module_namespace: str) -> None:
+    """只移除当前动态 Plugin 命名空间及其相对导入的子模块。"""
+    if not isinstance(module_namespace, str) or not module_namespace:
+        return
+    prefix = f"{module_namespace}."
+    for module_name in tuple(sys.modules):
+        if module_name == module_namespace or module_name.startswith(prefix):
+            sys.modules.pop(module_name, None)
+
+
+def _close_rejected_awaitable(value: object) -> None:
+    """尽力关闭被拒绝的异步 register 返回值，不运行或等待它。"""
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _relative_plugin_module_name(
+    callback_module: object,
+    module_namespace: str,
+) -> str | None:
+    """把动态包名还原为稳定的 Plugin 包内相对模块名。"""
+    if not isinstance(callback_module, str):
+        return None
+    prefix = f"{module_namespace}."
+    if callback_module.startswith(prefix):
+        return callback_module[len(prefix):]
+    return None
 
 
 def _failed_result(
