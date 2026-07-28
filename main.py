@@ -89,12 +89,18 @@ def cli_loop() -> None:
             cli_ui.start_input()
             controller.run()
     finally:
-        if cli_ui is not None:
-            cli_ui.stop_input()
-        if worker_started and worker is not None:
-            worker.shutdown()
-        plugin_runtime.close()
-        cleanup_all_session_resources()
+        try:
+            if cli_ui is not None:
+                cli_ui.stop_input()
+        finally:
+            try:
+                if worker_started and worker is not None:
+                    worker.shutdown()
+            finally:
+                try:
+                    plugin_runtime.close()
+                finally:
+                    cleanup_all_session_resources()
 
 
 def main() -> None:
