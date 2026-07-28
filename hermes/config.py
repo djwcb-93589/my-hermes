@@ -17,6 +17,10 @@ import yaml
 from openai import AsyncOpenAI, OpenAI
 
 from hermes.approval_security import ApprovalSecurityPolicy
+from hermes.config_values import (
+    expand_env_vars as _expand_env_vars,
+    hermes_home,
+)
 from hermes.path_policy import PathAccessPolicy
 
 
@@ -91,26 +95,6 @@ _SUPPORTED_BROWSER_CHANNELS = frozenset({
     "msedge-canary",
 })
 _PLUGIN_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
-
-
-def _expand_env_vars(value):
-    """Recursively resolve ${VAR} references in config values."""
-    if isinstance(value, str):
-        def replacer(match):
-            var_name = match.group(1)
-            return os.getenv(var_name, match.group(0))
-        return re.sub(r'\$\{(\w+)\}', replacer, value)
-
-    elif isinstance(value, dict):
-        return {
-            key: _expand_env_vars(val)
-            for key, val in value.items()
-        }
-
-    elif isinstance(value, list):
-        return [_expand_env_vars(item) for item in value]
-
-    return value
 
 
 def _validate_filesystem_security_config(config: dict) -> None:
@@ -531,8 +515,7 @@ from pathlib import Path as _Path
 
 # Project root = parent of the hermes/ package directory. Falls back to
 # $HERMES_HOME if set; never touches the user's home directory.
-_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
-HERMES_HOME = _Path(os.getenv("HERMES_HOME") or _PROJECT_ROOT)
+HERMES_HOME = hermes_home()
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 
 load_env()

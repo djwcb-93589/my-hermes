@@ -39,7 +39,7 @@ def run_plugins_command(arguments: list[str]) -> int:
         _print_doctor(result)
         return 0 if result.ready else 1
     except PluginManagerError as exc:
-        print(f"error: {type(exc).__name__}")
+        print(f"error: {exc.error_code}")
         return 1
     except Exception as exc:
         # 管理命令不输出完整异常文本或路径，只保留脱敏类型。

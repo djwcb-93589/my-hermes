@@ -15,7 +15,12 @@ from typing import Iterator
 
 import yaml
 
-from hermes.hooks import AsyncHookRegistry, SyncHookRegistry
+from hermes.hooks import (
+    AsyncHookRegistry,
+    HookRegistrationError,
+    SyncHookRegistry,
+)
+from hermes.config_values import expand_env_vars, hermes_home
 from hermes.plugins.context import AsyncPluginContext, SyncPluginContext
 from hermes.plugins.runtime import (
     PluginManifestError,
@@ -32,11 +37,51 @@ from hermes.plugins.runtime import (
 
 
 _CONFIG_UPDATE_LOCK = threading.RLock()
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+_PLUGIN_ERROR_CODES = frozenset(
+    {
+        "PluginNotFound",
+        "DuplicatePluginName",
+        "ProjectPluginsDisabled",
+        "InvalidPluginName",
+        "ConfigSymlinkNotAllowed",
+        "ConfigLockSymlinkNotAllowed",
+        "ConfigReadFailed",
+        "ConfigYamlInvalid",
+        "ConfigNotMapping",
+        "PluginsConfigInvalid",
+        "ConfigLockFailed",
+        "ConfigWriteFailed",
+        "InvalidManifest",
+        "PathEscape",
+        "RegisterNotFound",
+        "AsyncRegisterNotAllowed",
+        "RegisterEntrypointUnsupported",
+        "HookRegistrationError",
+        "PluginImportFailed",
+        "SysPathModified",
+        "InvalidArguments",
+        "InternalError",
+    }
+)
 
 
 class PluginManagerError(RuntimeError):
     """Plugin 管理操作失败，错误信息只用于本地命令提示。"""
+
+    def __init__(self, error_code: str) -> None:
+        normalized = (
+            error_code
+            if isinstance(error_code, str) and error_code in _PLUGIN_ERROR_CODES
+            else "InternalError"
+        )
+        self._error_code = normalized
+        super().__init__(normalized)
+
+    @property
+    def error_code(self) -> str:
+        """返回稳定、脱敏的管理错误码。"""
+        return self._error_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,9 +137,11 @@ class PluginManager:
         user_plugin_root: Path | None = None,
     ) -> None:
         self.config_path = Path(config_path or _default_config_path())
-        self.project_root = (project_root or _PROJECT_ROOT).resolve()
+        # 默认项目根目录必须跟随调用管理命令时的当前工作目录，不能依赖
+        # manager.py 的源码位置，也不能在模块导入时提前固定。
+        self.project_root = (project_root or Path.cwd()).resolve()
         self.user_plugin_root = (
-            user_plugin_root or self.config_path.parent / "plugins"
+            user_plugin_root or hermes_home() / "plugins"
         ).expanduser()
 
     def list_plugins(self) -> tuple[PluginInspection, ...]:
@@ -155,7 +202,7 @@ class PluginManager:
                         manifest_valid=False,
                         duplicate=False,
                         status="invalid_manifest",
-                        error_type=type(exc).__name__,
+                        error_type=_error_code(exc),
                     )
                 )
                 continue
@@ -271,6 +318,13 @@ class PluginManager:
 
         duplicate = len(candidates) > 1
         checks.append(_check("unique plugin name", not duplicate, "DuplicatePluginName" if duplicate else None))
+        if duplicate:
+            return PluginDoctorResult(
+                name=normalized_name,
+                version=None,
+                checks=tuple(checks),
+                ready=False,
+            )
         candidate = candidates[0]
         checks.append(_check("directory contained in search root", candidate.is_safe, "PathEscape" if not candidate.is_safe else None))
         if candidate.source_type == "project" and not plugins_config["enable_project_plugins"]:
@@ -290,7 +344,7 @@ class PluginManager:
                 )
             )
         except Exception as exc:
-            checks.append(_check("manifest valid", False, type(exc).__name__))
+            checks.append(_check("manifest valid", False, _error_code(exc)))
             return PluginDoctorResult(
                 name=normalized_name,
                 version=version,
@@ -319,7 +373,7 @@ class PluginManager:
             _validate_static_register(entrypoint)
             checks.append(_check("register callable", True))
         except Exception as exc:
-            checks.append(_check("register callable", False, type(exc).__name__))
+            checks.append(_check("register callable", False, _error_code(exc)))
             return tuple(checks)
 
         sync_result = self._diagnose_one_registry(
@@ -357,7 +411,7 @@ class PluginManager:
             )
             register = getattr(module, "register", None)
             if not callable(register):
-                raise PluginManifestError("plugin register must be callable")
+                raise PluginManagerError("RegisterNotFound")
             transaction = _PluginTransaction(
                 registry,
                 plugin_name,
@@ -366,13 +420,13 @@ class PluginManager:
             outcome = register(context_type(transaction.register))
             if inspect.isawaitable(outcome):
                 _close_rejected_awaitable(outcome)
-                raise PluginManifestError("plugin register must not be async")
+                raise PluginManagerError("AsyncRegisterNotAllowed")
             if tuple(sys.path) != original_sys_path:
-                raise PluginManifestError("plugin must not modify sys.path")
+                raise PluginManagerError("SysPathModified")
             transaction.commit(registry)
             return (_check(check_name, True),)
         except Exception as exc:
-            return (_check(check_name, False, type(exc).__name__),)
+            return (_check(check_name, False, _error_code(exc)),)
         finally:
             if tuple(sys.path) != original_sys_path:
                 sys.path[:] = original_sys_path
@@ -381,7 +435,8 @@ class PluginManager:
 
     def _plugins_config(self) -> dict[str, object]:
         raw = _read_raw_config(self.config_path)
-        return _plugins_from_raw(raw)
+        expanded = expand_env_vars(raw)
+        return _plugins_from_raw(expanded)
 
     def _unique_candidate(
         self,
@@ -397,7 +452,7 @@ class PluginManager:
         if not candidates:
             project_candidate = self._project_candidate_if_disabled(name, plugins_config)
             if project_candidate is not None:
-                raise PluginManagerError("project plugin requires enable_project_plugins")
+                raise PluginManagerError("ProjectPluginsDisabled")
             raise PluginManagerError("PluginNotFound")
         if len(candidates) > 1:
             raise PluginManagerError("DuplicatePluginName")
@@ -423,6 +478,23 @@ class PluginManager:
         return _PluginCandidate(name, resolved, "project", is_safe=safe)
 
 
+def _error_code(exc: BaseException) -> str:
+    """把内部异常转换为稳定的脱敏管理错误码。"""
+    if isinstance(exc, PluginManagerError):
+        return exc.error_code
+    if isinstance(exc, PluginManifestError):
+        return "InvalidManifest"
+    if isinstance(exc, HookRegistrationError):
+        return "HookRegistrationError"
+    if isinstance(exc, (OSError,)):
+        return "PluginImportFailed"
+    if isinstance(exc, ImportError):
+        return "PluginImportFailed"
+    if isinstance(exc, SyntaxError):
+        return "RegisterEntrypointUnsupported"
+    return "InternalError"
+
+
 def _check(name: str, passed: bool, detail: str | None = None) -> PluginDoctorCheck:
     return PluginDoctorCheck(name=name, status="PASS" if passed else "FAIL", detail=detail)
 
@@ -439,34 +511,59 @@ def _validate_candidate_for_enable(candidate: _PluginCandidate) -> None:
     try:
         _load_manifest(candidate)
     except Exception as exc:
-        raise PluginManagerError(type(exc).__name__) from exc
+        raise PluginManagerError("InvalidManifest") from exc
 
 
 def _validate_static_register(entrypoint: Path) -> None:
     try:
         tree = ast.parse(entrypoint.read_text(encoding="utf-8"), filename=str(entrypoint))
     except (OSError, SyntaxError) as exc:
-        raise PluginManagerError(type(exc).__name__) from exc
+        raise PluginManagerError("RegisterEntrypointUnsupported") from exc
     for node in tree.body:
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "register":
             raise PluginManagerError("AsyncRegisterNotAllowed")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = tuple(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            targets = (node.target,)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets = (node.target,)
+        else:
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == "register"
+            for target in targets
+        ):
+            raise PluginManagerError("RegisterEntrypointUnsupported")
+    for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "register":
             return
+        if isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                if (
+                    imported.name == "register"
+                    and (imported.asname is None or imported.asname == "register")
+                ):
+                    return
     raise PluginManagerError("RegisterNotFound")
 
 
 def _default_config_path() -> Path:
-    hermes_home = Path(os.getenv("HERMES_HOME") or _PROJECT_ROOT)
-    return hermes_home / "config.yaml"
+    return hermes_home() / "config.yaml"
 
 
 def _read_raw_config(path: Path) -> dict:
     if path.is_symlink():
         raise PluginManagerError("ConfigSymlinkNotAllowed")
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        raise PluginManagerError(type(exc).__name__) from exc
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PluginManagerError("ConfigReadFailed") from exc
+    try:
+        raw = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise PluginManagerError("ConfigYamlInvalid") from exc
     if not isinstance(raw, dict):
         raise PluginManagerError("ConfigNotMapping")
     return raw
@@ -481,7 +578,7 @@ def _plugins_from_raw(raw: dict) -> dict[str, object]:
     try:
         return _validate_plugins_config(dict(value))
     except Exception as exc:
-        raise PluginManagerError(type(exc).__name__) from exc
+        raise PluginManagerError("PluginsConfigInvalid") from exc
 
 
 @contextlib.contextmanager
@@ -494,32 +591,42 @@ def _configuration_lock(path: Path) -> Iterator[None]:
         try:
             lock_file = lock_path.open("a+b")
         except OSError as exc:
-            raise PluginManagerError(type(exc).__name__) from exc
+            raise PluginManagerError("ConfigLockFailed") from exc
+        lock_acquired = False
         try:
-            lock_file.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                lock_file.write(b"0")
-                lock_file.flush()
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            yield
-        finally:
             try:
+                lock_file.seek(0)
                 if os.name == "nt":
                     import msvcrt
 
+                    lock_file.write(b"0")
+                    lock_file.flush()
                     lock_file.seek(0)
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
                 else:
                     import fcntl
 
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                lock_acquired = True
+            except (ImportError, OSError) as exc:
+                raise PluginManagerError("ConfigLockFailed") from exc
+            yield
+        finally:
+            try:
+                if lock_acquired:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+
+                            lock_file.seek(0)
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except (ImportError, OSError):
+                        # 锁释放失败不能阻止文件句柄关闭，也不能覆盖主体异常。
+                        pass
             finally:
                 lock_file.close()
 
@@ -553,7 +660,7 @@ def _write_enabled_atomically(raw: dict, enabled: list[str], path: Path) -> None
         os.replace(temp_name, path)
         temp_name = None
     except (OSError, yaml.YAMLError) as exc:
-        raise PluginManagerError(type(exc).__name__) from exc
+        raise PluginManagerError("ConfigWriteFailed") from exc
     finally:
         if temp_name is not None:
             try:
