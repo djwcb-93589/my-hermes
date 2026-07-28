@@ -54,6 +54,7 @@ from hermes.errors import (
     switch_to_fallback,
 )
 from hermes.hooks import AsyncHookRegistry, SyncHookRegistry
+from hermes.steering import merge_steer_messages
 from hermes.tokens import compress, compress_async, estimate_tokens
 from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
 
@@ -162,7 +163,17 @@ def validate_approval_resume_history(
     return True
 
 
-def _approval_resume_error_response(error_type: str) -> dict:
+def _close_unstarted_steer_mailbox(steer_mailbox) -> str | None:
+    """入口在启动循环前失败时关闭未激活的 steer 邮箱。"""
+    if steer_mailbox is None:
+        return None
+    return merge_steer_messages(steer_mailbox.close_and_drain())
+
+
+def _approval_resume_error_response(
+    error_type: str,
+    steer_mailbox=None,
+) -> dict:
     """构造不携带工具参数或结果正文的审批恢复内部错误。"""
     return {
         "final_response": f"(agent error: {error_type})",
@@ -173,6 +184,7 @@ def _approval_resume_error_response(error_type: str) -> dict:
         "fatal": True,
         "retryable": False,
         "approval_request": None,
+        "pending_steer": _close_unstarted_steer_mailbox(steer_mailbox),
     }
 
 
@@ -253,6 +265,7 @@ class ConversationAgentLoop(AgentLoop):
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
         stream_sink=None,
+        steer_mailbox=None,
         hook_registry: SyncHookRegistry | None = None,
     ):
         super().__init__(
@@ -267,6 +280,7 @@ class ConversationAgentLoop(AgentLoop):
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             stream_sink=stream_sink,
+            steer_mailbox=steer_mailbox,
             hook_registry=hook_registry,
         )
         # 主会话专有状态
@@ -477,6 +491,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
         stream_sink=None,
+        steer_mailbox=None,
         hook_registry: AsyncHookRegistry | None = None,
     ):
         super().__init__(
@@ -491,6 +506,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             stream_sink=stream_sink,
+            steer_mailbox=steer_mailbox,
             hook_registry=hook_registry,
         )
         self.conn = conn
@@ -741,7 +757,7 @@ def _short_db_error(exc) -> str:
     return _sanitize_error_message(exc, max_len=200)
 
 
-def _persistence_error_response(exc) -> dict:
+def _persistence_error_response(exc, steer_mailbox=None) -> dict:
     """run_conversation 入口 DB 读写失败时的结构化返回。
 
     不启动 AgentLoop —— 历史都读不出来 / user msg 写不进去时,继续跑模型
@@ -759,6 +775,7 @@ def _persistence_error_response(exc) -> dict:
         "error_type": "persistence_error",
         "fatal": True,
         "retryable": False,
+        "pending_steer": _close_unstarted_steer_mailbox(steer_mailbox),
     }
 
 
@@ -804,6 +821,7 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
         "approval_request": result.approval_request,
         "tool_batches": result.tool_batches,
         "tool_call_count": result.tool_call_count,
+        "pending_steer": result.pending_steer,
     }
 
 
@@ -835,6 +853,7 @@ def run_conversation(
     *,
     resume_from_history: bool = False,
     stream_sink=None,
+    steer_mailbox=None,
     background_review_coordinator=None,
     hook_registry: SyncHookRegistry | None = None,
 ) -> dict:
@@ -855,7 +874,7 @@ def run_conversation(
             user_msg = {"role": "user", "content": user_message}
             add_messages(conn, session_id, [user_msg])
     except Exception as exc:
-        return _persistence_error_response(exc)
+        return _persistence_error_response(exc, steer_mailbox)
 
     tools, allowed_tool_names = _select_conversation_tools(
         enabled_toolsets,
@@ -884,6 +903,7 @@ def run_conversation(
         allowed_tool_names=allowed_tool_names,
         tool_context=tool_context,
         stream_sink=stream_sink,
+        steer_mailbox=steer_mailbox,
         hook_registry=hook_registry,
     )
     result: AgentLoopResult = loop.run(user_message)
@@ -919,6 +939,7 @@ async def run_conversation_async(
     *,
     async_client=None,
     stream_sink=None,
+    steer_mailbox=None,
     final_message_callback=None,
     persistence_call=None,
     resume_from_history: bool = False,
@@ -947,7 +968,8 @@ async def run_conversation_async(
             )
         except (TypeError, ValueError):
             return _approval_resume_error_response(
-                "invalid_approval_resume_state"
+                "invalid_approval_resume_state",
+                steer_mailbox,
             )
         try:
             if persistence_call is None:
@@ -973,7 +995,7 @@ async def run_conversation_async(
                         [user_msg],
                     )
         except Exception as exc:
-            return _persistence_error_response(exc)
+            return _persistence_error_response(exc, steer_mailbox)
 
         if resume_from_history and not validate_approval_resume_history(
             existing,
@@ -981,7 +1003,8 @@ async def run_conversation_async(
             str(approval_tool_call_id or ""),
         ):
             return _approval_resume_error_response(
-                "invalid_approval_resume_history"
+                "invalid_approval_resume_history",
+                steer_mailbox,
             )
 
         tools, allowed_tool_names = _select_conversation_tools(
@@ -1019,11 +1042,13 @@ async def run_conversation_async(
                 allowed_tool_names=allowed_tool_names,
                 tool_context=tool_context,
                 stream_sink=stream_sink,
+                steer_mailbox=steer_mailbox,
                 hook_registry=hook_registry,
             )
         except RuntimeError:
             return _approval_resume_error_response(
-                "approval_resume_fallback_unavailable"
+                "approval_resume_fallback_unavailable",
+                steer_mailbox,
             )
         result: AgentLoopResult = await loop.run(user_message)
         response = _conversation_result_response(result)

@@ -48,6 +48,11 @@ from hermes.model_streaming import (
     StreamEvent,
 )
 from hermes.redaction import redact_explicit_secrets
+from hermes.steering import (
+    SteerMailbox,
+    format_steer_guidance,
+    merge_steer_messages,
+)
 from hermes.tokens import estimate_tokens
 
 
@@ -79,6 +84,7 @@ class AgentLoopResult:
     approval_request: dict | None = None
     tool_batches: int = 0
     tool_call_count: int = 0
+    pending_steer: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +865,7 @@ class AgentLoop:
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
         stream_sink: "Callable[[StreamEvent], object] | None" = None,
+        steer_mailbox: SteerMailbox | None = None,
         hook_registry: SyncHookRegistry | None = None,
         parent_run_id: str | None = None,
     ):
@@ -880,6 +887,9 @@ class AgentLoop:
         # 默认 None = 不检查。后台 delegate 用它实现 cancel。
         self.cancel_checker = cancel_checker
         self.stream_sink = stream_sink
+        self.steer_mailbox = steer_mailbox
+        # 未进入 run 前邮箱保持 new；每次 run 结束后标记为已关闭。
+        self._steer_mailbox_closed = True
         if hook_registry is not None and not isinstance(
             hook_registry,
             SyncHookRegistry,
@@ -907,6 +917,64 @@ class AgentLoop:
 
     def _is_cancelled(self) -> bool:
         return self.cancel_checker is not None and bool(self.cancel_checker())
+
+    def steer(self, text: str) -> bool:
+        """向当前运行提交一条 steer；未配置邮箱时返回 False。"""
+        if self.steer_mailbox is None:
+            return False
+        return self.steer_mailbox.submit(text)
+
+    def _activate_steer_mailbox(self) -> None:
+        """在正式进入循环前激活邮箱，拒绝重复运行复用。"""
+        if self.steer_mailbox is None:
+            return
+        self.steer_mailbox.activate()
+        self._steer_mailbox_closed = False
+
+    def _close_steer_mailbox(self) -> tuple[str, ...]:
+        """关闭邮箱并取走剩余 steer；重复清理不会重复消费。"""
+        if self.steer_mailbox is None or self._steer_mailbox_closed:
+            return ()
+        pending = self.steer_mailbox.close_and_drain()
+        self._steer_mailbox_closed = True
+        return pending
+
+    def _finalize_steer_result(self, result: "AgentLoopResult") -> "AgentLoopResult":
+        """在结构化结果返回前关闭邮箱并附加未消费 steer。"""
+        result.pending_steer = merge_steer_messages(
+            self._close_steer_mailbox()
+        )
+        return result
+
+    def _inject_pending_steer(
+        self,
+        tool_messages: list[dict],
+        tool_error: "AgentLoopResult | None",
+    ) -> tuple[str, ...]:
+        """仅在完整且可继续的工具批次后把 steer 追加到最后结果。"""
+        if (
+            self.steer_mailbox is None
+            or tool_error is not None
+            or not tool_messages
+        ):
+            return ()
+        pending = self.steer_mailbox.drain()
+        if not pending:
+            return ()
+        last_tool_message = tool_messages[-1]
+        original_content = last_tool_message.get("content") or ""
+        guidance = format_steer_guidance(pending)
+        last_tool_message["content"] = (
+            f"{original_content}\n\n{guidance}"
+            if original_content
+            else guidance
+        )
+        return pending
+
+    def _restore_injected_steer(self, pending: tuple[str, ...]) -> None:
+        """工具批次持久化失败时恢复已取出的 steer。"""
+        if pending and self.steer_mailbox is not None:
+            self.steer_mailbox.restore_front(pending)
 
     def _record_tool_batch(self, tool_calls) -> None:
         self.tool_batches += 1
@@ -1282,16 +1350,21 @@ class AgentLoop:
         self.run_id = uuid.uuid4().hex
         self.tool_batches = 0
         self.tool_call_count = 0
+        self._activate_steer_mailbox()
         try:
-            result = self._run_inner(user_message)
-        except Exception as exc:
-            # 内部 _run_inner 已经处理了 model / persistence / tool 等已知
-            # 异常,真到这里说明是未预期 bug,统一标 internal_error
-            result = self._internal_error_result(
-                messages=[], error=f"unhandled exception: {exc!r}",
-            )
-        self._emit_run_end(result)
-        return result
+            try:
+                result = self._run_inner(user_message)
+            except Exception as exc:
+                # 内部 _run_inner 已经处理了 model / persistence / tool 等已知
+                # 异常,真到这里说明是未预期 bug,统一标 internal_error
+                result = self._internal_error_result(
+                    messages=[], error=f"unhandled exception: {exc!r}",
+                )
+            result = self._finalize_steer_result(result)
+            self._emit_run_end(result)
+            return result
+        finally:
+            self._close_steer_mailbox()
 
     def _run_inner(self, user_message: str) -> AgentLoopResult:
         messages = self.init_messages(user_message)
@@ -1472,10 +1545,15 @@ class AgentLoop:
                 except Exception as exc:
                     # 工具分发过程中的持久化 / 结构异常
                     return self._persistence_error_result(messages, repr(exc))
+                injected_steer = self._inject_pending_steer(
+                    tool_messages,
+                    tool_error,
+                )
                 try:
                     self.on_tool_messages_batch(msg_dict, tool_messages, response)
                 except Exception as exc:
                     # DB 写入失败:assistant + tool_messages 整组未落盘,停止 loop
+                    self._restore_injected_steer(injected_steer)
                     return self._persistence_error_result(messages, repr(exc))
                 self._emit_post_llm_call(
                     response=response,
@@ -1966,6 +2044,7 @@ class AsyncAgentLoop(AgentLoop):
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
         stream_sink: "Callable[[StreamEvent], object] | None" = None,
+        steer_mailbox: SteerMailbox | None = None,
         hook_registry: AsyncHookRegistry | None = None,
         parent_run_id: str | None = None,
     ):
@@ -1987,6 +2066,7 @@ class AsyncAgentLoop(AgentLoop):
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             stream_sink=stream_sink,
+            steer_mailbox=steer_mailbox,
             hook_registry=None,
             parent_run_id=parent_run_id,
         )
@@ -2027,16 +2107,21 @@ class AsyncAgentLoop(AgentLoop):
         self.run_id = uuid.uuid4().hex
         self.tool_batches = 0
         self.tool_call_count = 0
+        self._activate_steer_mailbox()
         try:
-            result = await self._run_inner(user_message)
-        except asyncio.CancelledError:
-            # 真正取消模型 HTTP 请求依赖 CancelledError 继续传到 Runner。
-            raise
-        except Exception as exc:
-            result = self._internal_error_result(
-                messages=[], error=f"unhandled exception: {exc!r}",
-            )
-        return await self._finalize_run_result(result)
+            try:
+                result = await self._run_inner(user_message)
+            except asyncio.CancelledError:
+                # 真正取消模型 HTTP 请求依赖 CancelledError 继续传到 Runner。
+                raise
+            except Exception as exc:
+                result = self._internal_error_result(
+                    messages=[], error=f"unhandled exception: {exc!r}",
+                )
+            result = self._finalize_steer_result(result)
+            return await self._finalize_run_result(result)
+        finally:
+            self._close_steer_mailbox()
 
     async def _finalize_run_result(
         self,
@@ -2303,13 +2388,19 @@ class AsyncAgentLoop(AgentLoop):
                     raise
                 except Exception as exc:
                     return self._persistence_error_result(messages, repr(exc))
+                injected_steer = self._inject_pending_steer(
+                    tool_messages,
+                    tool_error,
+                )
                 try:
                     await self.on_tool_messages_batch(
                         msg_dict, tool_messages, response,
                     )
                 except asyncio.CancelledError:
+                    self._restore_injected_steer(injected_steer)
                     raise
                 except Exception as exc:
+                    self._restore_injected_steer(injected_steer)
                     return self._persistence_error_result(messages, repr(exc))
                 await self._emit_post_llm_call_async(
                     response=response,
