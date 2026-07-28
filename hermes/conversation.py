@@ -476,6 +476,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         resume_state: dict | None = None,
         allowed_tool_names: set[str] | None = None,
         tool_context: dict | None = None,
+        stream_sink=None,
         hook_registry: AsyncHookRegistry | None = None,
     ):
         super().__init__(
@@ -489,6 +490,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
             tool_context=tool_context,
+            stream_sink=stream_sink,
             hook_registry=hook_registry,
         )
         self.conn = conn
@@ -916,6 +918,7 @@ async def run_conversation_async(
     cancel_checker=None,
     *,
     async_client=None,
+    stream_sink=None,
     final_message_callback=None,
     persistence_call=None,
     resume_from_history: bool = False,
@@ -1015,6 +1018,7 @@ async def run_conversation_async(
                 resume_state=normalized_resume_state,
                 allowed_tool_names=allowed_tool_names,
                 tool_context=tool_context,
+                stream_sink=stream_sink,
                 hook_registry=hook_registry,
             )
         except RuntimeError:

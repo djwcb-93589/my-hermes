@@ -80,7 +80,7 @@ def _value(obj, name: str, default=None):
     return getattr(obj, name, default)
 
 
-class SynchronousStreamAccumulator:
+class StreamAccumulator:
     """把 OpenAI 兼容流的多个 chunk 重建为一条完整模型消息。"""
 
     def __init__(self, attempt_id: str | None = None) -> None:
@@ -177,3 +177,7 @@ class SynchronousStreamAccumulator:
     def _fallback_tool_call_id(self, index: int) -> str:
         """为未提供 ID 的供应商生成本次尝试内稳定的工具调用 ID。"""
         return f"call_stream_{self._attempt_id}_{index}"
+
+
+# 保留旧名称，兼容已有同步调用方；累加逻辑由同步和异步流共同复用。
+SynchronousStreamAccumulator = StreamAccumulator

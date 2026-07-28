@@ -17,6 +17,7 @@ hooks 注入压缩 / fallback / DB 持久化等行为。
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -43,8 +44,8 @@ from hermes.hooks import (
 )
 from hermes.model_streaming import (
     ModelTurnResult,
+    StreamAccumulator,
     StreamEvent,
-    SynchronousStreamAccumulator,
 )
 from hermes.redaction import redact_explicit_secrets
 from hermes.tokens import estimate_tokens
@@ -857,7 +858,7 @@ class AgentLoop:
         model_kwargs: dict | None = None,
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
-        stream_sink: "Callable[[StreamEvent], None] | None" = None,
+        stream_sink: "Callable[[StreamEvent], object] | None" = None,
         hook_registry: SyncHookRegistry | None = None,
         parent_run_id: str | None = None,
     ):
@@ -1751,7 +1752,7 @@ class AgentLoop:
         stream_options = dict(stream_kwargs.get("stream_options") or {})
         stream_options["include_usage"] = True
         stream_kwargs["stream_options"] = stream_options
-        accumulator = SynchronousStreamAccumulator(attempt_id=attempt_id)
+        accumulator = StreamAccumulator(attempt_id=attempt_id)
         stream = None
         self._emit_stream_event(StreamEvent("model_turn_started", attempt_id))
         try:
@@ -1964,6 +1965,7 @@ class AsyncAgentLoop(AgentLoop):
         model_kwargs: dict | None = None,
         cancel_checker: "Callable[[], bool] | None" = None,
         tool_context: dict | None = None,
+        stream_sink: "Callable[[StreamEvent], object] | None" = None,
         hook_registry: AsyncHookRegistry | None = None,
         parent_run_id: str | None = None,
     ):
@@ -1984,6 +1986,7 @@ class AsyncAgentLoop(AgentLoop):
             model_kwargs=model_kwargs,
             cancel_checker=cancel_checker,
             tool_context=tool_context,
+            stream_sink=stream_sink,
             hook_registry=None,
             parent_run_id=parent_run_id,
         )
@@ -2193,8 +2196,9 @@ class AsyncAgentLoop(AgentLoop):
                     return self._model_error_result(messages, repr(exc))
                 raise
 
-            assistant_msg = response.choices[0].message
-            finish_reason = response.choices[0].finish_reason
+            model_turn = self._complete_model_turn(response)
+            assistant_msg = model_turn.assistant_message
+            finish_reason = model_turn.finish_reason
             has_output = bool(assistant_msg.content or assistant_msg.tool_calls)
             outcome = "success"
             if not has_output:
@@ -2539,12 +2543,106 @@ class AsyncAgentLoop(AgentLoop):
         api_messages = (
             [{"role": "system", "content": self.system_prompt}] + messages
         )
+        if self.stream_sink is not None:
+            return await self._call_model_stream_async(api_messages)
         return await self.client.chat.completions.create(
             model=self.model,
             messages=api_messages,
             tools=self.tools if self.tools else None,
             **self.model_kwargs,
         )
+
+    async def _call_model_stream_async(
+        self,
+        api_messages: list[dict],
+    ) -> ModelTurnResult:
+        """异步消费模型流，完成后才向循环返回完整模型回合。"""
+        attempt_id = uuid.uuid4().hex
+        stream_kwargs = dict(self.model_kwargs)
+        stream_kwargs["stream"] = True
+        stream_options = dict(stream_kwargs.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        stream_kwargs["stream_options"] = stream_options
+        accumulator = StreamAccumulator(attempt_id=attempt_id)
+        stream = None
+        try:
+            await self._emit_stream_event_async(
+                StreamEvent("model_turn_started", attempt_id)
+            )
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=api_messages,
+                tools=self.tools if self.tools else None,
+                **stream_kwargs,
+            )
+            if inspect.isawaitable(stream):
+                stream = await stream
+            async for chunk in stream:
+                content_delta, reasoning_delta = accumulator.add_chunk(chunk)
+                if content_delta:
+                    await self._emit_stream_event_async(
+                        StreamEvent("text_delta", attempt_id, content_delta)
+                    )
+                if reasoning_delta:
+                    await self._emit_stream_event_async(
+                        StreamEvent(
+                            "reasoning_delta",
+                            attempt_id,
+                            reasoning_delta,
+                        )
+                    )
+            result = accumulator.result()
+        except asyncio.CancelledError:
+            await self._emit_stream_event_async(
+                StreamEvent("model_turn_interrupted", attempt_id)
+            )
+            raise
+        except BaseException:
+            await self._emit_stream_event_async(
+                StreamEvent("model_turn_interrupted", attempt_id)
+            )
+            raise
+        finally:
+            await self._close_model_stream_async(stream)
+        await self._emit_stream_event_async(
+            StreamEvent("model_turn_completed", attempt_id)
+        )
+        return result
+
+    async def _close_model_stream_async(self, stream) -> None:
+        """尽力关闭异步模型流，清理异常不覆盖原始模型结果。"""
+        if stream is None:
+            return
+        close = getattr(stream, "aclose", None)
+        if not callable(close):
+            close = getattr(stream, "close", None)
+        if not callable(close):
+            return
+        try:
+            close_result = close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Async model stream close failed")
+
+    async def _emit_stream_event_async(self, event: StreamEvent) -> None:
+        """隔离 sink 异常，但保留异步任务取消语义。"""
+        sink = self.stream_sink
+        if sink is None:
+            return
+        try:
+            result = sink(event)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Stream sink failed: event=%s",
+                event.event_type,
+            )
 
     async def _emit_model_call_event_async(self, event: dict) -> None:
         """异步诊断同样 best effort，不得让记录失败中断会话。"""
