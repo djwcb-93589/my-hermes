@@ -527,6 +527,21 @@ def _entry_identity(
     return (entry.task_index, entry.order, entry.source)
 
 
+def _nearest_preceding_assistant_decision(
+    transition: _EvidenceEntry,
+    task_entries: list[_EvidenceEntry],
+) -> _EvidenceEntry | None:
+    """查找同一任务中位于目标变化之前且距离最近的策略判断。"""
+    candidates = [
+        entry
+        for entry in task_entries
+        if entry.task_index == transition.task_index
+        and entry.source is _EvidenceSource.ASSISTANT_DECISION
+        and entry.order < transition.order
+    ]
+    return max(candidates, key=lambda entry: entry.order, default=None)
+
+
 def _task_skeleton_entries(
     task_index: int,
     entries: list[_EvidenceEntry],
@@ -572,34 +587,24 @@ def _task_skeleton_entries(
         representative_index = spread[1] if len(spread) > 1 else spread[0]
         selected.append(error_entries[representative_index])
 
-    assistant_decisions = [
-        entry
-        for entry in task_entries
-        if entry.source is _EvidenceSource.ASSISTANT_DECISION
-    ]
-    last_assistant_decision = (
-        assistant_decisions[-1]
-        if assistant_decisions
-        else None
-    )
-    if last_assistant_decision is not None:
-        selected.append(last_assistant_decision)
-
     target_transition_entries = [
         entry
         for entry in task_entries
         if entry.target_transition
     ]
     if target_transition_entries:
-        if last_assistant_decision is not None:
-            following_target_changes = [
-                entry
-                for entry in target_transition_entries
-                if entry.order > last_assistant_decision.order
-            ]
-            if following_target_changes:
-                selected.append(following_target_changes[0])
-        selected.append(target_transition_entries[-1])
+        boundary_transitions = [
+            target_transition_entries[0],
+            target_transition_entries[-1],
+        ]
+        for transition in boundary_transitions:
+            decision = _nearest_preceding_assistant_decision(
+                transition,
+                task_entries,
+            )
+            if decision is not None:
+                selected.append(decision)
+            selected.append(transition)
 
     later_result_entries = [
         entry
