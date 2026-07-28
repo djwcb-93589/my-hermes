@@ -84,6 +84,9 @@ DEFAULT_CONFIG = {
     },
 }
 
+GATEWAY_BUSY_INPUT_MODES = frozenset({"queue", "steer", "interrupt"})
+DEFAULT_GATEWAY_BUSY_INPUT_MODE = "steer"
+
 
 _SUPPORTED_BROWSER_CHANNELS = frozenset({
     "chrome",
@@ -96,6 +99,37 @@ _SUPPORTED_BROWSER_CHANNELS = frozenset({
     "msedge-canary",
 })
 _PLUGIN_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
+
+
+def load_gateway_busy_input_mode(gateway_cfg: dict) -> str:
+    """校验并返回 Gateway 的通用忙碌输入策略。"""
+    if not isinstance(gateway_cfg, dict):
+        raise ValueError("gateway must be a mapping")
+
+    raw_mode = gateway_cfg.get(
+        "busy_input_mode",
+        DEFAULT_GATEWAY_BUSY_INPUT_MODE,
+    )
+    if not isinstance(raw_mode, str):
+        raise ValueError(
+            "gateway.busy_input_mode must be one of: interrupt, queue, steer"
+        )
+    mode = raw_mode.strip().lower()
+    if mode not in GATEWAY_BUSY_INPUT_MODES:
+        raise ValueError(
+            "gateway.busy_input_mode must be one of: interrupt, queue, steer"
+        )
+    return mode
+
+
+def _validate_gateway_config(config: dict) -> None:
+    """补齐并校验 Gateway 的通用输入策略。"""
+    gateway = config.get("gateway")
+    if gateway is None:
+        gateway = {}
+        config["gateway"] = gateway
+    mode = load_gateway_busy_input_mode(gateway)
+    gateway["busy_input_mode"] = mode
 
 
 def _validate_filesystem_security_config(config: dict) -> None:
@@ -467,6 +501,7 @@ def load_config(config_path=None) -> dict:
     if not isinstance(config, dict):
         raise ValueError(f"config file must contain a mapping: {config_path}")
     config = _expand_env_vars(config)
+    _validate_gateway_config(config)
     _validate_filesystem_security_config(config)
     _validate_terminal_backend_config(config)
     _validate_background_review_config(config)

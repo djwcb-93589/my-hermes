@@ -16,6 +16,11 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
+from hermes.steering import SteerMailbox
+
+
+_PENDING_SEQUENCE_METADATA_KEY = "_gateway_pending_sequence"
+
 
 @dataclass
 class SessionContext:
@@ -57,6 +62,13 @@ class SessionContext:
     # 最近一次 /sessions 实际展示的序号与完整会话 ID 对应关系。
     # None 表示本路由尚未执行过 /sessions，空字典表示列表已成功展示但没有会话。
     conversation_list_mapping: dict[int, str] | None = None
+    active_steer_mailbox: SteerMailbox | None = field(default=None, repr=False)
+    steer_generation: int | None = field(default=None, repr=False)
+    pending_sequence: int = 0
+    last_steer_sequence: int | None = None
+    pending_steer_event: object | None = field(default=None, repr=False)
+    pending_steer_generation: int | None = field(default=None, repr=False)
+    pending_steer_persisted: bool = False
 
 
 class SessionStore:
@@ -97,6 +109,43 @@ class SessionStore:
             return persisted
         finally:
             conn.close()
+
+    @staticmethod
+    def _close_active_steer_mailbox(ctx: SessionContext) -> None:
+        """关闭并解除当前 steer mailbox，避免旧 generation 继续接收输入。"""
+        mailbox = ctx.active_steer_mailbox
+        if mailbox is not None:
+            mailbox.close()
+        ctx.active_steer_mailbox = None
+        ctx.steer_generation = None
+
+    @classmethod
+    def _ensure_pending_sequence(
+        cls,
+        ctx: SessionContext,
+        event,
+    ) -> int:
+        """为事件分配稳定的 route 内部顺序号，并保留在事件元数据中。"""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        raw_sequence = metadata.get(_PENDING_SEQUENCE_METADATA_KEY)
+        if (
+            isinstance(raw_sequence, int)
+            and not isinstance(raw_sequence, bool)
+            and raw_sequence > 0
+        ):
+            ctx.pending_sequence = max(ctx.pending_sequence, raw_sequence)
+            return raw_sequence
+        ctx.pending_sequence += 1
+        metadata[_PENDING_SEQUENCE_METADATA_KEY] = ctx.pending_sequence
+        return ctx.pending_sequence
+
+    @classmethod
+    def event_sequence(cls, ctx: SessionContext, event) -> int:
+        """返回事件的 route 内部顺序号。"""
+        return cls._ensure_pending_sequence(ctx, event)
 
     def _save_conversation_id(
         self,
@@ -282,6 +331,7 @@ class SessionStore:
                 self._contexts[route_key] = ctx
             else:
                 ctx.invalidation_event.set()
+                self._close_active_steer_mailbox(ctx)
                 ctx.generation += 1
                 ctx.conversation_id = conversation_id
                 ctx.system_prompt = system_prompt
@@ -297,6 +347,10 @@ class SessionStore:
                 ctx.busy = False
                 ctx.dispatching = False
                 ctx.invalidation_event = asyncio.Event()
+                ctx.last_steer_sequence = None
+                ctx.pending_steer_event = None
+                ctx.pending_steer_generation = None
+                ctx.pending_steer_persisted = False
             ctx.last_activity = time.time()
             return ctx
 
@@ -319,6 +373,7 @@ class SessionStore:
             # /new 本身也是失效边界。即使共享取消标志随后清零,任何意外
             # 残留的旧 worker 仍会因 generation 不匹配而保持失效。
             ctx.invalidation_event.set()
+            self._close_active_steer_mailbox(ctx)
             ctx.generation += 1
             ctx.conversation_id = new_id
             ctx.system_prompt = system_prompt
@@ -326,6 +381,10 @@ class SessionStore:
             ctx.cancel_generation = None
             ctx.cancel_reason = None
             ctx.invalidation_event = asyncio.Event()
+            ctx.last_steer_sequence = None
+            ctx.pending_steer_event = None
+            ctx.pending_steer_generation = None
+            ctx.pending_steer_persisted = False
         ctx.last_activity = time.time()
         return ctx
 
@@ -358,6 +417,7 @@ class SessionStore:
                 self._contexts[route_key] = ctx
             else:
                 ctx.invalidation_event.set()
+                self._close_active_steer_mailbox(ctx)
                 ctx.generation += 1
                 ctx.conversation_id = new_id
                 ctx.system_prompt = system_prompt
@@ -365,6 +425,10 @@ class SessionStore:
                 ctx.cancel_generation = None
                 ctx.cancel_reason = None
                 ctx.invalidation_event = asyncio.Event()
+                ctx.last_steer_sequence = None
+                ctx.pending_steer_event = None
+                ctx.pending_steer_generation = None
+                ctx.pending_steer_persisted = False
             ctx.last_activity = time.time()
             return ctx
 
@@ -396,19 +460,97 @@ class SessionStore:
 
     def begin_task(self, ctx: SessionContext) -> tuple[int, asyncio.Event]:
         """开始一个串行任务并返回其不可变的世代与失效事件。"""
+        self._close_active_steer_mailbox(ctx)
         ctx.generation += 1
         ctx.cancel_requested = False
         ctx.cancel_generation = None
         ctx.cancel_reason = None
         ctx.invalidation_event = asyncio.Event()
         ctx.busy = True
+        ctx.active_generation = None
+        ctx.last_steer_sequence = None
+        ctx.pending_steer_event = None
+        ctx.pending_steer_generation = None
+        ctx.pending_steer_persisted = False
         return ctx.generation, ctx.invalidation_event
 
-    def enqueue(self, ctx: SessionContext, event) -> bool:
-        """在单会话上限内入队,队列已满时返回 False。"""
-        if len(ctx.pending) >= self.max_pending_messages:
+    def register_steer_mailbox(
+        self,
+        ctx: SessionContext,
+        generation: int,
+        mailbox: SteerMailbox,
+    ) -> bool:
+        """绑定当前 generation 的 mailbox，拒绝绑定到失效任务。"""
+        if not ctx.busy or ctx.generation != generation:
+            mailbox.close()
             return False
+        if ctx.active_generation not in (None, generation):
+            mailbox.close()
+            return False
+        if ctx.active_steer_mailbox is not None:
+            self._close_active_steer_mailbox(ctx)
+        ctx.active_generation = generation
+        ctx.active_steer_mailbox = mailbox
+        ctx.steer_generation = generation
+        ctx.last_steer_sequence = None
+        return True
+
+    def clear_steer_mailbox(
+        self,
+        ctx: SessionContext,
+        generation: int | None = None,
+    ) -> None:
+        """关闭当前 mailbox，并只清除属于指定 generation 的绑定。"""
+        if generation is not None and ctx.steer_generation != generation:
+            return
+        self._close_active_steer_mailbox(ctx)
+
+    def submit_steer(self, route_key: str, text: str) -> bool:
+        """在短 route 临界区内向当前 generation 提交 steer。"""
+        ctx = self._contexts.get(route_key)
+        if ctx is None or not ctx.busy:
+            return False
+        mailbox = ctx.active_steer_mailbox
+        generation = ctx.steer_generation
+        if (
+            mailbox is None
+            or generation is None
+            or generation != ctx.generation
+            or generation != ctx.active_generation
+            or ctx.cancel_requested
+            or not mailbox.is_active
+        ):
+            return False
+        if not mailbox.submit(text):
+            return False
+        ctx.last_steer_sequence = ctx.pending_sequence
+        return True
+
+    def enqueue(self, ctx: SessionContext, event, *, force: bool = False) -> bool:
+        """在单会话上限内入队,队列已满时返回 False。"""
+        if not force and len(ctx.pending) >= self.max_pending_messages:
+            return False
+        self._ensure_pending_sequence(ctx, event)
         ctx.pending.append(event)
+        return True
+
+    def enqueue_ordered(
+        self,
+        ctx: SessionContext,
+        event,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """按 route 接收顺序插入事件，避免晚到的内部 steer 越过旧消息。"""
+        if not force and len(ctx.pending) >= self.max_pending_messages:
+            return False
+        sequence = self._ensure_pending_sequence(ctx, event)
+        insert_at = len(ctx.pending)
+        for index, pending_event in enumerate(ctx.pending):
+            if self._ensure_pending_sequence(ctx, pending_event) > sequence:
+                insert_at = index
+                break
+        ctx.pending.insert(insert_at, event)
         return True
 
     def request_cancel(self, route_key: str, reason: str = "user") -> bool:
@@ -443,6 +585,8 @@ class SessionStore:
         ctx.cancel_requested = True
         ctx.cancel_generation = target_generation
         ctx.cancel_reason = effective_reason
+        if ctx.active_steer_mailbox is not None:
+            ctx.active_steer_mailbox.close()
         if reason != "shutdown" and ctx.generation == target_generation:
             ctx.generation += 1
         ctx.invalidation_event.set()
@@ -487,6 +631,14 @@ class SessionStore:
             "cancel_requested": ctx.cancel_requested,
             "cancel_reason": ctx.cancel_reason,
             "generation": ctx.generation,
+            "active_generation": ctx.active_generation,
+            "steer_available": bool(
+                ctx.busy
+                and ctx.active_steer_mailbox is not None
+                and ctx.steer_generation == ctx.active_generation == ctx.generation
+                and not ctx.cancel_requested
+                and ctx.active_steer_mailbox.is_active
+            ),
             "pending_count": len(ctx.pending),
             "pending_limit": self.max_pending_messages,
             "last_activity": ctx.last_activity,
@@ -528,6 +680,7 @@ class SessionStore:
             self._contexts[k].conversation_id for k in expired
         ]
         for k in expired:
+            self._close_active_steer_mailbox(self._contexts[k])
             del self._contexts[k]
             self._context_locks.pop(k, None)
         return conversation_ids

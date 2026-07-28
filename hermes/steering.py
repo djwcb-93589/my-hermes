@@ -40,6 +40,12 @@ class SteerMailbox:
             self._pending.append(normalized)
             return True
 
+    @property
+    def is_active(self) -> bool:
+        """返回 mailbox 当前是否仍接受 steer。"""
+        with self._lock:
+            return self._state == "active"
+
     def drain(self) -> tuple[str, ...]:
         """原子取出并清空当前待处理的 steer。"""
         with self._lock:
