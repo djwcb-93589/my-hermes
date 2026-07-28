@@ -20,13 +20,21 @@ from hermes.hooks.contracts import (
 from hermes.hooks.controls import (
     AddContext,
     Block,
+    DEFAULT_MAX_ADD_CONTEXT_CHARACTERS,
+    DEFAULT_MAX_ADD_CONTEXT_ITEMS,
     HookControlDispatchResult,
+    add_context_within_budget,
     build_control_dispatch_result,
     control_error_message,
     control_failure_reason,
     normalize_control_value,
+    redact_added_context_results,
 )
-from hermes.hooks.registry import _HookRegistryBase, _normalize_timeout
+from hermes.hooks.registry import (
+    _HookRegistryBase,
+    _normalize_add_context_budget,
+    _normalize_timeout,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -66,10 +74,24 @@ class _AsyncControlSnapshot:
 
 
 class AsyncHookRegistry(_HookRegistryBase):
-    """按顺序异步分发 Hook，超时或失败不会阻断后续回调。"""
+    """按顺序异步分发 Hook，超时或失败不会阻断后续回调。
 
-    def __init__(self, *, default_timeout_seconds: float | None = None) -> None:
-        super().__init__()
+    同步回调会在线程中运行；超时只能停止等待，无法强制终止该线程。
+    因此同步 Hook 不得包含死循环、无限阻塞或无超时网络请求；Gateway Plugin
+    应优先使用 async def 回调。
+    """
+
+    def __init__(
+        self,
+        *,
+        default_timeout_seconds: float | None = None,
+        max_add_context_items: int = DEFAULT_MAX_ADD_CONTEXT_ITEMS,
+        max_add_context_characters: int = DEFAULT_MAX_ADD_CONTEXT_CHARACTERS,
+    ) -> None:
+        super().__init__(
+            max_add_context_items=max_add_context_items,
+            max_add_context_characters=max_add_context_characters,
+        )
         self._default_timeout_seconds = _normalize_timeout(default_timeout_seconds)
         self._control_registrations: WeakKeyDictionary[
             HookRegistration,
@@ -340,14 +362,14 @@ class AsyncHookRegistry(_HookRegistryBase):
                     added_context=added_context,
                 )
 
-            results.append(
-                HookInvocationResult(
-                    hook_id=snapshot.hook_id,
-                    success=True,
-                    value=control_value,
-                )
-            )
             if isinstance(control_value, Block):
+                results.append(
+                    HookInvocationResult(
+                        hook_id=snapshot.hook_id,
+                        success=True,
+                        value=control_value,
+                    )
+                )
                 return build_control_dispatch_result(
                     event,
                     results,
@@ -355,7 +377,34 @@ class AsyncHookRegistry(_HookRegistryBase):
                     added_context=added_context,
                 )
             if isinstance(control_value, AddContext):
+                if not add_context_within_budget(
+                    added_context,
+                    control_value.text,
+                    max_items=self._max_add_context_items,
+                    max_characters=self._max_add_context_characters,
+                ):
+                    results.append(
+                        HookInvocationResult(
+                            hook_id=snapshot.hook_id,
+                            success=False,
+                            error_type="HookControlBudgetError",
+                            error_message="AddContext budget exceeded",
+                        )
+                    )
+                    return build_control_dispatch_result(
+                        event,
+                        redact_added_context_results(results),
+                        block_reason=control_failure_reason(),
+                        added_context=[],
+                    )
                 added_context.append(control_value.text)
+            results.append(
+                HookInvocationResult(
+                    hook_id=snapshot.hook_id,
+                    success=True,
+                    value=control_value,
+                )
+            )
         return build_control_dispatch_result(
             event,
             results,

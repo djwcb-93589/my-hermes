@@ -14,6 +14,8 @@ from hermes.redaction import redact_explicit_secrets
 _CONTROL_EVENT_NAMES = frozenset({"pre_llm_call", "pre_tool_call"})
 _MAX_BLOCK_REASON_LENGTH = 300
 _MAX_CONTEXT_LENGTH = 8_000
+DEFAULT_MAX_ADD_CONTEXT_ITEMS = 8
+DEFAULT_MAX_ADD_CONTEXT_CHARACTERS = 16_000
 _CONTROL_FAILURE_REASON = "Hook control failed."
 
 
@@ -100,6 +102,38 @@ def normalize_control_value(
 def control_failure_reason() -> str:
     """返回不暴露 Plugin 异常细节的统一控制失败原因。"""
     return _CONTROL_FAILURE_REASON
+
+
+def add_context_within_budget(
+    added_context: list[str],
+    text: str,
+    *,
+    max_items: int,
+    max_characters: int,
+) -> bool:
+    """检查单次 pre_llm_call 的临时上下文累计预算，不截断任何 Plugin 文本。"""
+    return (
+        len(added_context) < max_items
+        and sum(len(item) for item in added_context) + len(text)
+        <= max_characters
+    )
+
+
+def redact_added_context_results(
+    results: list[HookInvocationResult],
+) -> list[HookInvocationResult]:
+    """在累计预算失败时移除已收集的 Plugin 文本，保留诊断结构。"""
+    return [
+        HookInvocationResult(
+            hook_id=result.hook_id,
+            success=result.success,
+            value=None if isinstance(result.value, AddContext) else result.value,
+            error_type=result.error_type,
+            timed_out=result.timed_out,
+            error_message=result.error_message,
+        )
+        for result in results
+    ]
 
 
 def control_error_message(exc: Exception) -> str:

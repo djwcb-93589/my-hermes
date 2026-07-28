@@ -21,11 +21,15 @@ from hermes.hooks.contracts import (
 from hermes.hooks.controls import (
     AddContext,
     Block,
+    DEFAULT_MAX_ADD_CONTEXT_CHARACTERS,
+    DEFAULT_MAX_ADD_CONTEXT_ITEMS,
     HookControlDispatchResult,
+    add_context_within_budget,
     build_control_dispatch_result,
     control_error_message,
     control_failure_reason,
     normalize_control_value,
+    redact_added_context_results,
 )
 
 
@@ -63,12 +67,32 @@ def _normalize_timeout(value: float | None) -> float | None:
     return normalized
 
 
+def _normalize_add_context_budget(value: object, *, name: str) -> int:
+    """校验单次控制事件的 AddContext 累计预算。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
 class _HookRegistryBase:
     """集中同步和异步 Registry 共用的注册、快照和校验逻辑。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_add_context_items: int = DEFAULT_MAX_ADD_CONTEXT_ITEMS,
+        max_add_context_characters: int = DEFAULT_MAX_ADD_CONTEXT_CHARACTERS,
+    ) -> None:
         self._registrations: dict[HookName, list[HookRegistration]] = {}
         self._lock = RLock()
+        self._max_add_context_items = _normalize_add_context_budget(
+            max_add_context_items,
+            name="max_add_context_items",
+        )
+        self._max_add_context_characters = _normalize_add_context_budget(
+            max_add_context_characters,
+            name="max_add_context_characters",
+        )
 
     def register(
         self,
@@ -219,14 +243,14 @@ class SyncHookRegistry(_HookRegistryBase):
                     added_context=added_context,
                 )
 
-            results.append(
-                HookInvocationResult(
-                    hook_id=registration.hook_id,
-                    success=True,
-                    value=control_value,
-                )
-            )
             if isinstance(control_value, Block):
+                results.append(
+                    HookInvocationResult(
+                        hook_id=registration.hook_id,
+                        success=True,
+                        value=control_value,
+                    )
+                )
                 return build_control_dispatch_result(
                     event,
                     results,
@@ -234,7 +258,34 @@ class SyncHookRegistry(_HookRegistryBase):
                     added_context=added_context,
                 )
             if isinstance(control_value, AddContext):
+                if not add_context_within_budget(
+                    added_context,
+                    control_value.text,
+                    max_items=self._max_add_context_items,
+                    max_characters=self._max_add_context_characters,
+                ):
+                    results.append(
+                        HookInvocationResult(
+                            hook_id=registration.hook_id,
+                            success=False,
+                            error_type="HookControlBudgetError",
+                            error_message="AddContext budget exceeded",
+                        )
+                    )
+                    return build_control_dispatch_result(
+                        event,
+                        redact_added_context_results(results),
+                        block_reason=control_failure_reason(),
+                        added_context=[],
+                    )
                 added_context.append(control_value.text)
+            results.append(
+                HookInvocationResult(
+                    hook_id=registration.hook_id,
+                    success=True,
+                    value=control_value,
+                )
+            )
         return build_control_dispatch_result(
             event,
             results,

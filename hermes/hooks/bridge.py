@@ -24,7 +24,7 @@ from hermes.hooks.controls import (
     control_failure_reason,
 )
 from hermes.hooks.events import HookEventName
-from hermes.hooks.registry import SyncHookRegistry
+from hermes.hooks.registry import SyncHookRegistry, _normalize_timeout
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ _CONTROL_EVENTS = (
 )
 _BRIDGE_DEFAULT_TIMEOUT_SECONDS = 5.0
 _BRIDGE_OVERHEAD_SECONDS = 1.0
+DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS = 15.0
 
 
 class SyncControlBridge(SyncHookRegistry):
@@ -44,6 +45,10 @@ class SyncControlBridge(SyncHookRegistry):
         self,
         registry: AsyncHookRegistry,
         event_loop: asyncio.AbstractEventLoop,
+        *,
+        bridge_total_timeout_seconds: float = (
+            DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS
+        ),
     ) -> None:
         """在 Gateway 事件循环线程中固定控制 Hook 快照。"""
         super().__init__()
@@ -59,6 +64,10 @@ class SyncControlBridge(SyncHookRegistry):
             ) from exc
         if current_loop is not event_loop:
             raise RuntimeError("SyncControlBridge must be created on event_loop")
+        normalized_total_timeout = _normalize_timeout(
+            bridge_total_timeout_seconds
+        )
+        assert normalized_total_timeout is not None
 
         snapshots = registry._control_snapshot(
             _CONTROL_EVENTS,
@@ -77,12 +86,12 @@ class SyncControlBridge(SyncHookRegistry):
         self._snapshots = by_event
         self._closed = False
         self._retained = False
+        self._bridge_total_timeout_seconds = normalized_total_timeout
         self._total_wait_seconds = {
             event_name: self._calculate_total_wait(by_event[event_name])
             for event_name in _CONTROL_EVENTS
         }
 
-    @staticmethod
     def _calculate_total_wait(
         snapshots: tuple[_AsyncControlSnapshot, ...],
     ) -> float:
@@ -91,9 +100,9 @@ class SyncControlBridge(SyncHookRegistry):
             snapshot.timeout_seconds or _BRIDGE_DEFAULT_TIMEOUT_SECONDS
             for snapshot in snapshots
         )
-        return max(
-            _BRIDGE_OVERHEAD_SECONDS,
+        return min(
             total + _BRIDGE_OVERHEAD_SECONDS,
+            self._bridge_total_timeout_seconds,
         )
 
     def register(
@@ -226,6 +235,14 @@ class SyncControlBridge(SyncHookRegistry):
             return self._retained
 
 
-def build_sync_control_bridge(registry: AsyncHookRegistry) -> SyncControlBridge:
+def build_sync_control_bridge(
+    registry: AsyncHookRegistry,
+    *,
+    bridge_total_timeout_seconds: float = DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS,
+) -> SyncControlBridge:
     """在当前 Gateway 事件循环中创建一次同步 Delegate 控制快照。"""
-    return SyncControlBridge(registry, asyncio.get_running_loop())
+    return SyncControlBridge(
+        registry,
+        asyncio.get_running_loop(),
+        bridge_total_timeout_seconds=bridge_total_timeout_seconds,
+    )

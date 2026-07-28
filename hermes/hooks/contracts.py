@@ -160,7 +160,11 @@ class HookInvocationResult:
 
 @dataclass(frozen=True, slots=True)
 class HookDispatchResult:
-    """一次事件分发的完整结果，按 Hook 注册顺序保存。"""
+    """一次事件分发的完整结果，按 Hook 注册顺序保存。
+
+    观察型 Hook 的返回值仅保存在这里，供诊断和测试使用；AgentLoop 不会
+    消费这些值来改变模型消息、工具结果或最终运行结果。
+    """
 
     event: HookEvent
     results: tuple[HookInvocationResult, ...]
