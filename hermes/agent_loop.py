@@ -87,6 +87,15 @@ class AgentLoopResult:
     pending_steer: str | None = None
 
 
+@dataclass
+class InjectedSteer:
+    """记录一次工具结果注入，供持久化失败时完整回滚。"""
+
+    messages: tuple[str, ...]
+    tool_message: dict
+    original_content: object
+
+
 # ---------------------------------------------------------------------------
 # 共享 helper(也可独立使用)
 # ---------------------------------------------------------------------------
@@ -931,50 +940,85 @@ class AgentLoop:
         self.steer_mailbox.activate()
         self._steer_mailbox_closed = False
 
-    def _close_steer_mailbox(self) -> tuple[str, ...]:
-        """关闭邮箱并取走剩余 steer；重复清理不会重复消费。"""
+    def _close_steer_mailbox(self, *, drain: bool) -> tuple[str, ...]:
+        """关闭邮箱；取消路径保留 pending，正常结果路径才消费。"""
         if self.steer_mailbox is None or self._steer_mailbox_closed:
             return ()
-        pending = self.steer_mailbox.close_and_drain()
+        if drain:
+            pending = self.steer_mailbox.close_and_drain()
+        else:
+            self.steer_mailbox.close()
+            pending = ()
         self._steer_mailbox_closed = True
         return pending
 
     def _finalize_steer_result(self, result: "AgentLoopResult") -> "AgentLoopResult":
         """在结构化结果返回前关闭邮箱并附加未消费 steer。"""
         result.pending_steer = merge_steer_messages(
-            self._close_steer_mailbox()
+            self._close_steer_mailbox(drain=True)
         )
         return result
+
+    def _invalid_steer_mailbox_result(self, error) -> "AgentLoopResult":
+        """构造不暴露邮箱内部状态的稳定错误结果。"""
+        logger.warning(
+            "SteerMailbox activation failed: %s",
+            type(error).__name__,
+        )
+        return self._result(
+            ok=False,
+            status="error",
+            summary="",
+            messages=[],
+            error="invalid steer mailbox state",
+            error_type="invalid_steer_mailbox_state",
+            fatal=True,
+            retryable=False,
+        )
 
     def _inject_pending_steer(
         self,
         tool_messages: list[dict],
         tool_error: "AgentLoopResult | None",
-    ) -> tuple[str, ...]:
+        *,
+        has_next_iteration: bool,
+    ) -> InjectedSteer | None:
         """仅在完整且可继续的工具批次后把 steer 追加到最后结果。"""
         if (
             self.steer_mailbox is None
             or tool_error is not None
             or not tool_messages
+            or not has_next_iteration
         ):
-            return ()
+            return None
         pending = self.steer_mailbox.drain()
         if not pending:
-            return ()
+            return None
         last_tool_message = tool_messages[-1]
-        original_content = last_tool_message.get("content") or ""
+        original_content = last_tool_message.get("content")
+        content_text = "" if original_content is None else str(original_content)
         guidance = format_steer_guidance(pending)
         last_tool_message["content"] = (
-            f"{original_content}\n\n{guidance}"
-            if original_content
+            f"{content_text}\n\n{guidance}"
+            if content_text
             else guidance
         )
-        return pending
+        return InjectedSteer(
+            messages=pending,
+            tool_message=last_tool_message,
+            original_content=original_content,
+        )
 
-    def _restore_injected_steer(self, pending: tuple[str, ...]) -> None:
+    def _restore_injected_steer(
+        self,
+        injected: InjectedSteer | None,
+    ) -> None:
         """工具批次持久化失败时恢复已取出的 steer。"""
-        if pending and self.steer_mailbox is not None:
-            self.steer_mailbox.restore_front(pending)
+        if injected is None:
+            return
+        injected.tool_message["content"] = injected.original_content
+        if self.steer_mailbox is not None:
+            self.steer_mailbox.restore_front(injected.messages)
 
     def _record_tool_batch(self, tool_calls) -> None:
         self.tool_batches += 1
@@ -1348,9 +1392,17 @@ class AgentLoop:
         不让原始异常(openai client / sqlite3 / json)冒到最外层。
         """
         self.run_id = uuid.uuid4().hex
+        self.iterations = 0
+        self.tools_used = []
         self.tool_batches = 0
         self.tool_call_count = 0
-        self._activate_steer_mailbox()
+        self._tool_observations = []
+        try:
+            self._activate_steer_mailbox()
+        except Exception as exc:
+            result = self._invalid_steer_mailbox_result(exc)
+            self._emit_run_end(result)
+            return result
         try:
             try:
                 result = self._run_inner(user_message)
@@ -1364,7 +1416,7 @@ class AgentLoop:
             self._emit_run_end(result)
             return result
         finally:
-            self._close_steer_mailbox()
+            self._close_steer_mailbox(drain=False)
 
     def _run_inner(self, user_message: str) -> AgentLoopResult:
         messages = self.init_messages(user_message)
@@ -1548,6 +1600,7 @@ class AgentLoop:
                 injected_steer = self._inject_pending_steer(
                     tool_messages,
                     tool_error,
+                    has_next_iteration=(iteration + 1 < self.max_iterations),
                 )
                 try:
                     self.on_tool_messages_batch(msg_dict, tool_messages, response)
@@ -2105,9 +2158,18 @@ class AsyncAgentLoop(AgentLoop):
     async def run(self, user_message: str) -> AgentLoopResult:
         """异步跑一次完整循环,Task 取消必须原样向上传播。"""
         self.run_id = uuid.uuid4().hex
+        self.iterations = 0
+        self.tools_used = []
         self.tool_batches = 0
         self.tool_call_count = 0
-        self._activate_steer_mailbox()
+        self._tool_observations = []
+        try:
+            self._activate_steer_mailbox()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            result = self._invalid_steer_mailbox_result(exc)
+            return await self._finalize_run_result(result)
         try:
             try:
                 result = await self._run_inner(user_message)
@@ -2118,10 +2180,10 @@ class AsyncAgentLoop(AgentLoop):
                 result = self._internal_error_result(
                     messages=[], error=f"unhandled exception: {exc!r}",
                 )
-            result = self._finalize_steer_result(result)
-            return await self._finalize_run_result(result)
+            result = await self._finalize_run_result(result)
+            return self._finalize_steer_result(result)
         finally:
-            self._close_steer_mailbox()
+            self._close_steer_mailbox(drain=False)
 
     async def _finalize_run_result(
         self,
@@ -2391,6 +2453,7 @@ class AsyncAgentLoop(AgentLoop):
                 injected_steer = self._inject_pending_steer(
                     tool_messages,
                     tool_error,
+                    has_next_iteration=(iteration + 1 < self.max_iterations),
                 )
                 try:
                     await self.on_tool_messages_batch(

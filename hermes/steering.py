@@ -47,6 +47,11 @@ class SteerMailbox:
             self._pending.clear()
             return messages
 
+    def close(self) -> None:
+        """关闭邮箱但保留尚未消费的 steer。"""
+        with self._lock:
+            self._state = "closed"
+
     def restore_front(self, messages: tuple[str, ...]) -> None:
         """将已取出的 steer 按原顺序放回队首。"""
         if not messages:
