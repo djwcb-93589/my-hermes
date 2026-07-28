@@ -20,7 +20,11 @@ from hermes.hooks import (
     HookRegistrationError,
     SyncHookRegistry,
 )
-from hermes.config_values import expand_env_vars, hermes_home
+from hermes.config_values import (
+    expand_env_vars,
+    hermes_home,
+    load_env_values,
+)
 from hermes.plugins.context import AsyncPluginContext, SyncPluginContext
 from hermes.plugins.runtime import (
     PluginManifestError,
@@ -47,6 +51,7 @@ _PLUGIN_ERROR_CODES = frozenset(
         "ConfigSymlinkNotAllowed",
         "ConfigLockSymlinkNotAllowed",
         "ConfigReadFailed",
+        "EnvReadFailed",
         "ConfigYamlInvalid",
         "ConfigNotMapping",
         "PluginsConfigInvalid",
@@ -136,12 +141,19 @@ class PluginManager:
         project_root: Path | None = None,
         user_plugin_root: Path | None = None,
     ) -> None:
-        self.config_path = Path(config_path or _default_config_path())
+        config_home = hermes_home()
+        try:
+            load_env_values(config_home / ".env")
+        except (OSError, UnicodeError) as exc:
+            raise PluginManagerError("EnvReadFailed") from exc
+        self.config_path = Path(
+            config_path if config_path is not None else config_home / "config.yaml"
+        )
         # 默认项目根目录必须跟随调用管理命令时的当前工作目录，不能依赖
         # manager.py 的源码位置，也不能在模块导入时提前固定。
         self.project_root = (project_root or Path.cwd()).resolve()
         self.user_plugin_root = (
-            user_plugin_root or hermes_home() / "plugins"
+            user_plugin_root or config_home / "plugins"
         ).expanduser()
 
     def list_plugins(self) -> tuple[PluginInspection, ...]:
@@ -291,30 +303,39 @@ class PluginManager:
                 names=(normalized_name,),
             )
         )
-        project_candidate = self._project_candidate_if_disabled(
-            normalized_name,
-            plugins_config,
-        )
-        if project_candidate is not None and all(
-            item.directory != project_candidate.directory for item in candidates
-        ):
-            candidates.append(project_candidate)
 
         checks: list[PluginDoctorCheck] = []
-        checks.append(
-            _check(
-                "plugin discovered",
-                bool(candidates),
-                "PluginNotFound" if not candidates else None,
-            )
-        )
         if not candidates:
+            project_candidate = self._project_candidate_if_disabled(
+                normalized_name,
+                plugins_config,
+            )
+            if project_candidate is None:
+                checks.append(_check("plugin discovered", False, "PluginNotFound"))
+                return PluginDoctorResult(
+                    name=normalized_name,
+                    version=None,
+                    checks=tuple(checks),
+                    ready=False,
+                )
+            checks.append(_check("plugin discovered", True))
+            if not project_candidate.is_safe:
+                checks.append(_check("directory contained in search root", False, "PathEscape"))
+                return PluginDoctorResult(
+                    name=normalized_name,
+                    version=None,
+                    checks=tuple(checks),
+                    ready=False,
+                )
+            checks.append(_check("project plugins explicitly enabled", False, "ProjectPluginsDisabled"))
             return PluginDoctorResult(
                 name=normalized_name,
                 version=None,
                 checks=tuple(checks),
                 ready=False,
             )
+
+        checks.append(_check("plugin discovered", True))
 
         duplicate = len(candidates) > 1
         checks.append(_check("unique plugin name", not duplicate, "DuplicatePluginName" if duplicate else None))
@@ -326,7 +347,20 @@ class PluginManager:
                 ready=False,
             )
         candidate = candidates[0]
-        checks.append(_check("directory contained in search root", candidate.is_safe, "PathEscape" if not candidate.is_safe else None))
+        checks.append(
+            _check(
+                "directory contained in search root",
+                candidate.is_safe,
+                "PathEscape" if not candidate.is_safe else None,
+            )
+        )
+        if not candidate.is_safe:
+            return PluginDoctorResult(
+                name=normalized_name,
+                version=None,
+                checks=tuple(checks),
+                ready=False,
+            )
         if candidate.source_type == "project" and not plugins_config["enable_project_plugins"]:
             checks.append(_check("project plugins explicitly enabled", False, "ProjectPluginsDisabled"))
         version: str | None = None
@@ -452,6 +486,8 @@ class PluginManager:
         if not candidates:
             project_candidate = self._project_candidate_if_disabled(name, plugins_config)
             if project_candidate is not None:
+                if not project_candidate.is_safe:
+                    raise PluginManagerError("PathEscape")
                 raise PluginManagerError("ProjectPluginsDisabled")
             raise PluginManagerError("PluginNotFound")
         if len(candidates) > 1:
@@ -465,14 +501,17 @@ class PluginManager:
     ) -> _PluginCandidate | None:
         if plugins_config["enable_project_plugins"]:
             return None
-        project_dir = self.project_root / ".my-hermes" / "plugins" / name
-        if not project_dir.is_dir():
+        plugin_root = self.project_root / ".my-hermes" / "plugins"
+        project_dir = plugin_root / name
+        if not project_dir.is_dir() and not project_dir.is_symlink():
             return None
-        root = project_dir.parent.parent
         try:
             resolved = project_dir.resolve(strict=True)
-            safe = resolved.is_relative_to(root.resolve(strict=False))
-        except OSError:
+            resolved_plugin_root = plugin_root.resolve(strict=False)
+            safe = resolved.is_relative_to(resolved_plugin_root)
+            if safe and not resolved.is_dir():
+                return None
+        except (OSError, RuntimeError, ValueError):
             safe = False
             resolved = project_dir
         return _PluginCandidate(name, resolved, "project", is_safe=safe)
@@ -522,17 +561,25 @@ def _validate_static_register(entrypoint: Path) -> None:
     for node in tree.body:
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "register":
             raise PluginManagerError("AsyncRegisterNotAllowed")
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, ast.Assign):
             targets = tuple(node.targets)
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             targets = (node.target,)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             targets = (node.target,)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            targets = tuple(
+                item.optional_vars
+                for item in node.items
+                if item.optional_vars is not None
+            )
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.NamedExpr):
+            targets = (node.value.target,)
         else:
             continue
         if any(
-            isinstance(target, ast.Name) and target.id == "register"
+            _target_contains_register(target)
             for target in targets
         ):
             raise PluginManagerError("RegisterEntrypointUnsupported")
@@ -547,6 +594,15 @@ def _validate_static_register(entrypoint: Path) -> None:
                 ):
                     return
     raise PluginManagerError("RegisterNotFound")
+
+
+def _target_contains_register(target: ast.AST) -> bool:
+    """只在已经选定的顶层赋值目标中查找 register 名称。"""
+    if isinstance(target, ast.Name):
+        return target.id == "register"
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_contains_register(item) for item in target.elts)
+    return False
 
 
 def _default_config_path() -> Path:

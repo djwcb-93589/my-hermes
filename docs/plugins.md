@@ -158,3 +158,34 @@ Plugin cannot be enabled safely.
 `doctor` 会真实导入 Plugin 模块并调用一次 `register(ctx)`，只是使用相互隔离的临时 Sync/Async Registry，之后清理动态模块、子模块并恢复 `sys.path`。因此 doctor 不是沙箱，也不能证明第三方 Plugin 安全；启用不熟悉的 Plugin 前仍应审查其源码。
 
 `enable` 和 `disable` 修改配置后不会热更新当前进程。请重启 CLI 或 Gateway，配置变更才会加载。
+
+## 搜索范围和 doctor 的边界
+
+项目 Plugin 的固定目录是当前工作目录下的
+`.my-hermes/plugins/<plugin-name>/`。只有 `enable_project_plugins: true` 时，
+这个目录才会加入活动搜索根目录；目录中的符号链接目标也必须仍位于
+`.my-hermes/plugins/` 内，不能指向 `.my-hermes` 的其他目录、用户目录或外部路径。
+
+禁用项目 Plugin 不会参与活动搜索根目录的重名判断。例如用户目录和项目目录都
+有 `audit-log`，但项目扫描未开启时，生产 Runtime 和 `doctor audit-log` 都只看
+用户目录的候选，不会报告重复名称。只有活动搜索根目录完全找不到候选时，doctor
+才会检查项目目录；如果那里存在 Plugin，会报告：
+
+```text
+[PASS] plugin discovered
+[FAIL] project plugins explicitly enabled (ProjectPluginsDisabled)
+Plugin cannot be enabled safely.
+```
+
+## `.env` 和静态入口检查
+
+CLI/Gateway 生产启动与 `plugins` 管理命令都会先读取 `<HERMES_HOME>/.env`，再展开
+`config.yaml` 中的 `${VAR}`。已经存在的系统环境变量优先，`.env` 不会覆盖它们；
+缺失的变量仍保留原占位符。
+
+`plugins enable` 的静态检查只分析 Plugin `__init__.py` 的顶层入口。顶层的同步
+`def register(ctx)`、`from .registration import register` 和
+`from .registration import register as register` 都可以通过；顶层异步定义或
+`register = something`、`register: object = something`、`register += something`
+会被拒绝。函数体、类体或其他嵌套作用域里的局部变量不会被误认为 Plugin 入口。
+最终是否真实可调用，仍由 Runtime 和 doctor 的动态导入检查确认。

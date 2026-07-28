@@ -15,6 +15,24 @@ def hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME") or PROJECT_ROOT)
 
 
+def load_env_values(env_path: Path | None = None) -> None:
+    """轻量读取 .env，并且不覆盖进程已经提供的环境变量。"""
+    if env_path is None:
+        env_path = hermes_home() / ".env"
+    else:
+        env_path = Path(env_path)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
 def expand_env_vars(value):
     """递归展开 `${VAR}`；环境变量缺失时保留原占位符。"""
     if isinstance(value, str):

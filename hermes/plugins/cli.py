@@ -41,9 +41,9 @@ def run_plugins_command(arguments: list[str]) -> int:
     except PluginManagerError as exc:
         print(f"error: {exc.error_code}")
         return 1
-    except Exception as exc:
-        # 管理命令不输出完整异常文本或路径，只保留脱敏类型。
-        print(f"error: {type(exc).__name__}")
+    except Exception:
+        # 管理命令不向用户暴露底层异常类型、消息或路径。
+        print("error: InternalError")
         return 1
 
 

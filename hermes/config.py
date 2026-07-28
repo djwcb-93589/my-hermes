@@ -20,6 +20,7 @@ from hermes.approval_security import ApprovalSecurityPolicy
 from hermes.config_values import (
     expand_env_vars as _expand_env_vars,
     hermes_home,
+    load_env_values as _load_env_values,
 )
 from hermes.path_policy import PathAccessPolicy
 
@@ -442,23 +443,10 @@ def _validate_browser_config(config: dict) -> None:
 
 
 def load_env(env_path=None):
-    """Read a .env file and set as environment variables (simple implementation)."""
-    from pathlib import Path
+    """兼容旧接口，并复用轻量 .env 加载实现。"""
     if env_path is None:
         env_path = HERMES_HOME / ".env"
-
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            os.environ.setdefault(key, value)
+    return _load_env_values(env_path)
 
 
 def load_config(config_path=None) -> dict:
