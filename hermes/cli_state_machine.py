@@ -13,6 +13,7 @@ from typing import Callable, Protocol
 from hermes.cli_approval import execute_cli_approval
 from hermes.config import DB_PATH
 from hermes.conversation import run_conversation
+from hermes.hooks import SyncHookRegistry
 from hermes.db import (
     create_session,
     get_session_messages,
@@ -177,9 +178,16 @@ class CLIWorker:
         *,
         stream_sink: Callable[[object], None] | None,
         publish_result: Callable[[CLIWorkerResult], None],
+        hook_registry: SyncHookRegistry | None = None,
     ) -> None:
+        if hook_registry is not None and not isinstance(
+            hook_registry,
+            SyncHookRegistry,
+        ):
+            raise TypeError("hook_registry must be a SyncHookRegistry or None")
         self._stream_sink = stream_sink
         self._publish_result = publish_result
+        self._hook_registry = hook_registry
         self._tasks: queue.Queue[CLIWorkerTask | None] = queue.Queue()
         self._results: queue.Queue[CLIWorkerResult] = queue.Queue()
         self._lock = threading.Lock()
@@ -292,6 +300,7 @@ class CLIWorker:
                 ),
                 tool_policy=task.tool_policy,
                 stream_sink=self._stream_sink,
+                hook_registry=self._hook_registry,
             )
         except Exception as exc:
             return CLIWorkerResult(
@@ -354,6 +363,7 @@ class CLIWorker:
             resume_from_history=True,
             tool_policy=task.tool_policy,
             stream_sink=self._stream_sink,
+            hook_registry=self._hook_registry,
         )
         return CLIWorkerResult(
             kind=task.kind,

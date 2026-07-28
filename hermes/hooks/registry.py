@@ -144,6 +144,40 @@ class _HookRegistryBase:
         with self._lock:
             return tuple(self._registrations.get(normalized_event_name, ()))
 
+    def _commit_registrations(
+        self,
+        registrations: tuple[HookRegistration, ...],
+    ) -> tuple[HookRegistration, ...]:
+        """原子提交已在隔离 Registry 中校验过的一组注册项。"""
+        if not registrations:
+            return ()
+        with self._lock:
+            pending_by_event: dict[HookName, list[HookRegistration]] = {}
+            for registration in registrations:
+                if not isinstance(registration, HookRegistration):
+                    raise HookRegistrationError("invalid hook registration")
+                existing = self._registrations.get(registration.event_name, ())
+                pending = pending_by_event.setdefault(
+                    registration.event_name,
+                    [],
+                )
+                comparable = (*existing, *pending)
+                if any(item.callback is registration.callback for item in comparable):
+                    raise HookRegistrationError(
+                        "hook callback is already registered for event: "
+                        f"{registration.event_name}"
+                    )
+                if any(item.hook_id == registration.hook_id for item in comparable):
+                    raise HookRegistrationError(
+                        "hook_id is already registered for event: "
+                        f"{registration.event_name}: {registration.hook_id}"
+                    )
+                pending.append(registration)
+
+            for event_name, pending in pending_by_event.items():
+                self._registrations.setdefault(event_name, []).extend(pending)
+        return registrations
+
     def _registrations_for(
         self,
         event: HookEvent,

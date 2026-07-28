@@ -31,6 +31,7 @@ from hermes.config import (
     HERMES_HOME,
     PATH_ACCESS_POLICY,
 )
+from hermes.hooks import AsyncHookRegistry
 from hermes.db import (
     add_final_message_with_gateway_outbox,
     add_messages,
@@ -759,11 +760,23 @@ class GatewayRunner:
     每个实例只能启动一次；停止或启动失败后必须创建新的 Runner 实例。
     """
 
-    def __init__(self, config: dict, db_path: str):
+    def __init__(
+        self,
+        config: dict,
+        db_path: str,
+        *,
+        hook_registry: AsyncHookRegistry | None = None,
+    ):
         # Gateway 的配置校验依赖全局元数据，先完成幂等注册。
         register_all()
+        if hook_registry is not None and not isinstance(
+            hook_registry,
+            AsyncHookRegistry,
+        ):
+            raise TypeError("hook_registry must be an AsyncHookRegistry or None")
         self.config = config
         self.db_path = db_path
+        self._hook_registry = hook_registry
         self.adapters: dict[str, BasePlatformAdapter] = {}
         gateway_cfg = config.get("gateway", {})
         if not isinstance(gateway_cfg, dict):
@@ -5720,6 +5733,7 @@ class GatewayRunner:
             async_client=self._get_async_client(),
             final_message_callback=persist_final_message,
             persistence_call=self.persistence.call,
+            hook_registry=self._hook_registry,
             resume_from_history=resume_from_history,
             approval_resume_id=(approval["id"] if approval is not None else None),
             approval_tool_call_id=(

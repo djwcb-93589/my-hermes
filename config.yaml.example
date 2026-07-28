@@ -71,6 +71,12 @@ background_review:
   # 等待执行的后台 Review 任务数量上限；0 表示不排队。
   max_pending_jobs: 32
 
+# Python Plugin 仅从显式启用列表加载；项目本地目录默认不扫描。
+plugins:
+  enabled: []
+  search_paths: []
+  enable_project_plugins: false
+
 # 模型可控 File/Terminal 操作使用的统一安全策略。
 security:
   # 文件系统硬拒绝策略；不限制框架自身的内部持久化文件。

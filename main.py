@@ -11,7 +11,9 @@ import sys
 
 from hermes.cli_state_machine import CLIController, CLIEventQueue, CLIWorker
 from hermes.cli_ui import CLIInput, CLIUI, patched_cli_stdout
-from hermes.config import BASE_URL, BROWSER_CONFIG, HERMES_HOME, MODEL
+from hermes.config import BASE_URL, BROWSER_CONFIG, HERMES_HOME, MODEL, _config
+from hermes.hooks import SyncHookRegistry
+from hermes.plugins import SyncPluginRuntime
 from hermes.prompt import build_system_prompt
 from hermes.session_resources import cleanup_all_session_resources
 from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registry
@@ -32,6 +34,12 @@ def _cli_tool_policy() -> ToolPolicy:
 def cli_loop() -> None:
     """启动默认 CLI 的事件驱动输入、路由和单 worker 执行流程。"""
     register_all()
+    hook_registry = SyncHookRegistry()
+    plugin_runtime = SyncPluginRuntime(
+        hook_registry,
+        plugins_config=_config["plugins"],
+    )
+    plugin_runtime.load()
     tool_policy = _cli_tool_policy()
     enabled_toolsets = sorted(registry.resolve(tool_policy).toolsets)
     cached_prompt = build_system_prompt(
@@ -48,6 +56,7 @@ def cli_loop() -> None:
     worker = CLIWorker(
         stream_sink=events.post_stream_event,
         publish_result=events.post_worker_result,
+        hook_registry=hook_registry,
     )
     controller = CLIController(
         events=events,
@@ -66,6 +75,13 @@ def cli_loop() -> None:
                 base_url=BASE_URL,
                 prompt_length=len(cached_prompt),
             )
+            plugin_summary = plugin_runtime.summary
+            print(
+                "Plugins: "
+                f"loaded={plugin_summary.loaded} "
+                f"skipped={plugin_summary.skipped} "
+                f"failed={plugin_summary.failed}"
+            )
             worker.start()
             worker_started = True
             cli_ui.start_input()
@@ -74,6 +90,7 @@ def cli_loop() -> None:
         cli_ui.stop_input()
         if worker_started:
             worker.shutdown()
+        plugin_runtime.close()
         cleanup_all_session_resources()
 
 

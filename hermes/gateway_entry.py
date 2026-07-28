@@ -13,6 +13,8 @@ import signal
 
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
+from hermes.hooks import AsyncHookRegistry
+from hermes.plugins import AsyncPluginRuntime
 from hermes.tools import register_all
 
 
@@ -26,7 +28,24 @@ async def run_gateway():
     # Runner 构造阶段统一校验 Gateway 配置；非法配置会在任何 Adapter
     # 初始化或 Webhook 监听开始前直接终止启动。
     register_all()
-    runner = GatewayRunner(config=_config, db_path=DB_PATH)
+    hook_registry = AsyncHookRegistry()
+    plugin_runtime = AsyncPluginRuntime(
+        hook_registry,
+        plugins_config=_config["plugins"],
+    )
+    plugin_runtime.load()
+    plugin_summary = plugin_runtime.summary
+    print(
+        "Plugins: "
+        f"loaded={plugin_summary.loaded} "
+        f"skipped={plugin_summary.skipped} "
+        f"failed={plugin_summary.failed}"
+    )
+    runner = GatewayRunner(
+        config=_config,
+        db_path=DB_PATH,
+        hook_registry=hook_registry,
+    )
 
     platforms = _config.get("gateway", {}).get("platforms", {})
 
@@ -166,6 +185,7 @@ async def run_gateway():
 
     if not runner.adapters:
         print("  [gateway] WARNING: no adapters enabled. Check config.yaml.")
+        plugin_runtime.close()
         return
 
     try:
@@ -189,4 +209,5 @@ async def run_gateway():
         pass
     finally:
         await runner.stop()
+        plugin_runtime.close()
         print("  [gateway] stopped")

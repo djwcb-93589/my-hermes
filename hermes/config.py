@@ -72,6 +72,11 @@ DEFAULT_CONFIG = {
         "max_concurrent_jobs": 1,
         "max_pending_jobs": 32,
     },
+    "plugins": {
+        "enabled": [],
+        "search_paths": [],
+        "enable_project_plugins": False,
+    },
 }
 
 
@@ -85,6 +90,7 @@ _SUPPORTED_BROWSER_CHANNELS = frozenset({
     "msedge-dev",
     "msedge-canary",
 })
+_PLUGIN_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 
 
 def _expand_env_vars(value):
@@ -366,6 +372,42 @@ def _validate_background_review_config(config: dict) -> None:
     review["max_pending_jobs"] = max_pending_jobs
 
 
+def _validate_plugins_config(config: dict) -> None:
+    """补齐并校验显式 Plugin 加载配置，避免运行会话时才暴露错误。"""
+    plugins = config.get("plugins")
+    if plugins is None:
+        plugins = {}
+        config["plugins"] = plugins
+    if not isinstance(plugins, dict):
+        raise ValueError("plugins must be a mapping")
+
+    defaults = DEFAULT_CONFIG["plugins"]
+    enabled = plugins.get("enabled", defaults["enabled"])
+    if not isinstance(enabled, list) or any(
+        not isinstance(name, str) or not _PLUGIN_NAME_PATTERN.fullmatch(name)
+        for name in enabled
+    ):
+        raise ValueError("plugins.enabled must contain valid plugin names")
+    if len(set(enabled)) != len(enabled):
+        raise ValueError("plugins.enabled must not contain duplicates")
+    plugins["enabled"] = list(enabled)
+
+    search_paths = plugins.get("search_paths", defaults["search_paths"])
+    if not isinstance(search_paths, list) or any(
+        not isinstance(path, str) or not path.strip() for path in search_paths
+    ):
+        raise ValueError("plugins.search_paths must contain non-empty strings")
+    plugins["search_paths"] = list(search_paths)
+
+    enable_project_plugins = plugins.get(
+        "enable_project_plugins",
+        defaults["enable_project_plugins"],
+    )
+    if not isinstance(enable_project_plugins, bool):
+        raise ValueError("plugins.enable_project_plugins must be a boolean")
+    plugins["enable_project_plugins"] = enable_project_plugins
+
+
 def _validate_browser_config(config: dict) -> None:
     """补齐并校验浏览器运行时配置，避免工具调用时才暴露配置错误。"""
     browser = config.get("browser")
@@ -456,6 +498,7 @@ def load_config(config_path=None) -> dict:
     _validate_filesystem_security_config(config)
     _validate_terminal_backend_config(config)
     _validate_background_review_config(config)
+    _validate_plugins_config(config)
     _validate_browser_config(config)
     return config
 

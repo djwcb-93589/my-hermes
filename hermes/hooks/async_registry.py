@@ -129,6 +129,31 @@ class AsyncHookRegistry(_HookRegistryBase):
             )
         return registration
 
+    @property
+    def default_timeout_seconds(self) -> float | None:
+        """返回未单独配置时应用于异步 Hook 的超时值。"""
+        return self._default_timeout_seconds
+
+    def _commit_registrations(
+        self,
+        registrations: tuple[HookRegistration, ...],
+    ) -> tuple[HookRegistration, ...]:
+        """原子提交暂存注册项，并为控制分发建立共享执行句柄。"""
+        committed = super()._commit_registrations(registrations)
+        if not committed:
+            return committed
+        with self._lock:
+            for registration in committed:
+                self._control_registrations[registration] = (
+                    _AsyncControlRegistration(
+                        event_name=registration.event_name,
+                        hook_id=registration.hook_id,
+                        callback=registration.callback,
+                        execution_lock=asyncio.Lock(),
+                    )
+                )
+        return committed
+
     async def emit(self, event: HookEvent) -> HookDispatchResult:
         """顺序分发事件；每个 Hook 独立处理超时和异常。"""
         if not isinstance(event, HookEvent):
