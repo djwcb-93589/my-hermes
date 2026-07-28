@@ -39,6 +39,7 @@ from hermes.hooks import (
     build_post_llm_call_payload,
     build_post_tool_call_payload,
     build_run_end_payload,
+    build_sync_control_bridge,
 )
 from hermes.model_streaming import (
     ModelTurnResult,
@@ -330,8 +331,10 @@ def _detect_fatal_marker(text: str) -> str | None:
 def _extract_approval_request(
     output: str,
     tool_call,
+    *,
+    parsed_arguments: object | None = None,
 ) -> dict | None:
-    """从受信任 Tool Result 提取待审批请求，并绑定原始 tool_call 参数。"""
+    """从受信任 Tool Result 提取待审批请求，并绑定已解析参数。"""
     if not isinstance(output, str):
         return None
     try:
@@ -359,10 +362,12 @@ def _extract_approval_request(
     call_name = AgentLoop._tool_call_name(tool_call)
     if call_name != tool_name:
         return None
-    try:
-        arguments = json.loads(tool_call.function.arguments)
-    except (AttributeError, TypeError, ValueError):
-        return None
+    arguments = parsed_arguments
+    if arguments is None:
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except (AttributeError, TypeError, ValueError):
+            return None
     if not isinstance(arguments, dict):
         return None
 
@@ -537,6 +542,209 @@ def _model_call_event(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class ParsedToolCall:
+    """工具调用的一次性解析与安全边界检查结果。"""
+
+    tool_name: str
+    tool_call_id: str
+    arguments: object | None
+    argument_keys: tuple[str, ...]
+    entry: object | None
+    allowed: bool
+    blocked: bool
+    approval_mode: str
+    risk_level: str
+    durable_execution: bool
+    error_output: str | None = None
+    error_status: str | None = None
+    error_detail: str | None = None
+
+    @property
+    def is_dispatchable(self) -> bool:
+        """只有解析有效且通过全部硬边界的调用才能进入控制 Hook。"""
+        return self.error_output is None
+
+
+def parse_tool_call(
+    tool_call,
+    registry,
+    *,
+    blocked_tools: set[str] | None = None,
+    allowed_tool_names: set[str] | frozenset[str] | None = None,
+    durable_execution: bool = False,
+) -> ParsedToolCall:
+    """一次性完成参数解析、会话边界和 Registry 条目查询。"""
+    function = getattr(tool_call, "function", None)
+    tool_name = str(getattr(function, "name", "<unknown>"))
+    tool_call_id = str(getattr(tool_call, "id", ""))
+    try:
+        arguments = json.loads(getattr(function, "arguments", ""))
+    except Exception as exc:
+        short = _short_error(exc)
+        return ParsedToolCall(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            arguments=None,
+            argument_keys=(),
+            entry=None,
+            allowed=False,
+            blocked=False,
+            approval_mode="unknown",
+            risk_level="unknown",
+            durable_execution=durable_execution,
+            error_output=(
+                f"(error: invalid JSON arguments in {tool_name}: {short})"
+            ),
+            error_status="json",
+            error_detail=f"invalid JSON in tool_call {tool_name!r}: {short}",
+        )
+
+    argument_keys = (
+        tuple(sorted(str(key) for key in arguments))
+        if type(arguments) is dict
+        else ()
+    )
+    blocked = bool(blocked_tools and tool_name in blocked_tools)
+    allowed = (
+        allowed_tool_names is None or tool_name in allowed_tool_names
+    )
+    get_entry = getattr(registry, "get_entry", None)
+    entry = get_entry(tool_name) if callable(get_entry) else None
+    approval_mode = getattr(getattr(entry, "approval_mode", None), "value", None)
+    risk_level = getattr(getattr(entry, "risk_level", None), "value", None)
+    common = {
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "arguments": arguments,
+        "argument_keys": argument_keys,
+        "entry": entry,
+        "allowed": allowed,
+        "blocked": blocked,
+        "approval_mode": str(approval_mode or "unknown"),
+        "risk_level": str(risk_level or "unknown"),
+        "durable_execution": durable_execution,
+    }
+    if blocked:
+        return ParsedToolCall(
+            **common,
+            error_output=f"(error: '{tool_name}' is blocked)",
+            error_status="blocked",
+            error_detail=f"blocked tool invoked: {tool_name!r}",
+        )
+    if not allowed:
+        return ParsedToolCall(
+            **common,
+            error_output=json.dumps(
+                {
+                    "ok": False,
+                    "error_type": "tool_disabled",
+                    "fatal": True,
+                    "error": (
+                        "Tool is not enabled in this session: "
+                        f"{tool_name}"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            error_status="disabled",
+            error_detail=f"disabled tool invoked: {tool_name!r}",
+        )
+    if entry is None:
+        return ParsedToolCall(
+            **common,
+            error_output=json.dumps(
+                {"error": f"Unknown tool: {tool_name}"},
+                ensure_ascii=False,
+            ),
+            error_status="unknown_tool",
+            error_detail=f"unknown tool invoked: {tool_name!r}",
+        )
+    return ParsedToolCall(**common)
+
+
+def dispatch_parsed_tool_call(
+    parsed_call: ParsedToolCall,
+    registry,
+    *,
+    session_key: str | None = None,
+    tool_context: dict | None = None,
+    require_valid_durable_context: bool = False,
+) -> tuple[str, str | None, str | None]:
+    """复用已解析参数执行既有审批和 durable 工具分发流程。"""
+    if not parsed_call.is_dispatchable:
+        return (
+            parsed_call.error_output or "(error: tool call rejected)",
+            parsed_call.error_status,
+            parsed_call.error_detail,
+        )
+    try:
+        dispatch_context = dict(tool_context or {})
+        durable_context = dispatch_context.pop("durable_tool_execution", None)
+        # 普通 AgentLoop 不得把内部审批许可透传给工具。
+        dispatch_context.pop("allow_sensitive", None)
+        dispatch_context.pop("approval_grant", None)
+        dispatch_context["session_key"] = session_key
+        dispatch_entry = getattr(registry, "dispatch_entry", None)
+        if durable_context is None:
+            if callable(dispatch_entry):
+                output = dispatch_entry(
+                    parsed_call.entry,
+                    parsed_call.arguments,
+                    policy_validated=True,
+                    **dispatch_context,
+                )
+            else:
+                output = registry.dispatch(
+                    parsed_call.tool_name,
+                    parsed_call.arguments,
+                    **dispatch_context,
+                )
+        else:
+            from hermes.durable_tool_dispatcher import (
+                DurableToolDispatcher,
+                DurableToolExecutionContext,
+            )
+
+            context = DurableToolExecutionContext.from_value(durable_context)
+            if context is None:
+                if require_valid_durable_context:
+                    raise RuntimeError("durable tool execution context is invalid")
+                if callable(dispatch_entry):
+                    output = dispatch_entry(
+                        parsed_call.entry,
+                        parsed_call.arguments,
+                        policy_validated=True,
+                        **dispatch_context,
+                    )
+                else:
+                    output = registry.dispatch(
+                        parsed_call.tool_name,
+                        parsed_call.arguments,
+                        **dispatch_context,
+                    )
+            else:
+                output = DurableToolDispatcher(registry, context).dispatch(
+                    parsed_call.tool_name,
+                    parsed_call.arguments,
+                    tool_call_id=parsed_call.tool_call_id,
+                    entry=parsed_call.entry,
+                    policy_validated=True,
+                    **dispatch_context,
+                )
+    except Exception as exc:
+        short = _short_error(exc)
+        return (
+            f"(error: tool {parsed_call.tool_name} failed: {short})",
+            "dispatch",
+            (
+                f"tool {parsed_call.tool_name!r} dispatch raised: "
+                f"{type(exc).__name__}: {short}"
+            ),
+        )
+    return output, None, None
+
+
 def dispatch_tool_call(
     tool_call,
     registry,
@@ -544,6 +752,7 @@ def dispatch_tool_call(
     session_key: str | None = None,
     blocked_tools: set[str] | None = None,
     tool_context: dict | None = None,
+    parsed_call: ParsedToolCall | None = None,
 ) -> tuple[str, str | None, str | None]:
     """处理单个 tool_call。
 
@@ -557,62 +766,21 @@ def dispatch_tool_call(
     工具边界负责；Terminal/File 处理各自成功出口中的明确凭证值，
     这里不对所有正常 Tool Result 做全局扫描。
     """
-    tool_name = tool_call.function.name
-
-    if blocked_tools and tool_name in blocked_tools:
-        return (
-            f"(error: '{tool_name}' is blocked)",
-            "blocked",
-            f"blocked tool invoked: {tool_name!r}",
-        )
-
-    try:
-        tool_args = json.loads(tool_call.function.arguments)
-    except Exception as exc:
-        short = _short_error(exc)
-        return (
-            f"(error: invalid JSON arguments in {tool_name}: {short})",
-            "json",
-            f"invalid JSON in tool_call {tool_name!r}: {short}",
-        )
-
-    try:
-        dispatch_context = dict(tool_context or {})
-        durable_context = dispatch_context.pop("durable_tool_execution", None)
-        # 普通 AgentLoop 不得把内部审批许可透传给工具。
-        dispatch_context.pop("allow_sensitive", None)
-        dispatch_context.pop("approval_grant", None)
-        dispatch_context["session_key"] = session_key
-        if durable_context is None:
-            output = registry.dispatch(tool_name, tool_args, **dispatch_context)
-        else:
-            from hermes.durable_tool_dispatcher import (
-                DurableToolDispatcher,
-                DurableToolExecutionContext,
-            )
-
-            context = DurableToolExecutionContext.from_value(durable_context)
-            if context is None:
-                output = registry.dispatch(tool_name, tool_args, **dispatch_context)
-            else:
-                output = DurableToolDispatcher(
-                    registry,
-                    context,
-                ).dispatch(
-                    tool_name,
-                    tool_args,
-                    tool_call_id=tool_call.id,
-                    **dispatch_context,
-                )
-    except Exception as exc:
-        short = _short_error(exc)
-        return (
-            f"(error: tool {tool_name} failed: {short})",
-            "dispatch",
-            f"tool {tool_name!r} raised: {type(exc).__name__}: {short}",
-        )
-
-    return output, None, None
+    parsed = parsed_call or parse_tool_call(
+        tool_call,
+        registry,
+        blocked_tools=blocked_tools,
+        allowed_tool_names=(tool_context or {}).get("allowed_tool_names"),
+        durable_execution=(
+            (tool_context or {}).get("durable_tool_execution") is not None
+        ),
+    )
+    return dispatch_parsed_tool_call(
+        parsed,
+        registry,
+        session_key=session_key,
+        tool_context=tool_context,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -768,52 +936,30 @@ class AgentLoop:
             },
         )
 
-    def _pre_tool_hook_context(self, tool_call) -> HookContext | None:
-        """在既有工具边界之后构造不含参数值的控制上下文。"""
-        tool_name = self._tool_call_name(tool_call)
-        try:
-            tool_args = json.loads(tool_call.function.arguments)
-        except Exception:
-            return None
-
-        allowed_tool_names = getattr(self, "allowed_tool_names", None)
-        if (
-            (self.blocked_tools and tool_name in self.blocked_tools)
-            or (
-                allowed_tool_names is not None
-                and tool_name not in allowed_tool_names
-            )
-        ):
-            return None
-
-        get_entry = getattr(self.registry, "get_entry", None)
-        entry = get_entry(tool_name) if callable(get_entry) else None
-        if entry is None:
-            return None
-
-        argument_keys = (
-            sorted(str(key) for key in tool_args)
-            if type(tool_args) is dict
-            else []
+    def _parse_tool_call(self, tool_call) -> ParsedToolCall:
+        """为控制 Hook 与实际工具分发创建同一份已解析调用。"""
+        return parse_tool_call(
+            tool_call,
+            self.registry,
+            blocked_tools=self.blocked_tools,
+            allowed_tool_names=getattr(self, "allowed_tool_names", None),
+            durable_execution=(
+                self.tool_context.get("durable_tool_execution") is not None
+            ),
         )
-        approval_mode = getattr(getattr(entry, "approval_mode", None), "value", None)
-        risk_level = getattr(getattr(entry, "risk_level", None), "value", None)
+
+    def _pre_tool_hook_context(self, parsed_call: ParsedToolCall) -> HookContext:
+        """由已验证调用构造不含参数值的控制上下文。"""
         return self._hook_context(
-            invocation_suffix=f"pre_tool:{getattr(tool_call, 'id', '')}",
+            invocation_suffix=f"pre_tool:{parsed_call.tool_call_id}",
             payload={
-                "tool_name": tool_name,
-                "tool_call_id": str(getattr(tool_call, "id", "")),
-                "argument_keys": argument_keys,
-                "argument_count": len(argument_keys),
-                "approval_mode": (
-                    str(approval_mode) if approval_mode is not None else "unknown"
-                ),
-                "risk_level": (
-                    str(risk_level) if risk_level is not None else "unknown"
-                ),
-                "durable_execution": (
-                    self.tool_context.get("durable_tool_execution") is not None
-                ),
+                "tool_name": parsed_call.tool_name,
+                "tool_call_id": parsed_call.tool_call_id,
+                "argument_keys": list(parsed_call.argument_keys),
+                "argument_count": len(parsed_call.argument_keys),
+                "approval_mode": parsed_call.approval_mode,
+                "risk_level": parsed_call.risk_level,
+                "durable_execution": parsed_call.durable_execution,
             },
         )
 
@@ -845,21 +991,27 @@ class AgentLoop:
 
     def _dispatch_pre_tool_control(
         self,
-        tool_call,
+        parsed_call: ParsedToolCall,
     ) -> HookControlDispatchResult | None:
         """同步分发工具调用控制 Hook，未通过既有边界时不触发。"""
         registry = self.hook_registry
         if not isinstance(registry, SyncHookRegistry):
             return None
-        context = self._pre_tool_hook_context(tool_call)
-        if context is None:
-            return None
         return registry.emit_control(
             HookEvent(
                 name=HookEventName.PRE_TOOL_CALL.value,
-                context=context,
+                context=self._pre_tool_hook_context(parsed_call),
             )
         )
+
+    def _delegate_hook_registry(self) -> SyncHookRegistry | None:
+        """为同步 Delegate 提供显式同步控制接口，绝不跨线程调用异步 Registry。"""
+        registry = self.hook_registry
+        if isinstance(registry, SyncHookRegistry):
+            return registry
+        if isinstance(registry, AsyncHookRegistry):
+            return build_sync_control_bridge(registry)
+        return None
 
     @staticmethod
     def _hook_token_usage(response) -> dict[str, int]:
@@ -1370,6 +1522,7 @@ class AgentLoop:
         for tc in tool_calls:
             tool_started = time.perf_counter()
             tc_name = self._tool_call_name(tc)
+            parsed_call: ParsedToolCall | None = None
             skipped_due_to_failure = fatal_detail is not None
             deferred_for_approval = approval_request is not None
             hook_blocked = False
@@ -1383,24 +1536,33 @@ class AgentLoop:
                 err_status = None
                 err_detail = None
             else:
-                pre_tool_control = self._dispatch_pre_tool_control(tc)
-                if pre_tool_control is not None and pre_tool_control.blocked:
-                    hook_blocked = True
-                    output = (
-                        f"(error: tool {tc_name} blocked by Hook: "
-                        f"{pre_tool_control.block_reason})"
-                    )
-                    err_status = "hook_blocked"
-                    err_detail = "tool call was blocked by a control Hook"
+                parsed_call = self._parse_tool_call(tc)
+                if not parsed_call.is_dispatchable:
+                    output = parsed_call.error_output or "(error: tool call rejected)"
+                    err_status = parsed_call.error_status
+                    err_detail = parsed_call.error_detail
                 else:
-                    try:
-                        output, err_status, err_detail = self.dispatch_one(tc)
-                    except Exception as exc:
-                        # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
-                        short = _short_error(exc)
-                        output = f"(error: tool {tc_name} failed: {short})"
-                        err_status = "dispatch"
-                        err_detail = f"tool {tc_name!r} dispatch raised: {short}"
+                    pre_tool_control = self._dispatch_pre_tool_control(parsed_call)
+                    if pre_tool_control is not None and pre_tool_control.blocked:
+                        hook_blocked = True
+                        output = (
+                            f"(error: tool {tc_name} blocked by Hook: "
+                            f"{pre_tool_control.block_reason})"
+                        )
+                        err_status = "hook_blocked"
+                        err_detail = "tool call was blocked by a control Hook"
+                    else:
+                        try:
+                            output, err_status, err_detail = self.dispatch_one(
+                                tc,
+                                parsed_call,
+                            )
+                        except Exception as exc:
+                            # dispatch_one 自身出 bug(不是工具返错,是分发机制炸了)
+                            short = _short_error(exc)
+                            output = f"(error: tool {tc_name} failed: {short})"
+                            err_status = "dispatch"
+                            err_detail = f"tool {tc_name!r} dispatch raised: {short}"
 
             if tc_name not in self.tools_used:
                 self.tools_used.append(tc_name)
@@ -1434,7 +1596,13 @@ class AgentLoop:
             pending = (
                 approval_request
                 if deferred_for_approval
-                else _extract_approval_request(output, tc)
+                else _extract_approval_request(
+                    output,
+                    tc,
+                    parsed_arguments=(
+                        parsed_call.arguments if parsed_call is not None else None
+                    ),
+                )
             )
             if pending is not None:
                 self._record_tool_observation(
@@ -1652,7 +1820,11 @@ class AgentLoop:
         """即将进入 tool_call 处理。主会话用来重置 continuation_count。默认空。"""
         pass
 
-    def dispatch_one(self, tool_call) -> tuple[str, str | None, str | None]:
+    def dispatch_one(
+        self,
+        tool_call,
+        parsed_call: ParsedToolCall | None = None,
+    ) -> tuple[str, str | None, str | None]:
         """处理单个 tool_call。默认走 dispatch_tool_call helper。
 
         返回值里的 error_status 表示工具执行失败,但调用方仍会生成
@@ -1664,12 +1836,11 @@ class AgentLoop:
             tool_context["allowed_tool_names"] = allowed_tool_names
         if self.cancel_checker is not None:
             tool_context["cancel_checker"] = self.cancel_checker
-        if (
-            self._tool_call_name(tool_call) == "delegate_task"
-            and isinstance(self.hook_registry, SyncHookRegistry)
-        ):
+        if self._tool_call_name(tool_call) == "delegate_task":
             # 仅供同步 delegate 工具处理器转交子运行，不属于模型可见参数。
-            tool_context["hook_registry"] = self.hook_registry
+            delegate_registry = self._delegate_hook_registry()
+            if delegate_registry is not None:
+                tool_context["hook_registry"] = delegate_registry
             if self.run_id is not None:
                 tool_context["parent_run_id"] = self.run_id
         return dispatch_tool_call(
@@ -1677,6 +1848,7 @@ class AgentLoop:
             session_key=self.session_key,
             blocked_tools=self.blocked_tools,
             tool_context=tool_context,
+            parsed_call=parsed_call,
         )
 
     def on_tool_message(self, tool_call, tool_msg: dict, output: str) -> None:
@@ -1800,19 +1972,16 @@ class AsyncAgentLoop(AgentLoop):
 
     async def _dispatch_pre_tool_control_async(
         self,
-        tool_call,
+        parsed_call: ParsedToolCall,
     ) -> HookControlDispatchResult | None:
         """异步分发工具调用控制 Hook，未通过既有边界时不触发。"""
         registry = self.hook_registry
         if not isinstance(registry, AsyncHookRegistry):
             return None
-        context = self._pre_tool_hook_context(tool_call)
-        if context is None:
-            return None
         return await registry.emit_control(
             HookEvent(
                 name=HookEventName.PRE_TOOL_CALL.value,
-                context=context,
+                context=self._pre_tool_hook_context(parsed_call),
             )
         )
 
@@ -2175,6 +2344,7 @@ class AsyncAgentLoop(AgentLoop):
         for tc in tool_calls:
             tool_started = time.perf_counter()
             tc_name = self._tool_call_name(tc)
+            parsed_call: ParsedToolCall | None = None
             skipped_due_to_failure = fatal_detail is not None
             deferred_for_approval = approval_request is not None
             hook_blocked = False
@@ -2188,25 +2358,36 @@ class AsyncAgentLoop(AgentLoop):
                 err_status = None
                 err_detail = None
             else:
-                pre_tool_control = await self._dispatch_pre_tool_control_async(tc)
-                if pre_tool_control is not None and pre_tool_control.blocked:
-                    hook_blocked = True
-                    output = (
-                        f"(error: tool {tc_name} blocked by Hook: "
-                        f"{pre_tool_control.block_reason})"
-                    )
-                    err_status = "hook_blocked"
-                    err_detail = "tool call was blocked by a control Hook"
+                parsed_call = self._parse_tool_call(tc)
+                if not parsed_call.is_dispatchable:
+                    output = parsed_call.error_output or "(error: tool call rejected)"
+                    err_status = parsed_call.error_status
+                    err_detail = parsed_call.error_detail
                 else:
-                    try:
-                        output, err_status, err_detail = await self.dispatch_one(tc)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        short = _short_error(exc)
-                        output = f"(error: tool {tc_name} failed: {short})"
-                        err_status = "dispatch"
-                        err_detail = f"tool {tc_name!r} dispatch raised: {short}"
+                    pre_tool_control = await self._dispatch_pre_tool_control_async(
+                        parsed_call
+                    )
+                    if pre_tool_control is not None and pre_tool_control.blocked:
+                        hook_blocked = True
+                        output = (
+                            f"(error: tool {tc_name} blocked by Hook: "
+                            f"{pre_tool_control.block_reason})"
+                        )
+                        err_status = "hook_blocked"
+                        err_detail = "tool call was blocked by a control Hook"
+                    else:
+                        try:
+                            output, err_status, err_detail = await self.dispatch_one(
+                                tc,
+                                parsed_call,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            short = _short_error(exc)
+                            output = f"(error: tool {tc_name} failed: {short})"
+                            err_status = "dispatch"
+                            err_detail = f"tool {tc_name!r} dispatch raised: {short}"
 
             if tc_name not in self.tools_used:
                 self.tools_used.append(tc_name)
@@ -2240,7 +2421,13 @@ class AsyncAgentLoop(AgentLoop):
             pending = (
                 approval_request
                 if deferred_for_approval
-                else _extract_approval_request(output, tc)
+                else _extract_approval_request(
+                    output,
+                    tc,
+                    parsed_arguments=(
+                        parsed_call.arguments if parsed_call is not None else None
+                    ),
+                )
             )
             if pending is not None:
                 self._record_tool_observation(
@@ -2361,6 +2548,7 @@ class AsyncAgentLoop(AgentLoop):
     async def dispatch_one(
         self,
         tool_call,
+        parsed_call: ParsedToolCall | None = None,
     ) -> tuple[str, str | None, str | None]:
         """在线程池运行现有同步工具,避免阻塞 Gateway 事件循环。"""
         tool_context = dict(self.tool_context)
@@ -2369,6 +2557,12 @@ class AsyncAgentLoop(AgentLoop):
             tool_context["allowed_tool_names"] = allowed_tool_names
         if self.cancel_checker is not None:
             tool_context["cancel_checker"] = self.cancel_checker
+        if self._tool_call_name(tool_call) == "delegate_task":
+            delegate_registry = self._delegate_hook_registry()
+            if delegate_registry is not None:
+                tool_context["hook_registry"] = delegate_registry
+            if self.run_id is not None:
+                tool_context["parent_run_id"] = self.run_id
         return await asyncio.to_thread(
             dispatch_tool_call,
             tool_call,
@@ -2376,6 +2570,7 @@ class AsyncAgentLoop(AgentLoop):
             session_key=self.session_key,
             blocked_tools=self.blocked_tools,
             tool_context=tool_context,
+            parsed_call=parsed_call,
         )
 
     async def on_tool_message(

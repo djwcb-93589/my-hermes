@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
-from hermes.agent_loop import AgentLoop
+from hermes.agent_loop import AgentLoop, ParsedToolCall
 from hermes.backends import cleanup_backend
 from hermes.config import (
     MAX_CHILD_ITERATIONS,
@@ -222,16 +222,20 @@ class DelegateAgentLoop(AgentLoop):
         super().__init__(**kwargs)
         self.allowed_tool_names = allowed_tool_names
 
-    def dispatch_one(self, tool_call):
+    def dispatch_one(
+        self,
+        tool_call,
+        parsed_call: ParsedToolCall | None = None,
+    ):
         """拒绝未暴露在本子会话 schema 中的伪造工具调用。"""
-        tool_name = tool_call.function.name
-        if tool_name not in self.allowed_tool_names:
+        parsed = parsed_call or self._parse_tool_call(tool_call)
+        if not parsed.is_dispatchable:
             return (
-                f"(error: tool '{tool_name}' is disabled in this child session)",
-                "disabled",
-                f"disabled tool invoked: {tool_name!r}",
+                parsed.error_output or "(error: tool call rejected)",
+                parsed.error_status,
+                parsed.error_detail,
             )
-        return super().dispatch_one(tool_call)
+        return super().dispatch_one(tool_call, parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -424,21 +428,38 @@ def handle_delegate(args, **kwargs) -> str:
     # ---------- 后台模式 ----------
     manager = get_delegate_job_manager()
     # runner 只捕获本次任务所需的运行时引用，避免跨模块读取 Job 私有字段。
-    captured_hook_registry = hook_registry
-    captured_parent_run_id = parent_run_id
+    captured_runtime_refs: dict[str, object | None] = {
+        "hook_registry": hook_registry,
+        "parent_run_id": parent_run_id,
+    }
 
     def runner_factory(job):
         # 闭包绑定 cancel_checker:从 manager 查 job.cancel_requested
         job_id = job.job_id
 
         def runner() -> dict:
-            return run_delegate_child(
-                goal, context, toolsets, child_session_key,
-                cancel_checker=lambda: manager.is_cancel_requested(job_id),
-                tool_context=child_tool_context,
-                hook_registry=captured_hook_registry,
-                parent_run_id=captured_parent_run_id,
-            )
+            try:
+                runtime_registry = captured_runtime_refs["hook_registry"]
+                runtime_parent_run_id = captured_runtime_refs["parent_run_id"]
+                return run_delegate_child(
+                    goal, context, toolsets, child_session_key,
+                    cancel_checker=lambda: manager.is_cancel_requested(job_id),
+                    tool_context=child_tool_context,
+                    hook_registry=(
+                        runtime_registry
+                        if isinstance(runtime_registry, SyncHookRegistry)
+                        else None
+                    ),
+                    parent_run_id=(
+                        runtime_parent_run_id
+                        if isinstance(runtime_parent_run_id, str)
+                        else None
+                    ),
+                )
+            finally:
+                # Job 终态以外，runner 闭包自身也不再保留运行时 Hook 引用。
+                captured_runtime_refs["hook_registry"] = None
+                captured_runtime_refs["parent_run_id"] = None
         return runner
 
     submit_result = manager.submit(

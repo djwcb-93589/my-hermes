@@ -96,9 +96,19 @@ class DurableToolDispatcher:
         if self.context.connection is None and not self.context.database_path:
             raise ValueError("durable tool execution persistence target is required")
 
-    def dispatch(self, name: str, args: dict, *, tool_call_id: str, **kwargs) -> str:
+    def dispatch(
+        self,
+        name: str,
+        args: dict,
+        *,
+        tool_call_id: str,
+        entry=None,
+        policy_validated: bool = False,
+        **kwargs,
+    ) -> str:
         """记录调用开始、调用既有分发器，并保存确定或未知结果。"""
-        entry = self.registry.get_entry(name)
+        if entry is None:
+            entry = self.registry.get_entry(name)
         if entry is None:
             return self.registry.dispatch(name, args, **kwargs)
         if entry.status_check is not None:
@@ -126,7 +136,16 @@ class DurableToolDispatcher:
         execution_id = record["execution_id"]
         self._call(start_tool_execution, execution_id)
         try:
-            output = self.registry.dispatch(name, args, **kwargs)
+            dispatch_entry = getattr(self.registry, "dispatch_entry", None)
+            if callable(dispatch_entry):
+                output = dispatch_entry(
+                    entry,
+                    args,
+                    policy_validated=policy_validated,
+                    **kwargs,
+                )
+            else:
+                output = self.registry.dispatch(name, args, **kwargs)
         except Exception:
             self._mark_unknown_best_effort(execution_id)
             raise

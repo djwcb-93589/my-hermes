@@ -1,6 +1,7 @@
 """与业务流程解耦的通用 Hook 基础设施。"""
 
 from .async_registry import AsyncHookRegistry
+from .bridge import build_sync_control_bridge
 from .controls import (
     AddContext,
     Allow,
@@ -50,5 +51,6 @@ __all__ = [
     "build_post_llm_call_payload",
     "build_post_tool_call_payload",
     "build_run_end_payload",
+    "build_sync_control_bridge",
     "normalize_hook_event_name",
 ]

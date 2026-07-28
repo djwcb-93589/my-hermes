@@ -24,7 +24,9 @@ from hermes.agent_loop import (
     AgentLoop,
     AgentLoopResult,
     AsyncAgentLoop,
+    ParsedToolCall,
     _sanitize_error_message,
+    dispatch_parsed_tool_call,
 )
 from hermes.review.runtime import get_background_review_coordinator
 from hermes.config import (
@@ -57,23 +59,6 @@ from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
 
 
 logger = logging.getLogger(__name__)
-
-
-def _disabled_tool_result(tool_name: str) -> tuple[str, str, str]:
-    """构造不会触达全局 registry 的会话级禁用工具错误。"""
-    return (
-        json.dumps(
-            {
-                "ok": False,
-                "error_type": "tool_disabled",
-                "fatal": True,
-                "error": f"Tool is not enabled in this session: {tool_name}",
-            },
-            ensure_ascii=False,
-        ),
-        "disabled",
-        f"disabled tool invoked: {tool_name!r}",
-    )
 
 
 def _normalize_async_resume_state(value: dict | None) -> dict:
@@ -191,75 +176,45 @@ def _approval_resume_error_response(error_type: str) -> dict:
     }
 
 
-def _dispatch_conversation_tool_call(loop, tool_call):
+def _dispatch_conversation_tool_call(
+    loop,
+    tool_call,
+    parsed_call: ParsedToolCall | None = None,
+):
     """主会话工具分发共享实现,供同步 / 异步循环复用。"""
-    tool_name = tool_call.function.name
-    allowed_tool_names = getattr(loop, "allowed_tool_names", None)
-    if (
-        allowed_tool_names is not None
-        and tool_name not in allowed_tool_names
-    ):
-        return _disabled_tool_result(tool_name)
-    try:
-        tool_args = json.loads(tool_call.function.arguments)
-    except Exception as exc:
-        short = _sanitize_error_message(exc, max_len=200)
+    parsed = parsed_call or loop._parse_tool_call(tool_call)
+    if not parsed.is_dispatchable:
         return (
-            f"(error: invalid JSON arguments in {tool_name}: {short})",
-            "json",
-            f"invalid JSON in tool_call {tool_name!r}: {short}",
+            parsed.error_output or "(error: tool call rejected)",
+            parsed.error_status,
+            parsed.error_detail,
         )
     print(
-        f"  [tool] {tool_name}: "
-        f"{json.dumps(tool_args, ensure_ascii=False)[:120]}"
+        f"  [tool] {parsed.tool_name}: "
+        f"{json.dumps(parsed.arguments, ensure_ascii=False)[:120]}"
     )
-    try:
-        dispatch_context = dict(getattr(loop, "tool_context", {}))
-        # CLI 与普通 Gateway AgentLoop 都不能注入内部审批许可。
-        dispatch_context.pop("allow_sensitive", None)
-        dispatch_context.pop("approval_grant", None)
-        dispatch_context["session_key"] = loop.session_key
-        dispatch_context["allowed_tool_names"] = allowed_tool_names
-        if loop.cancel_checker is not None:
-            dispatch_context["cancel_checker"] = loop.cancel_checker
-        # 仅作为工具运行时参数传给同步 delegate，不进入模型参数、持久化消息或 Hook 上下文。
-        if (
-            tool_name == "delegate_task"
-            and isinstance(getattr(loop, "hook_registry", None), SyncHookRegistry)
-        ):
-            dispatch_context["hook_registry"] = loop.hook_registry
-            if loop.run_id is not None:
-                dispatch_context["parent_run_id"] = loop.run_id
-        durable_context = dispatch_context.pop("durable_tool_execution", None)
-        if durable_context is None:
-            output = loop.registry.dispatch(
-                tool_name, tool_args,
-                **dispatch_context,
-            )
-        else:
-            # 持久化包装只接收运行范围，工具 handler 的调用契约保持不变。
-            from hermes.durable_tool_dispatcher import (
-                DurableToolDispatcher,
-                DurableToolExecutionContext,
-            )
-
-            context = DurableToolExecutionContext.from_value(durable_context)
-            if context is None:
-                raise RuntimeError("durable tool execution context is invalid")
-            output = DurableToolDispatcher(loop.registry, context).dispatch(
-                tool_name,
-                tool_args,
-                tool_call_id=str(tool_call.id),
-                **dispatch_context,
-            )
-    except Exception as exc:
-        short = _sanitize_error_message(exc, max_len=200)
-        return (
-            f"(error: tool {tool_name} failed: {short})",
-            "dispatch",
-            f"tool {tool_name!r} raised: {short}",
-        )
-    return output, None, None
+    dispatch_context = dict(getattr(loop, "tool_context", {}))
+    dispatch_context["allowed_tool_names"] = getattr(
+        loop,
+        "allowed_tool_names",
+        None,
+    )
+    if loop.cancel_checker is not None:
+        dispatch_context["cancel_checker"] = loop.cancel_checker
+    # 仅作为 delegate 的运行时参数传递，不进入模型、消息或持久化数据。
+    if parsed.tool_name == "delegate_task":
+        delegate_registry = loop._delegate_hook_registry()
+        if delegate_registry is not None:
+            dispatch_context["hook_registry"] = delegate_registry
+        if loop.run_id is not None:
+            dispatch_context["parent_run_id"] = loop.run_id
+    return dispatch_parsed_tool_call(
+        parsed,
+        loop.registry,
+        session_key=loop.session_key,
+        tool_context=dispatch_context,
+        require_valid_durable_context=True,
+    )
 
 
 class ConversationAgentLoop(AgentLoop):
@@ -453,14 +408,18 @@ class ConversationAgentLoop(AgentLoop):
         """进入 tool_call 路径时重置 continuation_count(对齐原行为)。"""
         self._continuation_count = 0
 
-    def dispatch_one(self, tool_call) -> tuple[str, str | None, str | None]:
+    def dispatch_one(
+        self,
+        tool_call,
+        parsed_call: ParsedToolCall | None = None,
+    ) -> tuple[str, str | None, str | None]:
         """主会话保留 print 日志,并把工具异常包装成 tool message。
 
         工具失败不是 DB 事务失败;真正持久化失败交给 add_messages 抛出。
         工具异常回写给模型时走统一摘要(凭证值 / 路径规范化 / traceback),
         复用 agent_loop._sanitize_error_message 避免重复实现。
         """
-        return _dispatch_conversation_tool_call(self, tool_call)
+        return _dispatch_conversation_tool_call(self, tool_call, parsed_call)
 
     # 单条 tool result 不单独持久化,避免 assistant tool_call 与 tool result
     # 被拆成多次提交。
@@ -729,9 +688,10 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
     async def dispatch_one(
         self,
         tool_call,
+        parsed_call: ParsedToolCall | None = None,
     ) -> tuple[str, str | None, str | None]:
         return await asyncio.to_thread(
-            _dispatch_conversation_tool_call, self, tool_call,
+            _dispatch_conversation_tool_call, self, tool_call, parsed_call,
         )
 
     async def on_tool_message(
@@ -796,6 +756,9 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
         final = "(cancelled)"
     elif result.status == "awaiting_approval":
         final = ""
+    elif result.status == "hook_blocked":
+        # Plugin 的阻止原因可能包含策略细节，不向会话调用方直接暴露。
+        final = "(agent error: hook_blocked; fatal=True; retryable=False)"
     elif result.status == "model_error":
         final = (
             f"(agent error: model_error; fatal={result.fatal}; "

@@ -338,9 +338,27 @@ class ToolRegistry:
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        return self.dispatch_entry(entry, args, **kwargs)
+
+    def dispatch_entry(
+        self,
+        entry: ToolEntry,
+        args: dict,
+        *,
+        policy_validated: bool = False,
+        **kwargs,
+    ) -> str:
+        """使用已解析的 ToolEntry 分发，避免重复查询注册表。"""
+        if not isinstance(entry, ToolEntry):
+            raise TypeError("entry must be a ToolEntry")
+        if not isinstance(policy_validated, bool):
+            raise TypeError("policy_validated must be a bool")
+        name = entry.name
         handler_kwargs = dict(kwargs)
         allowed_tool_names = kwargs.get("allowed_tool_names")
         if (
+            not policy_validated
+            and
             allowed_tool_names is not None
             and name not in frozenset(str(item) for item in allowed_tool_names)
         ):
