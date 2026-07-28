@@ -338,27 +338,31 @@ class ToolRegistry:
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
-        return self.dispatch_entry(entry, args, **kwargs)
+        return self._dispatch_entry(entry, args, **kwargs)
 
-    def dispatch_entry(
+    def _dispatch_verified_entry(
         self,
         entry: ToolEntry,
         args: dict,
-        *,
-        policy_validated: bool = False,
         **kwargs,
     ) -> str:
-        """使用已解析的 ToolEntry 分发，避免重复查询注册表。"""
+        """仅供已完成 AgentLoop 策略校验的内部调用复用注册条目。"""
         if not isinstance(entry, ToolEntry):
             raise TypeError("entry must be a ToolEntry")
-        if not isinstance(policy_validated, bool):
-            raise TypeError("policy_validated must be a bool")
+        return self._dispatch_entry_core(entry, args, **kwargs)
+
+    def _dispatch_entry(
+        self,
+        entry: ToolEntry,
+        args: dict,
+        **kwargs,
+    ) -> str:
+        """统一执行注册条目及其不可绕过的运行时安全检查。"""
+        if not isinstance(entry, ToolEntry):
+            raise TypeError("entry must be a ToolEntry")
         name = entry.name
-        handler_kwargs = dict(kwargs)
         allowed_tool_names = kwargs.get("allowed_tool_names")
         if (
-            not policy_validated
-            and
             allowed_tool_names is not None
             and name not in frozenset(str(item) for item in allowed_tool_names)
         ):
@@ -367,6 +371,17 @@ class ToolRegistry:
                 "error_type": "tool_not_authorized",
                 "error": "tool is outside the current execution boundary",
             }, ensure_ascii=False)
+        return self._dispatch_entry_core(entry, args, **kwargs)
+
+    @staticmethod
+    def _dispatch_entry_core(
+        entry: ToolEntry,
+        args: dict,
+        **kwargs,
+    ) -> str:
+        """执行保留给所有入口的 cron、取消和 handler 契约逻辑。"""
+        name = entry.name
+        handler_kwargs = dict(kwargs)
         guard = kwargs.get("cron_capability_guard")
         if guard is not None:
             denial = guard.authorize_tool(name)

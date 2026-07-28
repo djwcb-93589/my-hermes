@@ -53,6 +53,10 @@ from hermes.tokens import estimate_tokens
 logger = logging.getLogger(__name__)
 
 
+_PARSED_TOOL_CALL_TOKEN = object()
+"""仅由 parse_tool_call() 写入的内部验证凭证。"""
+
+
 @dataclass
 class AgentLoopResult:
     """AgentLoop.run 的返回。"""
@@ -559,11 +563,28 @@ class ParsedToolCall:
     error_output: str | None = None
     error_status: str | None = None
     error_detail: str | None = None
+    _validation_token: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _validated_registry: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def is_dispatchable(self) -> bool:
         """只有解析有效且通过全部硬边界的调用才能进入控制 Hook。"""
         return self.error_output is None
+
+    def is_verified_for(self, registry: object) -> bool:
+        """验证调用只能在产生它的同一 Registry 上复用。"""
+        return (
+            self._validation_token is _PARSED_TOOL_CALL_TOKEN
+            and self._validated_registry is registry
+        )
 
 
 def parse_tool_call(
@@ -598,6 +619,8 @@ def parse_tool_call(
             ),
             error_status="json",
             error_detail=f"invalid JSON in tool_call {tool_name!r}: {short}",
+            _validation_token=_PARSED_TOOL_CALL_TOKEN,
+            _validated_registry=registry,
         )
 
     argument_keys = (
@@ -624,6 +647,8 @@ def parse_tool_call(
         "approval_mode": str(approval_mode or "unknown"),
         "risk_level": str(risk_level or "unknown"),
         "durable_execution": durable_execution,
+        "_validation_token": _PARSED_TOOL_CALL_TOKEN,
+        "_validated_registry": registry,
     }
     if blocked:
         return ParsedToolCall(
@@ -672,26 +697,26 @@ def dispatch_parsed_tool_call(
     require_valid_durable_context: bool = False,
 ) -> tuple[str, str | None, str | None]:
     """复用已解析参数执行既有审批和 durable 工具分发流程。"""
-    if not parsed_call.is_dispatchable:
+    if not parsed_call.is_verified_for(registry) or not parsed_call.is_dispatchable:
         return (
             parsed_call.error_output or "(error: tool call rejected)",
-            parsed_call.error_status,
-            parsed_call.error_detail,
+            parsed_call.error_status or "dispatch",
+            parsed_call.error_detail or "tool call was not internally validated",
         )
+    dispatch_context = dict(tool_context or {})
+    runtime_hook_registry = dispatch_context.get("hook_registry")
     try:
-        dispatch_context = dict(tool_context or {})
         durable_context = dispatch_context.pop("durable_tool_execution", None)
         # 普通 AgentLoop 不得把内部审批许可透传给工具。
         dispatch_context.pop("allow_sensitive", None)
         dispatch_context.pop("approval_grant", None)
         dispatch_context["session_key"] = session_key
-        dispatch_entry = getattr(registry, "dispatch_entry", None)
+        dispatch_entry = getattr(registry, "_dispatch_verified_entry", None)
         if durable_context is None:
             if callable(dispatch_entry):
                 output = dispatch_entry(
                     parsed_call.entry,
                     parsed_call.arguments,
-                    policy_validated=True,
                     **dispatch_context,
                 )
             else:
@@ -714,7 +739,6 @@ def dispatch_parsed_tool_call(
                     output = dispatch_entry(
                         parsed_call.entry,
                         parsed_call.arguments,
-                        policy_validated=True,
                         **dispatch_context,
                     )
                 else:
@@ -724,12 +748,11 @@ def dispatch_parsed_tool_call(
                         **dispatch_context,
                     )
             else:
-                output = DurableToolDispatcher(registry, context).dispatch(
+                output = DurableToolDispatcher(registry, context)._dispatch_verified(
                     parsed_call.tool_name,
                     parsed_call.arguments,
                     tool_call_id=parsed_call.tool_call_id,
                     entry=parsed_call.entry,
-                    policy_validated=True,
                     **dispatch_context,
                 )
     except Exception as exc:
@@ -742,6 +765,17 @@ def dispatch_parsed_tool_call(
                 f"{type(exc).__name__}: {short}"
             ),
         )
+    finally:
+        # 同步桥接器只在 delegate 工具运行时存在；普通子任务返回后立即
+        # 释放，后台任务则由 handler 显式转交给 worker 的 finally。
+        close = getattr(runtime_hook_registry, "close", None)
+        retained = getattr(
+            runtime_hook_registry,
+            "retained_for_background_delegate",
+            False,
+        )
+        if callable(close) and not retained:
+            close()
     return output, None, None
 
 

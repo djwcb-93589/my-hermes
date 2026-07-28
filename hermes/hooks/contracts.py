@@ -136,7 +136,7 @@ HookCallback = Callable[[HookContext], object]
 """同步或异步 Hook 回调的统一调用形状。"""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class HookRegistration:
     """已注册 Hook 的不可变描述。"""
 

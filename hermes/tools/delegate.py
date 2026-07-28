@@ -28,7 +28,7 @@ from hermes.config import (
     client as _default_client,
 )
 from hermes.delegate_jobs import get_delegate_job_manager
-from hermes.hooks import SyncHookRegistry
+from hermes.hooks import SyncControlBridge, SyncHookRegistry
 from hermes.tools import (
     ExecutionEnvironment,
     ToolPolicy,
@@ -405,16 +405,20 @@ def handle_delegate(args, **kwargs) -> str:
     if not background:
         # ---------- 同步模式 ----------
         print(f"  [delegate] sync child={child_session_key} goal={goal[:80]!r}")
-        r = run_delegate_child(
-            goal,
-            context,
-            toolsets,
-            child_session_key,
-            cancel_checker=child_cancel_checker,
-            tool_context=child_tool_context,
-            hook_registry=hook_registry,
-            parent_run_id=parent_run_id,
-        )
+        try:
+            r = run_delegate_child(
+                goal,
+                context,
+                toolsets,
+                child_session_key,
+                cancel_checker=child_cancel_checker,
+                tool_context=child_tool_context,
+                hook_registry=hook_registry,
+                parent_run_id=parent_run_id,
+            )
+        finally:
+            if isinstance(hook_registry, SyncControlBridge):
+                hook_registry.close()
         return _result(
             r["ok"], r["status"], r["summary"],
             iterations=r["iterations"],
@@ -427,6 +431,9 @@ def handle_delegate(args, **kwargs) -> str:
 
     # ---------- 后台模式 ----------
     manager = get_delegate_job_manager()
+    if isinstance(hook_registry, SyncControlBridge):
+        # 成功提交后由 worker finally 释放；提交失败仍由当前分发 finally 收回。
+        hook_registry.retain_for_background_delegate()
     # runner 只捕获本次任务所需的运行时引用，避免跨模块读取 Job 私有字段。
     captured_runtime_refs: dict[str, object | None] = {
         "hook_registry": hook_registry,
@@ -458,6 +465,8 @@ def handle_delegate(args, **kwargs) -> str:
                 )
             finally:
                 # Job 终态以外，runner 闭包自身也不再保留运行时 Hook 引用。
+                if isinstance(runtime_registry, SyncControlBridge):
+                    runtime_registry.close()
                 captured_runtime_refs["hook_registry"] = None
                 captured_runtime_refs["parent_run_id"] = None
         return runner
@@ -474,6 +483,8 @@ def handle_delegate(args, **kwargs) -> str:
     )
 
     if not submit_result["ok"]:
+        if isinstance(hook_registry, SyncControlBridge):
+            hook_registry.close()
         # 并发上限拒绝:job 还没创建,但 child_session_key 已分配过,
         # 这里 cleanup 防止潜在泄漏(run_delegate_child 没被调用过,
         # backend 也没真正创建,但保险一道)。

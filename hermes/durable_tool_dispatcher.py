@@ -102,13 +102,51 @@ class DurableToolDispatcher:
         args: dict,
         *,
         tool_call_id: str,
-        entry=None,
-        policy_validated: bool = False,
         **kwargs,
     ) -> str:
         """记录调用开始、调用既有分发器，并保存确定或未知结果。"""
+        entry = self.registry.get_entry(name)
+        return self._dispatch_with_entry(
+            name,
+            args,
+            tool_call_id=tool_call_id,
+            entry=entry,
+            verified=False,
+            **kwargs,
+        )
+
+    def _dispatch_verified(
+        self,
+        name: str,
+        args: dict,
+        *,
+        tool_call_id: str,
+        entry,
+        **kwargs,
+    ) -> str:
+        """仅供 ParsedToolCall 复用已确认的条目，不开放策略跳过参数。"""
         if entry is None:
-            entry = self.registry.get_entry(name)
+            raise TypeError("verified tool entry is required")
+        return self._dispatch_with_entry(
+            name,
+            args,
+            tool_call_id=tool_call_id,
+            entry=entry,
+            verified=True,
+            **kwargs,
+        )
+
+    def _dispatch_with_entry(
+        self,
+        name: str,
+        args: dict,
+        *,
+        tool_call_id: str,
+        entry,
+        verified: bool,
+        **kwargs,
+    ) -> str:
+        """共享 durable journal 流程，验证后的路径仅复用已确认条目。"""
         if entry is None:
             return self.registry.dispatch(name, args, **kwargs)
         if entry.status_check is not None:
@@ -136,12 +174,15 @@ class DurableToolDispatcher:
         execution_id = record["execution_id"]
         self._call(start_tool_execution, execution_id)
         try:
-            dispatch_entry = getattr(self.registry, "dispatch_entry", None)
+            dispatch_entry = getattr(
+                self.registry,
+                "_dispatch_verified_entry" if verified else "_dispatch_entry",
+                None,
+            )
             if callable(dispatch_entry):
                 output = dispatch_entry(
                     entry,
                     args,
-                    policy_validated=policy_validated,
                     **kwargs,
                 )
             else:
