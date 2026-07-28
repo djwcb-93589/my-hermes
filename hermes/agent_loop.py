@@ -29,7 +29,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Callable
 
 from hermes.approval import build_approval_deferred
-from hermes.config import client as _default_client
+from hermes.config import MODEL_TIMEOUT_SECONDS, client as _default_client
 from hermes.hooks import (
     AsyncHookRegistry,
     HookContext,
@@ -46,6 +46,12 @@ from hermes.model_streaming import (
     ModelTurnResult,
     StreamAccumulator,
     StreamEvent,
+)
+from hermes.model_execution import (
+    ModelExecutionCancelled,
+    ModelExecutionTimedOut,
+    consume_interruptible_stream,
+    run_interruptible_call,
 )
 from hermes.redaction import redact_explicit_secrets
 from hermes.steering import (
@@ -1478,6 +1484,28 @@ class AgentLoop:
             call_started = time.perf_counter()
             try:
                 response = self.call_model(request_messages)
+            except ModelExecutionCancelled:
+                return self._cancel_result(messages)
+            except ModelExecutionTimedOut:
+                if self._is_cancelled():
+                    return self._cancel_result(messages)
+                exc = TimeoutError("model request timed out")
+                self._emit_model_call_event(
+                    _model_call_event(
+                        iteration=self.iterations,
+                        model=call_model,
+                        model_role=call_model_role,
+                        latency_ms=(time.perf_counter() - call_started) * 1000,
+                        outcome="error",
+                        error=exc,
+                    )
+                )
+                decision = self.handle_model_error(exc, messages)
+                if decision == "retry":
+                    continue
+                if decision == "abort":
+                    return self._model_error_result(messages, repr(exc))
+                raise exc
             except Exception as exc:
                 self._emit_model_call_event(
                     _model_call_event(
@@ -1885,11 +1913,15 @@ class AgentLoop:
         )
         if self.stream_sink is not None:
             return self._call_model_stream(api_messages)
-        return self.client.chat.completions.create(
-            model=self.model,
-            messages=api_messages,
-            tools=self.tools if self.tools else None,
-            **self.model_kwargs,
+        return run_interruptible_call(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=api_messages,
+                tools=self.tools if self.tools else None,
+                **self.model_kwargs,
+            ),
+            cancel_checker=self._is_cancelled,
+            timeout_seconds=MODEL_TIMEOUT_SECONDS,
         )
 
     def _call_model_stream(self, api_messages: list[dict]) -> ModelTurnResult:
@@ -1901,36 +1933,50 @@ class AgentLoop:
         stream_options["include_usage"] = True
         stream_kwargs["stream_options"] = stream_options
         accumulator = StreamAccumulator(attempt_id=attempt_id)
-        stream = None
         self._emit_stream_event(StreamEvent("model_turn_started", attempt_id))
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=api_messages,
-                tools=self.tools if self.tools else None,
-                **stream_kwargs,
-            )
-            for chunk in stream:
+            def on_chunk(chunk) -> None:
+                if self._is_cancelled():
+                    raise ModelExecutionCancelled
                 content_delta, reasoning_delta = accumulator.add_chunk(chunk)
                 if content_delta:
+                    if self._is_cancelled():
+                        raise ModelExecutionCancelled
                     self._emit_stream_event(
                         StreamEvent("text_delta", attempt_id, content_delta)
                     )
                 if reasoning_delta:
+                    if self._is_cancelled():
+                        raise ModelExecutionCancelled
                     self._emit_stream_event(
                         StreamEvent("reasoning_delta", attempt_id, reasoning_delta)
                     )
+
+            consume_interruptible_stream(
+                lambda: self.client.chat.completions.create(
+                    model=self.model,
+                    messages=api_messages,
+                    tools=self.tools if self.tools else None,
+                    **stream_kwargs,
+                ),
+                cancel_checker=self._is_cancelled,
+                timeout_seconds=MODEL_TIMEOUT_SECONDS,
+                on_chunk=on_chunk,
+            )
+            if self._is_cancelled():
+                raise ModelExecutionCancelled
             result = accumulator.result()
+            if self._is_cancelled():
+                raise ModelExecutionCancelled
+        except ModelExecutionCancelled:
+            self._emit_stream_event(StreamEvent("model_turn_interrupted", attempt_id))
+            raise
+        except ModelExecutionTimedOut:
+            self._emit_stream_event(StreamEvent("model_turn_interrupted", attempt_id))
+            raise
         except BaseException:
             self._emit_stream_event(StreamEvent("model_turn_interrupted", attempt_id))
             raise
-        finally:
-            try:
-                close = getattr(stream, "close", None)
-                if callable(close):
-                    close()
-            except Exception:
-                pass
         self._emit_stream_event(StreamEvent("model_turn_completed", attempt_id))
         return result
 
