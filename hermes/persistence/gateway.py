@@ -1062,6 +1062,90 @@ def complete_gateway_message(
         )
 
 
+def complete_gateway_steer_messages_in_transaction(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_ids: list[str] | tuple[str, ...],
+) -> None:
+    """在外层消息事务内完成 steer 对应的原始 Queue 记录。"""
+    ids = tuple(message_ids)
+    if not ids or any(
+        not isinstance(message_id, str) or not message_id
+        for message_id in ids
+    ):
+        raise DBError("gateway steer completion requires message ids")
+    if len(set(ids)) != len(ids):
+        raise DBError("gateway steer completion contains duplicate ids")
+
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT message_id, event_json, status
+        FROM gateway_message_queue
+        WHERE route_key=? AND message_id IN ({placeholders})
+        """,
+        (route_key, *ids),
+    ).fetchall()
+    if len(rows) != len(ids):
+        raise DBError("gateway steer queue ownership is missing")
+
+    rows_by_id = {str(row[0]): row for row in rows}
+    if set(rows_by_id) != set(ids):
+        raise DBError("gateway steer queue ownership route mismatch")
+    source_rows: list[tuple[str, str]] = []
+    for message_id in ids:
+        _stored_id, event_json, status = rows_by_id[message_id]
+        if str(status) not in {"queued", "processing"}:
+            raise DBError("gateway steer queue status is not completable")
+        source_message_ids = gateway_event_source_message_ids(
+            str(event_json),
+            message_id,
+        )
+        for source_message_id in source_message_ids:
+            ownership = conn.execute(
+                """
+                SELECT owner_kind, owner_id, status
+                FROM gateway_source_message_ownership
+                WHERE route_key=? AND source_message_id=?
+                """,
+                (route_key, source_message_id),
+            ).fetchone()
+            if ownership is None:
+                raise DBError("gateway steer source ownership is missing")
+            if (
+                str(ownership[0]) != "queue"
+                or str(ownership[1]) != message_id
+                or str(ownership[2]) != str(status)
+            ):
+                raise DBError("gateway steer source ownership mismatch")
+            source_rows.append((source_message_id, message_id))
+
+    now = time.time()
+    for source_message_id, message_id in source_rows:
+        updated = conn.execute(
+            """
+            UPDATE gateway_source_message_ownership
+            SET status='completed', updated_at=?
+            WHERE route_key=? AND source_message_id=?
+              AND owner_kind='queue' AND owner_id=?
+            """,
+            (now, route_key, source_message_id, message_id),
+        )
+        if updated.rowcount != 1:
+            raise DBError("gateway steer ownership completion failed")
+    for message_id in ids:
+        deleted = conn.execute(
+            """
+            DELETE FROM gateway_message_queue
+            WHERE route_key=? AND message_id=?
+              AND status IN ('queued', 'processing')
+            """,
+            (route_key, message_id),
+        )
+        if deleted.rowcount != 1:
+            raise DBError("gateway steer queue deletion failed")
+
+
 def delete_gateway_messages(
     conn: sqlite3.Connection,
     route_key: str,

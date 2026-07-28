@@ -16,6 +16,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
+from hermes.gateway.types import MessageEvent
 from hermes.steering import SteerMailbox
 
 
@@ -64,11 +65,18 @@ class SessionContext:
     conversation_list_mapping: dict[int, str] | None = None
     active_steer_mailbox: SteerMailbox | None = field(default=None, repr=False)
     steer_generation: int | None = field(default=None, repr=False)
+    # 只保存当前 generation 已进入 mailbox 的原始事件，供确认或原序重排队使用。
+    inflight_steer_events: dict[str, MessageEvent] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    # generation 失效时保留未确认原事件，直到数据库恢复或后续显式收口。
+    deferred_steer_events: dict[str, MessageEvent] = field(
+        default_factory=dict,
+        repr=False,
+    )
     pending_sequence: int = 0
     last_steer_sequence: int | None = None
-    pending_steer_event: object | None = field(default=None, repr=False)
-    pending_steer_generation: int | None = field(default=None, repr=False)
-    pending_steer_persisted: bool = False
 
 
 class SessionStore:
@@ -118,6 +126,14 @@ class SessionStore:
             mailbox.close()
         ctx.active_steer_mailbox = None
         ctx.steer_generation = None
+
+    @staticmethod
+    def _defer_inflight_steer_events(ctx: SessionContext) -> None:
+        """generation 失效时转移未确认映射，不静默丢弃原事件。"""
+        if not ctx.inflight_steer_events:
+            return
+        ctx.deferred_steer_events.update(ctx.inflight_steer_events)
+        ctx.inflight_steer_events.clear()
 
     @classmethod
     def _ensure_pending_sequence(
@@ -348,9 +364,7 @@ class SessionStore:
                 ctx.dispatching = False
                 ctx.invalidation_event = asyncio.Event()
                 ctx.last_steer_sequence = None
-                ctx.pending_steer_event = None
-                ctx.pending_steer_generation = None
-                ctx.pending_steer_persisted = False
+                self._defer_inflight_steer_events(ctx)
             ctx.last_activity = time.time()
             return ctx
 
@@ -382,9 +396,7 @@ class SessionStore:
             ctx.cancel_reason = None
             ctx.invalidation_event = asyncio.Event()
             ctx.last_steer_sequence = None
-            ctx.pending_steer_event = None
-            ctx.pending_steer_generation = None
-            ctx.pending_steer_persisted = False
+            self._defer_inflight_steer_events(ctx)
         ctx.last_activity = time.time()
         return ctx
 
@@ -426,9 +438,7 @@ class SessionStore:
                 ctx.cancel_reason = None
                 ctx.invalidation_event = asyncio.Event()
                 ctx.last_steer_sequence = None
-                ctx.pending_steer_event = None
-                ctx.pending_steer_generation = None
-                ctx.pending_steer_persisted = False
+                self._defer_inflight_steer_events(ctx)
             ctx.last_activity = time.time()
             return ctx
 
@@ -469,9 +479,7 @@ class SessionStore:
         ctx.busy = True
         ctx.active_generation = None
         ctx.last_steer_sequence = None
-        ctx.pending_steer_event = None
-        ctx.pending_steer_generation = None
-        ctx.pending_steer_persisted = False
+        self._defer_inflight_steer_events(ctx)
         return ctx.generation, ctx.invalidation_event
 
     def register_steer_mailbox(
@@ -505,7 +513,7 @@ class SessionStore:
             return
         self._close_active_steer_mailbox(ctx)
 
-    def submit_steer(self, route_key: str, text: str) -> bool:
+    def submit_steer(self, route_key: str, entry, event=None) -> bool:
         """在短 route 临界区内向当前 generation 提交 steer。"""
         ctx = self._contexts.get(route_key)
         if ctx is None or not ctx.busy:
@@ -521,10 +529,77 @@ class SessionStore:
             or not mailbox.is_active
         ):
             return False
-        if not mailbox.submit(text):
+        if not mailbox.submit(entry):
             return False
-        ctx.last_steer_sequence = ctx.pending_sequence
+        ctx.last_steer_sequence = entry.sequence
+        if event is not None:
+            ctx.inflight_steer_events[entry.steer_id] = event
         return True
+
+    @staticmethod
+    def track_steer_event(
+        ctx: SessionContext,
+        generation: int,
+        steer_id: str,
+        event,
+    ) -> bool:
+        """记录已进入当前 generation mailbox 的原始事件。"""
+        if (
+            ctx.generation != generation
+            or ctx.steer_generation != generation
+            or ctx.active_steer_mailbox is None
+        ):
+            return False
+        ctx.inflight_steer_events[steer_id] = event
+        return True
+
+    @staticmethod
+    def acknowledge_steer_events(
+        ctx: SessionContext,
+        generation: int,
+        steer_ids,
+    ) -> None:
+        """仅在外层数据库事务成功提交后移除已确认的原始事件映射。"""
+        if ctx.steer_generation != generation:
+            return
+        for steer_id in tuple(steer_ids):
+            ctx.inflight_steer_events.pop(steer_id, None)
+
+    @staticmethod
+    def forget_steer_event(
+        ctx: SessionContext,
+        generation: int,
+        steer_id: str,
+    ) -> None:
+        """移除已经安全放回普通 pending 的 steer 映射。"""
+        if ctx.steer_generation == generation:
+            ctx.inflight_steer_events.pop(steer_id, None)
+
+    def rollback_task_begin(
+        self,
+        ctx: SessionContext,
+        generation: int,
+    ) -> None:
+        """回滚 mailbox 注册前的临时运行状态，保留原 Queue 记录。"""
+        if ctx.generation != generation:
+            return
+        self._close_active_steer_mailbox(ctx)
+        ctx.generation = max(0, generation - 1)
+        ctx.cancel_requested = False
+        ctx.cancel_generation = None
+        ctx.cancel_reason = None
+        ctx.invalidation_event.set()
+        ctx.invalidation_event = asyncio.Event()
+        ctx.active_task = None
+        ctx.active_generation = None
+        ctx.delivery_id = None
+        ctx.delivery_generation = None
+        ctx.worker_task = None
+        ctx.worker_generation = None
+        ctx.busy = False
+        ctx.dispatching = False
+        ctx.last_steer_sequence = None
+        self._defer_inflight_steer_events(ctx)
 
     def enqueue(self, ctx: SessionContext, event, *, force: bool = False) -> bool:
         """在单会话上限内入队,队列已满时返回 False。"""

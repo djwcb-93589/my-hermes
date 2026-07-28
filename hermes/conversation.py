@@ -54,7 +54,7 @@ from hermes.errors import (
     switch_to_fallback,
 )
 from hermes.hooks import AsyncHookRegistry, SyncHookRegistry
-from hermes.steering import merge_steer_messages
+from hermes.steering import SteerEntry
 from hermes.tokens import compress, compress_async, estimate_tokens
 from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
 
@@ -163,11 +163,11 @@ def validate_approval_resume_history(
     return True
 
 
-def _close_unstarted_steer_mailbox(steer_mailbox) -> str | None:
+def _close_unstarted_steer_mailbox(steer_mailbox) -> tuple[SteerEntry, ...]:
     """入口在启动循环前失败时关闭未激活的 steer 邮箱。"""
     if steer_mailbox is None:
-        return None
-    return merge_steer_messages(steer_mailbox.close_and_drain())
+        return ()
+    return steer_mailbox.close_and_drain()
 
 
 def _approval_resume_error_response(
@@ -451,6 +451,8 @@ class ConversationAgentLoop(AgentLoop):
         assistant_msg: dict,
         tool_messages: list[dict],
         response,
+        *,
+        steer_ids: tuple[str, ...] = (),
     ) -> None:
         # assistant tool_call 与对应 tool result 必须同事务写入,
         # 否则崩溃时会留下只有 tool_call 没有 tool result 的残缺历史。
@@ -486,6 +488,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         cancel_checker=None,
         final_message_callback=None,
         persistence_call=None,
+        steer_persist_callback=None,
         resume_from_history: bool = False,
         resume_state: dict | None = None,
         allowed_tool_names: set[str] | None = None,
@@ -540,6 +543,7 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         self.final_message_callback = final_message_callback
         # Gateway 注入异步数据库边界；CLI / 旧测试仍可使用调用方连接。
         self.persistence_call = persistence_call
+        self.steer_persist_callback = steer_persist_callback
         # fallback 客户端由本循环创建,结束时单独关闭;主客户端归 Runner 管理。
         self._fallback_client = None
         active_model = restored_state["active_model"]
@@ -640,11 +644,26 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         finally:
             self._fallback_client = None
 
-    async def _persist(self, operation, *args):
+    async def _persist(
+        self,
+        operation,
+        *args,
+        steer_ids: tuple[str, ...] = (),
+    ):
         """优先通过 Gateway 异步边界执行一个完整同步数据库操作。"""
+        kwargs = {}
+        if steer_ids and self.steer_persist_callback is not None:
+            if operation is not add_messages:
+                raise RuntimeError(
+                    "steer persistence callback requires an add_messages batch"
+                )
+            kwargs = {
+                "steer_persist_callback": self.steer_persist_callback,
+                "steer_ids": tuple(steer_ids),
+            }
         if self.persistence_call is not None:
-            return await self.persistence_call(operation, *args)
-        return operation(self.conn, *args)
+            return await self.persistence_call(operation, *args, **kwargs)
+        return operation(self.conn, *args, **kwargs)
 
     async def on_model_call_event(self, event: dict) -> None:
         """尽力记录脱敏诊断，诊断库写失败不影响正常会话。"""
@@ -739,11 +758,14 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         assistant_msg: dict,
         tool_messages: list[dict],
         response,
+        *,
+        steer_ids: tuple[str, ...] = (),
     ) -> None:
         await self._persist(
             add_messages,
             self.db_session_id,
             [assistant_msg, *tool_messages],
+            steer_ids=steer_ids,
         )
         self._retry_count = 0
 
@@ -942,6 +964,7 @@ async def run_conversation_async(
     steer_mailbox=None,
     final_message_callback=None,
     persistence_call=None,
+    steer_persist_callback=None,
     resume_from_history: bool = False,
     approval_resume_id: str | None = None,
     approval_tool_call_id: str | None = None,
@@ -1037,6 +1060,7 @@ async def run_conversation_async(
                 cancel_checker=cancel_checker,
                 final_message_callback=final_message_callback,
                 persistence_call=persistence_call,
+                steer_persist_callback=steer_persist_callback,
                 resume_from_history=resume_from_history,
                 resume_state=normalized_resume_state,
                 allowed_tool_names=allowed_tool_names,

@@ -49,9 +49,9 @@ from hermes.model_streaming import (
 )
 from hermes.redaction import redact_explicit_secrets
 from hermes.steering import (
+    SteerEntry,
     SteerMailbox,
     format_steer_guidance,
-    merge_steer_messages,
 )
 from hermes.tokens import estimate_tokens
 
@@ -84,14 +84,14 @@ class AgentLoopResult:
     approval_request: dict | None = None
     tool_batches: int = 0
     tool_call_count: int = 0
-    pending_steer: str | None = None
+    pending_steer: tuple[SteerEntry, ...] = ()
 
 
 @dataclass
 class InjectedSteer:
     """记录一次工具结果注入，供持久化失败时完整回滚。"""
 
-    messages: tuple[str, ...]
+    entries: tuple[SteerEntry, ...]
     tool_message: dict
     original_content: object
 
@@ -899,6 +899,7 @@ class AgentLoop:
         self.steer_mailbox = steer_mailbox
         # 未进入 run 前邮箱保持 new；每次 run 结束后标记为已关闭。
         self._steer_mailbox_closed = True
+        self._unconfirmed_steer: list[SteerEntry] = []
         if hook_registry is not None and not isinstance(
             hook_registry,
             SyncHookRegistry,
@@ -927,36 +928,39 @@ class AgentLoop:
     def _is_cancelled(self) -> bool:
         return self.cancel_checker is not None and bool(self.cancel_checker())
 
-    def steer(self, text: str) -> bool:
+    def steer(self, entry: SteerEntry) -> bool:
         """向当前运行提交一条 steer；未配置邮箱时返回 False。"""
         if self.steer_mailbox is None:
             return False
-        return self.steer_mailbox.submit(text)
+        return self.steer_mailbox.submit(entry)
 
     def _activate_steer_mailbox(self) -> None:
         """在正式进入循环前激活邮箱，拒绝重复运行复用。"""
         if self.steer_mailbox is None:
             return
+        self._unconfirmed_steer.clear()
         self.steer_mailbox.activate()
         self._steer_mailbox_closed = False
 
-    def _close_steer_mailbox(self, *, drain: bool) -> tuple[str, ...]:
+    def _close_steer_mailbox(self, *, drain: bool) -> tuple[SteerEntry, ...]:
         """关闭邮箱；取消路径保留 pending，正常结果路径才消费。"""
         if self.steer_mailbox is None or self._steer_mailbox_closed:
-            return ()
+            pending = tuple(self._unconfirmed_steer)
+            self._unconfirmed_steer.clear()
+            return pending
         if drain:
             pending = self.steer_mailbox.close_and_drain()
         else:
             self.steer_mailbox.close()
             pending = ()
         self._steer_mailbox_closed = True
-        return pending
+        unconfirmed = tuple(self._unconfirmed_steer)
+        self._unconfirmed_steer.clear()
+        return (*unconfirmed, *pending)
 
     def _finalize_steer_result(self, result: "AgentLoopResult") -> "AgentLoopResult":
         """在结构化结果返回前关闭邮箱并附加未消费 steer。"""
-        result.pending_steer = merge_steer_messages(
-            self._close_steer_mailbox(drain=True)
-        )
+        result.pending_steer = self._close_steer_mailbox(drain=True)
         return result
 
     def _invalid_steer_mailbox_result(self, error) -> "AgentLoopResult":
@@ -1004,7 +1008,7 @@ class AgentLoop:
             else guidance
         )
         return InjectedSteer(
-            messages=pending,
+            entries=pending,
             tool_message=last_tool_message,
             original_content=original_content,
         )
@@ -1018,7 +1022,11 @@ class AgentLoop:
             return
         injected.tool_message["content"] = injected.original_content
         if self.steer_mailbox is not None:
-            self.steer_mailbox.restore_front(injected.messages)
+            try:
+                self.steer_mailbox.restore_front(injected.entries)
+            except Exception:
+                # 邮箱已经失效时不能假装恢复成功，交给上层按原消息 ID 处理。
+                self._unconfirmed_steer.extend(injected.entries)
 
     def _record_tool_batch(self, tool_calls) -> None:
         self.tool_batches += 1
@@ -1603,7 +1611,16 @@ class AgentLoop:
                     has_next_iteration=(iteration + 1 < self.max_iterations),
                 )
                 try:
-                    self.on_tool_messages_batch(msg_dict, tool_messages, response)
+                    self.on_tool_messages_batch(
+                        msg_dict,
+                        tool_messages,
+                        response,
+                        steer_ids=(
+                            tuple(entry.steer_id for entry in injected_steer.entries)
+                            if injected_steer is not None
+                            else ()
+                        ),
+                    )
                 except Exception as exc:
                     # DB 写入失败:assistant + tool_messages 整组未落盘,停止 loop
                     self._restore_injected_steer(injected_steer)
@@ -2026,6 +2043,8 @@ class AgentLoop:
         assistant_msg: dict,
         tool_messages: list[dict],
         response,
+        *,
+        steer_ids: tuple[str, ...] = (),
     ) -> None:
         """assistant tool_call 与对应 tool results 全部生成后调用。默认空。"""
         pass
@@ -2457,7 +2476,14 @@ class AsyncAgentLoop(AgentLoop):
                 )
                 try:
                     await self.on_tool_messages_batch(
-                        msg_dict, tool_messages, response,
+                        msg_dict,
+                        tool_messages,
+                        response,
+                        steer_ids=(
+                            tuple(entry.steer_id for entry in injected_steer.entries)
+                            if injected_steer is not None
+                            else ()
+                        ),
                     )
                 except asyncio.CancelledError:
                     self._restore_injected_steer(injected_steer)
@@ -2873,6 +2899,8 @@ class AsyncAgentLoop(AgentLoop):
         assistant_msg: dict,
         tool_messages: list[dict],
         response,
+        *,
+        steer_ids: tuple[str, ...] = (),
     ) -> None:
         """assistant tool_call 与 tool results 生成后的异步 hook。默认空。"""
         pass

@@ -46,6 +46,7 @@ from hermes.db import (
     claim_gateway_approval_with_ack_outbox,
     complete_gateway_delivery,
     complete_gateway_message,
+    complete_gateway_steer_messages_in_transaction,
     create_gateway_file_delivery_outbox,
     create_gateway_approval_with_outbox,
     delete_gateway_messages,
@@ -117,7 +118,7 @@ from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
 from hermes.cron.executor import CronExecutor
 from hermes.cron.job import CronJob, CronRun
 from hermes.gateway.session_store import SessionStore
-from hermes.steering import SteerMailbox
+from hermes.steering import SteerEntry, SteerMailbox
 from hermes.durable_tool_dispatcher import (
     DurableToolDispatcher,
     DurableToolExecutionContext,
@@ -561,7 +562,7 @@ class _GatewayAgentResult:
     response: str | None
     failed: bool = False
     failure_type: str | None = None
-    pending_steer: str | None = None
+    pending_steer: tuple[SteerEntry, ...] = ()
 
 
 def _safe_audit_label(value: object) -> str:
@@ -1031,9 +1032,6 @@ class GatewayRunner:
     @staticmethod
     def _is_processing_event(event: MessageEvent) -> bool:
         """只有进入普通 Agent 流程的消息才展示平台处理状态。"""
-        metadata = event.metadata if isinstance(event.metadata, dict) else {}
-        if metadata.get("_gateway_internal") == "pending_steer":
-            return False
         return (event.text or "").strip().lower() not in {
             "/new",
             "/stop",
@@ -1117,8 +1115,12 @@ class GatewayRunner:
         """把 Agent 结构化错误映射为固定文案，绝不发送原始异常。"""
         final_response = result.get("final_response")
         pending_steer = result.get("pending_steer")
-        if not isinstance(pending_steer, str) or not pending_steer.strip():
-            pending_steer = None
+        if isinstance(pending_steer, (list, tuple)) and all(
+            isinstance(entry, SteerEntry) for entry in pending_steer
+        ):
+            pending_steer = tuple(pending_steer)
+        else:
+            pending_steer = ()
         if result.get("ok", False):
             response = str(final_response or "")
             if response:
@@ -3138,13 +3140,7 @@ class GatewayRunner:
             payloads = [{"content": content}]
         if not payloads:
             raise ValueError("adapter produced no outbound payload")
-        metadata = event.metadata if isinstance(event.metadata, dict) else {}
         reply_to_message_id = event.message_id
-        if self._is_pending_steer_event(event):
-            reply_to_message_id = str(
-                metadata.get("_gateway_reply_to_message_id")
-                or event.message_id
-            )
         return {
             "id": delivery_id,
             "route_key": route_key,
@@ -3962,76 +3958,61 @@ class GatewayRunner:
         if cancel_reason != "shutdown":
             await self._dispatch_next(ctx)
 
-    @staticmethod
-    def _is_pending_steer_event(event: MessageEvent) -> bool:
-        """识别只在 Gateway 内部流转的未消费 steer 事件。"""
-        metadata = event.metadata if isinstance(event.metadata, dict) else {}
-        return metadata.get("_gateway_internal") == "pending_steer"
-
-    @staticmethod
-    def _build_pending_steer_event(
-        source_event: MessageEvent,
-        text: str,
-        sequence: int,
-    ) -> MessageEvent:
-        """将未消费 steer 封装为可复用现有队列链路的内部事件。"""
-        return MessageEvent(
-            message_id=f"pending-steer:{uuid.uuid4()}",
-            text=text,
-            source=source_event.source,
-            reply_to_message_id=source_event.message_id,
-            metadata={
-                "_gateway_internal": "pending_steer",
-                "_gateway_pending_sequence": sequence,
-                "_gateway_reply_to_message_id": source_event.message_id,
-            },
-        )
-
     async def _requeue_pending_steer(
         self,
         ctx,
         generation: int,
-        source_event: MessageEvent,
-        text: str,
+        entries: tuple[SteerEntry, ...],
     ) -> None:
-        """在当前 worker 收尾时持久化并按接收顺序放回内部 steer 事件。"""
+        """按原始消息 ID 将未消费 steer 放回普通 pending。"""
         if (
             self._task_cancel_reason(ctx, generation) is not None
             or ctx.generation != generation
         ):
             return
-        pending_event = ctx.pending_steer_event
-        if (
-            not isinstance(pending_event, MessageEvent)
-            or ctx.pending_steer_generation != generation
-            or pending_event.text != text
-        ):
-            sequence = ctx.last_steer_sequence or (ctx.pending_sequence + 1)
-            pending_event = self._build_pending_steer_event(
-                source_event,
-                text,
-                sequence,
-            )
-            ctx.pending_steer_event = pending_event
-            ctx.pending_steer_generation = generation
-            ctx.pending_steer_persisted = False
-
-        if not ctx.pending_steer_persisted:
-            try:
-                await self._persist_event_async(ctx.route_key, pending_event)
-            except Exception as exc:
+        for entry in entries:
+            event = ctx.inflight_steer_events.get(entry.steer_id)
+            if (
+                not isinstance(event, MessageEvent)
+                or event.message_id != entry.steer_id
+            ):
                 print(
-                    f"  [gateway] {ctx.route_key}: pending steer persistence "
-                    f"failed ({type(exc).__name__})"
+                    "  [gateway:audit] steer requeue mapping missing "
+                    f"route={safe_route_digest(ctx.route_key)} "
+                    f"steer={safe_identifier_digest(entry.steer_id)}"
                 )
                 return
-            ctx.pending_steer_persisted = True
-
-        if not any(
-            queued.message_id == pending_event.message_id
-            for queued in ctx.pending
-        ):
-            self.sessions.enqueue_ordered(ctx, pending_event, force=True)
+            already_pending = any(
+                queued.message_id == event.message_id
+                for queued in ctx.pending
+            )
+            if not already_pending:
+                try:
+                    requeued = self.sessions.enqueue_ordered(
+                        ctx,
+                        event,
+                        force=True,
+                    )
+                except Exception as exc:
+                    print(
+                        "  [gateway:audit] steer requeue failed "
+                        f"route={safe_route_digest(ctx.route_key)} "
+                        f"steer={safe_identifier_digest(entry.steer_id)} "
+                        f"exception={type(exc).__name__}"
+                    )
+                    return
+                if not requeued:
+                    print(
+                        "  [gateway:audit] steer requeue rejected "
+                        f"route={safe_route_digest(ctx.route_key)} "
+                        f"steer={safe_identifier_digest(entry.steer_id)}"
+                    )
+                    return
+            self.sessions.forget_steer_event(
+                ctx,
+                generation,
+                entry.steer_id,
+            )
 
     def _drop_events(self, route_key: str, events: list[MessageEvent]) -> None:
         """持久化删除被 /new 明确取消的旧 pending。"""
@@ -4380,8 +4361,21 @@ class GatewayRunner:
             persisted = await self._message_persistence_state_async(event)
             if persisted is not None:
                 self._accepted_messages.add(queue_key)
-                return
-            if queue_key in self._accepted_messages:
+                if persisted.get("layer") == "queue" and persisted.get(
+                    "status"
+                ) in {"queued", "processing"}:
+                    existing_ctx = self.sessions.get(route_key)
+                    if (
+                        existing_ctx is not None
+                        and self._route_has_active_worker(existing_ctx)
+                    ):
+                        return
+                    # 数据库中仍为 queued/processing 的原始事件可直接复用，
+                    # 不再次持久化，也不创建新的 ownership。
+                    from_queue = True
+                else:
+                    return
+            elif queue_key in self._accepted_messages:
                 return
 
         approval_resume_id = None
@@ -4948,15 +4942,26 @@ class GatewayRunner:
         if self._route_has_active_worker(ctx):
             if not from_queue:
                 self.sessions.event_sequence(ctx, event)
+                event_persisted = False
                 if self.busy_input_mode == "steer":
                     if not await self._persist_event_async(route_key, event):
                         return
-                    if self.sessions.submit_steer(route_key, event.text):
-                        await self._complete_event_async(route_key, event)
+                    event_persisted = True
+                    steer_entry = SteerEntry(
+                        steer_id=event.message_id,
+                        text=event.text,
+                        sequence=self.sessions.event_sequence(ctx, event),
+                    )
+                    if self.sessions.submit_steer(
+                        route_key,
+                        steer_entry,
+                        event,
+                    ):
                         print(
                             f"  [gateway] {route_key}: steer accepted"
                         )
                         return
+                    # mailbox 接收失败时复用已经持久化的原始 Queue 记录。
             # 正在处理 → 在单会话上限内排队。
             if (
                 not from_queue
@@ -4970,7 +4975,10 @@ class GatewayRunner:
                 # 先持久化入站事件再创建 Outbox,保证重启恢复时
                 # Outbox 的 source_message_id 能在 gateway_messages
                 # 表中找到对应记录,去重窗口与审计关联不会断裂。
-                if not await self._persist_event_async(route_key, event):
+                if (
+                    not event_persisted
+                    and not await self._persist_event_async(route_key, event)
+                ):
                     return
                 await self._start_durable_reply_async(
                     route_key,
@@ -4982,6 +4990,7 @@ class GatewayRunner:
                 return
             if (
                 not from_queue
+                and not event_persisted
                 and not await self._persist_event_async(route_key, event)
             ):
                 return
@@ -5009,8 +5018,6 @@ class GatewayRunner:
             and not await self._persist_event_async(route_key, event)
         ):
             return
-        await self._mark_processing_best_effort(event)
-        await self._mark_event_processing_async(route_key, event)
         if approval_resume_id is not None:
             if (
                 self._lifecycle_phase
@@ -5026,7 +5033,25 @@ class GatewayRunner:
             generation,
             steer_mailbox,
         ):
+            steer_mailbox.close()
+            self.sessions.rollback_task_begin(ctx, generation)
+            print(
+                "  [gateway:audit] steer mailbox registration failed "
+                f"route={safe_route_digest(route_key)} "
+                f"message={safe_message_digest(event.message_id)}"
+            )
+            try:
+                self.sessions.enqueue_ordered(ctx, event, force=True)
+            except Exception as exc:
+                print(
+                    "  [gateway:audit] queued event recovery after mailbox "
+                    "registration failure failed "
+                    f"route={safe_route_digest(route_key)} "
+                    f"exception={type(exc).__name__}"
+                )
             return
+        await self._mark_processing_best_effort(event)
+        await self._mark_event_processing_async(route_key, event)
         delivery_id = str(uuid.uuid4())
         ctx.delivery_id = delivery_id
         ctx.delivery_generation = generation
@@ -5449,7 +5474,6 @@ class GatewayRunner:
                     await self._requeue_pending_steer(
                         ctx,
                         generation,
-                        delivery_event,
                         agent_result.pending_steer,
                     )
                 if owns_worker:
@@ -5687,6 +5711,31 @@ class GatewayRunner:
         conversation_id = ctx.conversation_id
         system_prompt = ctx.system_prompt
         task_event = event
+        callback_steer_ids: set[str] = set()
+
+        def persist_steer_callback(conn, steer_ids) -> None:
+            """在工具消息事务内确认对应的原始 Gateway Queue 记录。"""
+            ids = tuple(steer_ids)
+            if not ids:
+                return
+            if (
+                generation is None
+                or ctx.generation != generation
+                or self._task_cancel_reason(ctx, generation) is not None
+            ):
+                raise RuntimeError("stale steer generation")
+            if any(
+                steer_id not in ctx.inflight_steer_events
+                for steer_id in ids
+            ):
+                raise RuntimeError("steer event mapping is missing")
+            complete_gateway_steer_messages_in_transaction(
+                conn,
+                route_key,
+                ids,
+            )
+            callback_steer_ids.update(ids)
+
         approval_resume = None
         if resume_from_history:
             if not approval_resume_id:
@@ -5865,6 +5914,7 @@ class GatewayRunner:
             async_client=self._get_async_client(),
             final_message_callback=persist_final_message,
             persistence_call=self.persistence.call,
+            steer_persist_callback=persist_steer_callback,
             hook_registry=self._hook_registry,
             resume_from_history=resume_from_history,
             approval_resume_id=(approval["id"] if approval is not None else None),
@@ -5876,9 +5926,38 @@ class GatewayRunner:
             tool_policy=tool_policy,
             steer_mailbox=steer_mailbox,
         )
+        acknowledged_steer_ids: set[str] = set()
+        for steer_id in callback_steer_ids:
+            try:
+                state = await self.persistence.call(
+                    get_gateway_message_persistence_state,
+                    route_key,
+                    steer_id,
+                )
+            except Exception:
+                continue
+            if (
+                isinstance(state, dict)
+                and state.get("layer") == "queue"
+                and state.get("owner_id") == steer_id
+                and state.get("status") == "completed"
+            ):
+                acknowledged_steer_ids.add(steer_id)
+        if acknowledged_steer_ids:
+            self.sessions.acknowledge_steer_events(
+                ctx,
+                generation,
+                acknowledged_steer_ids,
+            )
+            for steer_id in acknowledged_steer_ids:
+                self._accepted_messages.discard((route_key, steer_id))
         pending_steer = result.get("pending_steer")
-        if not isinstance(pending_steer, str) or not pending_steer.strip():
-            pending_steer = None
+        if isinstance(pending_steer, (list, tuple)) and all(
+            isinstance(entry, SteerEntry) for entry in pending_steer
+        ):
+            pending_steer = tuple(pending_steer)
+        else:
+            pending_steer = ()
         if result.get("status") == "awaiting_approval":
             request = result.get("approval_request")
             if not isinstance(request, dict):

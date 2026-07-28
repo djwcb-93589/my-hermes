@@ -156,6 +156,7 @@ from hermes.persistence.gateway import (
     acquire_gateway_runtime_lease,
     check_gateway_runtime_readiness,
     complete_gateway_message,
+    complete_gateway_steer_messages_in_transaction,
     delete_gateway_messages,
     enqueue_gateway_message,
     enqueue_gateway_outbox,

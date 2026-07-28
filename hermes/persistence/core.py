@@ -190,6 +190,9 @@ def add_messages(
     conn: sqlite3.Connection,
     session_id: str,
     messages: list[dict],
+    *,
+    steer_persist_callback=None,
+    steer_ids: tuple[str, ...] = (),
 ) -> None:
     """批量写入,在单个事务内执行。任一失败则整组回滚。"""
     if not isinstance(messages, (list, tuple)):
@@ -199,6 +202,8 @@ def add_messages(
     with transaction(conn):
         for msg in messages:
             _insert_message(conn, session_id, msg)
+        if steer_ids and steer_persist_callback is not None:
+            steer_persist_callback(conn, tuple(steer_ids))
 
 
 def replace_tool_message_content(
