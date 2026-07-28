@@ -230,54 +230,21 @@ class _PluginRuntimeBase:
         self,
         enabled: tuple[str, ...],
     ) -> tuple[_PluginCandidate, ...]:
-        candidates: list[_PluginCandidate] = []
-        seen_roots: set[Path] = set()
-        for root, source_type in self._plugin_roots():
-            try:
-                resolved_root = root.resolve(strict=False)
-            except OSError:
-                continue
-            if resolved_root in seen_roots or not root.is_dir():
-                continue
-            seen_roots.add(resolved_root)
-            try:
-                children = tuple(root.iterdir())
-            except OSError:
-                continue
-            for child in children:
-                if child.name not in enabled or not child.is_dir():
-                    continue
-                try:
-                    resolved_child = child.resolve(strict=True)
-                    resolved_child.relative_to(resolved_root)
-                except (OSError, ValueError):
-                    candidates.append(
-                        _PluginCandidate(
-                            child.name,
-                            child,
-                            source_type,
-                            is_safe=False,
-                        )
-                    )
-                    continue
-                candidates.append(
-                    _PluginCandidate(child.name, resolved_child, source_type)
-                )
-        return tuple(candidates)
+        return discover_plugin_candidates(
+            self._plugins_config,
+            project_root=self._project_root,
+            user_plugin_root=self._user_plugin_root,
+            names=enabled,
+        )
 
     def _plugin_roots(
         self,
     ) -> tuple[tuple[Path, Literal["user", "search_path", "project"]], ...]:
-        roots: list[tuple[Path, Literal["user", "search_path", "project"]]] = [
-            (self._user_plugin_root, "user"),
-        ]
-        roots.extend(
-            (Path(value).expanduser(), "search_path")
-            for value in self._plugins_config["search_paths"]
+        return _plugin_roots_for_config(
+            self._plugins_config,
+            project_root=self._project_root,
+            user_plugin_root=self._user_plugin_root,
         )
-        if self._plugins_config["enable_project_plugins"]:
-            roots.append((self._project_root / ".my-hermes" / "plugins", "project"))
-        return tuple(roots)
 
     def _load_candidate(self, candidate: _PluginCandidate) -> PluginLoadResult:
         original_sys_path = tuple(sys.path)
@@ -345,6 +312,84 @@ class AsyncPluginRuntime(_PluginRuntimeBase):
         if not isinstance(registry, AsyncHookRegistry):
             raise TypeError("registry must be an AsyncHookRegistry")
         super().__init__(registry, **kwargs)
+
+
+def discover_plugin_candidates(
+    plugins_config: object,
+    *,
+    project_root: Path | None = None,
+    user_plugin_root: Path | None = None,
+    names: tuple[str, ...] | None = None,
+) -> tuple[_PluginCandidate, ...]:
+    """只发现目录，不导入模块；管理命令和 Runtime 共用此规则。"""
+    normalized = _validate_plugins_config(plugins_config)
+    project_root = (project_root or Path.cwd()).resolve()
+    if user_plugin_root is None:
+        from hermes.config import HERMES_HOME
+
+        user_plugin_root = HERMES_HOME / "plugins"
+    roots = _plugin_roots_for_config(
+        normalized,
+        project_root=project_root,
+        user_plugin_root=user_plugin_root.expanduser(),
+    )
+    allowed_names = set(names) if names is not None else None
+    candidates: list[_PluginCandidate] = []
+    seen_roots: set[Path] = set()
+    for root, source_type in roots:
+        try:
+            resolved_root = root.resolve(strict=False)
+        except OSError:
+            continue
+        if resolved_root in seen_roots or not root.is_dir():
+            continue
+        seen_roots.add(resolved_root)
+        try:
+            children = tuple(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if (
+                not child.is_dir()
+                or (allowed_names is not None and child.name not in allowed_names)
+            ):
+                continue
+            try:
+                resolved_child = child.resolve(strict=True)
+                resolved_child.relative_to(resolved_root)
+            except (OSError, ValueError):
+                candidates.append(
+                    _PluginCandidate(
+                        child.name,
+                        child,
+                        source_type,
+                        is_safe=False,
+                    )
+                )
+                continue
+            candidates.append(
+                _PluginCandidate(child.name, resolved_child, source_type)
+            )
+    return tuple(candidates)
+
+
+def _plugin_roots_for_config(
+    plugins_config: dict[str, object],
+    *,
+    project_root: Path,
+    user_plugin_root: Path,
+) -> tuple[tuple[Path, Literal["user", "search_path", "project"]], ...]:
+    """按统一配置生成允许扫描的 Plugin 根目录。"""
+    roots: list[tuple[Path, Literal["user", "search_path", "project"]]] = [
+        (user_plugin_root, "user"),
+    ]
+    roots.extend(
+        (Path(value).expanduser(), "search_path")
+        for value in plugins_config["search_paths"]
+    )
+    if plugins_config["enable_project_plugins"]:
+        roots.append((project_root / ".my-hermes" / "plugins", "project"))
+    return tuple(roots)
 
 
 def _validate_plugins_config(value: object) -> dict[str, object]:

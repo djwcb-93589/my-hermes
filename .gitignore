@@ -23,6 +23,7 @@ memories/
 数据脱敏和安全边界笔记.md
 *.md
 !README.md
+!docs/plugins.md
 !开发说明/*.md
 cache
 !README.md

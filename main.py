@@ -9,17 +9,12 @@ import asyncio
 import os
 import sys
 
-from hermes.cli_state_machine import CLIController, CLIEventQueue, CLIWorker
-from hermes.cli_ui import CLIInput, CLIUI, patched_cli_stdout
-from hermes.config import BASE_URL, BROWSER_CONFIG, HERMES_HOME, MODEL, _config
-from hermes.hooks import SyncHookRegistry
-from hermes.plugins import SyncPluginRuntime
-from hermes.prompt import build_system_prompt
-from hermes.session_resources import cleanup_all_session_resources
-from hermes.tools import ExecutionEnvironment, ToolPolicy, register_all, registry
 
 
 def _cli_tool_policy() -> ToolPolicy:
+    from hermes.config import BROWSER_CONFIG
+    from hermes.tools import ExecutionEnvironment, ToolPolicy, registry
+
     """只在配置启用时把 browser 加入当前 CLI 会话的工具边界。"""
     base_policy = ToolPolicy(ExecutionEnvironment.CLI)
     enabled_toolsets = set(registry.default_toolsets_for_policy(base_policy))
@@ -32,6 +27,15 @@ def _cli_tool_policy() -> ToolPolicy:
 
 
 def cli_loop() -> None:
+    from hermes.cli_state_machine import CLIController, CLIEventQueue, CLIWorker
+    from hermes.cli_ui import CLIInput, CLIUI, patched_cli_stdout
+    from hermes.config import BASE_URL, HERMES_HOME, MODEL, _config
+    from hermes.hooks import SyncHookRegistry
+    from hermes.plugins import SyncPluginRuntime
+    from hermes.prompt import build_system_prompt
+    from hermes.session_resources import cleanup_all_session_resources
+    from hermes.tools import register_all, registry
+
     """启动默认 CLI 的事件驱动输入、路由和单 worker 执行流程。"""
     register_all()
     hook_registry = SyncHookRegistry()
@@ -104,6 +108,10 @@ def cli_loop() -> None:
 
 
 def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "plugins":
+        from hermes.plugins.cli import run_plugins_command
+
+        raise SystemExit(run_plugins_command(sys.argv[2:]))
     if "--gateway" in sys.argv or "--gateway-unified" in sys.argv:
         # 统一 Gateway 入口（读取 config.yaml gateway.platforms）
         from hermes.gateway_entry import run_gateway
