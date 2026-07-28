@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime
 from typing import Callable
@@ -431,21 +432,41 @@ def handle_delegate(args, **kwargs) -> str:
 
     # ---------- 后台模式 ----------
     manager = get_delegate_job_manager()
-    if isinstance(hook_registry, SyncControlBridge):
-        # 成功提交后由 worker finally 释放；提交失败仍由当前分发 finally 收回。
-        hook_registry.retain_for_background_delegate()
     # runner 只捕获本次任务所需的运行时引用，避免跨模块读取 Job 私有字段。
     captured_runtime_refs: dict[str, object | None] = {
         "hook_registry": hook_registry,
         "parent_run_id": parent_run_id,
     }
+    startup_gate = threading.Event()
+    worker_accepted = {"value": False}
+
+    def release_submission_refs() -> None:
+        """提交未成功接管时由当前调用路径收回运行时引用。"""
+        runtime_registry = captured_runtime_refs["hook_registry"]
+        if isinstance(runtime_registry, SyncControlBridge):
+            runtime_registry.close()
+        captured_runtime_refs["hook_registry"] = None
+        captured_runtime_refs["parent_run_id"] = None
 
     def runner_factory(job):
         # 闭包绑定 cancel_checker:从 manager 查 job.cancel_requested
         job_id = job.job_id
 
         def runner() -> dict:
+            runtime_registry = None
             try:
+                startup_gate.wait()
+                if not worker_accepted["value"]:
+                    return {
+                        "ok": False,
+                        "status": "submit_failed",
+                        "summary": "",
+                        "iterations": 0,
+                        "tools_used": [],
+                        "tool_batches": 0,
+                        "tool_call_count": 0,
+                        "error": "background delegate submission failed",
+                    }
                 runtime_registry = captured_runtime_refs["hook_registry"]
                 runtime_parent_run_id = captured_runtime_refs["parent_run_id"]
                 return run_delegate_child(
@@ -471,25 +492,57 @@ def handle_delegate(args, **kwargs) -> str:
                 captured_runtime_refs["parent_run_id"] = None
         return runner
 
-    submit_result = manager.submit(
-        runner_factory=runner_factory,
-        goal=goal,
-        context=context,
-        toolsets=toolsets,
-        parent_session_key=parent_session_key,
-        child_session_key=child_session_key,
-        hook_registry=hook_registry,
-        parent_run_id=parent_run_id,
-    )
+    try:
+        submit_result = manager.submit(
+            runner_factory=runner_factory,
+            goal=goal,
+            context=context,
+            toolsets=toolsets,
+            parent_session_key=parent_session_key,
+            child_session_key=child_session_key,
+        )
+    except Exception:
+        worker_accepted["value"] = False
+        startup_gate.set()
+        release_submission_refs()
+        cleanup_backend(child_session_key)
+        return _json_dumps(
+            {
+                "ok": False,
+                "status": "submit_failed",
+                "error": "background delegate submission failed",
+            }
+        )
 
     if not submit_result["ok"]:
-        if isinstance(hook_registry, SyncControlBridge):
-            hook_registry.close()
+        worker_accepted["value"] = False
+        startup_gate.set()
+        release_submission_refs()
         # 并发上限拒绝:job 还没创建,但 child_session_key 已分配过,
         # 这里 cleanup 防止潜在泄漏(run_delegate_child 没被调用过,
         # backend 也没真正创建,但保险一道)。
         cleanup_backend(child_session_key)
         return _json_dumps(submit_result)
+
+    try:
+        if isinstance(hook_registry, SyncControlBridge):
+            # thread.start() 已成功返回后，才将桥接器所有权交给 worker。
+            hook_registry.retain_for_background_delegate()
+        worker_accepted["value"] = True
+    except Exception:
+        worker_accepted["value"] = False
+        release_submission_refs()
+        startup_gate.set()
+        cleanup_backend(child_session_key)
+        return _json_dumps(
+            {
+                "ok": False,
+                "status": "submit_failed",
+                "error": "background delegate submission failed",
+            }
+        )
+
+    startup_gate.set()
 
     print(f"  [delegate] background job={submit_result['job_id']} "
           f"child={child_session_key} goal={goal[:80]!r}")

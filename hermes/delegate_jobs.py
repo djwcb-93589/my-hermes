@@ -184,17 +184,35 @@ class DelegateJobManager:
             self._jobs[job_id] = job
 
         # 锁外构造 runner(避免 factory 内若有重操作会阻塞其它 submit)
-        runner = runner_factory(job)
+        try:
+            runner = runner_factory(job)
+            if not callable(runner):
+                raise TypeError("runner_factory must return a callable")
+        except Exception:
+            self._rollback_submission(job)
+            return {
+                "ok": False,
+                "status": "submit_failed",
+                "error": "background delegate runner setup failed",
+            }
 
-        thread = threading.Thread(
-            target=self._worker,
-            args=(job, runner),
-            name=f"delegate-worker-{job_id}",
-            daemon=True,
-        )
-        with self._lock:
-            job._thread = thread
-        thread.start()
+        try:
+            thread = threading.Thread(
+                target=self._worker,
+                args=(job, runner),
+                name=f"delegate-worker-{job_id}",
+                daemon=True,
+            )
+            with self._lock:
+                job._thread = thread
+            thread.start()
+        except Exception:
+            self._rollback_submission(job)
+            return {
+                "ok": False,
+                "status": "submit_failed",
+                "error": "background delegate worker failed to start",
+            }
 
         return {
             "ok": True,
@@ -202,6 +220,19 @@ class DelegateJobManager:
             "job_id": job_id,
             "child_session_key": child_session_key,
         }
+
+    def _rollback_submission(self, job: DelegateJob) -> None:
+        """撤销尚未交给 worker 的 Job，确保不会占用后台并发额度。"""
+        with self._lock:
+            job.status = "failed"
+            job.child_status = "submit_failed"
+            job.error = "background delegate submission failed"
+            job.finished_at = time.time()
+            job._hook_registry = None
+            job._parent_run_id = None
+            job._thread = None
+            if self._jobs.get(job.job_id) is job:
+                del self._jobs[job.job_id]
 
     def cancel(self, job_id: str) -> dict:
         """协作式取消:标记 cancel_requested,worker 在下一轮检查时退出。
