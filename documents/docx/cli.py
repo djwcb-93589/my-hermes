@@ -26,6 +26,10 @@ from .models import (
     FormatTextMatch,
     HeadingSpec,
     InspectDocumentRequest,
+    InsertBulletListAfter,
+    InsertHyperlinkAfter,
+    InsertImageAfter,
+    InsertNumberedListAfter,
     InsertParagraphAfter,
     InsertParagraphBefore,
     InsertTableAfter,
@@ -45,6 +49,9 @@ from .models import (
     TextRunSpec,
     UpdateParagraphProperties,
     UpdateDocumentMetadata,
+    UpdateFooterText,
+    UpdateHeaderText,
+    UpdatePageSetup,
 )
 from .runtime import NodeRuntime
 from .service import DocxService
@@ -524,6 +531,150 @@ def _parse_edit_operation(
             table_block_id=value.get("table_block_id"),
             row_index=value.get("row_index"),
         )
+    if operation_type == "insert_image_after":
+        _reject_unknown_keys(
+            value,
+            {
+                "type",
+                "block_id",
+                "image_path",
+                "width_px",
+                "height_px",
+                "alt_text",
+            },
+            f"第 {index} 个 insert_image_after",
+            "invalid_edit_operation",
+        )
+        _require_operation_keys(
+            value,
+            {"block_id", "image_path"},
+            index,
+            operation_type,
+        )
+        if (
+            not isinstance(value["image_path"], str)
+            or not value["image_path"]
+        ):
+            raise DocxError(
+                "invalid_edit_operation",
+                "insert_image_after.image_path 必须是非空路径字符串。",
+            )
+        return InsertImageAfter(
+            block_id=value["block_id"],
+            image_path=Path(value["image_path"]),
+            width_px=value.get("width_px"),
+            height_px=value.get("height_px"),
+            alt_text=value.get("alt_text"),
+        )
+    if operation_type == "insert_hyperlink_after":
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id", "text", "url"},
+            f"第 {index} 个 insert_hyperlink_after",
+            "invalid_edit_operation",
+        )
+        _require_operation_keys(
+            value,
+            {"block_id", "text", "url"},
+            index,
+            operation_type,
+        )
+        return InsertHyperlinkAfter(
+            block_id=value["block_id"],
+            text=value["text"],
+            url=value["url"],
+        )
+    if operation_type in {
+        "insert_bullet_list_after",
+        "insert_numbered_list_after",
+    }:
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id", "items"},
+            f"第 {index} 个 {operation_type}",
+            "invalid_edit_operation",
+        )
+        _require_operation_keys(
+            value,
+            {"block_id", "items"},
+            index,
+            operation_type,
+        )
+        operation_class = (
+            InsertBulletListAfter
+            if operation_type == "insert_bullet_list_after"
+            else InsertNumberedListAfter
+        )
+        return operation_class(
+            block_id=value["block_id"],
+            items=value["items"],
+        )
+    if operation_type == "update_page_setup":
+        _reject_unknown_keys(
+            value,
+            {
+                "type",
+                "section_index",
+                "page_size",
+                "orientation",
+                "margin_top_twips",
+                "margin_bottom_twips",
+                "margin_left_twips",
+                "margin_right_twips",
+            },
+            f"第 {index} 个 update_page_setup",
+            "invalid_edit_operation",
+        )
+        _require_operation_keys(
+            value,
+            {"section_index"},
+            index,
+            operation_type,
+        )
+        return UpdatePageSetup(
+            section_index=value["section_index"],
+            page_size=value.get("page_size"),
+            orientation=value.get("orientation"),
+            margin_top_twips=value.get("margin_top_twips"),
+            margin_bottom_twips=value.get("margin_bottom_twips"),
+            margin_left_twips=value.get("margin_left_twips"),
+            margin_right_twips=value.get("margin_right_twips"),
+        )
+    if operation_type == "update_header_text":
+        _reject_unknown_keys(
+            value,
+            {"type", "section_index", "text"},
+            f"第 {index} 个 update_header_text",
+            "invalid_edit_operation",
+        )
+        _require_operation_keys(
+            value,
+            {"section_index", "text"},
+            index,
+            operation_type,
+        )
+        return UpdateHeaderText(
+            section_index=value["section_index"],
+            text=value["text"],
+        )
+    if operation_type == "update_footer_text":
+        _reject_unknown_keys(
+            value,
+            {"type", "section_index", "text", "include_page_number"},
+            f"第 {index} 个 update_footer_text",
+            "invalid_edit_operation",
+        )
+        _require_operation_keys(
+            value,
+            {"section_index", "text"},
+            index,
+            operation_type,
+        )
+        return UpdateFooterText(
+            section_index=value["section_index"],
+            text=value["text"],
+            include_page_number=value.get("include_page_number", False),
+        )
     if operation_type == "update_document_metadata":
         _reject_unknown_keys(
             value,
@@ -536,6 +687,20 @@ def _parse_edit_operation(
         "invalid_edit_operation",
         f"第 {index} 个编辑操作 type 不受支持。",
     )
+
+
+def _require_operation_keys(
+    value: dict[str, Any],
+    required_keys: set[str],
+    operation_index: int,
+    operation_type: str,
+) -> None:
+    missing = sorted(required_keys - set(value))
+    if missing:
+        raise DocxError(
+            "invalid_edit_operation",
+            f"第 {operation_index} 个 {operation_type} 缺少必填字段。",
+        )
 
 
 def _parse_edit_runs(

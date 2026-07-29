@@ -11,16 +11,7 @@ from xml.sax.saxutils import quoteattr
 
 from .errors import DocxError
 from .package import DocxPackage
-
-
-_ALLOWED_REPLACEMENT_PARTS = frozenset(
-    {
-        "[Content_Types].xml",
-        "_rels/.rels",
-        "word/document.xml",
-        "docProps/core.xml",
-    }
-)
+from .package_mutation import PackageMutation, validate_package_mutation
 
 
 def write_original_package(package: DocxPackage, output_path: Path) -> None:
@@ -36,13 +27,11 @@ def write_original_package(package: DocxPackage, output_path: Path) -> None:
 def write_package(
     package: DocxPackage,
     output_path: Path,
-    replacements: dict[str, bytes],
+    mutation: PackageMutation,
 ) -> None:
-    """保留所有原 part 内容字节，仅替换受控 OOXML part。"""
+    """保留未修改 part 字节与 ZIP 属性，并应用受控 package mutation。"""
 
-    unknown_parts = set(replacements) - _ALLOWED_REPLACEMENT_PARTS
-    if unknown_parts:
-        raise DocxError("io_error", "编辑器尝试写入不受支持的 DOCX part。")
+    validate_package_mutation(package, mutation)
 
     written_parts: set[str] = set()
     try:
@@ -53,19 +42,24 @@ def write_package(
             allowZip64=True,
         ) as destination:
             for part_name in package.ordered_part_names:
+                if part_name in mutation.deletions:
+                    continue
                 if part_name in written_parts:
                     raise DocxError("invalid_docx_package", "DOCX 包含重复的 ZIP entry。")
                 written_parts.add(part_name)
                 source_info = package.get_part_info(part_name)
                 target_info = copy.copy(source_info)
-                payload = replacements.get(part_name)
+                payload = mutation.replacements.get(part_name)
                 if payload is None:
                     payload = package.read_part_bytes(part_name)
                 destination.writestr(target_info, payload)
 
-            for part_name, payload in replacements.items():
+            for part_name, payload in mutation.additions.items():
                 if part_name in written_parts:
-                    continue
+                    raise DocxError(
+                        "package_mutation_conflict",
+                        "addition 产生了重复 ZIP entry。",
+                    )
                 target_info = zipfile.ZipInfo(filename=part_name)
                 target_info.compress_type = zipfile.ZIP_DEFLATED
                 destination.writestr(target_info, payload)

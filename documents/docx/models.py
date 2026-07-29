@@ -331,6 +331,72 @@ class DeleteTableRow:
 
 
 @dataclass(frozen=True)
+class InsertImageAfter:
+    """在正文顶层 block 后插入本地 PNG/JPEG 图片段落。"""
+
+    block_id: str
+    image_path: Path
+    width_px: int | None = None
+    height_px: int | None = None
+    alt_text: str | None = None
+
+
+@dataclass(frozen=True)
+class InsertHyperlinkAfter:
+    """在正文顶层 block 后插入一个外部普通超链接段落。"""
+
+    block_id: str
+    text: str
+    url: str
+
+
+@dataclass(frozen=True)
+class InsertBulletListAfter:
+    """在正文顶层 block 后插入单级项目符号列表。"""
+
+    block_id: str
+    items: list[str]
+
+
+@dataclass(frozen=True)
+class InsertNumberedListAfter:
+    """在正文顶层 block 后插入独立编号的单级有序列表。"""
+
+    block_id: str
+    items: list[str]
+
+
+@dataclass(frozen=True)
+class UpdatePageSetup:
+    """修改明确 section 的页面大小、方向与四边页边距。"""
+
+    section_index: int
+    page_size: str | None = None
+    orientation: str | None = None
+    margin_top_twips: int | None = None
+    margin_bottom_twips: int | None = None
+    margin_left_twips: int | None = None
+    margin_right_twips: int | None = None
+
+
+@dataclass(frozen=True)
+class UpdateHeaderText:
+    """设置或清除明确 section 的 default 简单页眉。"""
+
+    section_index: int
+    text: str | None
+
+
+@dataclass(frozen=True)
+class UpdateFooterText:
+    """设置或清除明确 section 的 default 简单页脚。"""
+
+    section_index: int
+    text: str | None
+    include_page_number: bool = False
+
+
+@dataclass(frozen=True)
 class UpdateDocumentMetadata:
     """按显式字段集合更新基础核心属性。"""
 
@@ -350,6 +416,13 @@ EditOperation: TypeAlias = (
     | InsertTableAfter
     | AppendTableRow
     | DeleteTableRow
+    | InsertImageAfter
+    | InsertHyperlinkAfter
+    | InsertBulletListAfter
+    | InsertNumberedListAfter
+    | UpdatePageSetup
+    | UpdateHeaderText
+    | UpdateFooterText
     | UpdateDocumentMetadata
 )
 

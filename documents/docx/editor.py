@@ -61,7 +61,24 @@ from .models import (
     UpdateDocumentMetadata,
 )
 from .package import DocxPackage
+from .package_mutation import (
+    PackageMutation,
+    validate_package_mutation,
+    verify_package_mutation,
+)
 from .reader import DocxReader
+from .rich_content import (
+    EMPTY_RICH_CONTENT_PLAN,
+    PlannedRichBodyInsertion,
+    RICH_OPERATION_TYPES,
+    RichContentPlan,
+    ValidatedRichOperation,
+    prepare_rich_content_plan,
+    rich_operation_block_id,
+    validate_rich_operation,
+    validate_rich_operation_conflicts,
+    verify_rich_content_output,
+)
 from .search import build_match_id, iter_literal_matches
 from .textmap import (
     VisibleTextMap,
@@ -274,6 +291,7 @@ _ValidatedOperation = (
     | _ValidatedAppendTableRow
     | _ValidatedDeleteTableRow
     | _ValidatedMetadataOperation
+    | ValidatedRichOperation
 )
 
 
@@ -349,6 +367,7 @@ class _ExtendedEditPlan:
     format_groups: tuple[_PlannedFormatGroup, ...]
     table_insertions: tuple[_PlannedTableInsertion, ...]
     table_mutations: tuple[_PlannedTableMutation, ...]
+    rich_insertions: tuple[PlannedRichBodyInsertion, ...]
     structural_changed: bool
 
 
@@ -428,6 +447,8 @@ class DocxEditor:
         _require_revision(initial_snapshot.revision, expected_revision)
 
         replacements: dict[str, bytes] = {}
+        additions: dict[str, bytes] = {}
+        rich_plan = EMPTY_RICH_CONTENT_PLAN
         applied_edits = [
             AppliedEdit(
                 operation_index=operation.operation_index,
@@ -468,14 +489,43 @@ class DocxEditor:
                 body=body,
                 snapshot=initial_snapshot,
             )
+            metadata_context = _prepare_metadata_context(package, operations)
+            if metadata_context is not None:
+                for part_name, payload in _apply_metadata_edit(
+                    metadata_context
+                ).items():
+                    target = replacements if package.has_part(part_name) else additions
+                    target[part_name] = payload
+            content_types_payload = replacements.get(
+                _CONTENT_TYPES_PART,
+                package.read_xml_bytes(_CONTENT_TYPES_PART),
+            )
+            rich_operations = [
+                operation
+                for operation in operations
+                if isinstance(operation, RICH_OPERATION_TYPES)
+            ]
+            rich_plan = prepare_rich_content_plan(
+                package=package,
+                operations=rich_operations,
+                document_root=document_root,
+                body=body,
+                snapshot=initial_snapshot,
+                content_types_payload=content_types_payload,
+            )
+            _merge_rich_package_changes(
+                replacements,
+                additions,
+                rich_plan,
+            )
             extended_plan = _plan_extended_edits(
                 operations,
                 body=body,
                 snapshot=initial_snapshot,
+                rich_insertions=rich_plan.body_insertions,
             )
-            metadata_context = _prepare_metadata_context(package, operations)
 
-            document_changed = False
+            document_changed = rich_plan.document_changed
             for plan in planned_text_edits:
                 if _apply_text_edit(plan):
                     document_changed = True
@@ -510,17 +560,24 @@ class DocxEditor:
                     original_payload=document_original,
                 )
 
-            if metadata_context is not None:
-                replacements.update(_apply_metadata_edit(metadata_context))
+            mutation = PackageMutation(
+                replacements=replacements,
+                additions=additions,
+            )
+            validate_package_mutation(package, mutation)
 
-        changed = bool(replacements)
+        changed = bool(
+            mutation.replacements
+            or mutation.additions
+            or mutation.deletions
+        )
         temporary_output: Path | None = None
         try:
             with DocxPackage.open(source_path) as current_package:
                 _require_revision(current_package.revision, expected_revision)
                 temporary_output = create_temporary_output_path(output_path)
                 if changed:
-                    write_package(current_package, temporary_output, replacements)
+                    write_package(current_package, temporary_output, mutation)
                 else:
                     write_original_package(current_package, temporary_output)
 
@@ -539,6 +596,20 @@ class DocxEditor:
                 expected_state=expected_state,
                 output_body=output_body,
                 changed=changed,
+                expected_image_count=(
+                    initial_snapshot.image_count
+                    + rich_plan.added_image_count
+                ),
+            )
+            _verify_temporary_package(
+                source_path=source_path,
+                temporary_output=temporary_output,
+                expected_revision=expected_revision,
+                output_snapshot=output_snapshot,
+                initial_snapshot=initial_snapshot,
+                mutation=mutation,
+                rich_plan=rich_plan,
+                verify_rich=bool(rich_operations),
             )
             if overwrite:
                 commit_with_overwrite(temporary_output, output_path)
@@ -564,6 +635,34 @@ def edit_document(request: EditDocumentRequest) -> EditDocumentResult:
     """使用一次性 Editor 实例修改现有 DOCX。"""
 
     return DocxEditor().edit(request)
+
+
+def _merge_rich_package_changes(
+    replacements: dict[str, bytes],
+    additions: dict[str, bytes],
+    plan: RichContentPlan,
+) -> None:
+    """合并富内容 part，并只允许基于 metadata 结果继续更新 Content Types。"""
+
+    for part_name, payload in plan.replacements.items():
+        if part_name in additions:
+            raise DocxError(
+                "package_mutation_conflict",
+                "富内容 replacement 与已有 addition 冲突。",
+            )
+        if part_name in replacements and part_name != _CONTENT_TYPES_PART:
+            raise DocxError(
+                "package_mutation_conflict",
+                "多个编辑计划尝试替换同一个 DOCX part。",
+            )
+        replacements[part_name] = payload
+    for part_name, payload in plan.additions.items():
+        if part_name in replacements or part_name in additions:
+            raise DocxError(
+                "package_mutation_conflict",
+                "多个编辑计划尝试添加同一个 DOCX part。",
+            )
+        additions[part_name] = payload
 
 
 def _validate_request(
@@ -702,12 +801,25 @@ def _validate_operations(operations: list[object]) -> list[_ValidatedOperation]:
                 operation_index,
             )
         else:
-            raise DocxError(
-                "invalid_edit_operation",
-                f"第 {operation_index} 个编辑操作类型不受支持。",
+            rich_operation = validate_rich_operation(
+                operation,
+                operation_index,
             )
+            if rich_operation is None:
+                raise DocxError(
+                    "invalid_edit_operation",
+                    f"第 {operation_index} 个编辑操作类型不受支持。",
+                )
+            validated_operation = rich_operation
 
         validated.append(validated_operation)
+    validate_rich_operation_conflicts(
+        [
+            operation
+            for operation in validated
+            if isinstance(operation, RICH_OPERATION_TYPES)
+        ]
+    )
     _validate_operation_conflicts(validated)
     return validated
 
@@ -734,6 +846,8 @@ def _validated_operation_block_id(
         (_ValidatedAppendTableRow, _ValidatedDeleteTableRow),
     ):
         return operation.table_block_id
+    if isinstance(operation, RICH_OPERATION_TYPES):
+        return rich_operation_block_id(operation)
     return None
 
 
@@ -790,6 +904,10 @@ def _validate_operation_conflicts(
                 insertion_anchors.add(operation.block_id)
         elif isinstance(operation, _ValidatedInsertTable):
             insertion_anchors.add(operation.block_id)
+        elif isinstance(operation, RICH_OPERATION_TYPES):
+            block_id = rich_operation_block_id(operation)
+            if block_id is not None:
+                insertion_anchors.add(block_id)
         elif isinstance(operation, _ValidatedDeleteTableRow):
             row_target = (operation.table_block_id, operation.row_index)
             if row_target in deleted_rows:
@@ -1462,6 +1580,7 @@ def _plan_extended_edits(
     *,
     body: ElementTree.Element,
     snapshot: DocumentSnapshot,
+    rich_insertions: tuple[PlannedRichBodyInsertion, ...],
 ) -> _ExtendedEditPlan:
     body_locations = {
         location.block_id: location
@@ -1573,6 +1692,11 @@ def _plan_extended_edits(
         snapshot.paragraph_count
         - len(deleted_paragraphs)
         + len(paragraph_insertions)
+        + sum(
+            len(insertion.elements)
+            for insertion in rich_insertions
+            if all(element.tag == _W_PARAGRAPH for element in insertion.elements)
+        )
     )
     if deleted_paragraphs and final_paragraph_count < 1:
         raise DocxError(
@@ -1595,6 +1719,7 @@ def _plan_extended_edits(
         or deleted_paragraphs
         or table_insertions
         or table_mutations
+        or rich_insertions
     )
     return _ExtendedEditPlan(
         paragraph_insertions=tuple(paragraph_insertions),
@@ -1603,6 +1728,7 @@ def _plan_extended_edits(
         format_groups=tuple(format_groups),
         table_insertions=tuple(table_insertions),
         table_mutations=tuple(table_mutations),
+        rich_insertions=rich_insertions,
         structural_changed=structural_changed,
     )
 
@@ -2237,6 +2363,11 @@ def _apply_body_mutations(
         after_by_anchor.setdefault(id(insertion.anchor), []).append(
             (insertion.operation.operation_index, insertion.table)
         )
+    for insertion in plan.rich_insertions:
+        after_by_anchor.setdefault(id(insertion.anchor), []).extend(
+            (insertion.operation_index, element)
+            for element in insertion.elements
+        )
 
     deleted_ids = {id(paragraph) for paragraph in plan.deleted_paragraphs}
     new_children: list[ElementTree.Element] = []
@@ -2606,8 +2737,16 @@ def _build_expected_document_state(
     old_element_identities = {
         id(element) for element in original_block_elements.values()
     }
+    complex_inserted_element_ids = frozenset(
+        element_id
+        for insertion in extended_plan.rich_insertions
+        for element_id in insertion.complex_element_ids
+    )
     for block_id, element in current_block_elements.items():
-        if id(element) not in old_element_identities:
+        if (
+            id(element) not in old_element_identities
+            and id(element) not in complex_inserted_element_ids
+        ):
             editable_block_ids.add(block_id)
     for table_plan in extended_plan.table_mutations:
         new_table_id = remap_lookup.get(table_plan.table_block_id)
@@ -2741,6 +2880,43 @@ def _inspect_temporary_output(
         ) from exc
 
 
+def _verify_temporary_package(
+    *,
+    source_path: Path,
+    temporary_output: Path,
+    expected_revision: str,
+    output_snapshot: DocumentSnapshot,
+    initial_snapshot: DocumentSnapshot,
+    mutation: PackageMutation,
+    rich_plan: RichContentPlan,
+    verify_rich: bool,
+) -> None:
+    """复检 package mutation 字节保真及 P4.3 富内容关系。"""
+
+    with (
+        DocxPackage.open(source_path) as source_package,
+        DocxPackage.open(temporary_output) as output_package,
+    ):
+        _require_revision(source_package.revision, expected_revision)
+        if output_package.revision != output_snapshot.revision:
+            raise DocxError(
+                "edit_verification_failed",
+                "临时输出 package revision 与 Reader 结果不一致。",
+            )
+        verify_package_mutation(
+            source_package,
+            output_package,
+            mutation,
+        )
+        if verify_rich:
+            verify_rich_content_output(
+                package=output_package,
+                plan=rich_plan,
+                initial_snapshot=initial_snapshot,
+                output_snapshot=output_snapshot,
+            )
+
+
 def _read_temporary_output_body(
     temporary_output: Path,
     *,
@@ -2770,6 +2946,7 @@ def _verify_output(
     expected_state: _ExpectedDocumentState,
     output_body: ElementTree.Element,
     changed: bool,
+    expected_image_count: int,
 ) -> None:
     if changed and output_snapshot.revision == initial_snapshot.revision:
         raise DocxError(
@@ -2784,7 +2961,7 @@ def _verify_output(
     if (
         output_snapshot.paragraph_count != expected_state.paragraph_count
         or output_snapshot.table_count != expected_state.table_count
-        or output_snapshot.image_count != initial_snapshot.image_count
+        or output_snapshot.image_count != expected_image_count
         or output_snapshot.section_count != initial_snapshot.section_count
         or _snapshot_block_ids(output_snapshot) != expected_state.block_ids
         or _snapshot_top_level_sequence(output_snapshot)
