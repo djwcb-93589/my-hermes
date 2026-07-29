@@ -22,7 +22,7 @@ import random
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -112,6 +112,10 @@ from hermes.gateway.observability import (
     safe_route_digest,
 )
 from hermes.gateway.persistence import GatewayPersistence
+from hermes.gateway.progressive_output import (
+    ProgressiveReplyController,
+    load_progressive_output_config,
+)
 from hermes.persistence.gateway import delete_gateway_conversation_for_route
 from hermes.gateway.runtime_lease import GatewayRuntimeLease
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
@@ -564,6 +568,20 @@ class _GatewayAgentResult:
     failed: bool = False
     failure_type: str | None = None
     pending_steer: tuple[SteerEntry, ...] = ()
+    progressive_controller: ProgressiveReplyController | None = None
+
+
+class _GatewayAgentRunError(RuntimeError):
+    """携带展示控制器，同时保留未预期 Agent 异常的原始类型。"""
+
+    def __init__(
+        self,
+        original: Exception,
+        progressive_controller: ProgressiveReplyController,
+    ):
+        self.original = original
+        self.progressive_controller = progressive_controller
+        super().__init__(type(original).__name__)
 
 
 def _safe_audit_label(value: object) -> str:
@@ -787,6 +805,9 @@ class GatewayRunner:
         if not isinstance(gateway_cfg, dict):
             raise ValueError("gateway must be a mapping")
         self.busy_input_mode = load_gateway_busy_input_mode(gateway_cfg)
+        self.progressive_output_config = load_progressive_output_config(
+            gateway_cfg
+        )
         self.file_transfer_config = load_file_transfer_config(
             gateway_cfg,
             hermes_home=HERMES_HOME,
@@ -3539,6 +3560,7 @@ class GatewayRunner:
         ctx=None,
         generation: int | None = None,
         invalidation_event: asyncio.Event | None = None,
+        progressive_controller: ProgressiveReplyController | None = None,
     ) -> bool | None:
         """投递并逐片保存进度；``None`` 表示任务已取消或过期。"""
         while True:
@@ -3655,28 +3677,66 @@ class GatewayRunner:
                         outbox_id
                     ):
                         return None
-                    try:
-                        result = await adapter.send_prepared(
-                            outbox["chat_id"],
-                            payload,
-                            reply_to_message_id=outbox["reply_to_message_id"],
-                            thread_id=outbox["thread_id"],
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        print(
-                            "  [gateway:audit] event=outbox_send_error "
-                            f"{safe_route_digest(route_key)} "
-                            f"delivery_id={outbox_id} "
-                            f"lease_epoch={self._runtime_lease_epoch} "
-                            f"exception={type(exc).__name__}"
-                        )
-                        result = SendResult(
-                            success=False,
-                            error="internal_send_error",
-                            retryable=False,
-                        )
+                    result = None
+                    if (
+                        index == 0
+                        and progressive_controller is not None
+                        and progressive_controller.has_draft
+                        and progressive_controller.adapter is adapter
+                    ):
+                        try:
+                            result = await progressive_controller.finalize(
+                                payload
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            print(
+                                "  [gateway:audit] "
+                                "event=progressive_finalize_error "
+                                f"{safe_route_digest(route_key)} "
+                                f"delivery_id={outbox_id} "
+                                f"lease_epoch={self._runtime_lease_epoch} "
+                                f"exception={type(exc).__name__}"
+                            )
+                            result = SendResult(
+                                success=False,
+                                error="progressive_reply_finalize_failed",
+                                retryable=False,
+                            )
+                        progressive_controller = None
+                        if not result.success:
+                            print(
+                                "  [gateway:audit] "
+                                "event=progressive_finalize_fallback "
+                                f"{safe_route_digest(route_key)} "
+                                f"delivery_id={outbox_id} "
+                                f"lease_epoch={self._runtime_lease_epoch}"
+                            )
+                            result = None
+                    if result is None:
+                        try:
+                            result = await adapter.send_prepared(
+                                outbox["chat_id"],
+                                payload,
+                                reply_to_message_id=outbox["reply_to_message_id"],
+                                thread_id=outbox["thread_id"],
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            print(
+                                "  [gateway:audit] event=outbox_send_error "
+                                f"{safe_route_digest(route_key)} "
+                                f"delivery_id={outbox_id} "
+                                f"lease_epoch={self._runtime_lease_epoch} "
+                                f"exception={type(exc).__name__}"
+                            )
+                            result = SendResult(
+                                success=False,
+                                error="internal_send_error",
+                                retryable=False,
+                            )
 
                 if not result.success:
                     failed_result = result
@@ -5450,6 +5510,7 @@ class GatewayRunner:
         # 再次以 "cancelled" 调用,导致 adapter 收到重复状态通知。
         processing_finished = False
         agent_result = _GatewayAgentResult(None)
+        progressive_controller: ProgressiveReplyController | None = None
         try:
             if agent_task is None:
                 raw_agent_result = await self._run_agent(event, ctx)
@@ -5460,6 +5521,11 @@ class GatewayRunner:
             else:
                 # 保留嵌入式调用和既有 monkeypatch 返回纯文本的兼容性。
                 agent_result = _GatewayAgentResult(raw_agent_result)
+            progressive_controller = agent_result.progressive_controller
+            await self._close_progressive_controller(
+                progressive_controller,
+                abort=False,
+            )
             response = agent_result.response
             if (
                 ctx.delivery_generation == generation
@@ -5511,6 +5577,7 @@ class GatewayRunner:
                         ctx,
                         generation,
                         invalidation_event,
+                        progressive_controller=progressive_controller,
                     )
                 event_completed = True
                 await self._finish_processing_best_effort(
@@ -5580,6 +5647,7 @@ class GatewayRunner:
                     ctx,
                     generation,
                     invalidation_event,
+                    progressive_controller=progressive_controller,
                 )
                 if delivered:
                     event_completed = True
@@ -5626,6 +5694,7 @@ class GatewayRunner:
                     ctx,
                     generation,
                     invalidation_event,
+                    progressive_controller=progressive_controller,
                 )
                 if delivered:
                     event_completed = True
@@ -5639,7 +5708,18 @@ class GatewayRunner:
             abandoned = True
             print(f"  [gateway] {route_key}: task cancelled ({cancel_reason})")
         except Exception as exc:
-            print(f"  [gateway] {route_key} error: {type(exc).__name__}")
+            original_exc = exc
+            if isinstance(exc, _GatewayAgentRunError):
+                original_exc = exc.original
+                progressive_controller = exc.progressive_controller
+                await self._close_progressive_controller(
+                    progressive_controller,
+                    abort=False,
+                )
+            print(
+                f"  [gateway] {route_key} error: "
+                f"{type(original_exc).__name__}"
+            )
             drained_steer = self._close_and_drain_generation_steer(
                 ctx,
                 generation,
@@ -5656,6 +5736,7 @@ class GatewayRunner:
                     failed=agent_result.failed,
                     failure_type=agent_result.failure_type,
                     pending_steer=tuple(pending_by_id.values()),
+                    progressive_controller=progressive_controller,
                 )
             # 已有 outbox 时不能再发送第二条内部错误,否则可能与部分成功
             # 的正式回复重复。只有模型阶段尚未生成 outbox 才补错误回复。
@@ -5683,7 +5764,7 @@ class GatewayRunner:
                         )
                 else:
                     if existing_error_outbox is None:
-                        failure = self._safe_exception_result(exc)
+                        failure = self._safe_exception_result(original_exc)
                         try:
                             outbox = self._build_outbox(
                                 route_key,
@@ -5720,6 +5801,7 @@ class GatewayRunner:
                                 ctx,
                                 generation,
                                 invalidation_event,
+                                progressive_controller=progressive_controller,
                             )
                             if delivered:
                                 event_completed = True
@@ -5748,7 +5830,41 @@ class GatewayRunner:
                                         generation=generation,
                                     )
                                 )
+                    else:
+                        try:
+                            delivered = await self._deliver_outbox(
+                                route_key,
+                                delivery_event,
+                                delivery_id,
+                                ctx,
+                                generation,
+                                invalidation_event,
+                                progressive_controller=progressive_controller,
+                            )
+                            if delivered:
+                                event_completed = True
+                            elif delivered is None:
+                                cancel_reason = self._task_cancel_reason(
+                                    ctx,
+                                    generation,
+                                )
+                                abandoned = True
+                        except asyncio.CancelledError:
+                            cancel_reason = (
+                                self._task_cancel_reason(ctx, generation)
+                                or "cancelled"
+                            )
+                        except Exception as send_exc:
+                            print(
+                                f"  [gateway] {route_key}: persisted error "
+                                "outbox delivery failed "
+                                f"({type(send_exc).__name__})"
+                            )
         finally:
+            await self._close_progressive_controller(
+                progressive_controller,
+                abort=True,
+            )
             cancel_reason = self._refresh_task_cancel_reason(
                 ctx,
                 generation,
@@ -6033,6 +6149,63 @@ class GatewayRunner:
                 ),
             }, ensure_ascii=False), False
 
+    def _create_progressive_controller(
+        self,
+        event: MessageEvent,
+        ctx,
+        generation: int | None,
+    ) -> ProgressiveReplyController | None:
+        """为当前 generation 创建至多一个平台无关的渐进式控制器。"""
+        if (
+            not self.progressive_output_config.enabled
+            or generation is None
+        ):
+            return None
+        adapter = self.adapters.get(event.source.platform)
+        if (
+            adapter is None
+            or not adapter.supports_progressive_reply
+        ):
+            return None
+
+        def generation_is_valid() -> bool:
+            return (
+                ctx.generation == generation
+                and ctx.active_generation == generation
+                and self._task_cancel_reason(ctx, generation) is None
+                and not self._runtime_lease_blocks_delivery()
+            )
+
+        if not generation_is_valid():
+            return None
+        return ProgressiveReplyController(
+            route_key=ctx.route_key,
+            generation=generation,
+            event=event,
+            adapter=adapter,
+            config=self.progressive_output_config,
+            generation_is_valid=generation_is_valid,
+        )
+
+    @staticmethod
+    async def _close_progressive_controller(
+        controller: ProgressiveReplyController | None,
+        *,
+        abort: bool,
+    ) -> None:
+        """尽力回收展示任务，不让展示层异常覆盖 Agent 或 Outbox 结果。"""
+        if controller is None:
+            return
+        try:
+            if abort:
+                await controller.abort()
+            else:
+                await controller.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     async def _run_agent(
         self,
         event: MessageEvent,
@@ -6058,6 +6231,55 @@ class GatewayRunner:
         *,
         resume_from_history: bool = False,
         approval_resume_id: str | None = None,
+    ) -> _GatewayAgentResult:
+        """绑定单次运行的渐进式控制器，并保证异常路径回收后台任务。"""
+        progressive_holder: list[ProgressiveReplyController] = []
+        try:
+            result = await self._run_agent_async_impl(
+                event,
+                ctx,
+                resume_from_history=resume_from_history,
+                approval_resume_id=approval_resume_id,
+                progressive_holder=progressive_holder,
+            )
+        except asyncio.CancelledError:
+            if progressive_holder:
+                try:
+                    await progressive_holder[0].abort()
+                except BaseException:
+                    pass
+            raise
+        except Exception as exc:
+            if not progressive_holder:
+                raise
+            controller = progressive_holder[0]
+            try:
+                await controller.close()
+            except BaseException:
+                pass
+            raise _GatewayAgentRunError(exc, controller) from exc
+        except BaseException:
+            if progressive_holder:
+                try:
+                    await progressive_holder[0].abort()
+                except BaseException:
+                    pass
+            raise
+        if not progressive_holder:
+            return result
+        return replace(
+            result,
+            progressive_controller=progressive_holder[0],
+        )
+
+    async def _run_agent_async_impl(
+        self,
+        event: MessageEvent,
+        ctx,
+        *,
+        resume_from_history: bool = False,
+        approval_resume_id: str | None = None,
+        progressive_holder: list[ProgressiveReplyController],
     ) -> _GatewayAgentResult:
         """使用 AsyncOpenAI 跑主会话，数据库 hook 统一在线程执行。"""
         from hermes.db import ensure_session
@@ -6278,6 +6500,13 @@ class GatewayRunner:
                 route_key,
                 conversation_id,
             ))
+        progressive_controller = self._create_progressive_controller(
+            task_event,
+            ctx,
+            generation,
+        )
+        if progressive_controller is not None:
+            progressive_holder.append(progressive_controller)
         result = await run_conversation_async(
             event.text,
             None,
@@ -6299,6 +6528,11 @@ class GatewayRunner:
             tool_context=tool_context,
             tool_policy=tool_policy,
             steer_mailbox=steer_mailbox,
+            stream_sink=(
+                progressive_controller.feed
+                if progressive_controller is not None
+                else None
+            ),
         )
         acknowledged_steer_ids: set[str] = set()
         for steer_id in callback_steer_ids:

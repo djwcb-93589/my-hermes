@@ -28,6 +28,8 @@ class BasePlatformAdapter(ABC):
     旧子类只需继续实现 ``connect()``；默认 ``start_receiving()`` 会调用它。
     """
 
+    supports_progressive_reply: bool = False
+
     def __init__(self, platform_name: str):
         self.platform_name = platform_name
         self._on_message: Callable | None = None  # GatewayRunner 注入
@@ -150,6 +152,45 @@ class BasePlatformAdapter(ABC):
             reply_to_message_id=reply_to_message_id,
             thread_id=thread_id,
         )
+
+    async def start_progressive_reply(
+        self,
+        event: MessageEvent,
+        content: str,
+    ) -> SendResult:
+        """创建可编辑草稿；默认平台保持不支持。"""
+        return SendResult(
+            success=False,
+            error="progressive_reply_unsupported",
+            retryable=False,
+        )
+
+    async def update_progressive_reply(
+        self,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """更新可编辑草稿；默认平台保持不支持。"""
+        return SendResult(
+            success=False,
+            error="progressive_reply_unsupported",
+            retryable=False,
+        )
+
+    async def finalize_progressive_reply(
+        self,
+        message_id: str,
+        prepared_payload: dict,
+    ) -> SendResult:
+        """用最终 Outbox payload 完成草稿；默认平台保持不支持。"""
+        return SendResult(
+            success=False,
+            error="progressive_reply_unsupported",
+            retryable=False,
+        )
+
+    def release_progressive_reply(self, message_id: str) -> None:
+        """释放进程内草稿所有权；默认平台无需清理。"""
 
     async def handle_message(self, event: MessageEvent):
         """把翻译好的 event 转发给 GatewayRunner 回调。"""

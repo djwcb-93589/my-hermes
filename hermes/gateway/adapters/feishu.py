@@ -289,6 +289,7 @@ class FeishuAdapter(BasePlatformAdapter):
     """飞书 Webhook 消息 adapter。"""
 
     PLATFORM = "feishu"
+    supports_progressive_reply = True
 
     def __init__(
         self,
@@ -513,6 +514,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # 从而不突破 key 上限，也不删除仍有 waiter 的 lock。
         self._send_rate_overflow_lock = asyncio.Lock()
         self._send_rate_overflow_timestamps: deque[float] = deque()
+        # 仅保留本进程创建的可编辑草稿及其 chat，用于所有权校验和限速。
+        self._progressive_reply_chats: dict[str, str] = {}
+        self._progressive_reply_contents: dict[str, str] = {}
         # reaction 仅作为进程内用户体验状态，不进入 Inbox 或 Outbox。
         self._processing_reactions: OrderedDict[str, str] = OrderedDict()
         self._processing_attempts: OrderedDict[str, None] = OrderedDict()
@@ -3479,6 +3483,115 @@ class FeishuAdapter(BasePlatformAdapter):
             message_ids=message_ids,
         )
 
+    async def start_progressive_reply(
+        self,
+        event: MessageEvent,
+        content: str,
+    ) -> SendResult:
+        """回复当前触发消息，并创建一条仅在本进程内跟踪的可编辑草稿。"""
+        if not self._http:
+            return SendResult(
+                success=False,
+                error="adapter_unavailable",
+                retryable=True,
+            )
+        if not isinstance(content, str) or not content:
+            return SendResult(
+                success=False,
+                error="invalid_progressive_content",
+                retryable=False,
+            )
+        payload = self.prepare_outbound(
+            content,
+            delivery_id=f"progressive:{uuid.uuid4().hex}",
+        )[0]
+        result = await self.send_prepared(
+            event.source.chat_id,
+            payload,
+            reply_to_message_id=event.message_id,
+            thread_id=event.source.thread_id,
+            allow_direct_fallback=False,
+        )
+        if not result.success:
+            return result
+        message_id = str(result.message_id or "").strip()
+        if not message_id:
+            return SendResult(
+                success=False,
+                error="progressive_reply_id_missing",
+                retryable=False,
+            )
+        self._progressive_reply_chats[message_id] = event.source.chat_id
+        self._progressive_reply_contents[message_id] = str(
+            payload["content"]
+        )
+        return result
+
+    async def update_progressive_reply(
+        self,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """用字节安全的首个 post 分片更新当前进程创建的草稿。"""
+        if message_id not in self._progressive_reply_chats:
+            return SendResult(
+                success=False,
+                error="progressive_reply_not_owned",
+                retryable=False,
+            )
+        if not isinstance(content, str) or not content:
+            self.release_progressive_reply(message_id)
+            return SendResult(
+                success=False,
+                error="invalid_progressive_content",
+                retryable=False,
+            )
+        payload = self.prepare_outbound(
+            content,
+            delivery_id=f"progressive:{message_id}",
+        )[0]
+        result = await self._edit_progressive_reply(message_id, payload)
+        if not result.success:
+            self.release_progressive_reply(message_id)
+        return result
+
+    async def finalize_progressive_reply(
+        self,
+        message_id: str,
+        prepared_payload: dict,
+    ) -> SendResult:
+        """用持久化 Outbox 的精确首分片完成草稿。"""
+        if message_id not in self._progressive_reply_chats:
+            return SendResult(
+                success=False,
+                error="progressive_reply_not_owned",
+                retryable=False,
+            )
+        if (
+            not isinstance(prepared_payload, dict)
+            or prepared_payload.get("msg_type") != "post"
+            or not isinstance(prepared_payload.get("content"), str)
+            or not prepared_payload["content"]
+        ):
+            self.release_progressive_reply(message_id)
+            return SendResult(
+                success=False,
+                error="invalid_outbox_payload",
+                retryable=False,
+            )
+        try:
+            return await self._edit_progressive_reply(
+                message_id,
+                prepared_payload,
+            )
+        finally:
+            self.release_progressive_reply(message_id)
+
+    def release_progressive_reply(self, message_id: str) -> None:
+        """忘记草稿的进程内所有权，不执行平台网络操作。"""
+        self._progressive_reply_chats.pop(str(message_id or ""), None)
+        self._progressive_reply_contents.pop(str(message_id or ""), None)
+
     async def send_prepared(
         self,
         chat_id: str,
@@ -3486,6 +3599,7 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         reply_to_message_id: str | None = None,
         thread_id: str | None = None,
+        allow_direct_fallback: bool = True,
     ) -> SendResult:
         """发送一个已经确定格式和 UUID 的飞书消息分片。"""
         if not self._http:
@@ -3620,6 +3734,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     continue
                 if (
                     can_downgrade_reply
+                    and allow_direct_fallback
                     and delivery_mode in {"thread_reply", "reply"}
                     and code in FEISHU_REPLY_TARGET_MISSING_CODES
                 ):
@@ -3677,6 +3792,128 @@ class FeishuAdapter(BasePlatformAdapter):
                 await asyncio.sleep(max(0.0, delay))
 
         return last_result
+
+    async def _edit_progressive_reply(
+        self,
+        message_id: str,
+        payload: dict,
+    ) -> SendResult:
+        """编辑一条已登记草稿，复用 token、错误分类和 chat 级限速。"""
+        if not self._http:
+            return SendResult(
+                success=False,
+                error="adapter_unavailable",
+                retryable=True,
+            )
+        chat_id = self._progressive_reply_chats.get(message_id)
+        if not chat_id:
+            return SendResult(
+                success=False,
+                error="progressive_reply_not_owned",
+                retryable=False,
+            )
+        msg_type = payload.get("msg_type")
+        message_content = payload.get("content")
+        if (
+            msg_type != "post"
+            or not isinstance(message_content, str)
+            or not message_content
+        ):
+            return SendResult(
+                success=False,
+                error="invalid_outbox_payload",
+                retryable=False,
+            )
+        if self._progressive_reply_contents.get(message_id) == message_content:
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                sent_chunks=1,
+                total_chunks=1,
+                message_ids=[message_id],
+            )
+
+        token_refreshed = False
+        force_token_refresh = False
+        while True:
+            token_result = await self._refresh_token(
+                force=force_token_refresh,
+            )
+            force_token_refresh = False
+            if not token_result.success:
+                return SendResult(
+                    success=False,
+                    error=token_result.error or "token_unavailable",
+                    error_code=token_result.error_code,
+                    retryable=token_result.retryable,
+                    retry_after_seconds=token_result.retry_after_seconds,
+                )
+            token = token_result.token
+            try:
+                await self._wait_send_slot(chat_id)
+                response = await self._http.put(
+                    f"{self.api_base}/im/v1/messages/{message_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "msg_type": "post",
+                        "content": message_content,
+                    },
+                )
+                try:
+                    data = response.json()
+                except (TypeError, ValueError):
+                    data = {}
+                raw_code = data.get("code")
+                code = self._normalize_error_code(raw_code)
+                if code == 0:
+                    self._progressive_reply_contents[message_id] = (
+                        message_content
+                    )
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        sent_chunks=1,
+                        total_chunks=1,
+                        message_ids=[message_id],
+                    )
+
+                error, retryable, refresh_token = self._classify_send_error(
+                    response.status_code,
+                    code,
+                )
+                last_result = SendResult(
+                    success=False,
+                    error=error,
+                    error_code=(
+                        str(raw_code) if raw_code is not None else None
+                    ),
+                    retryable=retryable,
+                )
+                if refresh_token and not token_refreshed:
+                    await self._invalidate_token(token)
+                    token_refreshed = True
+                    force_token_refresh = True
+                    continue
+                if not retryable:
+                    return last_result
+                (
+                    _retry_after,
+                    _defer_to_runner,
+                    durable_retry_after,
+                ) = self._bounded_retry_after(response.headers)
+                last_result.retry_after_seconds = durable_retry_after
+                # 渐进式编辑失败即关闭本次预览，避免内部重试消耗飞书的
+                # 单消息编辑次数；最终回答仍由持久 Outbox 兜底。
+                return last_result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_result = self._classify_transport_exception(exc)
+                print(
+                    "  [feishu] progressive edit failed "
+                    f"({type(exc).__name__})"
+                )
+                return last_result
 
     def _cleanup_send_rate_cache(self, now: float, *, for_capacity: bool) -> None:
         """按 TTL 清理 chat 限速状态；容量不足时再淘汰空闲 LRU。"""
