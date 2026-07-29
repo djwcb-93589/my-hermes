@@ -3,7 +3,7 @@
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, final
 
 from .contracts import (
     ActionEffect,
@@ -15,7 +15,11 @@ from .contracts import (
     DeliveryMode,
     WindowInfo,
 )
-from .errors import BackendUnavailableError
+from .errors import (
+    BackendStartError,
+    BackendUnavailableError,
+    ComputerUseError,
+)
 
 
 type _BackendState = Literal["created", "started", "stopped"]
@@ -24,8 +28,9 @@ type _BackendState = Literal["created", "started", "stopped"]
 class ComputerUseBackend(ABC):
     """跨平台 Computer Use Backend 的统一抽象基类。
 
-    子类通过 ``_start`` 和 ``_stop`` 实现具体生命周期逻辑。所有抽象操作
-    的实现都必须在访问底层驱动前调用 ``_ensure_started``。
+    子类实现 ``_start``、``_stop`` 以及 ``_capture``、``_click`` 等
+    受保护操作。公共操作方法由基类统一检查生命周期后再调用受保护实现，
+    子类不需要也不应重复调用 ``_ensure_started``。
     """
 
     def __init__(self) -> None:
@@ -39,14 +44,25 @@ class ComputerUseBackend(ABC):
 
         return self._state
 
+    @final
     def start(self) -> None:
         """启动 Backend，并仅在成功后进入 ``started`` 状态。"""
 
         if self._state == "started":
             return
-        self._start()
-        self._state = "started"
+        try:
+            self._start()
+        except ComputerUseError:
+            raise
+        except Exception as exc:
+            raise BackendStartError(
+                "Failed to start Computer Use backend.",
+                details={"exception_type": type(exc).__name__},
+            ) from exc
+        else:
+            self._state = "started"
 
+    @final
     def stop(self) -> None:
         """停止 Backend；未启动或重复停止均安全返回。"""
 
@@ -85,7 +101,7 @@ class ComputerUseBackend(ABC):
                 details={"state": self._state},
             )
 
-    @abstractmethod
+    @final
     def capture(
         self,
         mode: CaptureMode = CaptureMode.SOM,
@@ -94,11 +110,31 @@ class ComputerUseBackend(ABC):
         window_id: int | None = None,
         max_elements: int = 100,
     ) -> CaptureResult:
-        """捕获目标界面；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后捕获目标界面。"""
+
+        self._ensure_started()
+        return self._capture(
+            mode=mode,
+            app=app,
+            pid=pid,
+            window_id=window_id,
+            max_elements=max_elements,
+        )
+
+    @abstractmethod
+    def _capture(
+        self,
+        mode: CaptureMode = CaptureMode.SOM,
+        app: str | None = None,
+        pid: int | None = None,
+        window_id: int | None = None,
+        max_elements: int = 100,
+    ) -> CaptureResult:
+        """执行子类特定的界面捕获。"""
 
         ...
 
-    @abstractmethod
+    @final
     def click(
         self,
         element: int | None = None,
@@ -110,11 +146,37 @@ class ComputerUseBackend(ABC):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """点击元素或坐标；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后点击元素或坐标。"""
+
+        self._ensure_started()
+        return self._click(
+            element=element,
+            coordinate=coordinate,
+            button=button,
+            click_count=click_count,
+            modifiers=modifiers,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            capture_after=capture_after,
+        )
+
+    @abstractmethod
+    def _click(
+        self,
+        element: int | None = None,
+        coordinate: tuple[int, int] | None = None,
+        button: str = "left",
+        click_count: int = 1,
+        modifiers: Sequence[str] | None = None,
+        delivery_mode: DeliveryMode = DeliveryMode.BACKGROUND,
+        bring_to_front: bool = False,
+        capture_after: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的点击操作。"""
 
         ...
 
-    @abstractmethod
+    @final
     def drag(
         self,
         from_element: int | None = None,
@@ -127,11 +189,39 @@ class ComputerUseBackend(ABC):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """在元素或坐标之间拖动；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后在元素或坐标之间拖动。"""
+
+        self._ensure_started()
+        return self._drag(
+            from_element=from_element,
+            to_element=to_element,
+            from_coordinate=from_coordinate,
+            to_coordinate=to_coordinate,
+            button=button,
+            modifiers=modifiers,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            capture_after=capture_after,
+        )
+
+    @abstractmethod
+    def _drag(
+        self,
+        from_element: int | None = None,
+        to_element: int | None = None,
+        from_coordinate: tuple[int, int] | None = None,
+        to_coordinate: tuple[int, int] | None = None,
+        button: str = "left",
+        modifiers: Sequence[str] | None = None,
+        delivery_mode: DeliveryMode = DeliveryMode.BACKGROUND,
+        bring_to_front: bool = False,
+        capture_after: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的拖动操作。"""
 
         ...
 
-    @abstractmethod
+    @final
     def scroll(
         self,
         direction: str,
@@ -143,11 +233,37 @@ class ComputerUseBackend(ABC):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """在目标位置滚动；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后在目标位置滚动。"""
+
+        self._ensure_started()
+        return self._scroll(
+            direction=direction,
+            amount=amount,
+            element=element,
+            coordinate=coordinate,
+            modifiers=modifiers,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            capture_after=capture_after,
+        )
+
+    @abstractmethod
+    def _scroll(
+        self,
+        direction: str,
+        amount: int,
+        element: int | None = None,
+        coordinate: tuple[int, int] | None = None,
+        modifiers: Sequence[str] | None = None,
+        delivery_mode: DeliveryMode = DeliveryMode.BACKGROUND,
+        bring_to_front: bool = False,
+        capture_after: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的滚动操作。"""
 
         ...
 
-    @abstractmethod
+    @final
     def type_text(
         self,
         text: str,
@@ -155,11 +271,29 @@ class ComputerUseBackend(ABC):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """输入文本；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后输入文本。"""
+
+        self._ensure_started()
+        return self._type_text(
+            text=text,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            capture_after=capture_after,
+        )
+
+    @abstractmethod
+    def _type_text(
+        self,
+        text: str,
+        delivery_mode: DeliveryMode = DeliveryMode.BACKGROUND,
+        bring_to_front: bool = False,
+        capture_after: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的文本输入。"""
 
         ...
 
-    @abstractmethod
+    @final
     def key(
         self,
         keys: Sequence[str],
@@ -167,43 +301,106 @@ class ComputerUseBackend(ABC):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """发送按键序列；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后发送按键序列。"""
+
+        self._ensure_started()
+        return self._key(
+            keys=keys,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            capture_after=capture_after,
+        )
+
+    @abstractmethod
+    def _key(
+        self,
+        keys: Sequence[str],
+        delivery_mode: DeliveryMode = DeliveryMode.BACKGROUND,
+        bring_to_front: bool = False,
+        capture_after: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的按键操作。"""
 
         ...
 
-    @abstractmethod
+    @final
     def list_apps(self) -> list[AppInfo]:
-        """列出可访问应用；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后列出可访问应用。"""
+
+        self._ensure_started()
+        return self._list_apps()
+
+    @abstractmethod
+    def _list_apps(self) -> list[AppInfo]:
+        """执行子类特定的应用枚举。"""
 
         ...
 
-    @abstractmethod
+    @final
     def list_windows(self) -> list[WindowInfo]:
-        """列出可访问窗口；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后列出可访问窗口。"""
+
+        self._ensure_started()
+        return self._list_windows()
+
+    @abstractmethod
+    def _list_windows(self) -> list[WindowInfo]:
+        """执行子类特定的窗口枚举。"""
 
         ...
 
-    @abstractmethod
+    @final
     def focus_app(
         self,
         app: str,
         raise_window: bool = False,
     ) -> ActionResult:
-        """聚焦目标应用；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后聚焦目标应用。"""
+
+        self._ensure_started()
+        return self._focus_app(
+            app=app,
+            raise_window=raise_window,
+        )
+
+    @abstractmethod
+    def _focus_app(
+        self,
+        app: str,
+        raise_window: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的应用聚焦。"""
 
         ...
 
-    @abstractmethod
+    @final
     def set_value(
         self,
         value: str,
         element: int | None = None,
         capture_after: bool = False,
     ) -> ActionResult:
-        """直接设置界面元素值；实现必须先检查 Backend 已启动。"""
+        """检查生命周期后直接设置界面元素值。"""
+
+        self._ensure_started()
+        return self._set_value(
+            value=value,
+            element=element,
+            capture_after=capture_after,
+        )
+
+    @abstractmethod
+    def _set_value(
+        self,
+        value: str,
+        element: int | None = None,
+        capture_after: bool = False,
+    ) -> ActionResult:
+        """执行子类特定的元素值设置。"""
 
         ...
 
+    @final
     def wait(self, seconds: float) -> ActionResult:
         """等待至多 30 秒并返回标准动作结果。"""
 
