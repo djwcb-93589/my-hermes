@@ -92,6 +92,7 @@ def _result(
     tool_call_count: int = 0,
     child_session_key: str = "",
     error: str | None = None,
+    error_type: str | None = None,
 ) -> str:
     """构造统一 JSON 返回。"""
     return json.dumps({
@@ -104,7 +105,22 @@ def _result(
         "tool_call_count": tool_call_count,
         "child_session_key": child_session_key,
         "error": error,
+        "error_type": error_type,
     }, ensure_ascii=False)
+
+
+def _combine_cancel_checkers(
+    *checkers: Callable[[], bool] | None,
+) -> Callable[[], bool] | None:
+    """组合实时取消检查器，任意一个返回真值即视为取消。"""
+    active_checkers = tuple(checker for checker in checkers if callable(checker))
+    if not active_checkers:
+        return None
+
+    def combined_checker() -> bool:
+        return any(bool(checker()) for checker in active_checkers)
+
+    return combined_checker
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +276,19 @@ def run_delegate_child(
     里保证执行,无论成功 / 异常 / 取消 / max_iter。
     """
     try:
+        if callable(cancel_checker) and bool(cancel_checker()):
+            return {
+                "ok": False,
+                "status": "cancelled",
+                "error_type": "cancelled",
+                "summary": "",
+                "iterations": 0,
+                "tools_used": [],
+                "tool_batches": 0,
+                "tool_call_count": 0,
+                "error": "cancel requested",
+            }
+
         resolution = _resolve_delegate_tools(toolsets)
         if not resolution.definitions:
             return {
@@ -295,6 +324,7 @@ def run_delegate_child(
             "tools_used": list(result.tools_used),
             "tool_batches": result.tool_batches,
             "tool_call_count": result.tool_call_count,
+            "error_type": result.error_type,
             "error": result.error,
         }
     except Exception as exc:
@@ -398,12 +428,22 @@ def handle_delegate(args, **kwargs) -> str:
         child_tool_context["cron_capability_guard"] = kwargs[
             "cron_capability_guard"
         ]
-    child_cancel_checker = None
+    parent_cancel_checker = kwargs.get("cancel_checker")
+    if not callable(parent_cancel_checker):
+        parent_cancel_checker = None
+
+    cron_cancel_checker = None
     cron_context = kwargs.get("cron_execution_context")
     if cron_context is not None:
-        child_cancel_checker = cron_context.cancel_checker
+        candidate = getattr(cron_context, "cancel_checker", None)
+        if callable(candidate):
+            cron_cancel_checker = candidate
 
     if not background:
+        child_cancel_checker = _combine_cancel_checkers(
+            parent_cancel_checker,
+            cron_cancel_checker,
+        )
         # ---------- 同步模式 ----------
         print(f"  [delegate] sync child={child_session_key} goal={goal[:80]!r}")
         try:
@@ -428,6 +468,7 @@ def handle_delegate(args, **kwargs) -> str:
             tool_call_count=r["tool_call_count"],
             child_session_key=child_session_key,
             error=r["error"],
+            error_type=r.get("error_type"),
         )
 
     # ---------- 后台模式 ----------
@@ -660,6 +701,7 @@ def register(registry):
         approval_mode="none",
         risk_level="high",
         default_enabled_environments=("cli", "cron"),
+        supports_cancellation=True,
     )
     registry.register(
         name="delegate_status",
