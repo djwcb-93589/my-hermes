@@ -179,6 +179,18 @@ gateway:
   queue_full_reply_max_attempts: 3
   # readiness 的 DB 读写/lease 探针短缓存，避免健康检查制造持续写锁。
   readiness_probe_cache_seconds: 1.0
+  # 飞书渐进式流式输出；仅对声明支持编辑能力的平台生效。
+  progressive_output:
+    # 默认启用；设为 false 时恢复为最终答案一次性发送。
+    enabled: true
+    # 收到首个正文 delta 后，创建草稿前的等待时间。
+    initial_delay_seconds: 0.3
+    # 两次中间编辑之间的最小间隔。
+    min_update_interval_seconds: 1.0
+    # 同一模型回合新增正文达到该字符数后才触发中间编辑。
+    min_chars_delta: 24
+    # 中间编辑次数上限；保留最终 Outbox 收口的编辑机会。
+    max_intermediate_edits: 18
   # 平台无关的文件传输边界；入站下载和受审批的出站发送均走持久任务。
   file_transfer:
     # 默认关闭；开启后允许飞书附件下载和普通 file 上传发送。

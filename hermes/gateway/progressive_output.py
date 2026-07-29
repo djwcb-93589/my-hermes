@@ -15,9 +15,9 @@ from hermes.model_streaming import StreamEvent
 
 @dataclass(frozen=True)
 class ProgressiveOutputConfig:
-    """渐进式输出配置；默认关闭以保持原有一次性发送行为。"""
+    """渐进式输出配置；默认启用，可通过配置恢复原有一次性发送行为。"""
 
-    enabled: bool = False
+    enabled: bool = True
     initial_delay_seconds: float = 0.3
     min_update_interval_seconds: float = 1.0
     min_chars_delta: int = 24
@@ -82,7 +82,7 @@ def load_progressive_output_config(
     if not isinstance(raw, dict):
         raise ValueError("gateway.progressive_output must be a mapping")
 
-    enabled = raw.get("enabled", False)
+    enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(
             "gateway.progressive_output.enabled must be a boolean"
