@@ -113,6 +113,7 @@ class CuaDriverClient:
 
             self._prepare_start()
             try:
+                self._validate_cwd()
                 process = subprocess.Popen(
                     list(self._config.command),
                     stdin=subprocess.PIPE,
@@ -251,6 +252,23 @@ class CuaDriverClient:
             self._transport_error = None
         with self._stderr_lock:
             self._stderr_lines.clear()
+
+    def _validate_cwd(self) -> None:
+        """在启动子进程前确认工作目录存在且为目录。"""
+
+        cwd = self._config.cwd
+        if cwd is None:
+            return
+        try:
+            path = Path(cwd)
+            is_available = path.exists() and path.is_dir()
+        except (OSError, ValueError):
+            is_available = False
+        if not is_available:
+            raise BackendStartError(
+                "cua-driver working directory is unavailable.",
+                details={"reason": "invalid_cwd"},
+            )
 
     def _start_reader_threads(
         self,
@@ -495,7 +513,7 @@ class CuaDriverClient:
             return
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except json.JSONDecodeError:
             self._set_transport_error(
                 ProtocolError(
                     "cua-driver returned invalid JSON.",
@@ -523,10 +541,24 @@ class CuaDriverClient:
                 process,
             )
             return
-        if "id" not in payload or type(payload["id"]) is not int:
+
+        if "method" in payload:
+            self._handle_server_message(payload, process)
+            return
+
+        if "id" not in payload:
             self._set_transport_error(
                 ProtocolError(
-                    "cua-driver response is missing a valid request ID.",
+                    "cua-driver response is missing a request ID.",
+                    details={"reason": "missing_response_id"},
+                ),
+                process,
+            )
+            return
+        if type(payload["id"]) is not int:
+            self._set_transport_error(
+                ProtocolError(
+                    "cua-driver response has an invalid request ID.",
                     details={"reason": "invalid_response_id"},
                 ),
                 process,
@@ -591,6 +623,62 @@ class CuaDriverClient:
             ),
             process,
         )
+
+    def _handle_server_message(
+        self,
+        payload: Mapping[str, Any],
+        process: subprocess.Popen[str],
+    ) -> None:
+        """忽略服务端通知并响应服务端请求。"""
+
+        method = payload["method"]
+        if not isinstance(method, str):
+            self._set_transport_error(
+                ProtocolError(
+                    "cua-driver message has an invalid method.",
+                    details={"reason": "invalid_method"},
+                ),
+                process,
+            )
+            return
+
+        if "id" not in payload:
+            return
+
+        request_id = payload["id"]
+        if not (
+            isinstance(request_id, str)
+            or type(request_id) is int
+        ):
+            self._set_transport_error(
+                ProtocolError(
+                    "cua-driver request has an invalid request ID.",
+                    details={"reason": "invalid_server_request_id"},
+                ),
+                process,
+            )
+            return
+
+        if method == "ping":
+            response: dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {},
+            }
+        else:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found",
+                },
+            }
+
+        try:
+            self._send_message(response, process)
+        except ComputerUseError:
+            return
 
     def _resolve_pending(
         self,
