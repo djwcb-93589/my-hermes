@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree
@@ -33,7 +34,6 @@ _W_TABLE = f"{{{_W_NS}}}tbl"
 _W_SECTION_PROPERTIES = f"{{{_W_NS}}}sectPr"
 _W_RUN = f"{{{_W_NS}}}r"
 _W_TEXT = f"{{{_W_NS}}}t"
-_W_DELETED_TEXT = f"{{{_W_NS}}}delText"
 _W_TAB = f"{{{_W_NS}}}tab"
 _W_BREAK = f"{{{_W_NS}}}br"
 _W_CARRIAGE_RETURN = f"{{{_W_NS}}}cr"
@@ -52,6 +52,12 @@ _W_INSERTION = f"{{{_W_NS}}}ins"
 _W_DELETION = f"{{{_W_NS}}}del"
 _W_MOVE_FROM = f"{{{_W_NS}}}moveFrom"
 _W_MOVE_TO = f"{{{_W_NS}}}moveTo"
+_W_RUN_PROPERTIES_CHANGE = f"{{{_W_NS}}}rPrChange"
+_W_PARAGRAPH_PROPERTIES_CHANGE = f"{{{_W_NS}}}pPrChange"
+_W_TABLE_PROPERTIES_CHANGE = f"{{{_W_NS}}}tblPrChange"
+_W_ROW_PROPERTIES_CHANGE = f"{{{_W_NS}}}trPrChange"
+_W_CELL_PROPERTIES_CHANGE = f"{{{_W_NS}}}tcPrChange"
+_W_SECTION_PROPERTIES_CHANGE = f"{{{_W_NS}}}sectPrChange"
 _W_COMMENT_RANGE_START = f"{{{_W_NS}}}commentRangeStart"
 _W_COMMENT_RANGE_END = f"{{{_W_NS}}}commentRangeEnd"
 _W_COMMENT_REFERENCE = f"{{{_W_NS}}}commentReference"
@@ -73,7 +79,33 @@ _W_GRID_AFTER = f"{{{_W_NS}}}gridAfter"
 _W_VAL = f"{{{_W_NS}}}val"
 _RELATIONSHIP = f"{{{_REL_NS}}}Relationship"
 
-_REVISION_TAGS = frozenset({_W_INSERTION, _W_DELETION, _W_MOVE_FROM, _W_MOVE_TO})
+_CONTENT_REVISION_TAGS = frozenset(
+    {_W_INSERTION, _W_DELETION, _W_MOVE_FROM, _W_MOVE_TO}
+)
+_HIDDEN_CONTENT_REVISION_TAGS = frozenset({_W_DELETION, _W_MOVE_FROM})
+_PROPERTY_REVISION_TAGS = frozenset(
+    {
+        _W_RUN_PROPERTIES_CHANGE,
+        _W_PARAGRAPH_PROPERTIES_CHANGE,
+        _W_TABLE_PROPERTIES_CHANGE,
+        _W_ROW_PROPERTIES_CHANGE,
+        _W_CELL_PROPERTIES_CHANGE,
+        _W_SECTION_PROPERTIES_CHANGE,
+    }
+)
+_PARAGRAPH_PROPERTY_REVISION_TAGS = frozenset(
+    {_W_RUN_PROPERTIES_CHANGE, _W_PARAGRAPH_PROPERTIES_CHANGE}
+)
+_TABLE_PROPERTY_REVISION_TAGS = frozenset(
+    {
+        _W_TABLE_PROPERTIES_CHANGE,
+        _W_ROW_PROPERTIES_CHANGE,
+        _W_CELL_PROPERTIES_CHANGE,
+    }
+)
+_PARAGRAPH_REVISION_TAGS = (
+    _CONTENT_REVISION_TAGS | _PARAGRAPH_PROPERTY_REVISION_TAGS
+)
 _COMMENT_TAGS = frozenset(
     {_W_COMMENT_RANGE_START, _W_COMMENT_RANGE_END, _W_COMMENT_REFERENCE}
 )
@@ -170,6 +202,15 @@ class DocxReader:
             body = document_root.find(_W_BODY)
             if body is None:
                 raise DocxError("invalid_docx_package", "word/document.xml 缺少 w:body。")
+            if any(
+                element.tag == _W_SECTION_PROPERTIES_CHANGE
+                for element in document_root.iter()
+            ):
+                state.add_warning(
+                    "tracked_changes",
+                    "文档包含 section 属性修订。",
+                    part="word/document.xml",
+                )
 
             blocks: list[ParagraphSnapshot | TableSnapshot] = []
             paragraph_count = 0
@@ -390,7 +431,7 @@ def _read_paragraph(
             "段落包含字段代码，仅返回可见结果文本。",
             block_id,
         )
-    if paragraph_tags.intersection(_REVISION_TAGS):
+    if paragraph_tags.intersection(_PARAGRAPH_REVISION_TAGS):
         _mark_block_warning(
             state,
             warning_types,
@@ -417,8 +458,9 @@ def _read_paragraph(
 
     runs: list[TextRunSnapshot] = []
     text_parts: list[str] = []
-    for run_element in paragraph.iter(_W_RUN):
+    for _ in paragraph.iter(_W_RUN):
         state.consume_run()
+    for run_element in _iter_visible_runs(paragraph):
         run_text = _read_run_text(run_element)
         state.consume_text(run_text)
         text_parts.append(run_text)
@@ -450,13 +492,32 @@ def _read_paragraph(
 def _read_run_text(run: ElementTree.Element) -> str:
     parts: list[str] = []
     for element in run.iter():
-        if element.tag in {_W_TEXT, _W_DELETED_TEXT}:
+        if element.tag == _W_TEXT:
             parts.append(element.text or "")
         elif element.tag == _W_TAB:
             parts.append("\t")
         elif element.tag in {_W_BREAK, _W_CARRIAGE_RETURN}:
             parts.append("\n")
     return "".join(parts)
+
+
+def _iter_visible_runs(
+    element: ElementTree.Element,
+) -> Iterator[ElementTree.Element]:
+    """按当前结果视图遍历 run，并跳过删除、移出和旧属性快照。"""
+
+    pending = list(reversed(element))
+    while pending:
+        child = pending.pop()
+        if (
+            child.tag in _HIDDEN_CONTENT_REVISION_TAGS
+            or child.tag in _PROPERTY_REVISION_TAGS
+        ):
+            continue
+        if child.tag == _W_RUN:
+            yield child
+        else:
+            pending.extend(reversed(child))
 
 
 def _read_run_properties(
@@ -492,6 +553,18 @@ def _read_table(
     state: _InspectionState,
 ) -> TableSnapshot:
     table_warning_types: list[str] = []
+    table_tags = {element.tag for element in table.iter()}
+    table_has_property_revision = bool(
+        table_tags.intersection(_TABLE_PROPERTY_REVISION_TAGS)
+    )
+    if table_has_property_revision:
+        _mark_block_warning(
+            state,
+            table_warning_types,
+            "tracked_changes",
+            "表格包含属性修订。",
+            block_id,
+        )
     row_elements, wrapped_rows = _collect_table_rows(table)
     if wrapped_rows:
         _mark_block_warning(
@@ -514,7 +587,7 @@ def _read_table(
             _W_TABLE_PROPERTIES,
             _W_TABLE_GRID,
             _W_ROW,
-            *_REVISION_TAGS,
+            *_CONTENT_REVISION_TAGS,
         }:
             _mark_block_warning(
                 state,
@@ -529,6 +602,9 @@ def _read_table(
     for row_index, row_element in enumerate(row_elements):
         state.consume_row()
         cells, wrapped_cells = _collect_row_cells(row_element)
+        row_has_property_revision = any(
+            element.tag == _W_ROW_PROPERTIES_CHANGE for element in row_element.iter()
+        )
         row_snapshot: list[TableCellSnapshot] = []
         row_lengths.append(len(cells))
         if not cells or wrapped_cells or _row_has_grid_offsets(row_element):
@@ -547,6 +623,10 @@ def _read_table(
                 cell_element,
                 block_id=cell_id,
                 state=state,
+                inherited_property_revision=(
+                    _W_TABLE_PROPERTIES_CHANGE in table_tags
+                    or row_has_property_revision
+                ),
             )
             row_snapshot.append(cell_snapshot)
             for warning_type in cell_snapshot.warnings:
@@ -580,8 +660,20 @@ def _read_table_cell(
     *,
     block_id: str,
     state: _InspectionState,
+    inherited_property_revision: bool = False,
 ) -> TableCellSnapshot:
     warning_types: list[str] = []
+    cell_has_property_revision = any(
+        element.tag == _W_CELL_PROPERTIES_CHANGE for element in cell.iter()
+    )
+    if inherited_property_revision or cell_has_property_revision:
+        _mark_block_warning(
+            state,
+            warning_types,
+            "tracked_changes",
+            "单元格所属表格结构包含属性修订。",
+            block_id,
+        )
     cell_properties = cell.find(_W_CELL_PROPERTIES)
     if _cell_has_merge(cell_properties):
         _mark_block_warning(
@@ -636,9 +728,12 @@ def _collect_table_rows(
     for child in table:
         if child.tag == _W_ROW:
             rows.append(child)
-        elif child.tag in _REVISION_TAGS:
+        elif child.tag in _CONTENT_REVISION_TAGS:
             wrapped_rows = True
-            rows.extend(element for element in child if element.tag == _W_ROW)
+            if child.tag not in _HIDDEN_CONTENT_REVISION_TAGS:
+                rows.extend(
+                    element for element in child if element.tag == _W_ROW
+                )
     return rows, wrapped_rows
 
 
@@ -650,9 +745,12 @@ def _collect_row_cells(
     for child in row:
         if child.tag == _W_CELL:
             cells.append(child)
-        elif child.tag in _REVISION_TAGS:
+        elif child.tag in _CONTENT_REVISION_TAGS:
             wrapped_cells = True
-            cells.extend(element for element in child if element.tag == _W_CELL)
+            if child.tag not in _HIDDEN_CONTENT_REVISION_TAGS:
+                cells.extend(
+                    element for element in child if element.tag == _W_CELL
+                )
     return cells, wrapped_cells
 
 
