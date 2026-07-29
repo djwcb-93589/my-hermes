@@ -279,6 +279,8 @@ class CLIWorker:
                 return self._approve_and_resume(conn, task)
             if task.kind == "deny":
                 return self._deny_approval(conn, task)
+            if task.kind == "cancel_approval":
+                return self._cancel_pending_approval(conn, task)
             return CLIWorkerResult(
                 kind=task.kind,
                 error=f"unsupported CLI worker task: {task.kind}",
@@ -388,6 +390,38 @@ class CLIWorker:
             task.session_id,
             str(task.approval_request.get("tool_call_id", "")),
             denied,
+        ):
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                error="approval result could not be recorded",
+            )
+        return CLIWorkerResult(kind=task.kind, session_id=task.session_id)
+
+    @staticmethod
+    def _cancel_pending_approval(
+        conn,
+        task: CLIWorkerTask,
+    ) -> CLIWorkerResult:
+        """将等待中的审批记录为用户取消，不执行工具或恢复 AgentLoop。"""
+        if task.session_id is None or not isinstance(
+            task.approval_request,
+            dict,
+        ):
+            return CLIWorkerResult(
+                kind=task.kind,
+                error="approval request is invalid",
+            )
+        cancelled = json.dumps({
+            "ok": False,
+            "error_type": "cancelled",
+            "error": "operation was cancelled by the user",
+        }, ensure_ascii=False)
+        if not replace_tool_message_content(
+            conn,
+            task.session_id,
+            str(task.approval_request.get("tool_call_id", "")),
+            cancelled,
         ):
             return CLIWorkerResult(
                 kind=task.kind,
@@ -623,7 +657,10 @@ class CLIController:
             self._running = False
             self._current_cancel_event = None
             self._apply_worker_result(result)
-            self._ui.show_worker_result(result)
+            if result.kind == "cancel_approval" and result.error is None:
+                self._ui.show_message("当前审批已取消。")
+            else:
+                self._ui.show_worker_result(result)
             self._submit_next_queued_message()
 
     def _apply_worker_result(self, result: CLIWorkerResult) -> None:
@@ -640,8 +677,9 @@ class CLIController:
             return
         if result.session_id is not None:
             self._session_id = result.session_id
-        if result.kind == "deny" and result.error is None:
-            self._pending_approval = None
+        if result.kind in {"deny", "cancel_approval"}:
+            if result.error is None:
+                self._pending_approval = None
             return
         conversation_result = result.conversation_result
         if not isinstance(conversation_result, dict):
@@ -681,13 +719,23 @@ class CLIController:
         announce_idle: bool,
     ) -> None:
         if self._pending_approval is not None and not self._running:
-            self._ui.show_message(
-                "当前任务正在等待审批，没有运行中的操作。\n请使用 /deny 拒绝审批。"
+            task = CLIWorkerTask(
+                kind="cancel_approval",
+                session_id=self._session_id,
+                approval_request=self._pending_approval,
             )
+            if self._session_id is None or not self._submit_task(task):
+                self._ui.show_message("审批取消请求未提交，请重试。")
+            else:
+                self._ui.show_message("已请求取消当前审批")
             return
-        if not self._running or self._current_cancel_event is None:
+        if not self._running:
             if announce_idle:
                 self._ui.show_message("当前没有正在运行的任务。")
+            return
+        if self._current_cancel_event is None:
+            if announce_idle:
+                self._ui.show_message("当前控制任务正在收尾，无法中途停止。")
             return
         if self._current_cancel_event.is_set():
             if announce_idle:
