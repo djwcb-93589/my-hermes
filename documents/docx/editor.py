@@ -35,12 +35,20 @@ from .models import (
     ParagraphSnapshot,
     ReplaceParagraphText,
     ReplaceTableCellText,
+    ReplaceTextMatch,
     TableCellSnapshot,
     TableSnapshot,
     UpdateDocumentMetadata,
 )
 from .package import DocxPackage
 from .reader import DocxReader
+from .search import build_match_id, iter_literal_matches
+from .textmap import (
+    VisibleTextMap,
+    append_text_content,
+    build_visible_text_map,
+    replace_visible_text_range,
+)
 from .writer import (
     parse_xml_preserving_misc,
     serialize_xml,
@@ -54,16 +62,11 @@ _CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-propertie
 _DC_NS = "http://purl.org/dc/elements/1.1/"
 _CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 _PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
-_XML_NS = "http://www.w3.org/XML/1998/namespace"
 
 _W_BODY = f"{{{_W_NS}}}body"
 _W_RUN = f"{{{_W_NS}}}r"
 _W_RUN_PROPERTIES = f"{{{_W_NS}}}rPr"
 _W_PARAGRAPH_PROPERTIES = f"{{{_W_NS}}}pPr"
-_W_TEXT = f"{{{_W_NS}}}t"
-_W_TAB = f"{{{_W_NS}}}tab"
-_W_BREAK = f"{{{_W_NS}}}br"
-_XML_SPACE = f"{{{_XML_NS}}}space"
 
 _CORE_PROPERTIES = f"{{{_CP_NS}}}coreProperties"
 _CONTENT_TYPES = f"{{{_CONTENT_TYPES_NS}}}Types"
@@ -99,6 +102,7 @@ _ALL_METADATA_FIELDS = (
     "last_modified_by",
 )
 _REVISION_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MATCH_ID_PATTERN = re.compile(r"match:[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -118,7 +122,23 @@ class _ValidatedMetadataOperation:
     fields: dict[str, str | None]
 
 
-_ValidatedOperation = _ValidatedTextOperation | _ValidatedMetadataOperation
+@dataclass(frozen=True)
+class _ValidatedMatchOperation:
+    operation_index: int
+    operation_type: str
+    match_id: str
+    block_id: str
+    expected_text: str
+    replacement_text: str
+    preserve_format: bool
+    target_kind: str
+
+
+_ValidatedOperation = (
+    _ValidatedTextOperation
+    | _ValidatedMatchOperation
+    | _ValidatedMetadataOperation
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +146,14 @@ class _PlannedTextEdit:
     operation: _ValidatedTextOperation
     paragraph: ElementTree.Element
     current_text: str
+
+
+@dataclass(frozen=True)
+class _PlannedMatchEdit:
+    operation: _ValidatedMatchOperation
+    text_map: VisibleTextMap
+    start: int
+    end: int
 
 
 @dataclass(frozen=True)
@@ -185,7 +213,10 @@ class DocxEditor:
                 operation_type=operation.operation_type,
                 block_id=(
                     operation.block_id
-                    if isinstance(operation, _ValidatedTextOperation)
+                    if isinstance(
+                        operation,
+                        (_ValidatedTextOperation, _ValidatedMatchOperation),
+                    )
                     else None
                 ),
             )
@@ -206,7 +237,11 @@ class DocxEditor:
                     "word/document.xml 缺少 w:body。",
                 )
 
-            planned_text_edits = _plan_text_edits(
+            (
+                planned_text_edits,
+                planned_match_edits,
+                expected_target_texts,
+            ) = _plan_text_edits(
                 operations,
                 body=body,
                 snapshot=initial_snapshot,
@@ -216,6 +251,9 @@ class DocxEditor:
             document_changed = False
             for plan in planned_text_edits:
                 if _apply_text_edit(plan):
+                    document_changed = True
+            for plan in planned_match_edits:
+                if _apply_match_edit(plan):
                     document_changed = True
             if document_changed:
                 replacements[_DOCUMENT_PART] = serialize_xml(
@@ -245,6 +283,7 @@ class DocxEditor:
                 initial_snapshot=initial_snapshot,
                 output_snapshot=output_snapshot,
                 operations=operations,
+                expected_target_texts=expected_target_texts,
                 changed=changed,
             )
             if overwrite:
@@ -324,6 +363,7 @@ def _validate_request(
 def _validate_operations(operations: list[object]) -> list[_ValidatedOperation]:
     validated: list[_ValidatedOperation] = []
     seen_targets: set[str] = set()
+    seen_match_ids: set[str] = set()
     metadata_seen = False
 
     for operation_index, operation in enumerate(operations):
@@ -340,6 +380,11 @@ def _validate_operations(operations: list[object]) -> list[_ValidatedOperation]:
                 operation_index=operation_index,
                 operation_type="replace_table_cell_text",
                 target_kind="table_cell",
+            )
+        elif isinstance(operation, ReplaceTextMatch):
+            validated_operation = _validate_match_operation(
+                operation,
+                operation_index,
             )
         elif isinstance(operation, UpdateDocumentMetadata):
             if metadata_seen:
@@ -358,13 +403,23 @@ def _validate_operations(operations: list[object]) -> list[_ValidatedOperation]:
                 f"第 {operation_index} 个编辑操作类型不受支持。",
             )
 
-        if isinstance(validated_operation, _ValidatedTextOperation):
+        if isinstance(
+            validated_operation,
+            (_ValidatedTextOperation, _ValidatedMatchOperation),
+        ):
             if validated_operation.block_id in seen_targets:
                 raise DocxError(
                     "duplicate_edit_target",
                     "同一个 block_id 在一次请求中只能修改一次。",
                 )
             seen_targets.add(validated_operation.block_id)
+        if isinstance(validated_operation, _ValidatedMatchOperation):
+            if validated_operation.match_id in seen_match_ids:
+                raise DocxError(
+                    "duplicate_edit_target",
+                    "同一个 match_id 在一次请求中只能修改一次。",
+                )
+            seen_match_ids.add(validated_operation.match_id)
         validated.append(validated_operation)
     return validated
 
@@ -445,23 +500,91 @@ def _validate_metadata_operation(
     )
 
 
+def _validate_match_operation(
+    operation: ReplaceTextMatch,
+    operation_index: int,
+) -> _ValidatedMatchOperation:
+    if (
+        not isinstance(operation.match_id, str)
+        or not _MATCH_ID_PATTERN.fullmatch(operation.match_id)
+    ):
+        raise DocxError(
+            "invalid_edit_operation",
+            "replace_text_match 的 match_id 格式无效。",
+        )
+    if not isinstance(operation.block_id, str):
+        raise DocxError("invalid_edit_operation", "block_id 必须是字符串。")
+    if is_paragraph_block_id(operation.block_id):
+        target_kind = "paragraph"
+    elif is_table_cell_block_id(operation.block_id):
+        target_kind = "table_cell"
+    else:
+        raise DocxError(
+            "invalid_edit_operation",
+            "replace_text_match 的 block_id 格式无效。",
+        )
+    if not isinstance(operation.expected_text, str) or not operation.expected_text:
+        raise DocxError(
+            "invalid_edit_operation",
+            "replace_text_match 的 expected_text 必须是非空字符串。",
+        )
+    if (
+        not isinstance(operation.replacement_text, str)
+        or "\r" in operation.replacement_text
+        or not _is_valid_xml_text(operation.replacement_text)
+    ):
+        raise DocxError(
+            "invalid_edit_operation",
+            "replacement_text 不是受支持的 XML 文本；换行请使用 \\n。",
+        )
+    if not isinstance(operation.preserve_format, bool):
+        raise DocxError(
+            "invalid_edit_operation",
+            "preserve_format 必须是布尔值。",
+        )
+    return _ValidatedMatchOperation(
+        operation_index=operation_index,
+        operation_type="replace_text_match",
+        match_id=operation.match_id,
+        block_id=operation.block_id,
+        expected_text=operation.expected_text,
+        replacement_text=operation.replacement_text,
+        preserve_format=operation.preserve_format,
+        target_kind=target_kind,
+    )
+
+
 def _plan_text_edits(
     operations: list[_ValidatedOperation],
     *,
     body: ElementTree.Element,
     snapshot: DocumentSnapshot,
-) -> list[_PlannedTextEdit]:
+) -> tuple[
+    list[_PlannedTextEdit],
+    list[_PlannedMatchEdit],
+    dict[str, str],
+]:
     targets = build_edit_target_index(body)
     snapshot_targets = _snapshot_text_targets(snapshot)
-    plans: list[_PlannedTextEdit] = []
+    text_plans: list[_PlannedTextEdit] = []
+    match_plans: list[_PlannedMatchEdit] = []
+    expected_target_texts: dict[str, str] = {}
 
     for operation in operations:
-        if not isinstance(operation, _ValidatedTextOperation):
+        if not isinstance(
+            operation,
+            (_ValidatedTextOperation, _ValidatedMatchOperation),
+        ):
             continue
         location = targets.get(operation.block_id)
         snapshot_target = snapshot_targets.get(operation.block_id)
         if location is None and snapshot_target is None:
-            raise DocxError("block_not_found", "指定的 block_id 不存在。")
+            error_type = (
+                "match_not_found"
+                if isinstance(operation, _ValidatedMatchOperation)
+                else "block_not_found"
+            )
+            raise DocxError(error_type, "指定的 block_id 不存在。")
         if location is None or snapshot_target is None:
             raise DocxError(
                 "edit_verification_failed",
@@ -506,18 +629,100 @@ def _plan_text_edits(
             current_text = snapshot_target.cell.text
 
         if not editable or paragraph is None:
+            if isinstance(operation, _ValidatedMatchOperation):
+                raise DocxError(
+                    "match_not_editable",
+                    "匹配内容或其所属表格包含复杂结构，当前阶段不允许局部编辑。",
+                )
             raise DocxError(
                 "block_not_editable",
                 "指定内容块或其所属表格包含复杂结构，当前阶段不允许编辑。",
             )
-        plans.append(
-            _PlannedTextEdit(
+
+        if isinstance(operation, _ValidatedTextOperation):
+            text_plans.append(
+                _PlannedTextEdit(
+                    operation=operation,
+                    paragraph=paragraph,
+                    current_text=current_text,
+                )
+            )
+            expected_target_texts[operation.block_id] = operation.text
+            continue
+
+        text_map = build_visible_text_map(paragraph)
+        if text_map.text != current_text:
+            raise DocxError(
+                "edit_verification_failed",
+                "Reader 与文字映射的可见内容不一致。",
+            )
+        start, end = _locate_match_span(
+            operation,
+            text=text_map.text,
+            revision=snapshot.revision,
+        )
+        try:
+            text_range = text_map.resolve_range(start, end)
+        except ValueError as exc:
+            raise DocxError(
+                "match_conflict",
+                "匹配范围无法映射到当前可见文字。",
+            ) from exc
+        if operation.preserve_format and not text_range.uniform_format:
+            raise DocxError(
+                "match_not_editable",
+                "匹配跨越多个格式不同的 run，无法安全保留格式。",
+            )
+        match_plans.append(
+            _PlannedMatchEdit(
                 operation=operation,
-                paragraph=paragraph,
-                current_text=current_text,
+                text_map=text_map,
+                start=start,
+                end=end,
             )
         )
-    return plans
+        expected_target_texts[operation.block_id] = (
+            text_map.text[:start]
+            + operation.replacement_text
+            + text_map.text[end:]
+        )
+    return text_plans, match_plans, expected_target_texts
+
+
+def _locate_match_span(
+    operation: _ValidatedMatchOperation,
+    *,
+    text: str,
+    revision: str,
+) -> tuple[int, int]:
+    expected_text_found = False
+    for start, end in iter_literal_matches(
+        text,
+        operation.expected_text,
+        case_sensitive=True,
+        whole_word=False,
+    ):
+        expected_text_found = True
+        if (
+            build_match_id(
+                revision,
+                operation.block_id,
+                start,
+                end,
+                text[start:end],
+            )
+            == operation.match_id
+        ):
+            return start, end
+    if not expected_text_found:
+        raise DocxError(
+            "match_conflict",
+            "当前 block 中已不存在 expected_text。",
+        )
+    raise DocxError(
+        "match_not_found",
+        "match_id 在当前 revision 和 block 中不存在。",
+    )
 
 
 def _prepare_metadata_context(
@@ -667,9 +872,25 @@ def _apply_text_edit(plan: _PlannedTextEdit) -> bool:
     run = ElementTree.SubElement(plan.paragraph, _W_RUN)
     if first_run_properties is not None:
         run.append(first_run_properties)
-    _append_text_content(run, operation.text)
+    append_text_content(run, operation.text)
     after = ElementTree.tostring(plan.paragraph, encoding="utf-8")
     return before != after
+
+
+def _apply_match_edit(plan: _PlannedMatchEdit) -> bool:
+    try:
+        return replace_visible_text_range(
+            plan.text_map,
+            start=plan.start,
+            end=plan.end,
+            replacement=plan.operation.replacement_text,
+            preserve_format=plan.operation.preserve_format,
+        )
+    except ValueError as exc:
+        raise DocxError(
+            "edit_verification_failed",
+            "已规划的局部文字范围无法安全写回。",
+        ) from exc
 
 
 def _apply_metadata_edit(context: _MetadataContext) -> dict[str, bytes]:
@@ -736,39 +957,6 @@ def _apply_metadata_edit(context: _MetadataContext) -> dict[str, bytes]:
     return replacements
 
 
-def _append_text_content(run: ElementTree.Element, text: str) -> None:
-    buffer: list[str] = []
-    child_created = False
-
-    def flush_text() -> None:
-        nonlocal child_created
-        if not buffer:
-            return
-        value = "".join(buffer)
-        buffer.clear()
-        text_element = ElementTree.SubElement(run, _W_TEXT)
-        text_element.text = value
-        if value[:1].isspace() or value[-1:].isspace():
-            text_element.set(_XML_SPACE, "preserve")
-        child_created = True
-
-    for character in text:
-        if character == "\t":
-            flush_text()
-            ElementTree.SubElement(run, _W_TAB)
-            child_created = True
-        elif character == "\n":
-            flush_text()
-            ElementTree.SubElement(run, _W_BREAK)
-            child_created = True
-        else:
-            buffer.append(character)
-    flush_text()
-    if not child_created:
-        empty_text = ElementTree.SubElement(run, _W_TEXT)
-        empty_text.text = ""
-
-
 def _inspect_temporary_output(
     reader: DocxReader,
     temporary_output: Path,
@@ -793,6 +981,7 @@ def _verify_output(
     initial_snapshot: DocumentSnapshot,
     output_snapshot: DocumentSnapshot,
     operations: list[_ValidatedOperation],
+    expected_target_texts: dict[str, str],
     changed: bool,
 ) -> None:
     if changed and output_snapshot.revision == initial_snapshot.revision:
@@ -823,10 +1012,16 @@ def _verify_output(
     edited_block_ids = {
         operation.block_id
         for operation in operations
-        if isinstance(operation, _ValidatedTextOperation)
+        if isinstance(
+            operation,
+            (_ValidatedTextOperation, _ValidatedMatchOperation),
+        )
     }
     for operation in operations:
-        if isinstance(operation, _ValidatedTextOperation):
+        if isinstance(
+            operation,
+            (_ValidatedTextOperation, _ValidatedMatchOperation),
+        ):
             target = output_targets.get(operation.block_id)
             if operation.target_kind == "paragraph":
                 if not isinstance(target, ParagraphSnapshot):
@@ -840,7 +1035,8 @@ def _verify_output(
                     "修改后的目标类型与请求不一致。",
                 )
             if (
-                _snapshot_target_text(target) != operation.text
+                _snapshot_target_text(target)
+                != expected_target_texts.get(operation.block_id)
                 or not _snapshot_target_is_editable(target)
             ):
                 raise DocxError(

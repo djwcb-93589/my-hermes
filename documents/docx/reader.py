@@ -45,6 +45,7 @@ _W_RUN_PROPERTIES = f"{{{_W_NS}}}rPr"
 _W_BOLD = f"{{{_W_NS}}}b"
 _W_ITALIC = f"{{{_W_NS}}}i"
 _W_UNDERLINE = f"{{{_W_NS}}}u"
+_W_VANISH = f"{{{_W_NS}}}vanish"
 _W_HYPERLINK = f"{{{_W_NS}}}hyperlink"
 _W_SIMPLE_FIELD = f"{{{_W_NS}}}fldSimple"
 _W_FIELD_CHAR = f"{{{_W_NS}}}fldChar"
@@ -454,6 +455,14 @@ def _read_paragraph(
             "段落包含未完整建模的 OOXML 内容。",
             block_id,
         )
+    if any(_run_is_hidden(run) for run in paragraph.iter(_W_RUN)):
+        _mark_block_warning(
+            state,
+            warning_types,
+            "unsupported_content",
+            "段落包含当前搜索和编辑阶段不处理的隐藏文字。",
+            block_id,
+        )
 
     runs: list[TextRunSnapshot] = []
     text_parts: list[str] = []
@@ -514,9 +523,15 @@ def _iter_visible_runs(
         ):
             continue
         if child.tag == _W_RUN:
-            yield child
+            if not _run_is_hidden(child):
+                yield child
         else:
             pending.extend(reversed(child))
+
+
+def _run_is_hidden(run: ElementTree.Element) -> bool:
+    properties = run.find(_W_RUN_PROPERTIES)
+    return _read_toggle(properties, _W_VANISH) is True
 
 
 def _read_run_properties(

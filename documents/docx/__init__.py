@@ -1,4 +1,4 @@
-"""独立 DOCX 创建、只读检查与安全编辑模块的稳定公共接口。"""
+"""独立 DOCX 创建、读取、搜索与安全编辑模块的稳定公共接口。"""
 
 from .errors import DocxError
 from .models import (
@@ -17,14 +17,19 @@ from .models import (
     ParagraphSpec,
     ReplaceParagraphText,
     ReplaceTableCellText,
+    ReplaceTextMatch,
+    SearchDocumentRequest,
+    SearchDocumentResult,
     TableCellSnapshot,
     TableSnapshot,
     TableSpec,
+    TextMatch,
     TextRunSnapshot,
     TextRunSpec,
     UpdateDocumentMetadata,
 )
 from .reader import DocxReader, inspect_document
+from .search import DocxSearcher, search_document
 from .editor import DocxEditor, edit_document
 from .service import DocxService, create_document
 
@@ -38,6 +43,7 @@ __all__ = [
     "DocxError",
     "DocxEditor",
     "DocxReader",
+    "DocxSearcher",
     "DocxService",
     "EditDocumentRequest",
     "EditDocumentResult",
@@ -48,13 +54,18 @@ __all__ = [
     "ParagraphSpec",
     "ReplaceParagraphText",
     "ReplaceTableCellText",
+    "ReplaceTextMatch",
+    "SearchDocumentRequest",
+    "SearchDocumentResult",
     "TableCellSnapshot",
     "TableSnapshot",
     "TableSpec",
+    "TextMatch",
     "TextRunSnapshot",
     "TextRunSpec",
     "UpdateDocumentMetadata",
     "create_document",
     "edit_document",
     "inspect_document",
+    "search_document",
 ]

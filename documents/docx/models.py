@@ -171,6 +171,45 @@ class InspectDocumentRequest:
 
 
 @dataclass(frozen=True)
+class SearchDocumentRequest:
+    """按当前结果视图搜索现有 DOCX 的请求。"""
+
+    source_path: Path
+    query: str
+    case_sensitive: bool = True
+    whole_word: bool = False
+    include_paragraphs: bool = True
+    include_table_cells: bool = True
+    max_matches: int = 100
+
+
+@dataclass(frozen=True)
+class TextMatch:
+    """一个位于单个内容块内的稳定可见文字匹配。"""
+
+    match_id: str
+    block_id: str
+    matched_text: str
+    start: int
+    end: int
+    prefix: str
+    suffix: str
+    editable: bool
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class SearchDocumentResult:
+    """一次只读搜索的 revision 与有界匹配结果。"""
+
+    source_path: Path
+    revision: str
+    query: str
+    matches: list[TextMatch]
+    total_matches: int
+
+
+@dataclass(frozen=True)
 class ReplaceParagraphText:
     """替换正文顶层普通段落文字。"""
 
@@ -189,6 +228,17 @@ class ReplaceTableCellText:
 
 
 @dataclass(frozen=True)
+class ReplaceTextMatch:
+    """根据当前 revision 下的稳定 match_id 局部替换文字。"""
+
+    match_id: str
+    block_id: str
+    expected_text: str
+    replacement_text: str
+    preserve_format: bool = True
+
+
+@dataclass(frozen=True)
 class UpdateDocumentMetadata:
     """按显式字段集合更新基础核心属性。"""
 
@@ -196,7 +246,10 @@ class UpdateDocumentMetadata:
 
 
 EditOperation: TypeAlias = (
-    ReplaceParagraphText | ReplaceTableCellText | UpdateDocumentMetadata
+    ReplaceParagraphText
+    | ReplaceTableCellText
+    | ReplaceTextMatch
+    | UpdateDocumentMetadata
 )
 
 

@@ -37,6 +37,9 @@ DOCX_ERROR_TYPES = frozenset(
         "source_output_same",
         "edit_verification_failed",
         "output_revision_unchanged",
+        "match_not_found",
+        "match_conflict",
+        "match_not_editable",
     }
 )
 

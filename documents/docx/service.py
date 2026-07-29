@@ -1,4 +1,4 @@
-"""独立 DOCX 创建、只读检查与安全编辑服务。"""
+"""独立 DOCX 创建、读取、搜索与安全编辑服务。"""
 
 from __future__ import annotations
 
@@ -30,11 +30,14 @@ from .models import (
     InspectDocumentRequest,
     PageBreakSpec,
     ParagraphSpec,
+    SearchDocumentRequest,
+    SearchDocumentResult,
     TableSpec,
     TextRunSpec,
 )
 from .reader import DocxReader
 from .runtime import NodeRuntime
+from .search import DocxSearcher
 
 
 _ALLOWED_ALIGNMENTS = frozenset({"left", "center", "right", "justify"})
@@ -46,11 +49,12 @@ _REQUIRED_DOCX_ENTRIES = (
 
 
 class DocxService:
-    """提供 Node 创建能力及纯 Python 读取与安全编辑能力。"""
+    """提供 Node 创建能力及纯 Python 读取、搜索与安全编辑能力。"""
 
     def __init__(self, node_executable: str | Path | None = None) -> None:
         self._runtime = NodeRuntime(node_executable=node_executable)
         self._reader = DocxReader()
+        self._searcher = DocxSearcher(reader=self._reader)
         self._editor = DocxEditor(reader=self._reader)
 
     def inspect_document(self, request: InspectDocumentRequest) -> DocumentSnapshot:
@@ -62,6 +66,14 @@ class DocxService:
         """编辑现有 DOCX；该路径不检查或调用 Node runtime。"""
 
         return self._editor.edit(request)
+
+    def search_document(
+        self,
+        request: SearchDocumentRequest,
+    ) -> SearchDocumentResult:
+        """搜索现有 DOCX；该路径只读取当前可见文字。"""
+
+        return self._searcher.search(request)
 
     def create_document(
         self,

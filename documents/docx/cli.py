@@ -1,4 +1,4 @@
-"""独立 DOCX 创建、只读检查与安全编辑命令行入口。"""
+"""独立 DOCX 创建、读取、搜索与安全编辑命令行入口。"""
 
 from __future__ import annotations
 
@@ -24,9 +24,13 @@ from .models import (
     ParagraphSpec,
     ReplaceParagraphText,
     ReplaceTableCellText,
+    ReplaceTextMatch,
+    SearchDocumentRequest,
+    SearchDocumentResult,
     TableCellSnapshot,
     TableSnapshot,
     TableSpec,
+    TextMatch,
     TextRunSnapshot,
     TextRunSpec,
     UpdateDocumentMetadata,
@@ -94,6 +98,24 @@ _JSON_MODEL_FIELDS: dict[type[object], tuple[str, ...]] = {
         "applied_edits",
     ),
     AppliedEdit: ("operation_index", "operation_type", "block_id"),
+    SearchDocumentResult: (
+        "source_path",
+        "revision",
+        "query",
+        "matches",
+        "total_matches",
+    ),
+    TextMatch: (
+        "match_id",
+        "block_id",
+        "matched_text",
+        "start",
+        "end",
+        "prefix",
+        "suffix",
+        "editable",
+        "warnings",
+    ),
 }
 _JSON_BLOCK_TYPES: dict[type[object], str] = {
     ParagraphSnapshot: "paragraph",
@@ -115,6 +137,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = _run_runtime_check(args)
         elif args.command == "inspect":
             payload = _run_inspect(args)
+        elif args.command == "search":
+            payload = _run_search(args)
         elif args.command == "edit":
             payload = _run_edit(args)
         else:
@@ -161,6 +185,15 @@ def _build_parser() -> _JsonArgumentParser:
     inspect_parser.add_argument("--no-tables", action="store_true")
     inspect_parser.add_argument("--max-blocks", type=int)
     inspect_parser.add_argument("--max-text-chars", type=int)
+
+    search_parser = subparsers.add_parser("search", help="搜索现有 DOCX 的可见文字")
+    search_parser.add_argument("--source", required=True, type=Path)
+    search_parser.add_argument("--query", required=True)
+    search_parser.add_argument("--ignore-case", action="store_true")
+    search_parser.add_argument("--whole-word", action="store_true")
+    search_parser.add_argument("--no-paragraphs", action="store_true")
+    search_parser.add_argument("--no-table-cells", action="store_true")
+    search_parser.add_argument("--max-matches", type=int, default=100)
 
     edit_parser = subparsers.add_parser("edit", help="基于 revision 安全修改现有 DOCX")
     edit_parser.add_argument("--source", required=True, type=Path)
@@ -216,6 +249,23 @@ def _run_inspect(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, **serialized}
 
 
+def _run_search(args: argparse.Namespace) -> dict[str, Any]:
+    request = SearchDocumentRequest(
+        source_path=args.source,
+        query=args.query,
+        case_sensitive=not args.ignore_case,
+        whole_word=args.whole_word,
+        include_paragraphs=not args.no_paragraphs,
+        include_table_cells=not args.no_table_cells,
+        max_matches=args.max_matches,
+    )
+    result = DocxService().search_document(request)
+    serialized = _serialize_json_value(result)
+    if not isinstance(serialized, dict):
+        raise DocxError("io_error", "DOCX 搜索结果序列化失败。")
+    return {"ok": True, **serialized}
+
+
 def _run_edit(args: argparse.Namespace) -> dict[str, Any]:
     operations = _read_edit_operations(args.operations)
     request = EditDocumentRequest(
@@ -234,7 +284,12 @@ def _run_edit(args: argparse.Namespace) -> dict[str, Any]:
 
 def _read_edit_operations(
     path: Path,
-) -> list[ReplaceParagraphText | ReplaceTableCellText | UpdateDocumentMetadata]:
+) -> list[
+    ReplaceParagraphText
+    | ReplaceTableCellText
+    | ReplaceTextMatch
+    | UpdateDocumentMetadata
+]:
     try:
         with path.expanduser().open("r", encoding="utf-8") as source:
             value = json.load(source)
@@ -271,7 +326,12 @@ def _read_edit_operations(
 def _parse_edit_operation(
     value: object,
     index: int,
-) -> ReplaceParagraphText | ReplaceTableCellText | UpdateDocumentMetadata:
+) -> (
+    ReplaceParagraphText
+    | ReplaceTableCellText
+    | ReplaceTextMatch
+    | UpdateDocumentMetadata
+):
     if not isinstance(value, dict):
         raise DocxError(
             "invalid_edit_operation",
@@ -307,6 +367,27 @@ def _parse_edit_operation(
                 "preserve_first_run_format",
                 True,
             ),
+        )
+    if operation_type == "replace_text_match":
+        _reject_unknown_keys(
+            value,
+            {
+                "type",
+                "match_id",
+                "block_id",
+                "expected_text",
+                "replacement_text",
+                "preserve_format",
+            },
+            f"第 {index} 个 replace_text_match",
+            "invalid_edit_operation",
+        )
+        return ReplaceTextMatch(
+            match_id=value.get("match_id"),
+            block_id=value.get("block_id"),
+            expected_text=value.get("expected_text"),
+            replacement_text=value.get("replacement_text"),
+            preserve_format=value.get("preserve_format", True),
         )
     if operation_type == "update_document_metadata":
         _reject_unknown_keys(

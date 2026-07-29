@@ -15,6 +15,7 @@ _W_PARAGRAPH = f"{{{_W_NS}}}p"
 _W_PARAGRAPH_PROPERTIES = f"{{{_W_NS}}}pPr"
 _W_RUN = f"{{{_W_NS}}}r"
 _W_RUN_PROPERTIES = f"{{{_W_NS}}}rPr"
+_W_VANISH = f"{{{_W_NS}}}vanish"
 _W_TEXT = f"{{{_W_NS}}}t"
 _W_TAB = f"{{{_W_NS}}}tab"
 _W_BREAK = f"{{{_W_NS}}}br"
@@ -115,6 +116,7 @@ _FORBIDDEN_PARAGRAPH_TAGS = frozenset(
 _ALLOWED_RUN_CHILDREN = frozenset(
     {_W_RUN_PROPERTIES, _W_TEXT, _W_TAB, _W_BREAK, _W_CARRIAGE_RETURN}
 )
+_FALSE_VALUES = frozenset({"0", "false", "off", "no", "none"})
 _PARAGRAPH_BLOCK_PATTERN = re.compile(r"body:p:(0|[1-9]\d*)\Z")
 _TABLE_CELL_BLOCK_PATTERN = re.compile(
     r"body:table:(0|[1-9]\d*):row:(0|[1-9]\d*):cell:(0|[1-9]\d*)\Z"
@@ -325,6 +327,13 @@ def _is_strictly_editable_run(run: ElementTree.Element) -> bool:
                 return False
         elif len(child) != 0:
             return False
+    properties = run.find(_W_RUN_PROPERTIES)
+    if properties is not None:
+        vanish = properties.find(_W_VANISH)
+        if vanish is not None:
+            raw_value = vanish.attrib.get(_W_VAL, vanish.attrib.get("val"))
+            if raw_value is None or raw_value.lower() not in _FALSE_VALUES:
+                return False
     return True
 
 
