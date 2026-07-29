@@ -38,35 +38,6 @@ class _StreamOutcome:
     value: object | None = None
 
 
-class _StreamProgress:
-    """在线程之间安全维护最近一次取得模型 chunk 的时间。"""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._last_progress_at = time.monotonic()
-
-    def mark_started(self) -> None:
-        """从后台线程开始创建 stream 的时刻重新开始等待窗口。"""
-        now = time.monotonic()
-        with self._lock:
-            self._last_progress_at = now
-
-    def mark_chunk_received(self) -> None:
-        """记录同步 stream 成功返回一个 chunk 的时刻。"""
-        now = time.monotonic()
-        with self._lock:
-            self._last_progress_at = now
-
-    def remaining(self, timeout_seconds: float | None) -> float | None:
-        """返回距离最近一次进展还剩多少等待时间。"""
-        if timeout_seconds is None:
-            return None
-        now = time.monotonic()
-        with self._lock:
-            last_progress_at = self._last_progress_at
-        return timeout_seconds - (now - last_progress_at)
-
-
 class _StreamState:
     """在线程之间安全交接 stream，并把关闭请求限制为一次。"""
 
@@ -257,7 +228,6 @@ def consume_interruptible_stream(
     outcome_queue: queue.Queue[_StreamOutcome] = queue.Queue(maxsize=1)
     stop_event = threading.Event()
     stream_state = _StreamState()
-    stream_progress = _StreamProgress()
     if _is_cancelled(cancel_checker):
         _raise_cancelled(stop_event)
 
@@ -269,14 +239,12 @@ def consume_interruptible_stream(
 
     def worker() -> None:
         try:
-            stream_progress.mark_started()
             stream = stream_factory()
             stream_state.set_stream(stream)
             if stop_event.is_set():
                 return
             for chunk in stream:
-                # 必须在 Queue put 前记录，避免本地背压被误判为模型无进展。
-                stream_progress.mark_chunk_received()
+                # 先检查停止事件，再将原始 chunk 放入有界 Queue。
                 if stop_event.is_set():
                     return
                 while not stop_event.is_set():
@@ -303,65 +271,95 @@ def consume_interruptible_stream(
     )
     thread.start()
 
-    def abort_if_needed() -> None:
+    idle_wait_started_at: float | None = None
+
+    def raise_if_cancelled() -> None:
         if _is_cancelled(cancel_checker):
             stop_event.set()
             stream_state.request_close()
             raise ModelExecutionCancelled
-        remaining = stream_progress.remaining(timeout_seconds)
-        if remaining is not None and remaining <= 0:
-            # 超时边界再次检查取消，保证取消优先级高于超时。
-            if _is_cancelled(cancel_checker):
-                stop_event.set()
-                stream_state.request_close()
-                raise ModelExecutionCancelled
-            stop_event.set()
-            stream_state.request_close()
-            raise ModelExecutionTimedOut
 
-    def remaining_wait() -> float:
-        remaining = stream_progress.remaining(timeout_seconds)
-        if remaining is None:
-            return poll_interval
-        if remaining <= 0:
-            abort_if_needed()
-        return min(poll_interval, remaining)
+    def begin_idle_wait() -> None:
+        nonlocal idle_wait_started_at
+        if idle_wait_started_at is None:
+            # 只有本地没有待处理数据且没有终态时，才开始远端等待窗口。
+            idle_wait_started_at = time.monotonic()
+
+    def end_idle_wait() -> None:
+        nonlocal idle_wait_started_at
+        idle_wait_started_at = None
+
+    def remaining_idle_wait() -> float | None:
+        if timeout_seconds is None or idle_wait_started_at is None:
+            return None
+        return timeout_seconds - (time.monotonic() - idle_wait_started_at)
+
+    def raise_if_stream_idle_timed_out() -> None:
+        remaining = remaining_idle_wait()
+        if remaining is None or remaining > 0:
+            return
+        # 超时即将生效时再次检查取消，保证取消优先级高于超时。
+        raise_if_cancelled()
+        stop_event.set()
+        stream_state.request_close()
+        raise ModelExecutionTimedOut
 
     def deliver(chunk) -> None:
-        abort_if_needed()
+        raise_if_cancelled()
         try:
             on_chunk(chunk)
         except BaseException:
             stop_event.set()
             stream_state.request_close()
             raise
+        # 回调执行期间不计算远端等待时间，但回调返回后仍须及时响应取消。
+        raise_if_cancelled()
 
     while True:
-        abort_if_needed()
+        raise_if_cancelled()
         try:
             chunk = chunk_queue.get_nowait()
         except queue.Empty:
-            try:
-                outcome = outcome_queue.get_nowait()
-            except queue.Empty:
-                try:
-                    chunk = chunk_queue.get(timeout=remaining_wait())
-                except queue.Empty:
-                    continue
-                deliver(chunk)
-                continue
+            pass
+        else:
+            # 本地已经有数据时结束远端等待窗口，交付期间不检查模型超时。
+            end_idle_wait()
+            deliver(chunk)
+            continue
 
-            # 消费线程先写入全部 chunk，后写入终态；终态到达后仍需排空队列。
+        try:
+            outcome = outcome_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            # 终态到达后不再计算远端等待时间，但必须先排空已入队 chunk。
+            end_idle_wait()
             while True:
-                abort_if_needed()
+                raise_if_cancelled()
                 try:
                     pending_chunk = chunk_queue.get_nowait()
                 except queue.Empty:
                     break
                 deliver(pending_chunk)
+            raise_if_cancelled()
             if outcome.succeeded:
-                abort_if_needed()
                 return None
             raise outcome.value
-        else:
-            deliver(chunk)
+
+        # 此处已经确认本地 Queue 为空且没有终态，调用线程即将等待远端数据。
+        begin_idle_wait()
+        raise_if_stream_idle_timed_out()
+        try:
+            wait_seconds = poll_interval
+            remaining = remaining_idle_wait()
+            if remaining is not None:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.0, remaining),
+                )
+            chunk = chunk_queue.get(timeout=wait_seconds)
+        except queue.Empty:
+            # 下一轮会先检查取消、Queue 和终态，再决定是否超时。
+            continue
+        end_idle_wait()
+        deliver(chunk)
