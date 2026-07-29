@@ -1,7 +1,7 @@
 """Computer Use 的公开契约入口。"""
 
 from .backend import ComputerUseBackend
-from .backends import FakeBackend, FakeCall, NoopBackend
+from .backends import CuaDriverBackend, FakeBackend, FakeCall, NoopBackend
 from .contracts import (
     ActionEffect,
     ActionResult,
@@ -61,6 +61,7 @@ __all__ = [
     "ActionUnverifiedError",
     "ProtocolError",
     "DriverNotFoundError",
+    "CuaDriverBackend",
     "NoopBackend",
     "FakeBackend",
     "FakeCall",

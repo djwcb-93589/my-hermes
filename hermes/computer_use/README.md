@@ -7,14 +7,37 @@
 ## 当前阶段
 
 当前已完成 P0 公开数据契约、P1 Backend 抽象与统一错误契约、P2
-NoopBackend 和 FakeBackend，以及 P3 cua-driver 进程生命周期和 MCP stdio
-通信层。当前仍然：
+NoopBackend 和 FakeBackend、P3 cua-driver 进程生命周期和 MCP stdio
+通信层，以及以下阶段：
 
-- 没有任何真实 Backend；
-- 不能截图；
+- P3.6 已完成 Windows 子进程环境继承和启动说明；
+- P4 已完成 cua-driver 只读观察 Backend。
+
+`CuaDriverBackend` 当前支持：
+
+- `capture`
+- `list_apps`
+- `list_windows`
+- `wait`
+
+当前明确不支持：
+
+- `click`
+- `double_click`
+- `right_click`
+- `middle_click`
+- `drag`
+- `scroll`
+- `type`
+- `key`
+- `focus_app`
+- `set_value`
+
+因此当前仍然：
+
 - 不能点击；
 - 不能输入；
-- 尚未把 cua-driver 工具结果转换成 Computer Use 正式结果；
+- 不能执行任何会修改电脑状态的动作；
 - 没有 CLI；
 - 没有 Agent 接入。
 
@@ -48,13 +71,45 @@ ComputerUseExecutor.execute(...)
 
 调用结果必须使用 `ComputerUseResult` 定义的正式返回类型，不能用裸字典替代稳定契约。
 
-未来的 cua-driver Backend、FakeBackend 和 NoopBackend 都必须实现同一个
+`CuaDriverBackend`、FakeBackend 和 NoopBackend 都实现同一个
 `ComputerUseBackend` 接口。Backend 实现负责遵守统一生命周期、操作签名和异常契约。
 
 NoopBackend 用于最简单的调用链检查，只返回空捕获或不可验证的动作结果。
 FakeBackend 用于在内存中配置应用、窗口、捕获结果、动作结果和异常，并记录调用。
-两者都不会操作真实电脑。P3 通信层只管理 cua-driver 子进程、MCP 初始化和请求响应，
-尚未实现具体 Computer Use 动作。
+两者都不会操作真实电脑。`CuaDriverBackend` 通过 P3 transport 管理 cua-driver
+子进程，并把 P4 支持的应用、窗口、捕获和等待结果转换为正式数据契约。捕获以
+驱动返回的窗口为目标，不会自动聚焦窗口或启动应用。
+
+## Windows 启动
+
+transport 使用 `shell=False` 和原生参数序列启动 cua-driver。命令中必须显式包含
+驱动所需的 `mcp` 子命令：
+
+```python
+from hermes.computer_use.transport import CuaDriverConfig
+
+config = CuaDriverConfig(
+    command=["cua-driver", "mcp"],
+)
+```
+
+如果 cua-driver 没有加入 VSCode 进程继承的 `PATH`，可以使用 Windows 原生绝对
+路径：
+
+```python
+from hermes.computer_use.transport import CuaDriverConfig
+
+config = CuaDriverConfig(
+    command=[
+        r"C:\tools\cua-driver\cua-driver.exe",
+        "mcp",
+    ],
+)
+```
+
+不要传入 `/c/tools/...` 形式的 Git Bash 路径。transport 不会自动添加 `"mcp"`，
+也不会自动安装、下载或查找 cua-driver，更不会修改系统 `PATH`。`env` 仅表示在
+父进程环境基础上覆盖或增加的变量。
 
 ## 图片边界
 
@@ -62,4 +117,4 @@ FakeBackend 用于在内存中配置应用、窗口、捕获结果、动作结�
 
 ## 后续阶段
 
-- P4：实现 `capture`、`list_apps`、`list_windows`、`wait`，并将驱动结果转换为正式数据契约
+- P5/P6：逐步实现会修改电脑状态的动作及其必要边界

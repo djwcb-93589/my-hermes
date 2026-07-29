@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import subprocess
 import threading
 from collections import deque
@@ -124,7 +125,8 @@ class CuaDriverClient:
                     errors="replace",
                     bufsize=1,
                     cwd=self._config.cwd,
-                    env=self._config.env,
+                    env=self._build_child_env(),
+                    shell=False,
                 )
                 self._process = process
                 self._start_reader_threads(process)
@@ -269,6 +271,35 @@ class CuaDriverClient:
                 "cua-driver working directory is unavailable.",
                 details={"reason": "invalid_cwd"},
             )
+
+    def _build_child_env(self) -> dict[str, str] | None:
+        """继承父进程环境并应用独立配置的覆盖项。"""
+
+        overrides = self._config.env
+        if not overrides:
+            return None
+
+        child_env = os.environ.copy()
+        if os.name != "nt":
+            child_env.update(overrides)
+            return child_env
+
+        normalized_keys: dict[str, str] = {}
+        for key in list(child_env):
+            normalized = key.upper()
+            if normalized in normalized_keys:
+                child_env.pop(key, None)
+            else:
+                normalized_keys[normalized] = key
+
+        for key, value in overrides.items():
+            normalized = key.upper()
+            previous_key = normalized_keys.get(normalized)
+            if previous_key is not None and previous_key != key:
+                child_env.pop(previous_key, None)
+            child_env[key] = value
+            normalized_keys[normalized] = key
+        return child_env
 
     def _start_reader_threads(
         self,
