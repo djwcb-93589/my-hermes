@@ -1,8 +1,8 @@
 """
 delegate 工具:同步、可隔离的 leaf subagent。
 
-每次 delegate 调用生成唯一 ``child_session_key``,通过 AgentLoop 跑子
-agent 循环,所有工具调用透传 child_session_key 实现 cwd / 文件状态隔离。
+每个实际启动的 delegate 调用生成唯一 ``child_session_key``,通过 AgentLoop
+跑子 agent 循环,所有工具调用透传 child_session_key 实现 cwd / 文件状态隔离。
 无论成功 / 异常 / max_iter,都通过 finally 清理对应 backend。
 
 子 agent 是 leaf agent:
@@ -224,7 +224,7 @@ class DelegateAgentLoop(AgentLoop):
 
     handle_model_error 覆盖为返 ``"abort"``:模型 API 异常走
     ``status="model_error"`` 路径,而不是默认 ``"raise"`` 冒泡到
-    handle_delegate 兜底被误标为 tool_error。
+    handle_delegate 的基础设施未预期异常边界。
 
     构造参数 ``model_kwargs`` 透传给基类,用于 provider-specific 额外
     参数(extra_body / temperature 等),由调用方决定。
@@ -329,9 +329,10 @@ def run_delegate_child(
         }
     except Exception as exc:
         # DelegateAgentLoop.handle_model_error 已返 abort,模型异常不会冒泡
-        # 到这里;真到这里说明是别的未预期异常,归到 tool_error 作兜底
+        # 到这里;真到这里说明是 Delegate 执行基础设施的未预期异常。
         return {
-            "ok": False, "status": "tool_error",
+            "ok": False, "status": "error",
+            "error_type": "internal_error",
             "summary": "", "iterations": 0, "tools_used": [],
             "tool_batches": 0, "tool_call_count": 0,
             "error": repr(exc),
@@ -378,16 +379,9 @@ def handle_delegate(args, **kwargs) -> str:
             ),
         )
 
-    # 提前过滤:无可用工具直接返,不创建 backend / job
-    if not _resolve_delegate_tools(toolsets).definitions:
-        return _result(
-            False, "invalid_args", "",
-            error=(f"no usable tools after applying child restrictions; "
-                   f"requested={args.get('toolsets')!r}"),
-        )
-
     background = bool(args.get("background", False))
-    if kwargs.get("cron_execution_context") is not None and background:
+    cron_context = kwargs.get("cron_execution_context")
+    if cron_context is not None and background:
         return _result(
             False,
             "background_delegate_disabled",
@@ -397,6 +391,41 @@ def handle_delegate(args, **kwargs) -> str:
                 "use background=false so the parent run waits for the child."
             ),
         )
+
+    parent_cancel_checker = kwargs.get("cancel_checker")
+    if not callable(parent_cancel_checker):
+        parent_cancel_checker = None
+
+    cron_cancel_checker = None
+    if cron_context is not None:
+        candidate = getattr(cron_context, "cancel_checker", None)
+        if callable(candidate):
+            cron_cancel_checker = candidate
+
+    child_cancel_checker = None
+    if not background:
+        child_cancel_checker = _combine_cancel_checkers(
+            parent_cancel_checker,
+            cron_cancel_checker,
+        )
+        if child_cancel_checker is not None and child_cancel_checker():
+            return _result(
+                False,
+                "cancelled",
+                "",
+                error="cancel requested",
+                error_type="cancelled",
+            )
+
+    # 只有确定可能启动 child 时才解析工具并分配 child_session_key。
+    if not _resolve_delegate_tools(toolsets).definitions:
+        return _result(
+            False, "invalid_args", "",
+            error=(f"no usable tools after applying child restrictions; "
+                   f"requested={args.get('toolsets')!r}"),
+        )
+
+    child_session_key = f"child-{uuid.uuid4().hex[:12]}"
     parent_session_key = kwargs.get("session_key")
     # 这两个值仅来自工具运行时上下文，绝不写入模型参数、消息或工具结果。
     runtime_hook_registry = kwargs.get("hook_registry")
@@ -411,7 +440,6 @@ def handle_delegate(args, **kwargs) -> str:
         if isinstance(runtime_parent_run_id, str) and runtime_parent_run_id
         else None
     )
-    child_session_key = f"child-{uuid.uuid4().hex[:12]}"
     child_tool_context = {
         "interactive_approval": kwargs.get(
             "interactive_approval",
@@ -420,30 +448,14 @@ def handle_delegate(args, **kwargs) -> str:
     }
     if kwargs.get("approval_mode") is not None:
         child_tool_context["approval_mode"] = kwargs.get("approval_mode")
-    if kwargs.get("cron_execution_context") is not None:
-        child_tool_context["cron_execution_context"] = kwargs[
-            "cron_execution_context"
-        ]
+    if cron_context is not None:
+        child_tool_context["cron_execution_context"] = cron_context
     if kwargs.get("cron_capability_guard") is not None:
         child_tool_context["cron_capability_guard"] = kwargs[
             "cron_capability_guard"
         ]
-    parent_cancel_checker = kwargs.get("cancel_checker")
-    if not callable(parent_cancel_checker):
-        parent_cancel_checker = None
-
-    cron_cancel_checker = None
-    cron_context = kwargs.get("cron_execution_context")
-    if cron_context is not None:
-        candidate = getattr(cron_context, "cancel_checker", None)
-        if callable(candidate):
-            cron_cancel_checker = candidate
 
     if not background:
-        child_cancel_checker = _combine_cancel_checkers(
-            parent_cancel_checker,
-            cron_cancel_checker,
-        )
         # ---------- 同步模式 ----------
         print(f"  [delegate] sync child={child_session_key} goal={goal[:80]!r}")
         try:
@@ -655,7 +667,8 @@ def register(registry):
                 "effects across rounds), and only sees the goal + optional "
                 "context. background=false (default) blocks until the child "
                 "finishes and returns {ok, status, summary, iterations, "
-                "tools_used, child_session_key, error}. background=true "
+                "tools_used, tool_batches, tool_call_count, "
+                "child_session_key, error, error_type}. background=true "
                 "submits a background job and immediately returns "
                 "{ok, status='submitted', job_id, child_session_key}; poll "
                 "with delegate_status / delegate_result / delegate_cancel."
