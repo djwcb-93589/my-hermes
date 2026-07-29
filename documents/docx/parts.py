@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import PurePosixPath, PureWindowsPath
+from typing import Literal, NoReturn
 from xml.etree import ElementTree
 
 from .errors import DocxError
@@ -129,20 +130,35 @@ def allocate_image_part_name(
 class ContentTypesManager:
     """校验并增量维护 `[Content_Types].xml`。"""
 
-    def __init__(self, root: ElementTree.Element) -> None:
+    def __init__(
+        self,
+        root: ElementTree.Element,
+        *,
+        error_type: Literal[
+            "package_mutation_conflict",
+            "edit_verification_failed",
+        ] = "package_mutation_conflict",
+        validate_order: bool = True,
+    ) -> None:
+        self._structure_error_type = error_type
         if root.tag != _CONTENT_TYPES:
-            raise DocxError(
-                "package_mutation_conflict",
+            self._raise_structure_error(
                 "[Content_Types].xml 根节点无效。",
             )
         self.root = root
         self.changed = False
         self._defaults: dict[str, tuple[str, ElementTree.Element]] = {}
         self._overrides: dict[str, tuple[str, ElementTree.Element]] = {}
+        override_seen = False
+        self._canonical_order = True
         for child in root:
             if not isinstance(child.tag, str):
                 continue
             if child.tag == _DEFAULT:
+                if override_seen:
+                    self._canonical_order = False
+                    if validate_order:
+                        self.validate_canonical_order()
                 extension = child.attrib.get("Extension", "").lower()
                 content_type = child.attrib.get("ContentType", "")
                 if (
@@ -150,31 +166,42 @@ class ContentTypesManager:
                     or not content_type
                     or extension in self._defaults
                 ):
-                    raise DocxError(
-                        "package_mutation_conflict",
+                    self._raise_structure_error(
                         "Content Types 包含重复或无效的 Default。",
                     )
                 self._defaults[extension] = (content_type, child)
             elif child.tag == _OVERRIDE:
+                override_seen = True
                 raw_name = child.attrib.get("PartName", "")
                 content_type = child.attrib.get("ContentType", "")
                 if not raw_name.startswith("/") or not content_type:
-                    raise DocxError(
-                        "package_mutation_conflict",
+                    self._raise_structure_error(
                         "Content Types 包含无效的 Override。",
                     )
-                part_name = normalize_part_name(raw_name[1:])
+                try:
+                    part_name = normalize_part_name(raw_name[1:])
+                except DocxError as exc:
+                    self._raise_structure_error(
+                        "Content Types 包含无效的 Override。",
+                        cause=exc,
+                    )
                 if part_name in self._overrides:
-                    raise DocxError(
-                        "package_mutation_conflict",
+                    self._raise_structure_error(
                         "Content Types 包含重复的 Override。",
                     )
                 self._overrides[part_name] = (content_type, child)
             else:
-                raise DocxError(
-                    "package_mutation_conflict",
+                self._raise_structure_error(
                     "Content Types 包含不支持的直接子节点。",
                 )
+
+    def validate_canonical_order(self) -> None:
+        """确认全部 Default 位于第一个 Override 之前。"""
+
+        if not self._canonical_order:
+            self._raise_structure_error(
+                "Content Types 的 Default 不能位于 Override 之后。",
+            )
 
     def ensure_default(self, extension: str, content_type: str) -> None:
         normalized_extension = extension.lower().lstrip(".")
@@ -186,14 +213,22 @@ class ContentTypesManager:
                     "图片扩展名的 Content Type 与现有定义冲突。",
                 )
             return
-        element = ElementTree.SubElement(
-            self.root,
+        element = ElementTree.Element(
             _DEFAULT,
             {
                 "Extension": normalized_extension,
                 "ContentType": content_type,
             },
         )
+        insertion_index = next(
+            (
+                index
+                for index, child in enumerate(self.root)
+                if child.tag == _OVERRIDE
+            ),
+            len(self.root),
+        )
+        self.root.insert(insertion_index, element)
         self._defaults[normalized_extension] = (content_type, element)
         self.changed = True
 
@@ -226,3 +261,14 @@ class ContentTypesManager:
         extension = normalized_name.rsplit(".", 1)[-1].lower()
         default = self._defaults.get(extension)
         return default[0] if default is not None else None
+
+    def _raise_structure_error(
+        self,
+        message: str,
+        *,
+        cause: Exception | None = None,
+    ) -> NoReturn:
+        error = DocxError(self._structure_error_type, message)
+        if cause is None:
+            raise error
+        raise error from cause

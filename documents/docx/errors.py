@@ -41,6 +41,14 @@ DOCX_ERROR_TYPES = frozenset(
         "match_conflict",
         "match_not_editable",
         "search_verification_failed",
+        "invalid_image",
+        "image_limit_exceeded",
+        "unsupported_image_format",
+        "invalid_hyperlink",
+        "section_not_found",
+        "package_mutation_conflict",
+        "relationship_conflict",
+        "part_name_conflict",
     }
 )
 

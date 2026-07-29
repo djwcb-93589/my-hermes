@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from types import MappingProxyType
+from typing import Literal, NoReturn
 from xml.etree import ElementTree
 
 from .errors import DocxError
@@ -18,9 +20,25 @@ _W_PARAGRAPH_PROPERTIES = f"{{{_W_NS}}}pPr"
 _W_RUN = f"{{{_W_NS}}}r"
 _W_SECTION_PROPERTIES = f"{{{_W_NS}}}sectPr"
 _W_SECTION_PROPERTIES_CHANGE = f"{{{_W_NS}}}sectPrChange"
+_W_FOOTNOTE_PROPERTIES = f"{{{_W_NS}}}footnotePr"
+_W_ENDNOTE_PROPERTIES = f"{{{_W_NS}}}endnotePr"
+_W_SECTION_TYPE = f"{{{_W_NS}}}type"
 _W_TITLE_PAGE = f"{{{_W_NS}}}titlePg"
 _W_PAGE_SIZE = f"{{{_W_NS}}}pgSz"
 _W_PAGE_MARGIN = f"{{{_W_NS}}}pgMar"
+_W_PAPER_SOURCE = f"{{{_W_NS}}}paperSrc"
+_W_PAGE_BORDERS = f"{{{_W_NS}}}pgBorders"
+_W_LINE_NUMBER_TYPE = f"{{{_W_NS}}}lnNumType"
+_W_PAGE_NUMBER_TYPE = f"{{{_W_NS}}}pgNumType"
+_W_COLUMNS = f"{{{_W_NS}}}cols"
+_W_FORM_PROTECTION = f"{{{_W_NS}}}formProt"
+_W_VERTICAL_ALIGNMENT = f"{{{_W_NS}}}vAlign"
+_W_NO_ENDNOTE = f"{{{_W_NS}}}noEndnote"
+_W_TEXT_DIRECTION = f"{{{_W_NS}}}textDirection"
+_W_BIDI = f"{{{_W_NS}}}bidi"
+_W_RTL_GUTTER = f"{{{_W_NS}}}rtlGutter"
+_W_DOCUMENT_GRID = f"{{{_W_NS}}}docGrid"
+_W_PRINTER_SETTINGS = f"{{{_W_NS}}}printerSettings"
 _W_HEADER_REFERENCE = f"{{{_W_NS}}}headerReference"
 _W_FOOTER_REFERENCE = f"{{{_W_NS}}}footerReference"
 _W_HEADER = f"{{{_W_NS}}}hdr"
@@ -61,6 +79,35 @@ DEFAULT_MARGINS = {
     _W_GUTTER: 0,
 }
 MAX_MARGIN_TWIPS = 31_680
+_SECTPR_CHILD_ORDER: Mapping[str, int] = MappingProxyType(
+    {
+        _W_HEADER_REFERENCE: 10,
+        _W_FOOTER_REFERENCE: 20,
+        _W_FOOTNOTE_PROPERTIES: 30,
+        _W_ENDNOTE_PROPERTIES: 40,
+        _W_SECTION_TYPE: 50,
+        _W_PAGE_SIZE: 60,
+        _W_PAGE_MARGIN: 70,
+        _W_PAPER_SOURCE: 80,
+        _W_PAGE_BORDERS: 90,
+        _W_LINE_NUMBER_TYPE: 100,
+        _W_PAGE_NUMBER_TYPE: 110,
+        _W_COLUMNS: 120,
+        _W_FORM_PROTECTION: 130,
+        _W_VERTICAL_ALIGNMENT: 140,
+        _W_NO_ENDNOTE: 150,
+        _W_TITLE_PAGE: 160,
+        _W_TEXT_DIRECTION: 170,
+        _W_BIDI: 180,
+        _W_RTL_GUTTER: 190,
+        _W_DOCUMENT_GRID: 200,
+        _W_PRINTER_SETTINGS: 210,
+        _W_SECTION_PROPERTIES_CHANGE: 1000,
+    }
+)
+_SECTPR_SINGLETON_CHILDREN = frozenset(
+    set(_SECTPR_CHILD_ORDER) - {_W_HEADER_REFERENCE, _W_FOOTER_REFERENCE}
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +133,12 @@ class HeaderFooterExpectation:
     part_name: str | None
     text: str | None
     include_page_number: bool
+
+
+@dataclass(frozen=True)
+class SectionStructureExpectation:
+    section_index: int
+    expected_child_tags: tuple[str, ...]
 
 
 def locate_sections(body: ElementTree.Element) -> tuple[SectionLocation, ...]:
@@ -133,6 +186,72 @@ def require_section(
     if section_index >= len(locations):
         raise DocxError("section_not_found", "指定的 section_index 不存在。")
     return locations[section_index]
+
+
+def validate_section_child_order(
+    section: ElementTree.Element,
+    *,
+    error_type: Literal["block_not_editable", "edit_verification_failed"],
+) -> None:
+    """验证 sectPr 白名单、单例约束及规范的直接子节点顺序。"""
+
+    if section.tag != _W_SECTION_PROPERTIES:
+        _raise_section_structure_error(error_type)
+    previous_order = -1
+    singleton_tags: set[str] = set()
+    for child in section:
+        if not isinstance(child.tag, str):
+            continue
+        child_order = _require_known_section_child_order(
+            child.tag,
+            error_type=error_type,
+        )
+        if child_order < previous_order:
+            _raise_section_structure_error(error_type)
+        previous_order = child_order
+        if child.tag not in _SECTPR_SINGLETON_CHILDREN:
+            continue
+        if child.tag in singleton_tags:
+            _raise_section_structure_error(error_type)
+        singleton_tags.add(child.tag)
+
+
+def build_section_structure_expectation(
+    location: SectionLocation,
+) -> SectionStructureExpectation:
+    """记录修改计划完成后的 section 直接元素标签顺序。"""
+
+    validate_section_child_order(
+        location.section_properties,
+        error_type="block_not_editable",
+    )
+    return SectionStructureExpectation(
+        section_index=location.section_index,
+        expected_child_tags=_section_child_tags(
+            location.section_properties
+        ),
+    )
+
+
+def verify_section_structure(
+    locations: tuple[SectionLocation, ...],
+    expectation: SectionStructureExpectation,
+) -> None:
+    """验证输出 section 的顺序合法且与内存修改计划完全一致。"""
+
+    location = require_section(locations, expectation.section_index)
+    validate_section_child_order(
+        location.section_properties,
+        error_type="edit_verification_failed",
+    )
+    if (
+        _section_child_tags(location.section_properties)
+        != expectation.expected_child_tags
+    ):
+        raise DocxError(
+            "edit_verification_failed",
+            "输出 section 的属性标签顺序与修改计划不一致。",
+        )
 
 
 def apply_page_setup(
@@ -273,20 +392,7 @@ def set_header_footer_reference(
             RELATIONSHIP_ID: relationship_id,
         },
     )
-    allowed_before = (
-        {_W_HEADER_REFERENCE}
-        if part_kind == "header"
-        else {_W_HEADER_REFERENCE, _W_FOOTER_REFERENCE}
-    )
-    insertion_index = next(
-        (
-            index
-            for index, child in enumerate(section)
-            if child.tag not in allowed_before
-        ),
-        len(section),
-    )
-    section.insert(insertion_index, reference)
+    _insert_section_child(section, reference)
 
 
 def get_default_header_footer_reference_id(
@@ -410,6 +516,10 @@ def verify_page_setup(
     expectation: PageSetupExpectation,
 ) -> None:
     location = require_section(locations, expectation.section_index)
+    validate_section_child_order(
+        location.section_properties,
+        error_type="edit_verification_failed",
+    )
     page_sizes = [
         child
         for child in location.section_properties
@@ -597,21 +707,21 @@ def _insert_section_child(
     section: ElementTree.Element,
     child: ElementTree.Element,
 ) -> None:
-    order = {
-        _W_HEADER_REFERENCE: 10,
-        _W_FOOTER_REFERENCE: 20,
-        _W_PAGE_SIZE: 60,
-        _W_PAGE_MARGIN: 70,
-    }
-    target_order = order[child.tag]
-    insertion_index = next(
-        (
-            index
-            for index, existing in enumerate(section)
-            if order.get(existing.tag, 50) > target_order
-        ),
-        len(section),
+    target_order = _require_known_section_child_order(
+        child.tag,
+        error_type="block_not_editable",
     )
+    insertion_index = len(section)
+    for index, existing in enumerate(section):
+        if not isinstance(existing.tag, str):
+            continue
+        existing_order = _require_known_section_child_order(
+            existing.tag,
+            error_type="block_not_editable",
+        )
+        if existing_order > target_order:
+            insertion_index = index
+            break
     section.insert(insertion_index, child)
 
 
@@ -620,6 +730,10 @@ def _ensure_section_editable(
     *,
     header_footer: bool,
 ) -> None:
+    validate_section_child_order(
+        section,
+        error_type="block_not_editable",
+    )
     if any(
         element.tag == _W_SECTION_PROPERTIES_CHANGE
         for element in section.iter()
@@ -633,3 +747,31 @@ def _ensure_section_editable(
             "block_not_editable",
             "当前阶段不支持启用首页不同的 section 页眉页脚。",
         )
+
+
+def _require_known_section_child_order(
+    tag: object,
+    *,
+    error_type: Literal["block_not_editable", "edit_verification_failed"],
+) -> int:
+    if not isinstance(tag, str) or tag not in _SECTPR_CHILD_ORDER:
+        _raise_section_structure_error(error_type)
+    return _SECTPR_CHILD_ORDER[tag]
+
+
+def _section_child_tags(section: ElementTree.Element) -> tuple[str, ...]:
+    return tuple(
+        child.tag
+        for child in section
+        if isinstance(child.tag, str)
+    )
+
+
+def _raise_section_structure_error(
+    error_type: Literal["block_not_editable", "edit_verification_failed"],
+) -> NoReturn:
+    if error_type == "edit_verification_failed":
+        message = "输出 section 的属性顺序或直接子节点结构无效。"
+    else:
+        message = "当前 section 的属性顺序不符合本阶段支持的安全结构。"
+    raise DocxError(error_type, message)

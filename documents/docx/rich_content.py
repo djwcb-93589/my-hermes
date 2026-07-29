@@ -60,7 +60,9 @@ from .sections import (
     HeaderFooterExpectation,
     PageSetupExpectation,
     SectionLocation,
+    SectionStructureExpectation,
     apply_page_setup,
+    build_section_structure_expectation,
     create_footer_xml,
     create_header_xml,
     get_default_header_footer_reference_id,
@@ -68,8 +70,10 @@ from .sections import (
     require_section,
     set_header_footer_reference,
     validate_simple_header_footer_part,
+    validate_section_child_order,
     verify_header_footer_part,
     verify_page_setup,
+    verify_section_structure,
 )
 from .writer import parse_xml_preserving_misc, serialize_xml
 
@@ -232,7 +236,9 @@ class RichContentPlan:
     list_expectations: tuple[ListExpectation, ...]
     page_setup_expectations: tuple[PageSetupExpectation, ...]
     header_footer_expectations: tuple[HeaderFooterExpectation, ...]
+    section_structure_expectations: tuple[SectionStructureExpectation, ...]
     expected_external_relationships: frozenset[tuple[str, str, str, str]]
+    content_types_changed: bool
     document_changed: bool
 
     @property
@@ -249,7 +255,9 @@ EMPTY_RICH_CONTENT_PLAN = RichContentPlan(
     list_expectations=(),
     page_setup_expectations=(),
     header_footer_expectations=(),
+    section_structure_expectations=(),
     expected_external_relationships=frozenset(),
+    content_types_changed=False,
     document_changed=False,
 )
 
@@ -478,7 +486,10 @@ def prepare_rich_content_plan(
         content_types_payload,
         _CONTENT_TYPES_PART,
     )
-    content_types = ContentTypesManager(content_types_root)
+    content_types = ContentTypesManager(
+        content_types_root,
+        validate_order=False,
+    )
     relationships_existed = package.has_part(_DOCUMENT_RELATIONSHIPS_PART)
     if relationships_existed:
         relationships_original = package.read_xml_bytes(
@@ -667,6 +678,7 @@ def prepare_rich_content_plan(
         target = replacements if numbering.existed else additions
         target[numbering.part_name] = numbering_payload
     if content_types.changed:
+        content_types.validate_canonical_order()
         replacements[_CONTENT_TYPES_PART] = serialize_xml(
             content_types.root,
             original_payload=content_types_payload,
@@ -679,6 +691,26 @@ def prepare_rich_content_plan(
         target = replacements if relationships_existed else additions
         target[_DOCUMENT_RELATIONSHIPS_PART] = relationship_payload
 
+    affected_section_indexes = sorted(
+        {
+            operation.section_index
+            for operation in operations
+            if isinstance(
+                operation,
+                (
+                    ValidatedPageSetup,
+                    ValidatedHeaderUpdate,
+                    ValidatedFooterUpdate,
+                ),
+            )
+        }
+    )
+    section_structure_expectations = tuple(
+        build_section_structure_expectation(
+            require_section(section_locations, section_index)
+        )
+        for section_index in affected_section_indexes
+    )
     return RichContentPlan(
         body_insertions=tuple(body_insertions),
         replacements=replacements,
@@ -688,6 +720,7 @@ def prepare_rich_content_plan(
         list_expectations=tuple(list_expectations),
         page_setup_expectations=tuple(page_expectations),
         header_footer_expectations=tuple(header_footer_expectations),
+        section_structure_expectations=section_structure_expectations,
         expected_external_relationships=frozenset(
             {
                 *external_relationships(package),
@@ -702,6 +735,7 @@ def prepare_rich_content_plan(
                 ),
             }
         ),
+        content_types_changed=content_types.changed,
         document_changed=bool(
             body_insertions
             or page_expectations
@@ -753,7 +787,11 @@ def verify_rich_content_output(
             create_relationships_root(),
             source_part=_DOCUMENT_PART,
         )
-    content_types = ContentTypesManager(package.read_xml(_CONTENT_TYPES_PART))
+    content_types = ContentTypesManager(
+        package.read_xml(_CONTENT_TYPES_PART),
+        error_type="edit_verification_failed",
+        validate_order=plan.content_types_changed,
+    )
     _verify_images(
         package,
         document_root,
@@ -779,6 +817,8 @@ def verify_rich_content_output(
             "edit_verification_failed",
             "输出快照与 section locator 的数量不一致。",
         )
+    for expectation in plan.section_structure_expectations:
+        verify_section_structure(section_locations, expectation)
     for expectation in plan.page_setup_expectations:
         verify_page_setup(section_locations, expectation)
     for expectation in plan.header_footer_expectations:
@@ -1261,6 +1301,10 @@ def _verify_header_footer(
     expectation: HeaderFooterExpectation,
 ) -> None:
     location = require_section(section_locations, expectation.section_index)
+    validate_section_child_order(
+        location.section_properties,
+        error_type="edit_verification_failed",
+    )
     reference_tag = (
         f"{{{_W_NS}}}headerReference"
         if expectation.part_kind == "header"
