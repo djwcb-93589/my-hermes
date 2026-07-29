@@ -6,6 +6,7 @@ from collections import deque
 import json
 import queue
 import threading
+import uuid
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Protocol
@@ -22,6 +23,7 @@ from hermes.db import (
     replace_tool_message_content,
     session_exists,
 )
+from hermes.steering import SteerEntry, SteerMailbox
 
 
 DEFAULT_CLI_MESSAGE_QUEUE_LIMIT = 20
@@ -50,6 +52,13 @@ class CLIMessageQueue:
     def dequeue(self) -> str | None:
         """取出最早进入队列的消息。"""
         return self._messages.popleft() if self._messages else None
+
+    def restore_front(self, messages: list[str] | tuple[str, ...]) -> None:
+        """按原顺序把未消费的 steer 文本放回普通队首。"""
+        restored = tuple(messages)
+        if any(not isinstance(message, str) for message in restored):
+            raise TypeError("restored CLI messages must be strings")
+        self._messages.extendleft(reversed(restored))
 
     def clear(self) -> int:
         """清空尚未提交的消息，并返回清空数量。"""
@@ -87,6 +96,7 @@ class CLIWorkerTask:
     approval_scope: str = "once"
     current_session_id: str | None = None
     cancel_event: threading.Event | None = None
+    steer_mailbox: SteerMailbox | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +300,11 @@ class CLIWorker:
 
     def _run_conversation_task(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
         session_id = task.session_id or create_session(conn)
+        steer_kwargs = (
+            {"steer_mailbox": task.steer_mailbox}
+            if task.steer_mailbox is not None
+            else {}
+        )
         try:
             result = run_conversation(
                 task.user_input,
@@ -303,6 +318,7 @@ class CLIWorker:
                 tool_policy=task.tool_policy,
                 stream_sink=self._stream_sink,
                 hook_registry=self._hook_registry,
+                **steer_kwargs,
             )
         except Exception as exc:
             return CLIWorkerResult(
@@ -353,6 +369,11 @@ class CLIWorker:
                 error=f"approval execution failed: {exc}",
             )
 
+        steer_kwargs = (
+            {"steer_mailbox": task.steer_mailbox}
+            if task.steer_mailbox is not None
+            else {}
+        )
         result = run_conversation(
             "",
             conn,
@@ -366,6 +387,7 @@ class CLIWorker:
             tool_policy=task.tool_policy,
             stream_sink=self._stream_sink,
             hook_registry=self._hook_registry,
+            **steer_kwargs,
         )
         return CLIWorkerResult(
             kind=task.kind,
@@ -471,6 +493,7 @@ class CLIController:
         self._running = False
         self._shutting_down = False
         self._current_cancel_event: threading.Event | None = None
+        self._active_steer_mailbox: SteerMailbox | None = None
 
     def run(self) -> None:
         """等待输入或 worker 通知；不使用轮询或定时唤醒。"""
@@ -543,6 +566,14 @@ class CLIController:
             )
             return
 
+        if (
+            self._running
+            and self._active_steer_mailbox is not None
+            and not command.startswith("/")
+        ):
+            self._submit_or_queue_message(user_input)
+            return
+
         if self._pending_approval is not None:
             self._handle_pending_approval(command, command_argument)
             return
@@ -610,6 +641,20 @@ class CLIController:
             self._ui.show_message("agent is running; approval is still pending.")
 
     def _submit_or_queue_message(self, user_input: str) -> None:
+        if self._running:
+            mailbox = self._active_steer_mailbox
+            if mailbox is not None:
+                entry = SteerEntry(
+                    steer_id=f"cli-steer:{uuid.uuid4().hex}",
+                    text=user_input,
+                )
+                try:
+                    submitted = mailbox.submit(entry)
+                except Exception:
+                    submitted = False
+                if submitted:
+                    self._ui.show_message("已向当前任务发送引导。")
+                    return
         if self._running or not self._message_queue.is_empty():
             if self._message_queue.enqueue(user_input):
                 self._ui.show_message("message queued.")
@@ -639,29 +684,56 @@ class CLIController:
     def _submit_task(self, task: CLIWorkerTask, *, begins_stream: bool = False) -> bool:
         if self._shutting_down or self._running:
             return False
-        cancel_event = (
-            threading.Event() if task.kind in {"conversation", "approve"} else None
-        )
-        if cancel_event is not None:
-            task = replace(task, cancel_event=cancel_event)
+        starts_agent = task.kind in {"conversation", "approve"}
+        cancel_event = threading.Event() if starts_agent else None
+        steer_mailbox = SteerMailbox() if starts_agent else None
+        if starts_agent:
+            task = replace(
+                task,
+                cancel_event=cancel_event,
+                steer_mailbox=steer_mailbox,
+            )
         if begins_stream:
             self._ui.begin_stream_request()
         if not self._worker.submit(task):
             return False
         self._running = True
         self._current_cancel_event = cancel_event
+        self._active_steer_mailbox = steer_mailbox
         return True
 
     def _handle_worker_results(self) -> None:
         for result in self._worker.drain_results():
             self._running = False
             self._current_cancel_event = None
+            self._active_steer_mailbox = None
+            self._restore_pending_steer(result)
             self._apply_worker_result(result)
             if result.kind == "cancel_approval" and result.error is None:
                 self._ui.show_message("当前审批已取消。")
             else:
                 self._ui.show_worker_result(result)
             self._submit_next_queued_message()
+
+    def _restore_pending_steer(self, result: CLIWorkerResult) -> None:
+        """把 AgentLoop 未消费的 steer 文本原序恢复到普通队首。"""
+        conversation_result = result.conversation_result
+        if not isinstance(conversation_result, dict):
+            return
+        pending_steer = conversation_result.get("pending_steer")
+        if not isinstance(pending_steer, (list, tuple)):
+            return
+        seen_ids: set[str] = set()
+        messages: list[str] = []
+        for entry in pending_steer:
+            if (
+                not isinstance(entry, SteerEntry)
+                or entry.steer_id in seen_ids
+            ):
+                continue
+            seen_ids.add(entry.steer_id)
+            messages.append(entry.text)
+        self._message_queue.restore_front(messages)
 
     def _apply_worker_result(self, result: CLIWorkerResult) -> None:
         if result.kind == "list_sessions":
