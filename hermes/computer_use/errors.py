@@ -95,3 +95,15 @@ class ActionUnverifiedError(ComputerUseError):
     """动作已调用但无法确认真实生效。"""
 
     code = "action_unverified"
+
+
+class ProtocolError(ComputerUseError):
+    """cua-driver 返回了无效的 JSON-RPC 或 MCP 数据。"""
+
+    code = "protocol_error"
+
+
+class DriverNotFoundError(ComputerUseError):
+    """系统无法找到配置的 cua-driver 命令。"""
+
+    code = "driver_not_found"

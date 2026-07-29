@@ -6,14 +6,15 @@
 
 ## 当前阶段
 
-当前已完成 P0 公开数据契约、P1 Backend 抽象与统一错误契约，以及 P2
-NoopBackend 和 FakeBackend。当前仍然：
+当前已完成 P0 公开数据契约、P1 Backend 抽象与统一错误契约、P2
+NoopBackend 和 FakeBackend，以及 P3 cua-driver 进程生命周期和 MCP stdio
+通信层。当前仍然：
 
 - 没有任何真实 Backend；
 - 不能截图；
 - 不能点击；
 - 不能输入；
-- 不能连接 cua-driver；
+- 尚未把 cua-driver 工具结果转换成 Computer Use 正式结果；
 - 没有 CLI；
 - 没有 Agent 接入。
 
@@ -52,7 +53,8 @@ ComputerUseExecutor.execute(...)
 
 NoopBackend 用于最简单的调用链检查，只返回空捕获或不可验证的动作结果。
 FakeBackend 用于在内存中配置应用、窗口、捕获结果、动作结果和异常，并记录调用。
-两者都不会操作真实电脑；下一阶段才会连接 cua-driver。
+两者都不会操作真实电脑。P3 通信层只管理 cua-driver 子进程、MCP 初始化和请求响应，
+尚未实现具体 Computer Use 动作。
 
 ## 图片边界
 
@@ -60,5 +62,4 @@ FakeBackend 用于在内存中配置应用、窗口、捕获结果、动作结�
 
 ## 后续阶段
 
-- P3：cua-driver 生命周期与通信
-- P4：只读观察能力
+- P4：实现 `capture`、`list_apps`、`list_windows`、`wait`，并将驱动结果转换为正式数据契约
