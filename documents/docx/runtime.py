@@ -15,6 +15,7 @@ from .errors import DocxError
 
 
 _MINIMUM_NODE_MAJOR = 20
+_DEPENDENCY_CHECK_TIMEOUT_SECONDS = 10.0
 _VERSION_PATTERN = re.compile(r"^v?(?P<major>\d+)(?:\.\d+){0,2}")
 
 
@@ -25,6 +26,7 @@ class NodeRuntime:
         self._configured_executable = node_executable
         self._runtime_dir = Path(__file__).resolve().parent / "node_runtime"
         self._script_path = self._runtime_dir / "scripts" / "create.mjs"
+        self._dependency_check_path = self._runtime_dir / "scripts" / "check.mjs"
         self._resolved_executable: Path | None = None
         self._node_version: str | None = None
         self._checked = False
@@ -47,6 +49,7 @@ class NodeRuntime:
             self._runtime_dir / "package.json",
             self._runtime_dir / "package-lock.json",
             self._script_path,
+            self._dependency_check_path,
         )
         dependency_directory = self._runtime_dir / "node_modules" / "docx"
         if (
@@ -58,6 +61,7 @@ class NodeRuntime:
                 "DOCX Node 依赖尚未准备，请先在安装阶段运行 npm ci。",
             )
 
+        self._check_dependencies(executable)
         self._resolved_executable = executable
         self._node_version = version
         self._checked = True
@@ -213,6 +217,46 @@ class NodeRuntime:
                 "Node 主版本过低，要求 Node 20 或更高版本。",
             )
         return version
+
+    def _check_dependencies(self, executable: Path) -> None:
+        try:
+            completed = subprocess.run(
+                [str(executable), str(self._dependency_check_path)],
+                shell=False,
+                cwd=self._runtime_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_DEPENDENCY_CHECK_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node 依赖加载检查超时。",
+            ) from exc
+        except (FileNotFoundError, OSError) as exc:
+            raise DocxError("node_runtime_unavailable", "Node 运行时不可用。") from exc
+
+        lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        if completed.returncode != 0 or len(lines) != 1:
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node 依赖无法加载，请在安装阶段重新运行 npm ci。",
+            )
+        try:
+            result = json.loads(lines[0])
+        except json.JSONDecodeError as exc:
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node 依赖检查返回了无效结果。",
+            ) from exc
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node 依赖检查返回了无效结果。",
+            )
 
     @staticmethod
     def _read_child_error_type(stdout: str, stderr: str) -> str | None:

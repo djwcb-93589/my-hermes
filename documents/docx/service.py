@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -31,6 +32,17 @@ _REQUIRED_DOCX_ENTRIES = (
     "_rels/.rels",
     "word/document.xml",
 )
+_UNSUPPORTED_LINK_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "EXDEV", None),
+    )
+    if value is not None
+)
+_UNSUPPORTED_LINK_WINERRORS = frozenset({1, 50})
 
 
 class DocxService:
@@ -78,13 +90,10 @@ class DocxService:
             _validate_docx(temporary_output)
             size_bytes = _read_file_size(temporary_output)
             sha256 = _calculate_sha256(temporary_output)
-            if not request.overwrite and os.path.lexists(output_path):
-                raise DocxError("output_exists", "目标 DOCX 已存在。")
-            try:
-                os.replace(temporary_output, output_path)
-            except OSError as exc:
-                raise DocxError("io_error", "无法原子写入目标 DOCX。") from exc
-            temporary_output = None
+            if request.overwrite:
+                _commit_with_overwrite(temporary_output, output_path)
+            else:
+                _commit_without_overwrite(temporary_output, output_path)
             return CreateDocumentResult(
                 output_path=output_path,
                 size_bytes=size_bytes,
@@ -281,10 +290,9 @@ def _create_temporary_output_path(output_path: Path) -> Path:
             suffix=".tmp.docx",
             dir=output_path.parent,
         )
+        temporary_path = Path(raw_path).resolve()
         os.close(descriptor)
         descriptor = None
-        temporary_path = Path(raw_path).resolve()
-        temporary_path.unlink()
         return temporary_path
     except OSError as exc:
         if descriptor is not None:
@@ -294,6 +302,36 @@ def _create_temporary_output_path(output_path: Path) -> Path:
                 pass
         _best_effort_unlink(temporary_path)
         raise DocxError("io_error", "无法在目标目录创建临时 DOCX。") from exc
+
+
+def _commit_with_overwrite(temporary_output: Path, output_path: Path) -> None:
+    try:
+        os.replace(temporary_output, output_path)
+    except OSError as exc:
+        raise DocxError("io_error", "无法原子替换目标 DOCX。") from exc
+
+
+def _commit_without_overwrite(temporary_output: Path, output_path: Path) -> None:
+    if temporary_output.parent != output_path.parent:
+        raise DocxError("io_error", "无覆盖提交要求临时文件与目标文件位于同一目录。")
+    if not hasattr(os, "link"):
+        raise DocxError("io_error", "当前平台不支持原子无覆盖 DOCX 提交。")
+    try:
+        os.link(temporary_output, output_path)
+    except FileExistsError as exc:
+        raise DocxError("output_exists", "目标 DOCX 已存在。") from exc
+    except PermissionError as exc:
+        raise DocxError("io_error", "没有权限以原子无覆盖方式提交目标 DOCX。") from exc
+    except OSError as exc:
+        if (
+            exc.errno in _UNSUPPORTED_LINK_ERRNOS
+            or getattr(exc, "winerror", None) in _UNSUPPORTED_LINK_WINERRORS
+        ):
+            raise DocxError(
+                "io_error",
+                "当前文件系统不支持原子无覆盖 DOCX 提交。",
+            ) from exc
+        raise DocxError("io_error", "无法以原子无覆盖方式提交目标 DOCX。") from exc
 
 
 def _validate_docx(path: Path) -> None:

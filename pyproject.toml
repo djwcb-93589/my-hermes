@@ -26,5 +26,6 @@ include = ["hermes", "hermes.*", "browser", "browser.*", "documents", "documents
 "documents.docx" = [
     "node_runtime/package.json",
     "node_runtime/package-lock.json",
-    "node_runtime/scripts/*.mjs",
+    "node_runtime/scripts/check.mjs",
+    "node_runtime/scripts/create.mjs",
 ]

@@ -39,4 +39,5 @@ browser/screenshot/
 自进化机制设计.txt
 scripts/
 !/documents/docx/node_runtime/scripts/
+!/documents/docx/node_runtime/scripts/check.mjs
 !/documents/docx/node_runtime/scripts/create.mjs

@@ -273,7 +273,7 @@ async function main() {
   }
 
   const buffer = await Packer.toBuffer(new Document(documentOptions));
-  await writeFile(outputPath, buffer);
+  await writeFile(outputPath, buffer, { flag: "w" });
   process.stdout.write(
     `${JSON.stringify({
       ok: true,
