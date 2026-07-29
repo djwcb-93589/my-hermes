@@ -9,6 +9,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from .errors import DocxError
+from .locator import iter_body_children, visible_row_cells, visible_table_rows
 from .models import (
     DocumentMetadata,
     DocumentSnapshot,
@@ -215,34 +216,32 @@ class DocxReader:
             blocks: list[ParagraphSnapshot | TableSnapshot] = []
             paragraph_count = 0
             table_count = 0
-            paragraph_index = 0
-            table_index = 0
 
-            for child in body:
-                if child.tag == _W_PARAGRAPH:
+            for location in iter_body_children(body):
+                if location.kind == "paragraph" and location.block_id is not None:
                     state.consume_block()
-                    block_id = f"body:p:{paragraph_index}"
-                    paragraph_index += 1
                     paragraph_count += 1
                     blocks.append(
                         _read_paragraph(
-                            child,
-                            block_id=block_id,
+                            location.element,
+                            block_id=location.block_id,
                             state=state,
                             include_runs=validated_request.include_runs,
                         )
                     )
-                elif child.tag == _W_TABLE:
+                elif location.kind == "table" and location.block_id is not None:
                     state.consume_block()
-                    block_id = f"body:table:{table_index}"
-                    table_index += 1
                     table_count += 1
-                    table = _read_table(child, block_id=block_id, state=state)
+                    table = _read_table(
+                        location.element,
+                        block_id=location.block_id,
+                        state=state,
+                    )
                     if validated_request.include_tables:
                         blocks.append(table)
-                elif child.tag == _W_SECTION_PROPERTIES:
+                elif location.kind == "section":
                     continue
-                else:
+                elif location.kind == "unsupported":
                     state.add_warning(
                         "unsupported_content",
                         "正文包含尚未建模的顶层 OOXML 内容。",
@@ -565,7 +564,7 @@ def _read_table(
             "表格包含属性修订。",
             block_id,
         )
-    row_elements, wrapped_rows = _collect_table_rows(table)
+    row_elements, wrapped_rows = visible_table_rows(table)
     if wrapped_rows:
         _mark_block_warning(
             state,
@@ -601,7 +600,7 @@ def _read_table(
     row_lengths: list[int] = []
     for row_index, row_element in enumerate(row_elements):
         state.consume_row()
-        cells, wrapped_cells = _collect_row_cells(row_element)
+        cells, wrapped_cells = visible_row_cells(row_element)
         row_has_property_revision = any(
             element.tag == _W_ROW_PROPERTIES_CHANGE for element in row_element.iter()
         )
@@ -720,40 +719,6 @@ def _read_table_cell(
     )
 
 
-def _collect_table_rows(
-    table: ElementTree.Element,
-) -> tuple[list[ElementTree.Element], bool]:
-    rows: list[ElementTree.Element] = []
-    wrapped_rows = False
-    for child in table:
-        if child.tag == _W_ROW:
-            rows.append(child)
-        elif child.tag in _CONTENT_REVISION_TAGS:
-            wrapped_rows = True
-            if child.tag not in _HIDDEN_CONTENT_REVISION_TAGS:
-                rows.extend(
-                    element for element in child if element.tag == _W_ROW
-                )
-    return rows, wrapped_rows
-
-
-def _collect_row_cells(
-    row: ElementTree.Element,
-) -> tuple[list[ElementTree.Element], bool]:
-    cells: list[ElementTree.Element] = []
-    wrapped_cells = False
-    for child in row:
-        if child.tag == _W_CELL:
-            cells.append(child)
-        elif child.tag in _CONTENT_REVISION_TAGS:
-            wrapped_cells = True
-            if child.tag not in _HIDDEN_CONTENT_REVISION_TAGS:
-                cells.extend(
-                    element for element in child if element.tag == _W_CELL
-                )
-    return cells, wrapped_cells
-
-
 def _collect_cell_paragraphs(
     cell: ElementTree.Element,
 ) -> tuple[list[ElementTree.Element], list[ElementTree.Element]]:
@@ -837,7 +802,7 @@ def _add_warning_type(warning_types: list[str], warning_type: str) -> None:
 def _element_text(element: ElementTree.Element | None) -> str | None:
     if element is None:
         return None
-    return element.text
+    return element.text or ""
 
 
 def _local_name(tag: str) -> str:

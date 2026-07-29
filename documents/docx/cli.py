@@ -1,4 +1,4 @@
-"""独立 DOCX 创建与只读检查命令行入口。"""
+"""独立 DOCX 创建、只读检查与安全编辑命令行入口。"""
 
 from __future__ import annotations
 
@@ -10,20 +10,26 @@ from typing import Any, Sequence
 
 from .errors import DocxError
 from .models import (
+    AppliedEdit,
     CreateDocumentRequest,
     DocumentMetadata,
     DocumentSnapshot,
     DocumentWarning,
+    EditDocumentRequest,
+    EditDocumentResult,
     HeadingSpec,
     InspectDocumentRequest,
     PageBreakSpec,
     ParagraphSnapshot,
     ParagraphSpec,
+    ReplaceParagraphText,
+    ReplaceTableCellText,
     TableCellSnapshot,
     TableSnapshot,
     TableSpec,
     TextRunSnapshot,
     TextRunSpec,
+    UpdateDocumentMetadata,
 )
 from .runtime import NodeRuntime
 from .service import DocxService
@@ -77,6 +83,17 @@ _JSON_MODEL_FIELDS: dict[type[object], tuple[str, ...]] = {
         "warnings",
     ),
     DocumentWarning: ("warning_type", "message", "part", "block_id"),
+    EditDocumentResult: (
+        "source_path",
+        "output_path",
+        "old_revision",
+        "new_revision",
+        "size_bytes",
+        "sha256",
+        "changed",
+        "applied_edits",
+    ),
+    AppliedEdit: ("operation_index", "operation_type", "block_id"),
 }
 _JSON_BLOCK_TYPES: dict[type[object], str] = {
     ParagraphSnapshot: "paragraph",
@@ -98,6 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = _run_runtime_check(args)
         elif args.command == "inspect":
             payload = _run_inspect(args)
+        elif args.command == "edit":
+            payload = _run_edit(args)
         else:
             payload = _run_create(args)
         _print_json(payload)
@@ -142,6 +161,13 @@ def _build_parser() -> _JsonArgumentParser:
     inspect_parser.add_argument("--no-tables", action="store_true")
     inspect_parser.add_argument("--max-blocks", type=int)
     inspect_parser.add_argument("--max-text-chars", type=int)
+
+    edit_parser = subparsers.add_parser("edit", help="基于 revision 安全修改现有 DOCX")
+    edit_parser.add_argument("--source", required=True, type=Path)
+    edit_parser.add_argument("--output", required=True, type=Path)
+    edit_parser.add_argument("--expected-revision", required=True)
+    edit_parser.add_argument("--operations", required=True, type=Path)
+    edit_parser.add_argument("--overwrite", action="store_true")
     return parser
 
 
@@ -188,6 +214,112 @@ def _run_inspect(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(serialized, dict):
         raise DocxError("io_error", "DOCX 快照序列化失败。")
     return {"ok": True, **serialized}
+
+
+def _run_edit(args: argparse.Namespace) -> dict[str, Any]:
+    operations = _read_edit_operations(args.operations)
+    request = EditDocumentRequest(
+        source_path=args.source,
+        output_path=args.output,
+        expected_revision=args.expected_revision,
+        operations=operations,
+        overwrite=args.overwrite,
+    )
+    result = DocxService().edit_document(request)
+    serialized = _serialize_json_value(result)
+    if not isinstance(serialized, dict):
+        raise DocxError("io_error", "DOCX 编辑结果序列化失败。")
+    return {"ok": True, **serialized}
+
+
+def _read_edit_operations(
+    path: Path,
+) -> list[ReplaceParagraphText | ReplaceTableCellText | UpdateDocumentMetadata]:
+    try:
+        with path.expanduser().open("r", encoding="utf-8") as source:
+            value = json.load(source)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise DocxError(
+            "invalid_edit_operation",
+            "operations 文件不是有效的 UTF-8 JSON。",
+        ) from exc
+    except OSError as exc:
+        raise DocxError("io_error", "无法读取 operations 文件。") from exc
+    if not isinstance(value, dict):
+        raise DocxError(
+            "invalid_edit_operation",
+            "operations 文件顶层必须是 JSON object。",
+        )
+    _reject_unknown_keys(
+        value,
+        {"operations"},
+        "operations 文件",
+        "invalid_edit_operation",
+    )
+    raw_operations = value.get("operations")
+    if not isinstance(raw_operations, list):
+        raise DocxError(
+            "invalid_edit_operation",
+            "operations 字段必须是列表。",
+        )
+    return [
+        _parse_edit_operation(operation, index)
+        for index, operation in enumerate(raw_operations)
+    ]
+
+
+def _parse_edit_operation(
+    value: object,
+    index: int,
+) -> ReplaceParagraphText | ReplaceTableCellText | UpdateDocumentMetadata:
+    if not isinstance(value, dict):
+        raise DocxError(
+            "invalid_edit_operation",
+            f"第 {index} 个编辑操作必须是 JSON object。",
+        )
+    operation_type = value.get("type")
+    if operation_type == "replace_paragraph_text":
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id", "text", "preserve_first_run_format"},
+            f"第 {index} 个 replace_paragraph_text",
+            "invalid_edit_operation",
+        )
+        return ReplaceParagraphText(
+            block_id=value.get("block_id"),
+            text=value.get("text"),
+            preserve_first_run_format=value.get(
+                "preserve_first_run_format",
+                True,
+            ),
+        )
+    if operation_type == "replace_table_cell_text":
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id", "text", "preserve_first_run_format"},
+            f"第 {index} 个 replace_table_cell_text",
+            "invalid_edit_operation",
+        )
+        return ReplaceTableCellText(
+            block_id=value.get("block_id"),
+            text=value.get("text"),
+            preserve_first_run_format=value.get(
+                "preserve_first_run_format",
+                True,
+            ),
+        )
+    if operation_type == "update_document_metadata":
+        _reject_unknown_keys(
+            value,
+            {"type", "fields"},
+            f"第 {index} 个 update_document_metadata",
+            "invalid_edit_operation",
+        )
+        return UpdateDocumentMetadata(fields=value.get("fields"))
+    raise DocxError(
+        "invalid_edit_operation",
+        f"第 {index} 个编辑操作 type 不受支持。",
+    )
 
 
 def _read_specification(path: Path) -> dict[str, Any]:

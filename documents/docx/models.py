@@ -168,3 +168,67 @@ class InspectDocumentRequest:
     include_tables: bool = True
     max_blocks: int | None = None
     max_text_chars: int | None = None
+
+
+@dataclass(frozen=True)
+class ReplaceParagraphText:
+    """替换正文顶层普通段落文字。"""
+
+    block_id: str
+    text: str
+    preserve_first_run_format: bool = True
+
+
+@dataclass(frozen=True)
+class ReplaceTableCellText:
+    """替换简单表格单元格的唯一段落文字。"""
+
+    block_id: str
+    text: str
+    preserve_first_run_format: bool = True
+
+
+@dataclass(frozen=True)
+class UpdateDocumentMetadata:
+    """按显式字段集合更新基础核心属性。"""
+
+    fields: dict[str, str | None]
+
+
+EditOperation: TypeAlias = (
+    ReplaceParagraphText | ReplaceTableCellText | UpdateDocumentMetadata
+)
+
+
+@dataclass(frozen=True)
+class EditDocumentRequest:
+    """基于已知 revision 编辑现有 DOCX 的请求。"""
+
+    source_path: Path
+    output_path: Path
+    expected_revision: str
+    operations: list[EditOperation]
+    overwrite: bool = False
+
+
+@dataclass(frozen=True)
+class AppliedEdit:
+    """按请求顺序记录的已验证编辑操作。"""
+
+    operation_index: int
+    operation_type: str
+    block_id: str | None
+
+
+@dataclass(frozen=True)
+class EditDocumentResult:
+    """成功写出并重新验证后的编辑结果。"""
+
+    source_path: Path
+    output_path: Path
+    old_revision: str
+    new_revision: str
+    size_bytes: int
+    sha256: str
+    changed: bool
+    applied_edits: list[AppliedEdit]

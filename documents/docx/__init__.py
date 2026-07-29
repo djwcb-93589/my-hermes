@@ -1,45 +1,60 @@
-"""独立 DOCX 创建与只读检查模块的稳定公共接口。"""
+"""独立 DOCX 创建、只读检查与安全编辑模块的稳定公共接口。"""
 
 from .errors import DocxError
 from .models import (
+    AppliedEdit,
     CreateDocumentRequest,
     CreateDocumentResult,
     DocumentMetadata,
     DocumentSnapshot,
     DocumentWarning,
+    EditDocumentRequest,
+    EditDocumentResult,
     HeadingSpec,
     InspectDocumentRequest,
     PageBreakSpec,
     ParagraphSnapshot,
     ParagraphSpec,
+    ReplaceParagraphText,
+    ReplaceTableCellText,
     TableCellSnapshot,
     TableSnapshot,
     TableSpec,
     TextRunSnapshot,
     TextRunSpec,
+    UpdateDocumentMetadata,
 )
 from .reader import DocxReader, inspect_document
+from .editor import DocxEditor, edit_document
 from .service import DocxService, create_document
 
 __all__ = [
+    "AppliedEdit",
     "CreateDocumentRequest",
     "CreateDocumentResult",
     "DocumentMetadata",
     "DocumentSnapshot",
     "DocumentWarning",
     "DocxError",
+    "DocxEditor",
     "DocxReader",
     "DocxService",
+    "EditDocumentRequest",
+    "EditDocumentResult",
     "HeadingSpec",
     "InspectDocumentRequest",
     "PageBreakSpec",
     "ParagraphSnapshot",
     "ParagraphSpec",
+    "ReplaceParagraphText",
+    "ReplaceTableCellText",
     "TableCellSnapshot",
     "TableSnapshot",
     "TableSpec",
     "TextRunSnapshot",
     "TextRunSpec",
+    "UpdateDocumentMetadata",
     "create_document",
+    "edit_document",
     "inspect_document",
 ]

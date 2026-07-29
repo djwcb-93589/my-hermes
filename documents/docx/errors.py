@@ -28,6 +28,15 @@ DOCX_ERROR_TYPES = frozenset(
         "docx_limit_exceeded",
         "xml_parse_failed",
         "inspect_limit_exceeded",
+        "revision_conflict",
+        "block_not_found",
+        "block_not_editable",
+        "invalid_edit_operation",
+        "duplicate_edit_target",
+        "edit_operation_conflict",
+        "source_output_same",
+        "edit_verification_failed",
+        "output_revision_unchanged",
     }
 )
 

@@ -107,10 +107,57 @@ class DocxPackage:
 
         return tuple(sorted(self._parts))
 
+    @property
+    def ordered_part_names(self) -> tuple[str, ...]:
+        """按原 ZIP entry 顺序返回规范化 part 名称。"""
+
+        return tuple(self._parts)
+
     def has_part(self, part_name: str) -> bool:
         """判断指定规范化 part 是否存在。"""
 
         return part_name in self._parts
+
+    def read_source_bytes(self) -> bytes:
+        """返回本次安全打开所对应的完整源文件字节。"""
+
+        return self._buffer.getvalue()
+
+    def read_part_bytes(self, part_name: str) -> bytes:
+        """读取已通过包级大小和路径检查的单个 part。"""
+
+        info = self._parts.get(part_name)
+        if info is None:
+            raise DocxError("invalid_docx_package", f"DOCX 缺少必要 part：{part_name}。")
+        try:
+            return self._archive.read(info)
+        except (zipfile.BadZipFile, KeyError, NotImplementedError, OSError, RuntimeError) as exc:
+            raise DocxError("invalid_docx_package", f"无法读取 DOCX part：{part_name}。") from exc
+
+    def get_part_info(self, part_name: str) -> zipfile.ZipInfo:
+        """返回 writer 复制 ZIP entry 属性所需的内部信息。"""
+
+        info = self._parts.get(part_name)
+        if info is None:
+            raise DocxError("invalid_docx_package", f"DOCX 缺少必要 part：{part_name}。")
+        return info
+
+    def read_xml_bytes(self, part_name: str) -> bytes:
+        """按 XML 专用大小与 DTD 规则读取原始 part 字节。"""
+
+        info = self._parts.get(part_name)
+        if info is None:
+            raise DocxError("invalid_docx_package", f"DOCX 缺少必要 part：{part_name}。")
+        if info.file_size > DOCX_LIMITS.max_xml_size:
+            raise DocxError("docx_limit_exceeded", f"XML part 超过大小限制：{part_name}。")
+        payload = self.read_part_bytes(part_name)
+        upper_payload = payload.upper().replace(b"\x00", b"")
+        if b"<!DOCTYPE" in upper_payload or b"<!ENTITY" in upper_payload:
+            raise DocxError(
+                "invalid_docx_package",
+                f"XML part 包含禁止的 DTD 或实体：{part_name}。",
+            )
+        return payload
 
     def read_xml(self, part_name: str) -> ElementTree.Element:
         """在 XML 大小和 DTD 限制内读取指定 part。"""
@@ -118,21 +165,7 @@ class DocxPackage:
         cached = self._xml_cache.get(part_name)
         if cached is not None:
             return cached
-        info = self._parts.get(part_name)
-        if info is None:
-            raise DocxError("invalid_docx_package", f"DOCX 缺少必要 part：{part_name}。")
-        if info.file_size > DOCX_LIMITS.max_xml_size:
-            raise DocxError("docx_limit_exceeded", f"XML part 超过大小限制：{part_name}。")
-        try:
-            payload = self._archive.read(info)
-        except (zipfile.BadZipFile, KeyError, NotImplementedError, OSError, RuntimeError) as exc:
-            raise DocxError("invalid_docx_package", f"无法读取 DOCX part：{part_name}。") from exc
-        upper_payload = payload.upper().replace(b"\x00", b"")
-        if b"<!DOCTYPE" in upper_payload or b"<!ENTITY" in upper_payload:
-            raise DocxError(
-                "invalid_docx_package",
-                f"XML part 包含禁止的 DTD 或实体：{part_name}。",
-            )
+        payload = self.read_xml_bytes(part_name)
         try:
             root = ElementTree.fromstring(payload)
         except ElementTree.ParseError as exc:

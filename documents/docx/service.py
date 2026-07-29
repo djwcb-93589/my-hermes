@@ -1,8 +1,7 @@
-"""独立 DOCX 创建与只读检查服务。"""
+"""独立 DOCX 创建、只读检查与安全编辑服务。"""
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import math
@@ -13,11 +12,20 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from xml.etree import ElementTree
 
+from .atomic import (
+    best_effort_unlink as _best_effort_unlink,
+    commit_with_overwrite as _commit_with_overwrite,
+    commit_without_overwrite as _commit_without_overwrite,
+    create_temporary_output_path as _create_temporary_output_path,
+)
+from .editor import DocxEditor
 from .errors import DocxError
 from .models import (
     CreateDocumentRequest,
     CreateDocumentResult,
     DocumentSnapshot,
+    EditDocumentRequest,
+    EditDocumentResult,
     HeadingSpec,
     InspectDocumentRequest,
     PageBreakSpec,
@@ -35,30 +43,25 @@ _REQUIRED_DOCX_ENTRIES = (
     "_rels/.rels",
     "word/document.xml",
 )
-_UNSUPPORTED_LINK_ERRNOS = frozenset(
-    value
-    for value in (
-        getattr(errno, "ENOSYS", None),
-        getattr(errno, "ENOTSUP", None),
-        getattr(errno, "EOPNOTSUPP", None),
-        getattr(errno, "EXDEV", None),
-    )
-    if value is not None
-)
-_UNSUPPORTED_LINK_WINERRORS = frozenset({1, 50})
 
 
 class DocxService:
-    """提供 Node 创建能力与纯 Python 只读检查能力。"""
+    """提供 Node 创建能力及纯 Python 读取与安全编辑能力。"""
 
     def __init__(self, node_executable: str | Path | None = None) -> None:
         self._runtime = NodeRuntime(node_executable=node_executable)
         self._reader = DocxReader()
+        self._editor = DocxEditor(reader=self._reader)
 
     def inspect_document(self, request: InspectDocumentRequest) -> DocumentSnapshot:
         """读取现有 DOCX；该路径不检查或调用 Node runtime。"""
 
         return self._reader.inspect(request)
+
+    def edit_document(self, request: EditDocumentRequest) -> EditDocumentResult:
+        """编辑现有 DOCX；该路径不检查或调用 Node runtime。"""
+
+        return self._editor.edit(request)
 
     def create_document(
         self,
@@ -290,59 +293,6 @@ def _write_temporary_spec(payload: dict[str, Any]) -> Path:
         raise DocxError("io_error", "无法创建临时 DOCX 规格文件。") from exc
 
 
-def _create_temporary_output_path(output_path: Path) -> Path:
-    temporary_path: Path | None = None
-    descriptor: int | None = None
-    try:
-        descriptor, raw_path = tempfile.mkstemp(
-            prefix=".myhermes-docx-",
-            suffix=".tmp.docx",
-            dir=output_path.parent,
-        )
-        temporary_path = Path(raw_path).resolve()
-        os.close(descriptor)
-        descriptor = None
-        return temporary_path
-    except OSError as exc:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        _best_effort_unlink(temporary_path)
-        raise DocxError("io_error", "无法在目标目录创建临时 DOCX。") from exc
-
-
-def _commit_with_overwrite(temporary_output: Path, output_path: Path) -> None:
-    try:
-        os.replace(temporary_output, output_path)
-    except OSError as exc:
-        raise DocxError("io_error", "无法原子替换目标 DOCX。") from exc
-
-
-def _commit_without_overwrite(temporary_output: Path, output_path: Path) -> None:
-    if temporary_output.parent != output_path.parent:
-        raise DocxError("io_error", "无覆盖提交要求临时文件与目标文件位于同一目录。")
-    if not hasattr(os, "link"):
-        raise DocxError("io_error", "当前平台不支持原子无覆盖 DOCX 提交。")
-    try:
-        os.link(temporary_output, output_path)
-    except FileExistsError as exc:
-        raise DocxError("output_exists", "目标 DOCX 已存在。") from exc
-    except PermissionError as exc:
-        raise DocxError("io_error", "没有权限以原子无覆盖方式提交目标 DOCX。") from exc
-    except OSError as exc:
-        if (
-            exc.errno in _UNSUPPORTED_LINK_ERRNOS
-            or getattr(exc, "winerror", None) in _UNSUPPORTED_LINK_WINERRORS
-        ):
-            raise DocxError(
-                "io_error",
-                "当前文件系统不支持原子无覆盖 DOCX 提交。",
-            ) from exc
-        raise DocxError("io_error", "无法以原子无覆盖方式提交目标 DOCX。") from exc
-
-
 def _validate_docx(path: Path) -> None:
     try:
         if not path.is_file() or path.stat().st_size <= 0:
@@ -400,12 +350,3 @@ def _calculate_sha256(path: Path) -> str:
     except OSError as exc:
         raise DocxError("io_error", "无法计算生成 DOCX 的 SHA-256。") from exc
     return digest.hexdigest()
-
-
-def _best_effort_unlink(path: Path | None) -> None:
-    if path is None:
-        return
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
