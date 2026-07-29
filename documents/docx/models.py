@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeAlias
+
+
+class _UnsetPropertyValue:
+    """表示段落属性字段未参与本次更新。"""
+
+    __slots__ = ()
+
+
+UNSET = _UnsetPropertyValue()
 
 
 @dataclass
@@ -239,6 +248,89 @@ class ReplaceTextMatch:
 
 
 @dataclass(frozen=True)
+class InsertParagraphBefore:
+    """在一个稳定定位的正文段落前插入普通段落。"""
+
+    block_id: str
+    runs: list[TextRunSpec]
+    style: str | None = None
+    alignment: str | None = None
+
+
+@dataclass(frozen=True)
+class InsertParagraphAfter:
+    """在一个稳定定位的正文段落后插入普通段落。"""
+
+    block_id: str
+    runs: list[TextRunSpec]
+    style: str | None = None
+    alignment: str | None = None
+
+
+@dataclass(frozen=True)
+class AppendParagraph:
+    """在正文末尾、最终 section properties 之前追加普通段落。"""
+
+    runs: list[TextRunSpec]
+    style: str | None = None
+    alignment: str | None = None
+
+
+@dataclass(frozen=True)
+class DeleteParagraph:
+    """删除一个简单正文顶层段落。"""
+
+    block_id: str
+
+
+@dataclass(frozen=True)
+class UpdateParagraphProperties:
+    """更新显式给出的段落基础属性；None 表示清空。"""
+
+    block_id: str
+    style: str | None | object = UNSET
+    alignment: str | None | object = UNSET
+    heading_level: int | None | object = UNSET
+
+
+@dataclass(frozen=True)
+class FormatTextMatch:
+    """根据稳定 match_id 修改单个普通 run 内的直接格式。"""
+
+    match_id: str
+    block_id: str
+    bold: bool | None = None
+    italic: bool | None = None
+    underline: bool | None = None
+    expected_text: str | None = None
+
+
+@dataclass(frozen=True)
+class InsertTableAfter:
+    """在正文顶层 block 后插入简单规则表格。"""
+
+    block_id: str
+    rows: list[list[str]]
+    header_row: bool = False
+
+
+@dataclass(frozen=True)
+class AppendTableRow:
+    """在规则表格末尾追加普通行。"""
+
+    table_block_id: str
+    cells: list[str]
+
+
+@dataclass(frozen=True)
+class DeleteTableRow:
+    """按旧快照中的行号删除规则表格普通行。"""
+
+    table_block_id: str
+    row_index: int
+
+
+@dataclass(frozen=True)
 class UpdateDocumentMetadata:
     """按显式字段集合更新基础核心属性。"""
 
@@ -249,6 +341,15 @@ EditOperation: TypeAlias = (
     ReplaceParagraphText
     | ReplaceTableCellText
     | ReplaceTextMatch
+    | InsertParagraphBefore
+    | InsertParagraphAfter
+    | AppendParagraph
+    | DeleteParagraph
+    | UpdateParagraphProperties
+    | FormatTextMatch
+    | InsertTableAfter
+    | AppendTableRow
+    | DeleteTableRow
     | UpdateDocumentMetadata
 )
 
@@ -274,6 +375,14 @@ class AppliedEdit:
 
 
 @dataclass(frozen=True)
+class BlockRemap:
+    """结构编辑后一个旧 block_id 对应的新位置。"""
+
+    old_block_id: str
+    new_block_id: str | None
+
+
+@dataclass(frozen=True)
 class EditDocumentResult:
     """成功写出并重新验证后的编辑结果。"""
 
@@ -285,3 +394,4 @@ class EditDocumentResult:
     sha256: str
     changed: bool
     applied_edits: list[AppliedEdit]
+    block_remap: list[BlockRemap] = field(default_factory=list)

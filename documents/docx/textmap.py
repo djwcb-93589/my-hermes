@@ -15,6 +15,9 @@ _XML_NS = "http://www.w3.org/XML/1998/namespace"
 _W_PARAGRAPH = f"{{{_W_NS}}}p"
 _W_RUN = f"{{{_W_NS}}}r"
 _W_RUN_PROPERTIES = f"{{{_W_NS}}}rPr"
+_W_BOLD = f"{{{_W_NS}}}b"
+_W_ITALIC = f"{{{_W_NS}}}i"
+_W_UNDERLINE = f"{{{_W_NS}}}u"
 _W_VANISH = f"{{{_W_NS}}}vanish"
 _W_TEXT = f"{{{_W_NS}}}t"
 _W_TAB = f"{{{_W_NS}}}tab"
@@ -91,6 +94,17 @@ class VisibleTextReplacement:
     end: int
     replacement: str
     preserve_format: bool
+
+
+@dataclass(frozen=True)
+class VisibleTextFormatting:
+    """一个基于原始 VisibleTextMap 坐标的直接格式修改。"""
+
+    start: int
+    end: int
+    bold: bool | None
+    italic: bool | None
+    underline: bool | None
 
 
 @dataclass(frozen=True)
@@ -431,6 +445,122 @@ def replace_visible_text_ranges(
     return before != after
 
 
+def format_visible_text_ranges(
+    text_map: VisibleTextMap,
+    formatting_ranges: tuple[VisibleTextFormatting, ...],
+) -> bool:
+    """在普通单 run 范围内统一应用多个不重叠直接格式修改。"""
+
+    if not formatting_ranges:
+        return False
+    ordered = tuple(
+        sorted(formatting_ranges, key=lambda item: (item.start, item.end))
+    )
+    resolved: list[tuple[VisibleTextFormatting, VisibleTextRange]] = []
+    previous_end = -1
+    for formatting in ordered:
+        if formatting.start < previous_end:
+            raise ValueError("visible text formatting ranges overlap")
+        if (
+            formatting.bold is None
+            and formatting.italic is None
+            and formatting.underline is None
+        ):
+            raise ValueError("visible text formatting has no fields")
+        if not text_map.is_searchable_range(formatting.start, formatting.end):
+            raise ValueError("visible text formatting crosses an explicit break")
+        text_range = text_map.resolve_range(formatting.start, formatting.end)
+        if len(text_range.affected_run_indexes) != 1:
+            raise ValueError("visible text formatting crosses multiple runs")
+        resolved.append((formatting, text_range))
+        previous_end = formatting.end
+
+    changed_ranges = [
+        (formatting, text_range)
+        for formatting, text_range in resolved
+        if _formatting_changes_run(formatting, text_range.start_run.element)
+    ]
+    if not changed_ranges:
+        return False
+
+    ranges_by_run: dict[
+        int,
+        list[tuple[VisibleTextFormatting, VisibleTextRange]],
+    ] = {}
+    for formatting, text_range in changed_ranges:
+        ranges_by_run.setdefault(text_range.start_run.index, []).append(
+            (formatting, text_range)
+        )
+
+    before = ElementTree.tostring(text_map.paragraph, encoding="utf-8")
+    paragraph_children = list(text_map.paragraph)
+    planned_replacements: list[
+        tuple[int, ElementTree.Element, list[ElementTree.Element]]
+    ] = []
+    for run_index, run_ranges in ranges_by_run.items():
+        visible_run = text_map.runs[run_index]
+        child_index = _identity_index(paragraph_children, visible_run.element)
+        if child_index < 0:
+            raise ValueError("mapped formatting run is not a paragraph child")
+
+        replacement_runs: list[ElementTree.Element] = []
+        cursor = visible_run.start
+        for formatting, _ in run_ranges:
+            _append_original_interval_runs(
+                text_map,
+                start=cursor,
+                end=formatting.start,
+                destination=replacement_runs,
+            )
+            formatted_runs: list[ElementTree.Element] = []
+            _append_original_interval_runs(
+                text_map,
+                start=formatting.start,
+                end=formatting.end,
+                destination=formatted_runs,
+            )
+            if len(formatted_runs) != 1:
+                raise ValueError("formatted range cannot be isolated in one run")
+            _set_run_direct_format(formatted_runs[0], formatting)
+            replacement_runs.extend(formatted_runs)
+            cursor = formatting.end
+        _append_original_interval_runs(
+            text_map,
+            start=cursor,
+            end=visible_run.end,
+            destination=replacement_runs,
+        )
+        if not replacement_runs:
+            raise ValueError("formatted run reconstruction is empty")
+        planned_replacements.append(
+            (child_index, visible_run.element, replacement_runs)
+        )
+
+    for child_index, original_run, replacement_runs in sorted(
+        planned_replacements,
+        key=lambda item: item[0],
+        reverse=True,
+    ):
+        text_map.paragraph.remove(original_run)
+        for offset, replacement_run in enumerate(replacement_runs):
+            text_map.paragraph.insert(child_index + offset, replacement_run)
+    after = ElementTree.tostring(text_map.paragraph, encoding="utf-8")
+    return before != after
+
+
+def read_run_direct_format(
+    run: ElementTree.Element,
+) -> tuple[bool | None, bool | None, bool | None]:
+    """读取普通 run 的 bold、italic、underline 直接格式。"""
+
+    properties = run.find(_W_RUN_PROPERTIES)
+    return (
+        _read_direct_toggle(properties, _W_BOLD),
+        _read_direct_toggle(properties, _W_ITALIC),
+        _read_direct_toggle(properties, _W_UNDERLINE),
+    )
+
+
 def append_text_content(run: ElementTree.Element, text: str) -> None:
     """把普通文字、制表符和换行写成对应的 WordprocessingML 节点。"""
 
@@ -550,6 +680,70 @@ def _run_is_hidden(run: ElementTree.Element) -> bool:
         return False
     raw_value = vanish.attrib.get(_W_VAL, vanish.attrib.get("val"))
     return raw_value is None or raw_value.lower() not in _FALSE_VALUES
+
+
+def _read_direct_toggle(
+    properties: ElementTree.Element | None,
+    tag: str,
+) -> bool | None:
+    if properties is None:
+        return None
+    matching = [child for child in properties if child.tag == tag]
+    if len(matching) > 1:
+        raise ValueError("run contains duplicate direct format properties")
+    if not matching:
+        return None
+    raw_value = matching[0].attrib.get(
+        _W_VAL,
+        matching[0].attrib.get("val"),
+    )
+    return raw_value is None or raw_value.lower() not in _FALSE_VALUES
+
+
+def _formatting_changes_run(
+    formatting: VisibleTextFormatting,
+    run: ElementTree.Element,
+) -> bool:
+    current = read_run_direct_format(run)
+    requested = (
+        formatting.bold,
+        formatting.italic,
+        formatting.underline,
+    )
+    return any(
+        value is not None and value != existing
+        for value, existing in zip(requested, current, strict=True)
+    )
+
+
+def _set_run_direct_format(
+    run: ElementTree.Element,
+    formatting: VisibleTextFormatting,
+) -> None:
+    properties = run.find(_W_RUN_PROPERTIES)
+    if properties is None:
+        properties = ElementTree.Element(_W_RUN_PROPERTIES)
+        run.insert(0, properties)
+    for tag, value in (
+        (_W_BOLD, formatting.bold),
+        (_W_ITALIC, formatting.italic),
+        (_W_UNDERLINE, formatting.underline),
+    ):
+        if value is None:
+            continue
+        matching = [child for child in properties if child.tag == tag]
+        if len(matching) > 1:
+            raise ValueError("run contains duplicate direct format properties")
+        element = matching[0] if matching else ElementTree.SubElement(
+            properties,
+            tag,
+        )
+        if value:
+            element.attrib.pop(_W_VAL, None)
+            element.attrib.pop("val", None)
+        else:
+            element.attrib.pop("val", None)
+            element.set(_W_VAL, "0")
 
 
 def _replace_within_text_node(

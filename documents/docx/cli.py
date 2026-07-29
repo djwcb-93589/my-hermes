@@ -11,14 +11,24 @@ from typing import Any, Sequence
 from .errors import DocxError
 from .models import (
     AppliedEdit,
+    AppendParagraph,
+    AppendTableRow,
+    BlockRemap,
     CreateDocumentRequest,
+    DeleteParagraph,
+    DeleteTableRow,
     DocumentMetadata,
     DocumentSnapshot,
     DocumentWarning,
     EditDocumentRequest,
     EditDocumentResult,
+    EditOperation,
+    FormatTextMatch,
     HeadingSpec,
     InspectDocumentRequest,
+    InsertParagraphAfter,
+    InsertParagraphBefore,
+    InsertTableAfter,
     PageBreakSpec,
     ParagraphSnapshot,
     ParagraphSpec,
@@ -33,6 +43,7 @@ from .models import (
     TextMatch,
     TextRunSnapshot,
     TextRunSpec,
+    UpdateParagraphProperties,
     UpdateDocumentMetadata,
 )
 from .runtime import NodeRuntime
@@ -96,8 +107,10 @@ _JSON_MODEL_FIELDS: dict[type[object], tuple[str, ...]] = {
         "sha256",
         "changed",
         "applied_edits",
+        "block_remap",
     ),
     AppliedEdit: ("operation_index", "operation_type", "block_id"),
+    BlockRemap: ("old_block_id", "new_block_id"),
     SearchDocumentResult: (
         "source_path",
         "revision",
@@ -284,12 +297,7 @@ def _run_edit(args: argparse.Namespace) -> dict[str, Any]:
 
 def _read_edit_operations(
     path: Path,
-) -> list[
-    ReplaceParagraphText
-    | ReplaceTableCellText
-    | ReplaceTextMatch
-    | UpdateDocumentMetadata
-]:
+) -> list[EditOperation]:
     try:
         with path.expanduser().open("r", encoding="utf-8") as source:
             value = json.load(source)
@@ -326,12 +334,7 @@ def _read_edit_operations(
 def _parse_edit_operation(
     value: object,
     index: int,
-) -> (
-    ReplaceParagraphText
-    | ReplaceTableCellText
-    | ReplaceTextMatch
-    | UpdateDocumentMetadata
-):
+) -> EditOperation:
     if not isinstance(value, dict):
         raise DocxError(
             "invalid_edit_operation",
@@ -389,6 +392,129 @@ def _parse_edit_operation(
             replacement_text=value.get("replacement_text"),
             preserve_format=value.get("preserve_format", True),
         )
+    if operation_type in {
+        "insert_paragraph_before",
+        "insert_paragraph_after",
+    }:
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id", "runs", "style", "alignment"},
+            f"第 {index} 个 {operation_type}",
+            "invalid_edit_operation",
+        )
+        runs = _parse_edit_runs(value.get("runs"), index, operation_type)
+        operation_class = (
+            InsertParagraphBefore
+            if operation_type == "insert_paragraph_before"
+            else InsertParagraphAfter
+        )
+        return operation_class(
+            block_id=value.get("block_id"),
+            runs=runs,
+            style=value.get("style"),
+            alignment=value.get("alignment"),
+        )
+    if operation_type == "append_paragraph":
+        _reject_unknown_keys(
+            value,
+            {"type", "runs", "style", "alignment"},
+            f"第 {index} 个 append_paragraph",
+            "invalid_edit_operation",
+        )
+        return AppendParagraph(
+            runs=_parse_edit_runs(
+                value.get("runs"),
+                index,
+                operation_type,
+            ),
+            style=value.get("style"),
+            alignment=value.get("alignment"),
+        )
+    if operation_type == "delete_paragraph":
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id"},
+            f"第 {index} 个 delete_paragraph",
+            "invalid_edit_operation",
+        )
+        return DeleteParagraph(block_id=value.get("block_id"))
+    if operation_type == "update_paragraph_properties":
+        _reject_unknown_keys(
+            value,
+            {
+                "type",
+                "block_id",
+                "style",
+                "alignment",
+                "heading_level",
+            },
+            f"第 {index} 个 update_paragraph_properties",
+            "invalid_edit_operation",
+        )
+        property_values: dict[str, object] = {
+            "block_id": value.get("block_id")
+        }
+        for field_name in ("style", "alignment", "heading_level"):
+            if field_name in value:
+                property_values[field_name] = value[field_name]
+        return UpdateParagraphProperties(**property_values)
+    if operation_type == "format_text_match":
+        _reject_unknown_keys(
+            value,
+            {
+                "type",
+                "match_id",
+                "block_id",
+                "expected_text",
+                "bold",
+                "italic",
+                "underline",
+            },
+            f"第 {index} 个 format_text_match",
+            "invalid_edit_operation",
+        )
+        return FormatTextMatch(
+            match_id=value.get("match_id"),
+            block_id=value.get("block_id"),
+            expected_text=value.get("expected_text"),
+            bold=value.get("bold"),
+            italic=value.get("italic"),
+            underline=value.get("underline"),
+        )
+    if operation_type == "insert_table_after":
+        _reject_unknown_keys(
+            value,
+            {"type", "block_id", "rows", "header_row"},
+            f"第 {index} 个 insert_table_after",
+            "invalid_edit_operation",
+        )
+        return InsertTableAfter(
+            block_id=value.get("block_id"),
+            rows=value.get("rows"),
+            header_row=value.get("header_row", False),
+        )
+    if operation_type == "append_table_row":
+        _reject_unknown_keys(
+            value,
+            {"type", "table_block_id", "cells"},
+            f"第 {index} 个 append_table_row",
+            "invalid_edit_operation",
+        )
+        return AppendTableRow(
+            table_block_id=value.get("table_block_id"),
+            cells=value.get("cells"),
+        )
+    if operation_type == "delete_table_row":
+        _reject_unknown_keys(
+            value,
+            {"type", "table_block_id", "row_index"},
+            f"第 {index} 个 delete_table_row",
+            "invalid_edit_operation",
+        )
+        return DeleteTableRow(
+            table_block_id=value.get("table_block_id"),
+            row_index=value.get("row_index"),
+        )
     if operation_type == "update_document_metadata":
         _reject_unknown_keys(
             value,
@@ -400,6 +526,47 @@ def _parse_edit_operation(
     raise DocxError(
         "invalid_edit_operation",
         f"第 {index} 个编辑操作 type 不受支持。",
+    )
+
+
+def _parse_edit_runs(
+    value: object,
+    operation_index: int,
+    operation_type: str,
+) -> list[TextRunSpec]:
+    if not isinstance(value, list):
+        raise DocxError(
+            "invalid_edit_operation",
+            f"第 {operation_index} 个 {operation_type} 的 runs 必须是列表。",
+        )
+    return [
+        _parse_edit_run(run, operation_index, run_index, operation_type)
+        for run_index, run in enumerate(value)
+    ]
+
+
+def _parse_edit_run(
+    value: object,
+    operation_index: int,
+    run_index: int,
+    operation_type: str,
+) -> TextRunSpec:
+    if not isinstance(value, dict):
+        raise DocxError(
+            "invalid_edit_operation",
+            f"第 {operation_index} 个 {operation_type} 的第 {run_index} 个 run 必须是 JSON object。",
+        )
+    _reject_unknown_keys(
+        value,
+        {"text", "bold", "italic", "underline"},
+        f"第 {operation_index} 个 {operation_type} 的第 {run_index} 个 run",
+        "invalid_edit_operation",
+    )
+    return TextRunSpec(
+        text=value.get("text"),
+        bold=value.get("bold", False),
+        italic=value.get("italic", False),
+        underline=value.get("underline", False),
     )
 
 
