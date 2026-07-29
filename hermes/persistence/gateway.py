@@ -1270,6 +1270,62 @@ def get_gateway_message_persistence_state(
     }
 
 
+def get_gateway_steer_recovery_states(
+    conn: sqlite3.Connection,
+    route_key: str,
+    message_ids: list[str] | tuple[str, ...],
+) -> dict[str, dict]:
+    """越过并发写事务后读取待恢复 steer 的 Queue 与 ownership 状态。"""
+    ids = tuple(message_ids)
+    if not ids or any(
+        not isinstance(message_id, str) or not message_id
+        for message_id in ids
+    ):
+        raise DBError("gateway steer recovery requires message ids")
+    if len(set(ids)) != len(ids):
+        raise DBError("gateway steer recovery contains duplicate ids")
+
+    states: dict[str, dict] = {}
+    with _immediate_transaction(conn):
+        for offset in range(0, len(ids), 500):
+            batch = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"""
+                SELECT ownership.source_message_id,
+                       ownership.owner_kind,
+                       ownership.status,
+                       ownership.owner_id,
+                       queue.status
+                FROM gateway_source_message_ownership AS ownership
+                LEFT JOIN gateway_message_queue AS queue
+                  ON queue.route_key=ownership.route_key
+                 AND queue.message_id=ownership.owner_id
+                WHERE ownership.route_key=?
+                  AND ownership.source_message_id IN ({placeholders})
+                """,
+                (route_key, *batch),
+            ).fetchall()
+            for (
+                source_message_id,
+                owner_kind,
+                status,
+                owner_id,
+                queue_status,
+            ) in rows:
+                states[str(source_message_id)] = {
+                    "layer": str(owner_kind),
+                    "status": str(status),
+                    "owner_id": str(owner_id),
+                    "queue_status": (
+                        str(queue_status)
+                        if queue_status is not None
+                        else None
+                    ),
+                }
+    return states
+
+
 def _serialize_gateway_json(value, field_name: str) -> str:
     try:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

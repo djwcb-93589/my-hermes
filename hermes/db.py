@@ -166,6 +166,7 @@ from hermes.persistence.gateway import (
     get_gateway_conversation_for_route,
     get_gateway_conversation_id,
     get_gateway_message_persistence_state,
+    get_gateway_steer_recovery_states,
     get_gateway_outbox,
     get_gateway_queued_messages,
     get_gateway_routes_with_pending_outbox,

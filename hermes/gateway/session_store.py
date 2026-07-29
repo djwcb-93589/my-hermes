@@ -70,8 +70,16 @@ class SessionContext:
         default_factory=dict,
         repr=False,
     )
+    inflight_steer_generations: dict[str, int] = field(
+        default_factory=dict,
+        repr=False,
+    )
     # generation 失效时保留未确认原事件，直到数据库恢复或后续显式收口。
     deferred_steer_events: dict[str, MessageEvent] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    deferred_steer_generations: dict[str, int] = field(
         default_factory=dict,
         repr=False,
     )
@@ -128,12 +136,95 @@ class SessionStore:
         ctx.steer_generation = None
 
     @staticmethod
-    def _defer_inflight_steer_events(ctx: SessionContext) -> None:
+    def _defer_inflight_steer_events(
+        ctx: SessionContext,
+        generation: int | None = None,
+    ) -> None:
         """generation 失效时转移未确认映射，不静默丢弃原事件。"""
         if not ctx.inflight_steer_events:
             return
-        ctx.deferred_steer_events.update(ctx.inflight_steer_events)
+        fallback_generation = generation
+        if fallback_generation is None:
+            fallback_generation = (
+                ctx.steer_generation
+                if ctx.steer_generation is not None
+                else ctx.worker_generation
+            )
+        if fallback_generation is None:
+            fallback_generation = (
+                ctx.active_generation
+                if ctx.active_generation is not None
+                else ctx.generation
+            )
+        for steer_id, event in ctx.inflight_steer_events.items():
+            ctx.deferred_steer_events[steer_id] = event
+            ctx.deferred_steer_generations[steer_id] = (
+                ctx.inflight_steer_generations.get(
+                    steer_id,
+                    fallback_generation,
+                )
+            )
         ctx.inflight_steer_events.clear()
+        ctx.inflight_steer_generations.clear()
+
+    @staticmethod
+    def defer_steer_events(
+        ctx: SessionContext,
+        generation: int,
+    ) -> None:
+        """把指定 generation 的未确认 steer 转入可重试收口区。"""
+        for steer_id, event in tuple(ctx.inflight_steer_events.items()):
+            event_generation = ctx.inflight_steer_generations.get(
+                steer_id,
+                generation,
+            )
+            if event_generation != generation:
+                continue
+            ctx.deferred_steer_events[steer_id] = event
+            ctx.deferred_steer_generations[steer_id] = generation
+            ctx.inflight_steer_events.pop(steer_id, None)
+            ctx.inflight_steer_generations.pop(steer_id, None)
+
+    @staticmethod
+    def get_deferred_steer_events(
+        ctx: SessionContext,
+        generation: int,
+    ) -> tuple[MessageEvent, ...]:
+        """返回指定 generation 尚未完成收口的原始 steer 事件。"""
+        return tuple(
+            event
+            for steer_id, event in ctx.deferred_steer_events.items()
+            if ctx.deferred_steer_generations.get(
+                steer_id,
+                generation,
+            ) == generation
+        )
+
+    @staticmethod
+    def resolve_steer_event(
+        ctx: SessionContext,
+        generation: int,
+        steer_id: str,
+    ) -> None:
+        """仅清除属于指定 generation 且已得到可靠结论的 steer。"""
+        if (
+            steer_id in ctx.inflight_steer_events
+            and ctx.inflight_steer_generations.get(
+                steer_id,
+                generation,
+            ) == generation
+        ):
+            ctx.inflight_steer_events.pop(steer_id, None)
+            ctx.inflight_steer_generations.pop(steer_id, None)
+        if (
+            steer_id in ctx.deferred_steer_events
+            and ctx.deferred_steer_generations.get(
+                steer_id,
+                generation,
+            ) == generation
+        ):
+            ctx.deferred_steer_events.pop(steer_id, None)
+            ctx.deferred_steer_generations.pop(steer_id, None)
 
     @classmethod
     def _ensure_pending_sequence(
@@ -534,6 +625,7 @@ class SessionStore:
         ctx.last_steer_sequence = entry.sequence
         if event is not None:
             ctx.inflight_steer_events[entry.steer_id] = event
+            ctx.inflight_steer_generations[entry.steer_id] = generation
         return True
 
     @staticmethod
@@ -551,6 +643,7 @@ class SessionStore:
         ):
             return False
         ctx.inflight_steer_events[steer_id] = event
+        ctx.inflight_steer_generations[steer_id] = generation
         return True
 
     @staticmethod
@@ -560,10 +653,12 @@ class SessionStore:
         steer_ids,
     ) -> None:
         """仅在外层数据库事务成功提交后移除已确认的原始事件映射。"""
-        if ctx.steer_generation != generation:
-            return
         for steer_id in tuple(steer_ids):
-            ctx.inflight_steer_events.pop(steer_id, None)
+            SessionStore.resolve_steer_event(
+                ctx,
+                generation,
+                steer_id,
+            )
 
     @staticmethod
     def forget_steer_event(
@@ -572,8 +667,11 @@ class SessionStore:
         steer_id: str,
     ) -> None:
         """移除已经安全放回普通 pending 的 steer 映射。"""
-        if ctx.steer_generation == generation:
-            ctx.inflight_steer_events.pop(steer_id, None)
+        SessionStore.resolve_steer_event(
+            ctx,
+            generation,
+            steer_id,
+        )
 
     def rollback_task_begin(
         self,

@@ -65,6 +65,7 @@ from hermes.db import (
     get_gateway_conversation_for_route,
     get_gateway_file_delivery,
     get_gateway_message_persistence_state,
+    get_gateway_steer_recovery_states,
     get_gateway_routes_with_pending_outbox,
     get_next_recoverable_gateway_outbox_for_route,
     get_gateway_outbox,
@@ -4014,6 +4015,123 @@ class GatewayRunner:
                 entry.steer_id,
             )
 
+    async def _restore_user_cancelled_steer(
+        self,
+        ctx,
+        generation: int,
+    ) -> None:
+        """在 /stop 收尾中把该 generation 未确认 steer 恢复为普通 pending。"""
+        self.sessions.defer_steer_events(ctx, generation)
+        events = self.sessions.get_deferred_steer_events(
+            ctx,
+            generation,
+        )
+        if not events:
+            return
+
+        try:
+            ordered_events = tuple(sorted(
+                events,
+                key=lambda item: self.sessions.event_sequence(ctx, item),
+            ))
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=steer_stop_order_failed "
+                f"route={safe_route_digest(ctx.route_key)} "
+                f"exception={type(exc).__name__}"
+            )
+            return
+
+        message_ids = tuple(event.message_id for event in ordered_events)
+        try:
+            states = await self.persistence.call(
+                get_gateway_steer_recovery_states,
+                ctx.route_key,
+                message_ids,
+            )
+        except Exception as exc:
+            print(
+                "  [gateway:audit] event=steer_stop_state_failed "
+                f"route={safe_route_digest(ctx.route_key)} "
+                f"exception={type(exc).__name__}"
+            )
+            return
+
+        for event in ordered_events:
+            message_id = event.message_id
+            state = states.get(message_id)
+            owns_queue = (
+                isinstance(state, dict)
+                and state.get("layer") == "queue"
+                and state.get("owner_id") == message_id
+            )
+            status = state.get("status") if owns_queue else None
+            queue_status = (
+                state.get("queue_status")
+                if owns_queue
+                else None
+            )
+
+            if (
+                owns_queue
+                and status in {"completed", "cancelled"}
+                and queue_status is None
+            ):
+                self.sessions.resolve_steer_event(
+                    ctx,
+                    generation,
+                    message_id,
+                )
+                self._accepted_messages.discard(
+                    (ctx.route_key, message_id)
+                )
+                continue
+
+            if (
+                not owns_queue
+                or status not in {"queued", "processing"}
+                or queue_status != status
+            ):
+                print(
+                    "  [gateway:audit] event=steer_stop_state_unresolved "
+                    f"route={safe_route_digest(ctx.route_key)} "
+                    f"steer={safe_identifier_digest(message_id)}"
+                )
+                continue
+
+            already_pending = any(
+                getattr(pending_event, "message_id", None) == message_id
+                for pending_event in ctx.pending
+            )
+            if not already_pending:
+                try:
+                    requeued = self.sessions.enqueue_ordered(
+                        ctx,
+                        event,
+                        force=True,
+                    )
+                except Exception as exc:
+                    print(
+                        "  [gateway:audit] event=steer_stop_requeue_failed "
+                        f"route={safe_route_digest(ctx.route_key)} "
+                        f"steer={safe_identifier_digest(message_id)} "
+                        f"exception={type(exc).__name__}"
+                    )
+                    continue
+                if not requeued:
+                    print(
+                        "  [gateway:audit] event=steer_stop_requeue_rejected "
+                        f"route={safe_route_digest(ctx.route_key)} "
+                        f"steer={safe_identifier_digest(message_id)}"
+                    )
+                    continue
+
+            self.sessions.resolve_steer_event(
+                ctx,
+                generation,
+                message_id,
+            )
+
     def _drop_events(self, route_key: str, events: list[MessageEvent]) -> None:
         """持久化删除被 /new 明确取消的旧 pending。"""
         message_ids = [event.message_id for event in events]
@@ -5466,6 +5584,25 @@ class GatewayRunner:
                         ctx=ctx,
                         generation=generation,
                     )
+                if (
+                    owns_worker
+                    and cancel_reason == "user"
+                    and self._task_cancel_reason(ctx, generation) == "user"
+                ):
+                    try:
+                        await self._restore_user_cancelled_steer(
+                            ctx,
+                            generation,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        print(
+                            "  [gateway:audit] "
+                            "event=steer_stop_recovery_failed "
+                            f"route={safe_route_digest(route_key)} "
+                            f"exception={type(exc).__name__}"
+                        )
                 if (
                     owns_worker
                     and cancel_reason is None
