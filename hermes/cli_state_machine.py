@@ -110,6 +110,7 @@ class CLIWorkerResult:
     messages: tuple[dict, ...] = ()
     current_session_id: str | None = None
     error: str | None = None
+    pending_steer: tuple[SteerEntry, ...] = ()
 
 
 class CLIEventType(str, Enum):
@@ -298,6 +299,18 @@ class CLIWorker:
         finally:
             conn.close()
 
+    @staticmethod
+    def _close_and_drain_steer_mailbox(
+        mailbox: SteerMailbox | None,
+    ) -> tuple[SteerEntry, ...]:
+        """异常路径尽力收口 mailbox，且不覆盖原始 Worker 异常。"""
+        if mailbox is None:
+            return ()
+        try:
+            return mailbox.close_and_drain()
+        except Exception:
+            return ()
+
     def _run_conversation_task(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
         session_id = task.session_id or create_session(conn)
         steer_kwargs = (
@@ -321,10 +334,14 @@ class CLIWorker:
                 **steer_kwargs,
             )
         except Exception as exc:
+            pending_steer = self._close_and_drain_steer_mailbox(
+                task.steer_mailbox,
+            )
             return CLIWorkerResult(
                 kind=task.kind,
                 session_id=session_id,
                 error=f"worker task failed: {type(exc).__name__}",
+                pending_steer=pending_steer,
             )
         return CLIWorkerResult(
             kind=task.kind,
@@ -374,21 +391,34 @@ class CLIWorker:
             if task.steer_mailbox is not None
             else {}
         )
-        result = run_conversation(
-            "",
-            conn,
-            task.session_id,
-            task.cached_prompt,
-            session_key=task.session_id,
-            cancel_checker=(
-                task.cancel_event.is_set if task.cancel_event is not None else None
-            ),
-            resume_from_history=True,
-            tool_policy=task.tool_policy,
-            stream_sink=self._stream_sink,
-            hook_registry=self._hook_registry,
-            **steer_kwargs,
-        )
+        try:
+            result = run_conversation(
+                "",
+                conn,
+                task.session_id,
+                task.cached_prompt,
+                session_key=task.session_id,
+                cancel_checker=(
+                    task.cancel_event.is_set
+                    if task.cancel_event is not None
+                    else None
+                ),
+                resume_from_history=True,
+                tool_policy=task.tool_policy,
+                stream_sink=self._stream_sink,
+                hook_registry=self._hook_registry,
+                **steer_kwargs,
+            )
+        except Exception as exc:
+            pending_steer = self._close_and_drain_steer_mailbox(
+                task.steer_mailbox,
+            )
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                error=f"worker task failed: {type(exc).__name__}",
+                pending_steer=pending_steer,
+            )
         return CLIWorkerResult(
             kind=task.kind,
             session_id=task.session_id,
@@ -717,15 +747,17 @@ class CLIController:
 
     def _restore_pending_steer(self, result: CLIWorkerResult) -> None:
         """把 AgentLoop 未消费的 steer 文本原序恢复到普通队首。"""
+        pending_entries: list[SteerEntry] = []
         conversation_result = result.conversation_result
-        if not isinstance(conversation_result, dict):
-            return
-        pending_steer = conversation_result.get("pending_steer")
-        if not isinstance(pending_steer, (list, tuple)):
-            return
+        if isinstance(conversation_result, dict):
+            conversation_pending = conversation_result.get("pending_steer")
+            if isinstance(conversation_pending, (list, tuple)):
+                pending_entries.extend(conversation_pending)
+        pending_entries.extend(result.pending_steer)
+
         seen_ids: set[str] = set()
         messages: list[str] = []
-        for entry in pending_steer:
+        for entry in pending_entries:
             if (
                 not isinstance(entry, SteerEntry)
                 or entry.steer_id in seen_ids

@@ -201,6 +201,30 @@ class SessionStore:
         )
 
     @staticmethod
+    def get_unconfirmed_steer_event_records(
+        ctx: SessionContext,
+    ) -> tuple[tuple[int, MessageEvent], ...]:
+        """返回所有尚未得到持久确认的 steer generation 与原始事件。"""
+        records: dict[str, tuple[int, MessageEvent]] = {}
+        for steer_id, event in ctx.deferred_steer_events.items():
+            records[steer_id] = (
+                ctx.deferred_steer_generations.get(
+                    steer_id,
+                    ctx.generation,
+                ),
+                event,
+            )
+        for steer_id, event in ctx.inflight_steer_events.items():
+            records[steer_id] = (
+                ctx.inflight_steer_generations.get(
+                    steer_id,
+                    ctx.generation,
+                ),
+                event,
+            )
+        return tuple(records.values())
+
+    @staticmethod
     def resolve_steer_event(
         ctx: SessionContext,
         generation: int,
@@ -748,7 +772,7 @@ class SessionStore:
         # 语义，也保留已经发生的显式放弃；显式原因之间仅允许更强的
         # /new 或 user 覆盖 superseded，避免 /new 后到的新消息降级原因。
         if previous_reason == "shutdown" or reason == "shutdown":
-            effective_reason = previous_reason or reason
+            effective_reason = "shutdown"
         else:
             priority = {"superseded": 1, "user": 2, "new": 3}
             effective_reason = max(

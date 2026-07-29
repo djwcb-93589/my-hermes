@@ -1173,7 +1173,11 @@ class GatewayRunner:
         )
 
     @staticmethod
-    def _safe_exception_result(exc: Exception) -> _GatewayAgentResult:
+    def _safe_exception_result(
+        exc: Exception,
+        *,
+        pending_steer: tuple[SteerEntry, ...] = (),
+    ) -> _GatewayAgentResult:
         """兜底异常只按类型分类，不把异常文本或本地路径发给用户。"""
         error_name = type(exc).__name__.lower()
         error_module = type(exc).__module__.lower()
@@ -1182,23 +1186,27 @@ class GatewayRunner:
                 _SAFE_MODEL_TIMEOUT_REPLY,
                 failed=True,
                 failure_type="model_timeout",
+                pending_steer=pending_steer,
             )
         if "connection" in error_name or error_module.startswith("openai"):
             return _GatewayAgentResult(
                 _SAFE_MODEL_UNAVAILABLE_REPLY,
                 failed=True,
                 failure_type="model_unavailable",
+                pending_steer=pending_steer,
             )
         if "sqlite" in error_module or "persistence" in error_name:
             return _GatewayAgentResult(
                 _SAFE_PERSISTENCE_REPLY,
                 failed=True,
                 failure_type="persistence_error",
+                pending_steer=pending_steer,
             )
         return _GatewayAgentResult(
             _SAFE_INTERNAL_REPLY,
             failed=True,
             failure_type="internal_error",
+            pending_steer=pending_steer,
         )
 
     @staticmethod
@@ -3388,6 +3396,21 @@ class GatewayRunner:
             return getattr(ctx, "cancel_reason", None) or "user"
         return None
 
+    @classmethod
+    def _refresh_task_cancel_reason(
+        cls,
+        ctx,
+        generation: int | None,
+        observed_reason: str | None,
+    ) -> str | None:
+        """以 SessionStore 中该 generation 的最新原因刷新 worker 观察值。"""
+        latest_reason = cls._task_cancel_reason(ctx, generation)
+        return (
+            latest_reason
+            if latest_reason is not None
+            else observed_reason
+        )
+
     def _cancel_stale_outbox(
         self,
         ctx,
@@ -3928,6 +3951,11 @@ class GatewayRunner:
                 f"({type(exc).__name__})"
             )
         finally:
+            cancel_reason = self._refresh_task_cancel_reason(
+                ctx,
+                generation,
+                cancel_reason,
+            )
             current_task = asyncio.current_task()
             owns_worker = (
                 ctx.worker_task is current_task
@@ -3982,7 +4010,7 @@ class GatewayRunner:
                     f"route={safe_route_digest(ctx.route_key)} "
                     f"steer={safe_identifier_digest(entry.steer_id)}"
                 )
-                return
+                continue
             already_pending = any(
                 queued.message_id == event.message_id
                 for queued in ctx.pending
@@ -4001,14 +4029,14 @@ class GatewayRunner:
                         f"steer={safe_identifier_digest(entry.steer_id)} "
                         f"exception={type(exc).__name__}"
                     )
-                    return
+                    continue
                 if not requeued:
                     print(
                         "  [gateway:audit] steer requeue rejected "
                         f"route={safe_route_digest(ctx.route_key)} "
                         f"steer={safe_identifier_digest(entry.steer_id)}"
                     )
-                    return
+                    continue
             self.sessions.forget_steer_event(
                 ctx,
                 generation,
@@ -4335,6 +4363,11 @@ class GatewayRunner:
                 f"({type(exc).__name__})"
             )
         finally:
+            cancel_reason = self._refresh_task_cancel_reason(
+                ctx,
+                generation,
+                cancel_reason,
+            )
             current_task = asyncio.current_task()
             owns_worker = (
                 ctx.worker_task is current_task
@@ -4947,12 +4980,30 @@ class GatewayRunner:
                 ctx.conversation_id,
                 decision_source="new_conversation",
             )
+            unconfirmed_steer = (
+                self.sessions.get_unconfirmed_steer_event_records(ctx)
+            )
             if self._route_has_active_worker(ctx):
                 # /new 作为串行屏障:丢弃命令前尚未执行的旧消息,
                 # 等当前 worker 完全退出后再切换 conversation_id。
-                dropped_events = list(ctx.pending)
+                dropped_by_id = {
+                    pending_event.message_id: pending_event
+                    for pending_event in ctx.pending
+                }
+                for _steer_generation, steer_event in unconfirmed_steer:
+                    dropped_by_id.setdefault(
+                        steer_event.message_id,
+                        steer_event,
+                    )
+                dropped_events = list(dropped_by_id.values())
                 await self._drop_events_async(route_key, dropped_events)
                 ctx.pending.clear()
+                for steer_generation, steer_event in unconfirmed_steer:
+                    self.sessions.resolve_steer_event(
+                        ctx,
+                        steer_generation,
+                        steer_event.message_id,
+                    )
                 if (
                     not from_queue
                     and not await self._persist_event_async(route_key, event)
@@ -4968,6 +5019,35 @@ class GatewayRunner:
                     f"({len(dropped_events)} old pending dropped)"
                 )
                 return
+            # /stop 恢复曾失败时，旧 generation 的 steer 仍可能只保留在
+            # durable Queue 与 deferred 映射中。空闲 /new 也必须完成屏障，
+            # 不能让这些旧输入在重启后进入新会话。
+            dropped_by_id = (
+                {
+                    pending_event.message_id: pending_event
+                    for pending_event in ctx.pending
+                }
+                if not from_queue
+                else {}
+            )
+            for _steer_generation, steer_event in unconfirmed_steer:
+                dropped_by_id.setdefault(
+                    steer_event.message_id,
+                    steer_event,
+                )
+            if dropped_by_id:
+                await self._drop_events_async(
+                    route_key,
+                    list(dropped_by_id.values()),
+                )
+                if not from_queue:
+                    ctx.pending.clear()
+                for steer_generation, steer_event in unconfirmed_steer:
+                    self.sessions.resolve_steer_event(
+                        ctx,
+                        steer_generation,
+                        steer_event.message_id,
+                    )
             if (
                 not from_queue
                 and not await self._persist_event_async(route_key, event)
@@ -5169,7 +5249,18 @@ class GatewayRunner:
                 )
             return
         await self._mark_processing_best_effort(event)
-        await self._mark_event_processing_async(route_key, event)
+        try:
+            await self._mark_event_processing_async(route_key, event)
+        except Exception as exc:
+            # 原始 Queue 记录已经可靠存在；状态标记失败不能让 route
+            # 停在尚未创建 worker 的 busy 状态。
+            print(
+                "  [gateway:audit] "
+                "event=queue_processing_mark_failed "
+                f"route={safe_route_digest(route_key)} "
+                f"message={safe_message_digest(event.message_id)} "
+                f"exception={type(exc).__name__}"
+            )
         delivery_id = str(uuid.uuid4())
         ctx.delivery_id = delivery_id
         ctx.delivery_generation = generation
@@ -5517,9 +5608,10 @@ class GatewayRunner:
                                     )
                                 )
         finally:
-            cancel_reason = cancel_reason or self._task_cancel_reason(
+            cancel_reason = self._refresh_task_cancel_reason(
                 ctx,
                 generation,
+                cancel_reason,
             )
             if (
                 agent_task is not None
@@ -5569,6 +5661,11 @@ class GatewayRunner:
                             event,
                         )
             finally:
+                cancel_reason = self._refresh_task_cancel_reason(
+                    ctx,
+                    generation,
+                    cancel_reason,
+                )
                 # 关键状态已落库后才对外暴露 route 空闲。普通
                 # 收尾先进入 dispatching，由 admission 锁保证 pending
                 # 队头不会被同时到达的新消息越过。
@@ -5587,7 +5684,6 @@ class GatewayRunner:
                 if (
                     owns_worker
                     and cancel_reason == "user"
-                    and self._task_cancel_reason(ctx, generation) == "user"
                 ):
                     try:
                         await self._restore_user_cancelled_steer(
@@ -6102,6 +6198,7 @@ class GatewayRunner:
                     _SAFE_INTERNAL_REPLY,
                     failed=True,
                     failure_type="invalid_approval_request",
+                    pending_steer=pending_steer,
                 )
             if not _gateway_approval_request_is_allowed(
                 request,
@@ -6112,6 +6209,7 @@ class GatewayRunner:
                     _SAFE_INTERNAL_REPLY,
                     failed=True,
                     failure_type="invalid_approval_request",
+                    pending_steer=pending_steer,
                 )
             try:
                 request = _bind_approval_request_metadata(
@@ -6124,21 +6222,38 @@ class GatewayRunner:
                     _SAFE_INTERNAL_REPLY,
                     failed=True,
                     failure_type="invalid_approval_request",
+                    pending_steer=pending_steer,
                 )
             if self._task_cancel_reason(ctx, generation) is not None:
-                return _GatewayAgentResult(None)
+                return _GatewayAgentResult(
+                    None,
+                    pending_steer=pending_steer,
+                )
             actor_id = self._stable_actor_id(task_event)
             if actor_id is None:
-                await self.persistence.call(
-                    fail_gateway_approval_identity_unavailable,
-                    conversation_id,
-                    str(request.get("id", "")),
-                    str(request.get("tool_call_id", "")),
-                )
+                try:
+                    await self.persistence.call(
+                        fail_gateway_approval_identity_unavailable,
+                        conversation_id,
+                        str(request.get("id", "")),
+                        str(request.get("tool_call_id", "")),
+                    )
+                except Exception as exc:
+                    print(
+                        "  [gateway:audit] "
+                        "event=approval_identity_failure_persist_failed "
+                        f"route={safe_route_digest(route_key)} "
+                        f"exception={type(exc).__name__}"
+                    )
+                    return self._safe_exception_result(
+                        exc,
+                        pending_steer=pending_steer,
+                    )
                 return _GatewayAgentResult(
                     "当前平台事件缺少可验证的用户身份，受控操作未执行。",
                     failed=True,
                     failure_type="approval_identity_unavailable",
+                    pending_steer=pending_steer,
                 )
             question = _format_approval_question(request)
             msg = {"role": "assistant", "content": question}
@@ -6150,17 +6265,29 @@ class GatewayRunner:
                 "approval_request",
                 queue_message_id=event.message_id,
             )
-            delivery_id = await self.persistence.call(
-                create_gateway_approval_with_outbox,
-                conversation_id,
-                request,
-                actor_id,
-                msg,
-                outbox,
-                _GATEWAY_APPROVAL_TTL_SECONDS,
-                agent_state=result.get("agent_state"),
-                **self._runtime_fence_kwargs(),
-            )
+            try:
+                delivery_id = await self.persistence.call(
+                    create_gateway_approval_with_outbox,
+                    conversation_id,
+                    request,
+                    actor_id,
+                    msg,
+                    outbox,
+                    _GATEWAY_APPROVAL_TTL_SECONDS,
+                    agent_state=result.get("agent_state"),
+                    **self._runtime_fence_kwargs(),
+                )
+            except Exception as exc:
+                print(
+                    "  [gateway:audit] "
+                    "event=approval_outbox_persist_failed "
+                    f"route={safe_route_digest(route_key)} "
+                    f"exception={type(exc).__name__}"
+                )
+                return self._safe_exception_result(
+                    exc,
+                    pending_steer=pending_steer,
+                )
             if (
                 getattr(ctx, "delivery_generation", generation) == generation
                 and self._task_cancel_reason(ctx, generation) is None
