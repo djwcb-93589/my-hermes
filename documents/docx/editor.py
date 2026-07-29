@@ -18,6 +18,7 @@ from .atomic import (
 from .errors import DocxError
 from .locator import (
     BodyChildLocation,
+    EditTargetLocation,
     TableCellLocation,
     build_edit_target_index,
     get_single_cell_paragraph,
@@ -45,9 +46,10 @@ from .reader import DocxReader
 from .search import build_match_id, iter_literal_matches
 from .textmap import (
     VisibleTextMap,
+    VisibleTextReplacement,
     append_text_content,
     build_visible_text_map,
-    replace_visible_text_range,
+    replace_visible_text_ranges,
 )
 from .writer import (
     parse_xml_preserving_misc,
@@ -149,11 +151,18 @@ class _PlannedTextEdit:
 
 
 @dataclass(frozen=True)
-class _PlannedMatchEdit:
+class _ResolvedMatchEdit:
     operation: _ValidatedMatchOperation
-    text_map: VisibleTextMap
     start: int
     end: int
+
+
+@dataclass(frozen=True)
+class _PlannedMatchGroup:
+    block_id: str
+    text_map: VisibleTextMap
+    edits: tuple[_ResolvedMatchEdit, ...]
+    expected_text: str
 
 
 @dataclass(frozen=True)
@@ -253,7 +262,7 @@ class DocxEditor:
                 if _apply_text_edit(plan):
                     document_changed = True
             for plan in planned_match_edits:
-                if _apply_match_edit(plan):
+                if _apply_match_group(plan):
                     document_changed = True
             if document_changed:
                 replacements[_DOCUMENT_PART] = serialize_xml(
@@ -362,7 +371,8 @@ def _validate_request(
 
 def _validate_operations(operations: list[object]) -> list[_ValidatedOperation]:
     validated: list[_ValidatedOperation] = []
-    seen_targets: set[str] = set()
+    whole_block_targets: set[str] = set()
+    match_targets: dict[str, list[_ValidatedMatchOperation]] = {}
     seen_match_ids: set[str] = set()
     metadata_seen = False
 
@@ -403,23 +413,33 @@ def _validate_operations(operations: list[object]) -> list[_ValidatedOperation]:
                 f"第 {operation_index} 个编辑操作类型不受支持。",
             )
 
-        if isinstance(
-            validated_operation,
-            (_ValidatedTextOperation, _ValidatedMatchOperation),
-        ):
-            if validated_operation.block_id in seen_targets:
+        if isinstance(validated_operation, _ValidatedTextOperation):
+            if validated_operation.block_id in whole_block_targets:
                 raise DocxError(
                     "duplicate_edit_target",
-                    "同一个 block_id 在一次请求中只能修改一次。",
+                    "同一个 block_id 在一次请求中只能执行一次整块替换。",
                 )
-            seen_targets.add(validated_operation.block_id)
-        if isinstance(validated_operation, _ValidatedMatchOperation):
+            if validated_operation.block_id in match_targets:
+                raise DocxError(
+                    "edit_operation_conflict",
+                    "同一个 block 不能同时执行整块替换和局部替换。",
+                )
+            whole_block_targets.add(validated_operation.block_id)
+        elif isinstance(validated_operation, _ValidatedMatchOperation):
             if validated_operation.match_id in seen_match_ids:
                 raise DocxError(
                     "duplicate_edit_target",
                     "同一个 match_id 在一次请求中只能修改一次。",
                 )
             seen_match_ids.add(validated_operation.match_id)
+            if validated_operation.block_id in whole_block_targets:
+                raise DocxError(
+                    "edit_operation_conflict",
+                    "同一个 block 不能同时执行整块替换和局部替换。",
+                )
+            match_targets.setdefault(validated_operation.block_id, []).append(
+                validated_operation
+            )
         validated.append(validated_operation)
     return validated
 
@@ -561,132 +581,181 @@ def _plan_text_edits(
     snapshot: DocumentSnapshot,
 ) -> tuple[
     list[_PlannedTextEdit],
-    list[_PlannedMatchEdit],
+    list[_PlannedMatchGroup],
     dict[str, str],
 ]:
     targets = build_edit_target_index(body)
     snapshot_targets = _snapshot_text_targets(snapshot)
     text_plans: list[_PlannedTextEdit] = []
-    match_plans: list[_PlannedMatchEdit] = []
+    match_plans: list[_PlannedMatchGroup] = []
     expected_target_texts: dict[str, str] = {}
+    match_operations_by_block: dict[str, list[_ValidatedMatchOperation]] = {}
 
     for operation in operations:
-        if not isinstance(
+        if isinstance(operation, _ValidatedMatchOperation):
+            match_operations_by_block.setdefault(operation.block_id, []).append(
+                operation
+            )
+            continue
+        if not isinstance(operation, _ValidatedTextOperation):
+            continue
+        paragraph, current_text = _resolve_text_edit_target(
             operation,
-            (_ValidatedTextOperation, _ValidatedMatchOperation),
-        ):
-            continue
-        location = targets.get(operation.block_id)
-        snapshot_target = snapshot_targets.get(operation.block_id)
-        if location is None and snapshot_target is None:
-            error_type = (
-                "match_not_found"
-                if isinstance(operation, _ValidatedMatchOperation)
-                else "block_not_found"
+            targets=targets,
+            snapshot_targets=snapshot_targets,
+        )
+        text_plans.append(
+            _PlannedTextEdit(
+                operation=operation,
+                paragraph=paragraph,
+                current_text=current_text,
             )
-            raise DocxError(error_type, "指定的 block_id 不存在。")
-        if location is None or snapshot_target is None:
-            raise DocxError(
-                "edit_verification_failed",
-                "Reader 与 locator 的 block_id 定位结果不一致。",
-            )
+        )
+        expected_target_texts[operation.block_id] = operation.text
 
-        if operation.target_kind == "paragraph":
-            if (
-                not isinstance(location, BodyChildLocation)
-                or location.kind != "paragraph"
-                or not isinstance(snapshot_target, ParagraphSnapshot)
-            ):
-                raise DocxError(
-                    "edit_verification_failed",
-                    "Reader 与 locator 的段落定位结果不一致。",
-                )
-            paragraph = location.element
-            editable = snapshot_target.editable and is_strictly_editable_paragraph(
-                paragraph
-            )
-            current_text = snapshot_target.text
-        else:
-            if (
-                not isinstance(location, TableCellLocation)
-                or not isinstance(snapshot_target, _SnapshotTableCellTarget)
-                or snapshot_target.cell.block_id != location.block_id
-                or not location.block_id.startswith(
-                    f"{snapshot_target.table.block_id}:row:"
-                )
-            ):
-                raise DocxError(
-                    "edit_verification_failed",
-                    "Reader 与 locator 的表格单元格定位结果不一致。",
-                )
-            paragraph = get_single_cell_paragraph(location)
-            editable = (
-                snapshot_target.table.editable
-                and snapshot_target.cell.editable
-                and paragraph is not None
-                and is_strictly_editable_table_cell(location)
-            )
-            current_text = snapshot_target.cell.text
-
-        if not editable or paragraph is None:
-            if isinstance(operation, _ValidatedMatchOperation):
-                raise DocxError(
-                    "match_not_editable",
-                    "匹配内容或其所属表格包含复杂结构，当前阶段不允许局部编辑。",
-                )
-            raise DocxError(
-                "block_not_editable",
-                "指定内容块或其所属表格包含复杂结构，当前阶段不允许编辑。",
-            )
-
-        if isinstance(operation, _ValidatedTextOperation):
-            text_plans.append(
-                _PlannedTextEdit(
-                    operation=operation,
-                    paragraph=paragraph,
-                    current_text=current_text,
-                )
-            )
-            expected_target_texts[operation.block_id] = operation.text
-            continue
-
+    for block_id, match_operations in match_operations_by_block.items():
+        representative = match_operations[0]
+        paragraph, current_text = _resolve_text_edit_target(
+            representative,
+            targets=targets,
+            snapshot_targets=snapshot_targets,
+        )
         text_map = build_visible_text_map(paragraph)
         if text_map.text != current_text:
             raise DocxError(
                 "edit_verification_failed",
                 "Reader 与文字映射的可见内容不一致。",
             )
-        start, end = _locate_match_span(
-            operation,
-            text=text_map.text,
-            revision=snapshot.revision,
+        resolved_edits: list[_ResolvedMatchEdit] = []
+        for operation in match_operations:
+            start, end = _locate_match_span(
+                operation,
+                text=text_map.text,
+                revision=snapshot.revision,
+            )
+            if not text_map.is_searchable_range(start, end):
+                raise DocxError(
+                    "match_not_editable",
+                    "匹配跨越显式分页符或分栏符，当前阶段不允许局部编辑。",
+                )
+            try:
+                text_range = text_map.resolve_range(start, end)
+            except ValueError as exc:
+                raise DocxError(
+                    "match_conflict",
+                    "匹配范围无法映射到当前可见文字。",
+                ) from exc
+            if operation.preserve_format and not text_range.uniform_format:
+                raise DocxError(
+                    "match_not_editable",
+                    "匹配跨越多个格式不同的 run，无法安全保留格式。",
+                )
+            resolved_edits.append(
+                _ResolvedMatchEdit(
+                    operation=operation,
+                    start=start,
+                    end=end,
+                )
+            )
+
+        ordered_edits = tuple(
+            sorted(resolved_edits, key=lambda item: (item.start, item.end))
         )
-        try:
-            text_range = text_map.resolve_range(start, end)
-        except ValueError as exc:
+        for previous, current in zip(ordered_edits, ordered_edits[1:]):
+            if current.start < previous.end:
+                raise DocxError(
+                    "edit_operation_conflict",
+                    "同一个 block 中的局部替换范围不能重叠。",
+                )
+
+        expected_text = text_map.text
+        for edit in reversed(ordered_edits):
+            expected_text = (
+                expected_text[: edit.start]
+                + edit.operation.replacement_text
+                + expected_text[edit.end :]
+            )
+        match_plan = _PlannedMatchGroup(
+            block_id=block_id,
+            text_map=text_map,
+            edits=ordered_edits,
+            expected_text=expected_text,
+        )
+        match_plans.append(match_plan)
+        expected_target_texts[block_id] = match_plan.expected_text
+    return text_plans, match_plans, expected_target_texts
+
+
+def _resolve_text_edit_target(
+    operation: _ValidatedTextOperation | _ValidatedMatchOperation,
+    *,
+    targets: dict[str, EditTargetLocation],
+    snapshot_targets: dict[str, _SnapshotTextTarget],
+) -> tuple[ElementTree.Element, str]:
+    location = targets.get(operation.block_id)
+    snapshot_target = snapshot_targets.get(operation.block_id)
+    if location is None and snapshot_target is None:
+        error_type = (
+            "match_not_found"
+            if isinstance(operation, _ValidatedMatchOperation)
+            else "block_not_found"
+        )
+        raise DocxError(error_type, "指定的 block_id 不存在。")
+    if location is None or snapshot_target is None:
+        raise DocxError(
+            "edit_verification_failed",
+            "Reader 与 locator 的 block_id 定位结果不一致。",
+        )
+
+    paragraph: ElementTree.Element | None
+    if operation.target_kind == "paragraph":
+        if (
+            not isinstance(location, BodyChildLocation)
+            or location.kind != "paragraph"
+            or not isinstance(snapshot_target, ParagraphSnapshot)
+        ):
             raise DocxError(
-                "match_conflict",
-                "匹配范围无法映射到当前可见文字。",
-            ) from exc
-        if operation.preserve_format and not text_range.uniform_format:
+                "edit_verification_failed",
+                "Reader 与 locator 的段落定位结果不一致。",
+            )
+        paragraph = location.element
+        editable = snapshot_target.editable and is_strictly_editable_paragraph(
+            paragraph
+        )
+        current_text = snapshot_target.text
+    else:
+        if (
+            not isinstance(location, TableCellLocation)
+            or not isinstance(snapshot_target, _SnapshotTableCellTarget)
+            or snapshot_target.cell.block_id != location.block_id
+            or not location.block_id.startswith(
+                f"{snapshot_target.table.block_id}:row:"
+            )
+        ):
+            raise DocxError(
+                "edit_verification_failed",
+                "Reader 与 locator 的表格单元格定位结果不一致。",
+            )
+        paragraph = get_single_cell_paragraph(location)
+        editable = (
+            snapshot_target.table.editable
+            and snapshot_target.cell.editable
+            and paragraph is not None
+            and is_strictly_editable_table_cell(location)
+        )
+        current_text = snapshot_target.cell.text
+
+    if not editable or paragraph is None:
+        if isinstance(operation, _ValidatedMatchOperation):
             raise DocxError(
                 "match_not_editable",
-                "匹配跨越多个格式不同的 run，无法安全保留格式。",
+                "匹配内容或其所属表格包含复杂结构，当前阶段不允许局部编辑。",
             )
-        match_plans.append(
-            _PlannedMatchEdit(
-                operation=operation,
-                text_map=text_map,
-                start=start,
-                end=end,
-            )
+        raise DocxError(
+            "block_not_editable",
+            "指定内容块或其所属表格包含复杂结构，当前阶段不允许编辑。",
         )
-        expected_target_texts[operation.block_id] = (
-            text_map.text[:start]
-            + operation.replacement_text
-            + text_map.text[end:]
-        )
-    return text_plans, match_plans, expected_target_texts
+    return paragraph, current_text
 
 
 def _locate_match_span(
@@ -877,14 +946,20 @@ def _apply_text_edit(plan: _PlannedTextEdit) -> bool:
     return before != after
 
 
-def _apply_match_edit(plan: _PlannedMatchEdit) -> bool:
+def _apply_match_group(plan: _PlannedMatchGroup) -> bool:
     try:
-        return replace_visible_text_range(
+        replacements = tuple(
+            VisibleTextReplacement(
+                start=edit.start,
+                end=edit.end,
+                replacement=edit.operation.replacement_text,
+                preserve_format=edit.operation.preserve_format,
+            )
+            for edit in reversed(plan.edits)
+        )
+        return replace_visible_text_ranges(
             plan.text_map,
-            start=plan.start,
-            end=plan.end,
-            replacement=plan.operation.replacement_text,
-            preserve_format=plan.operation.preserve_format,
+            replacements,
         )
     except ValueError as exc:
         raise DocxError(
@@ -1009,40 +1084,36 @@ def _verify_output(
 
     output_targets = _snapshot_text_targets(output_snapshot)
     initial_targets = _snapshot_text_targets(initial_snapshot)
-    edited_block_ids = {
-        operation.block_id
+    edited_target_kinds = {
+        operation.block_id: operation.target_kind
         for operation in operations
         if isinstance(
             operation,
             (_ValidatedTextOperation, _ValidatedMatchOperation),
         )
     }
-    for operation in operations:
-        if isinstance(
-            operation,
-            (_ValidatedTextOperation, _ValidatedMatchOperation),
-        ):
-            target = output_targets.get(operation.block_id)
-            if operation.target_kind == "paragraph":
-                if not isinstance(target, ParagraphSnapshot):
-                    raise DocxError(
-                        "edit_verification_failed",
-                        "修改后的目标类型与请求不一致。",
-                    )
-            elif not isinstance(target, _SnapshotTableCellTarget):
+    edited_block_ids = set(expected_target_texts)
+    for block_id, expected_text in expected_target_texts.items():
+        target = output_targets.get(block_id)
+        if edited_target_kinds.get(block_id) == "paragraph":
+            if not isinstance(target, ParagraphSnapshot):
                 raise DocxError(
                     "edit_verification_failed",
                     "修改后的目标类型与请求不一致。",
                 )
-            if (
-                _snapshot_target_text(target)
-                != expected_target_texts.get(operation.block_id)
-                or not _snapshot_target_is_editable(target)
-            ):
-                raise DocxError(
-                    "edit_verification_failed",
-                    "修改后的目标文字与请求不一致。",
-                )
+        elif not isinstance(target, _SnapshotTableCellTarget):
+            raise DocxError(
+                "edit_verification_failed",
+                "修改后的目标类型与请求不一致。",
+            )
+        if (
+            _snapshot_target_text(target) != expected_text
+            or not _snapshot_target_is_editable(target)
+        ):
+            raise DocxError(
+                "edit_verification_failed",
+                "修改后的目标文字与请求不一致。",
+            )
 
     for block_id, initial_target in initial_targets.items():
         if block_id in edited_block_ids:

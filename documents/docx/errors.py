@@ -40,6 +40,7 @@ DOCX_ERROR_TYPES = frozenset(
         "match_not_found",
         "match_conflict",
         "match_not_editable",
+        "search_verification_failed",
     }
 )
 
