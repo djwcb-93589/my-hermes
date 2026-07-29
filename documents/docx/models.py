@@ -299,10 +299,10 @@ class FormatTextMatch:
 
     match_id: str
     block_id: str
+    expected_text: str
     bold: bool | None = None
     italic: bool | None = None
     underline: bool | None = None
-    expected_text: str | None = None
 
 
 @dataclass(frozen=True)

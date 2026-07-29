@@ -62,7 +62,7 @@ from .models import (
 )
 from .package import DocxPackage
 from .reader import DocxReader
-from .search import build_match_id, iter_literal_matches, resolve_cached_match
+from .search import build_match_id, iter_literal_matches
 from .textmap import (
     VisibleTextMap,
     VisibleTextFormatting,
@@ -231,7 +231,7 @@ class _ValidatedFormatOperation:
     operation_type: str
     match_id: str
     block_id: str
-    expected_text: str | None
+    expected_text: str
     bold: bool | None
     italic: bool | None
     underline: bool | None
@@ -371,6 +371,7 @@ class _ExpectedDocumentState:
     paragraph_properties: dict[str, tuple[str | None, str | None]]
     table_shapes: dict[str, tuple[int, ...]]
     editable_block_ids: frozenset[str]
+    strict_table_block_ids: frozenset[str]
     format_ranges: tuple[_ExpectedFormatRange, ...]
     paragraph_count: int
     table_count: int
@@ -1115,26 +1116,22 @@ def _validate_format_operation(
             "invalid_edit_operation",
             "bold、italic 和 underline 必须是布尔值或 null。",
         )
-    if operation.expected_text is not None and (
+    if (
         not isinstance(operation.expected_text, str)
         or not operation.expected_text
     ):
         raise DocxError(
             "invalid_edit_operation",
-            "format_text_match.expected_text 必须是非空字符串或省略。",
+            "format_text_match.expected_text 必须是非空字符串。",
         )
     return _ValidatedFormatOperation(
         operation_index=operation_index,
         operation_type="format_text_match",
         match_id=operation.match_id,
         block_id=operation.block_id,
-        expected_text=(
-            _validate_plain_text(
-                operation.expected_text,
-                "format_text_match.expected_text",
-            )
-            if operation.expected_text is not None
-            else None
+        expected_text=_validate_plain_text(
+            operation.expected_text,
+            "format_text_match.expected_text",
         ),
         bold=operation.bold,
         italic=operation.italic,
@@ -1927,38 +1924,6 @@ def _locate_format_match_span(
     text: str,
     revision: str,
 ) -> tuple[int, int]:
-    if operation.expected_text is None:
-        cached = resolve_cached_match(
-            revision,
-            operation.match_id,
-            operation.block_id,
-        )
-        if cached is None:
-            raise DocxError(
-                "match_not_found",
-                "format_text_match 无法恢复匹配范围；请先在当前进程搜索或提供 expected_text。",
-            )
-        start, end, matched_text = cached
-        if (
-            start < 0
-            or end <= start
-            or end > len(text)
-            or text[start:end] != matched_text
-            or build_match_id(
-                revision,
-                operation.block_id,
-                start,
-                end,
-                matched_text,
-            )
-            != operation.match_id
-        ):
-            raise DocxError(
-                "match_conflict",
-                "缓存的格式匹配范围与当前 block 文字不一致。",
-            )
-        return start, end
-
     expected_text_found = False
     for start, end in iter_literal_matches(
         text,
@@ -2654,6 +2619,24 @@ def _build_expected_document_state(
                 if block_id.startswith(f"{new_table_id}:row:")
             )
 
+    strict_table_block_ids: set[str] = set()
+    for table_plan in extended_plan.table_insertions:
+        new_table_id = current_id_by_identity.get(id(table_plan.table))
+        if new_table_id is None:
+            raise DocxError(
+                "edit_verification_failed",
+                "新插入表格未出现在修改后结构中。",
+            )
+        strict_table_block_ids.add(new_table_id)
+    for table_plan in extended_plan.table_mutations:
+        new_table_id = remap_lookup.get(table_plan.table_block_id)
+        if new_table_id is None:
+            raise DocxError(
+                "edit_verification_failed",
+                "表格行编辑目标在结构计划中被意外删除。",
+            )
+        strict_table_block_ids.add(new_table_id)
+
     format_ranges: list[_ExpectedFormatRange] = []
     for group in extended_plan.format_groups:
         new_block_id = remap_lookup.get(group.block_id)
@@ -2682,6 +2665,7 @@ def _build_expected_document_state(
         paragraph_properties=paragraph_properties,
         table_shapes=table_shapes,
         editable_block_ids=frozenset(editable_block_ids),
+        strict_table_block_ids=frozenset(strict_table_block_ids),
         format_ranges=tuple(format_ranges),
         paragraph_count=paragraph_count,
         table_count=table_count,
@@ -2859,6 +2843,11 @@ def _verify_output(
                 "修改后的目标不再满足安全编辑结构。",
             )
 
+    _verify_strict_tables(
+        output_snapshot,
+        output_body,
+        expected_state.strict_table_block_ids,
+    )
     _verify_format_ranges(
         output_body,
         expected_state.format_ranges,
@@ -3039,6 +3028,40 @@ def _verify_format_ranges(
             raise DocxError(
                 "edit_verification_failed",
                 "修改后的直接文字格式与请求不一致。",
+            )
+
+
+def _verify_strict_tables(
+    output_snapshot: DocumentSnapshot,
+    output_body: ElementTree.Element,
+    table_block_ids: frozenset[str],
+) -> None:
+    """用 Reader 与 locator 双重复检新增或改行后的规则表格。"""
+
+    if not table_block_ids:
+        return
+    snapshot_tables = {
+        block.block_id: block
+        for block in output_snapshot.blocks
+        if isinstance(block, TableSnapshot)
+    }
+    xml_tables = {
+        location.block_id: location.element
+        for location in iter_body_children(output_body)
+        if location.kind == "table" and location.block_id is not None
+    }
+    for block_id in table_block_ids:
+        snapshot_table = snapshot_tables.get(block_id)
+        xml_table = xml_tables.get(block_id)
+        if (
+            snapshot_table is None
+            or not snapshot_table.editable
+            or xml_table is None
+            or not is_strictly_editable_table(xml_table)
+        ):
+            raise DocxError(
+                "edit_verification_failed",
+                "新增或修改行后的表格未通过规则网格复检。",
             )
 
 

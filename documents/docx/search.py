@@ -5,10 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
-from threading import Lock
 from xml.etree import ElementTree
 
 from .errors import DocxError
@@ -44,12 +42,6 @@ _W_CELL_PROPERTIES = f"{{{_W_NS}}}tcPr"
 _DOCUMENT_PART = "word/document.xml"
 _MATCH_CONTEXT_CHARACTERS = 40
 _MAX_MATCH_LIMIT = 10_000
-_MATCH_CACHE_LIMIT = 10_000
-_MATCH_CACHE: OrderedDict[
-    tuple[str, str, str],
-    tuple[int, int, str],
-] = OrderedDict()
-_MATCH_CACHE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -149,6 +141,11 @@ class DocxSearcher:
                                 match_warnings,
                                 ["format_boundary"],
                             )
+                        if len(text_range.affected_run_indexes) > 1:
+                            match_warnings = _merge_warning_types(
+                                match_warnings,
+                                ["multi_run_match"],
+                            )
                         matches.append(
                             TextMatch(
                                 match_id=build_match_id(
@@ -179,7 +176,6 @@ class DocxSearcher:
                             )
                         )
 
-        _remember_matches(snapshot.revision, matches)
         return SearchDocumentResult(
             source_path=snapshot.source_path,
             revision=snapshot.revision,
@@ -210,37 +206,6 @@ def build_match_id(
         separators=(",", ":"),
     ).encode("utf-8")
     return f"match:{hashlib.sha256(payload).hexdigest()}"
-
-
-def resolve_cached_match(
-    revision: str,
-    match_id: str,
-    block_id: str,
-) -> tuple[int, int, str] | None:
-    """读取当前进程最近一次搜索产生的匹配范围。"""
-
-    key = (revision, match_id, block_id)
-    with _MATCH_CACHE_LOCK:
-        value = _MATCH_CACHE.get(key)
-        if value is not None:
-            _MATCH_CACHE.move_to_end(key)
-        return value
-
-
-def _remember_matches(revision: str, matches: list[TextMatch]) -> None:
-    """有界保存格式操作无法从摘要本身反解的匹配坐标。"""
-
-    with _MATCH_CACHE_LOCK:
-        for match in matches:
-            key = (revision, match.match_id, match.block_id)
-            _MATCH_CACHE[key] = (
-                match.start,
-                match.end,
-                match.matched_text,
-            )
-            _MATCH_CACHE.move_to_end(key)
-        while len(_MATCH_CACHE) > _MATCH_CACHE_LIMIT:
-            _MATCH_CACHE.popitem(last=False)
 
 
 def iter_literal_matches(

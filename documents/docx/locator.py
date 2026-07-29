@@ -23,6 +23,7 @@ _W_CARRIAGE_RETURN = f"{{{_W_NS}}}cr"
 _W_TABLE = f"{{{_W_NS}}}tbl"
 _W_TABLE_PROPERTIES = f"{{{_W_NS}}}tblPr"
 _W_TABLE_GRID = f"{{{_W_NS}}}tblGrid"
+_W_GRID_COLUMN = f"{{{_W_NS}}}gridCol"
 _W_SECTION_PROPERTIES = f"{{{_W_NS}}}sectPr"
 _W_ROW = f"{{{_W_NS}}}tr"
 _W_ROW_PROPERTIES = f"{{{_W_NS}}}trPr"
@@ -375,21 +376,29 @@ def _strict_table_rows(
         return None
 
     table_properties_seen = False
-    table_grid_seen = False
+    table_grid: ElementTree.Element | None = None
     rows_started = False
     for child in table:
         if child.tag not in _ALLOWED_TABLE_CHILDREN:
             return None
         if child.tag == _W_TABLE_PROPERTIES:
-            if table_properties_seen or table_grid_seen or rows_started:
+            if table_properties_seen or table_grid is not None or rows_started:
                 return None
             table_properties_seen = True
         elif child.tag == _W_TABLE_GRID:
-            if table_grid_seen or rows_started:
+            if table_grid is not None or rows_started:
                 return None
-            table_grid_seen = True
+            table_grid = child
         else:
             rows_started = True
+
+    if table_grid is None or any(
+        child.tag != _W_GRID_COLUMN for child in table_grid
+    ):
+        return None
+    grid_column_count = len(table_grid)
+    if grid_column_count == 0:
+        return None
 
     rows, wrapped_rows = visible_table_rows(table)
     if wrapped_rows or not rows:
@@ -423,7 +432,10 @@ def _strict_table_rows(
         row_cell_counts.append(len(cells))
         located_rows.append((row, cells))
 
-    if len(set(row_cell_counts)) != 1:
+    if (
+        len(set(row_cell_counts)) != 1
+        or row_cell_counts[0] != grid_column_count
+    ):
         return None
     return located_rows
 

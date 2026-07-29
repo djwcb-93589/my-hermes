@@ -473,10 +473,19 @@ def _parse_edit_operation(
             f"第 {index} 个 format_text_match",
             "invalid_edit_operation",
         )
+        if (
+            "expected_text" not in value
+            or not isinstance(value["expected_text"], str)
+            or not value["expected_text"]
+        ):
+            raise DocxError(
+                "invalid_edit_operation",
+                "format_text_match.expected_text 必须是非空字符串。",
+            )
         return FormatTextMatch(
             match_id=value.get("match_id"),
             block_id=value.get("block_id"),
-            expected_text=value.get("expected_text"),
+            expected_text=value["expected_text"],
             bold=value.get("bold"),
             italic=value.get("italic"),
             underline=value.get("underline"),
