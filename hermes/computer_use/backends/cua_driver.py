@@ -137,12 +137,17 @@ class CuaDriverBackend(ComputerUseBackend):
                 details={"reason": "missing_capture_tool"},
             )
 
-        raw_result = self._client.call_tool(
-            capture_tool,
-            {
+        capture_arguments = {
+            "window_id": target.window_id,
+        }
+        if capture_tool == "get_window_state":
+            capture_arguments = {
                 "pid": target.pid,
                 "window_id": target.window_id,
-            },
+            }
+        raw_result = self._client.call_tool(
+            capture_tool,
+            capture_arguments,
         )
         payload = self._extract_tool_payload(
             raw_result,
@@ -229,7 +234,10 @@ class CuaDriverBackend(ComputerUseBackend):
     def _list_windows(self) -> list[WindowInfo]:
         """调用驱动并转换窗口列表。"""
 
-        raw_result = self._client.call_tool("list_windows", {})
+        raw_result = self._client.call_tool(
+            "list_windows",
+            {"on_screen_only": True},
+        )
         payload = self._extract_tool_payload(raw_result)
         items = self._require_list(
             payload,
@@ -260,21 +268,32 @@ class CuaDriverBackend(ComputerUseBackend):
                 "is_visible",
                 "visible",
             )
+            is_on_screen = item.get("is_on_screen")
             is_visible = (
-                visible_value
-                if isinstance(visible_value, bool)
-                else True
+                is_on_screen
+                if isinstance(is_on_screen, bool)
+                else (
+                    visible_value
+                    if isinstance(visible_value, bool)
+                    else True
+                )
             )
             metadata = {
                 key: item[key]
                 for key in (
                     "z_index",
-                    "off_screen",
                     "minimized",
                     "focused",
                 )
                 if key in item and self._is_small_value(item[key])
             }
+            off_screen = item.get("off_screen")
+            if isinstance(off_screen, bool):
+                metadata["off_screen"] = off_screen
+                if isinstance(is_on_screen, bool):
+                    is_visible = not off_screen
+            elif isinstance(is_on_screen, bool):
+                metadata["off_screen"] = not is_on_screen
             bounds_source = item.get("bounds", item)
             windows.append(
                 WindowInfo(
@@ -304,7 +323,11 @@ class CuaDriverBackend(ComputerUseBackend):
             if isinstance(verified_value, bool)
             else True
         )
-        effect = self._parse_effect(payload.get("effect"))
+        effect = (
+            self._parse_effect(payload["effect"])
+            if "effect" in payload
+            else ActionEffect.CONFIRMED
+        )
         path_value = payload.get("path")
         degraded_value = payload.get("degraded")
         code_value = payload.get("code")
@@ -646,6 +669,8 @@ class CuaDriverBackend(ComputerUseBackend):
                 "imageBase64",
                 "image",
                 "screenshot",
+                "screenshot_png_b64",
+                "png_b64",
             ):
                 if key not in candidate:
                     continue
@@ -669,7 +694,12 @@ class CuaDriverBackend(ComputerUseBackend):
         width = self._parse_dimension(sources, "width")
         height = self._parse_dimension(sources, "height")
         if encoded is None:
-            return None, None, width, height
+            return (
+                None,
+                None,
+                width if width is not None else 0,
+                height if height is not None else 0,
+            )
 
         try:
             image_bytes = base64.b64decode(encoded, validate=True)
@@ -681,14 +711,27 @@ class CuaDriverBackend(ComputerUseBackend):
 
         mime_type = self._first_string_from_sources(
             sources,
-            ("mimeType", "mime_type", "media_type"),
+            (
+                "mimeType",
+                "mime_type",
+                "media_type",
+                "screenshot_mime_type",
+            ),
         )
         if (
             mime_type is None
             and image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
         ):
             mime_type = "image/png"
-        return image_bytes, mime_type, width, height
+        parsed_width, parsed_height = self._image_dimensions_from_bytes(
+            image_bytes
+        )
+        return (
+            image_bytes,
+            mime_type,
+            width if width is not None else parsed_width,
+            height if height is not None else parsed_height,
+        )
 
     def _parse_elements(
         self,
@@ -732,13 +775,20 @@ class CuaDriverBackend(ComputerUseBackend):
             if not isinstance(item, Mapping):
                 continue
 
+            raw_index: int | None = None
+            for index_key in ("element_index", "index"):
+                candidate_index = item.get(index_key)
+                if (
+                    type(candidate_index) is int
+                    and candidate_index > 0
+                ):
+                    raw_index = candidate_index
+                    break
             if mode is CaptureMode.SOM:
                 index = len(elements) + 1
             else:
-                raw_index = item.get("index")
                 if (
-                    type(raw_index) is int
-                    and raw_index > 0
+                    raw_index is not None
                     and raw_index not in used_indexes
                 ):
                     index = raw_index
@@ -756,11 +806,16 @@ class CuaDriverBackend(ComputerUseBackend):
                 if isinstance(attributes_value, Mapping)
                 else {}
             )
+            if mode is CaptureMode.SOM and raw_index is not None:
+                attributes["driver_element_index"] = raw_index
             token_value = self._first_present(
                 item,
                 "element_token",
                 "token",
             )
+            bounds_source = item.get("bounds")
+            if bounds_source is None:
+                bounds_source = item.get("frame", item)
             elements.append(
                 UIElement(
                     index=index,
@@ -773,9 +828,7 @@ class CuaDriverBackend(ComputerUseBackend):
                             "title",
                         )
                     ),
-                    bounds=self._parse_bounds(
-                        item.get("bounds", item)
-                    ),
+                    bounds=self._parse_bounds(bounds_source),
                     app=(
                         self._string_value(item.get("app"))
                         or target.app
@@ -809,8 +862,8 @@ class CuaDriverBackend(ComputerUseBackend):
             raw_values = (
                 value.get("x"),
                 value.get("y"),
-                value.get("width"),
-                value.get("height"),
+                value.get("width", value.get("w")),
+                value.get("height", value.get("h")),
             )
         elif (
             isinstance(value, Sequence)
@@ -844,7 +897,7 @@ class CuaDriverBackend(ComputerUseBackend):
     def _parse_dimension(
         sources: Sequence[Mapping[str, Any] | None],
         name: str,
-    ) -> int:
+    ) -> int | None:
         """从候选结构中读取非负整数尺寸。"""
 
         for source in sources:
@@ -857,7 +910,93 @@ class CuaDriverBackend(ComputerUseBackend):
                 "cua-driver returned an invalid image dimension.",
                 details={"reason": f"invalid_{name}"},
             )
-        return 0
+        return None
+
+    @staticmethod
+    def _image_dimensions_from_bytes(
+        image_bytes: bytes,
+    ) -> tuple[int, int]:
+        """从 PNG 或 JPEG 文件头读取图片尺寸。"""
+
+        png_signature = b"\x89PNG\r\n\x1a\n"
+        if (
+            len(image_bytes) >= 24
+            and image_bytes.startswith(png_signature)
+            and image_bytes[12:16] == b"IHDR"
+        ):
+            width = int.from_bytes(image_bytes[16:20], "big")
+            height = int.from_bytes(image_bytes[20:24], "big")
+            if width > 0 and height > 0:
+                return width, height
+            return 0, 0
+
+        if not image_bytes.startswith(b"\xff\xd8"):
+            return 0, 0
+
+        sof_markers = {
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        }
+        offset = 2
+        while offset < len(image_bytes):
+            while (
+                offset < len(image_bytes)
+                and image_bytes[offset] != 0xFF
+            ):
+                offset += 1
+            while (
+                offset < len(image_bytes)
+                and image_bytes[offset] == 0xFF
+            ):
+                offset += 1
+            if offset >= len(image_bytes):
+                break
+
+            marker = image_bytes[offset]
+            offset += 1
+            if marker == 0xDA:
+                break
+            if marker in {0x01, *range(0xD0, 0xDA)}:
+                continue
+            if offset + 2 > len(image_bytes):
+                break
+
+            segment_length = int.from_bytes(
+                image_bytes[offset : offset + 2],
+                "big",
+            )
+            if (
+                segment_length < 2
+                or offset + segment_length > len(image_bytes)
+            ):
+                break
+            if marker in sof_markers:
+                if segment_length < 7:
+                    return 0, 0
+                height = int.from_bytes(
+                    image_bytes[offset + 3 : offset + 5],
+                    "big",
+                )
+                width = int.from_bytes(
+                    image_bytes[offset + 5 : offset + 7],
+                    "big",
+                )
+                if width > 0 and height > 0:
+                    return width, height
+                return 0, 0
+            offset += segment_length
+        return 0, 0
 
     @staticmethod
     def _looks_like_image(value: Mapping[str, Any]) -> bool:
@@ -870,12 +1009,16 @@ class CuaDriverBackend(ComputerUseBackend):
                 for key in (
                     "image",
                     "screenshot",
+                    "data",
                     "image_base64",
                     "imageBase64",
                     "base64",
+                    "screenshot_png_b64",
+                    "png_b64",
                     "mimeType",
                     "mime_type",
                     "media_type",
+                    "screenshot_mime_type",
                 )
             )
         )
@@ -947,8 +1090,8 @@ class CuaDriverBackend(ComputerUseBackend):
         return ""
 
     @staticmethod
-    def _parse_effect(value: Any) -> ActionEffect:
-        """采用可识别 effect，否则返回默认确认状态。"""
+    def _parse_effect(value: Any) -> ActionEffect | None:
+        """仅将可识别的 effect 转换为正式枚举。"""
 
         if isinstance(value, ActionEffect):
             return value
@@ -957,7 +1100,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 return ActionEffect(value)
             except ValueError:
                 pass
-        return ActionEffect.CONFIRMED
+        return None
 
     @staticmethod
     def _raise_action_unavailable(
