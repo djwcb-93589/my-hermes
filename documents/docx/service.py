@@ -1,4 +1,4 @@
-"""新建 DOCX 的校验、执行与原子输出服务。"""
+"""独立 DOCX 创建与只读检查服务。"""
 
 from __future__ import annotations
 
@@ -17,12 +17,15 @@ from .errors import DocxError
 from .models import (
     CreateDocumentRequest,
     CreateDocumentResult,
+    DocumentSnapshot,
     HeadingSpec,
+    InspectDocumentRequest,
     PageBreakSpec,
     ParagraphSpec,
     TableSpec,
     TextRunSpec,
 )
+from .reader import DocxReader
 from .runtime import NodeRuntime
 
 
@@ -46,10 +49,16 @@ _UNSUPPORTED_LINK_WINERRORS = frozenset({1, 50})
 
 
 class DocxService:
-    """通过隔离的固定 Node runtime 创建新 DOCX。"""
+    """提供 Node 创建能力与纯 Python 只读检查能力。"""
 
     def __init__(self, node_executable: str | Path | None = None) -> None:
         self._runtime = NodeRuntime(node_executable=node_executable)
+        self._reader = DocxReader()
+
+    def inspect_document(self, request: InspectDocumentRequest) -> DocumentSnapshot:
+        """读取现有 DOCX；该路径不检查或调用 Node runtime。"""
+
+        return self._reader.inspect(request)
 
     def create_document(
         self,

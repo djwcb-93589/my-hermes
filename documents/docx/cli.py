@@ -1,4 +1,4 @@
-"""独立 DOCX 创建命令行入口。"""
+"""独立 DOCX 创建与只读检查命令行入口。"""
 
 from __future__ import annotations
 
@@ -11,14 +11,77 @@ from typing import Any, Sequence
 from .errors import DocxError
 from .models import (
     CreateDocumentRequest,
+    DocumentMetadata,
+    DocumentSnapshot,
+    DocumentWarning,
     HeadingSpec,
+    InspectDocumentRequest,
     PageBreakSpec,
+    ParagraphSnapshot,
     ParagraphSpec,
+    TableCellSnapshot,
+    TableSnapshot,
     TableSpec,
+    TextRunSnapshot,
     TextRunSpec,
 )
 from .runtime import NodeRuntime
 from .service import DocxService
+
+
+_JSON_MODEL_FIELDS: dict[type[object], tuple[str, ...]] = {
+    DocumentSnapshot: (
+        "source_path",
+        "revision",
+        "size_bytes",
+        "metadata",
+        "blocks",
+        "warnings",
+        "paragraph_count",
+        "table_count",
+        "image_count",
+        "section_count",
+    ),
+    DocumentMetadata: (
+        "title",
+        "creator",
+        "subject",
+        "description",
+        "created",
+        "modified",
+        "last_modified_by",
+    ),
+    ParagraphSnapshot: (
+        "block_id",
+        "text",
+        "style",
+        "alignment",
+        "runs",
+        "editable",
+        "warnings",
+    ),
+    TextRunSnapshot: ("text", "bold", "italic", "underline"),
+    TableSnapshot: (
+        "block_id",
+        "rows",
+        "row_count",
+        "column_count",
+        "editable",
+        "warnings",
+    ),
+    TableCellSnapshot: (
+        "block_id",
+        "text",
+        "paragraphs",
+        "editable",
+        "warnings",
+    ),
+    DocumentWarning: ("warning_type", "message", "part", "block_id"),
+}
+_JSON_BLOCK_TYPES: dict[type[object], str] = {
+    ParagraphSnapshot: "paragraph",
+    TableSnapshot: "table",
+}
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -33,6 +96,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = _build_parser().parse_args(argv)
         if args.command == "runtime-check":
             payload = _run_runtime_check(args)
+        elif args.command == "inspect":
+            payload = _run_inspect(args)
         else:
             payload = _run_create(args)
         _print_json(payload)
@@ -70,6 +135,13 @@ def _build_parser() -> _JsonArgumentParser:
     create_parser.add_argument("--overwrite", action="store_true")
     create_parser.add_argument("--node-executable")
     create_parser.add_argument("--timeout-seconds", type=float, default=60.0)
+
+    inspect_parser = subparsers.add_parser("inspect", help="读取现有 DOCX 的结构化快照")
+    inspect_parser.add_argument("--source", required=True, type=Path)
+    inspect_parser.add_argument("--no-runs", action="store_true")
+    inspect_parser.add_argument("--no-tables", action="store_true")
+    inspect_parser.add_argument("--max-blocks", type=int)
+    inspect_parser.add_argument("--max-text-chars", type=int)
     return parser
 
 
@@ -101,6 +173,21 @@ def _run_create(args: argparse.Namespace) -> dict[str, Any]:
         "sha256": result.sha256,
         "block_count": result.block_count,
     }
+
+
+def _run_inspect(args: argparse.Namespace) -> dict[str, Any]:
+    request = InspectDocumentRequest(
+        source_path=args.source,
+        include_runs=not args.no_runs,
+        include_tables=not args.no_tables,
+        max_blocks=args.max_blocks,
+        max_text_chars=args.max_text_chars,
+    )
+    snapshot = DocxService().inspect_document(request)
+    serialized = _serialize_json_value(snapshot)
+    if not isinstance(serialized, dict):
+        raise DocxError("io_error", "DOCX 快照序列化失败。")
+    return {"ok": True, **serialized}
 
 
 def _read_specification(path: Path) -> dict[str, Any]:
@@ -222,6 +309,27 @@ def _reject_unknown_keys(
         raise DocxError(error_type, f"{label} 包含不支持的字段。")
 
 
+def _serialize_json_value(value: object) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_serialize_json_value(item) for item in value]
+
+    model_type = type(value)
+    model_fields = _JSON_MODEL_FIELDS.get(model_type)
+    if model_fields is None:
+        raise TypeError(f"Unsupported JSON model: {model_type.__name__}")
+    payload: dict[str, Any] = {}
+    block_type = _JSON_BLOCK_TYPES.get(model_type)
+    if block_type is not None:
+        payload["type"] = block_type
+    for field_name in model_fields:
+        payload[field_name] = _serialize_json_value(getattr(value, field_name))
+    return payload
+
+
 def _print_json(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     sys.stdout.write("\n")
@@ -229,4 +337,3 @@ def _print_json(payload: dict[str, Any]) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -19,6 +19,15 @@ DOCX_ERROR_TYPES = frozenset(
         "output_not_created",
         "output_invalid",
         "io_error",
+        "source_not_found",
+        "source_not_file",
+        "source_empty",
+        "source_unreadable",
+        "unsupported_document_feature",
+        "invalid_docx_package",
+        "docx_limit_exceeded",
+        "xml_parse_failed",
+        "inspect_limit_exceeded",
     }
 )
 
@@ -34,4 +43,3 @@ class DocxError(Exception):
         self.error_type = error_type
         self.message = message
         super().__init__(message)
-
