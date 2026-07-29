@@ -128,6 +128,17 @@ class _PlannedTextEdit:
     current_text: str
 
 
+@dataclass(frozen=True)
+class _SnapshotTableCellTarget:
+    """保留单元格快照及其所属表格的内部编辑上下文。"""
+
+    cell: TableCellSnapshot
+    table: TableSnapshot
+
+
+_SnapshotTextTarget = ParagraphSnapshot | _SnapshotTableCellTarget
+
+
 @dataclass
 class _MetadataContext:
     operation: _ValidatedMetadataOperation
@@ -448,10 +459,10 @@ def _plan_text_edits(
         if not isinstance(operation, _ValidatedTextOperation):
             continue
         location = targets.get(operation.block_id)
-        if location is None:
-            raise DocxError("block_not_found", "指定的 block_id 不存在。")
         snapshot_target = snapshot_targets.get(operation.block_id)
-        if snapshot_target is None:
+        if location is None and snapshot_target is None:
+            raise DocxError("block_not_found", "指定的 block_id 不存在。")
+        if location is None or snapshot_target is None:
             raise DocxError(
                 "edit_verification_failed",
                 "Reader 与 locator 的 block_id 定位结果不一致。",
@@ -463,34 +474,47 @@ def _plan_text_edits(
                 or location.kind != "paragraph"
                 or not isinstance(snapshot_target, ParagraphSnapshot)
             ):
-                raise DocxError("block_not_found", "指定的段落 block_id 不存在。")
+                raise DocxError(
+                    "edit_verification_failed",
+                    "Reader 与 locator 的段落定位结果不一致。",
+                )
             paragraph = location.element
             editable = snapshot_target.editable and is_strictly_editable_paragraph(
                 paragraph
             )
+            current_text = snapshot_target.text
         else:
             if (
                 not isinstance(location, TableCellLocation)
-                or not isinstance(snapshot_target, TableCellSnapshot)
+                or not isinstance(snapshot_target, _SnapshotTableCellTarget)
+                or snapshot_target.cell.block_id != location.block_id
+                or not location.block_id.startswith(
+                    f"{snapshot_target.table.block_id}:row:"
+                )
             ):
-                raise DocxError("block_not_found", "指定的单元格 block_id 不存在。")
+                raise DocxError(
+                    "edit_verification_failed",
+                    "Reader 与 locator 的表格单元格定位结果不一致。",
+                )
             paragraph = get_single_cell_paragraph(location)
             editable = (
-                snapshot_target.editable
+                snapshot_target.table.editable
+                and snapshot_target.cell.editable
                 and paragraph is not None
                 and is_strictly_editable_table_cell(location)
             )
+            current_text = snapshot_target.cell.text
 
         if not editable or paragraph is None:
             raise DocxError(
                 "block_not_editable",
-                "指定内容块包含复杂结构，当前阶段不允许编辑。",
+                "指定内容块或其所属表格包含复杂结构，当前阶段不允许编辑。",
             )
         plans.append(
             _PlannedTextEdit(
                 operation=operation,
                 paragraph=paragraph,
-                current_text=snapshot_target.text,
+                current_text=current_text,
             )
         )
     return plans
@@ -804,10 +828,20 @@ def _verify_output(
     for operation in operations:
         if isinstance(operation, _ValidatedTextOperation):
             target = output_targets.get(operation.block_id)
+            if operation.target_kind == "paragraph":
+                if not isinstance(target, ParagraphSnapshot):
+                    raise DocxError(
+                        "edit_verification_failed",
+                        "修改后的目标类型与请求不一致。",
+                    )
+            elif not isinstance(target, _SnapshotTableCellTarget):
+                raise DocxError(
+                    "edit_verification_failed",
+                    "修改后的目标类型与请求不一致。",
+                )
             if (
-                target is None
-                or target.text != operation.text
-                or not target.editable
+                _snapshot_target_text(target) != operation.text
+                or not _snapshot_target_is_editable(target)
             ):
                 raise DocxError(
                     "edit_verification_failed",
@@ -818,7 +852,12 @@ def _verify_output(
         if block_id in edited_block_ids:
             continue
         output_target = output_targets.get(block_id)
-        if output_target is None or output_target.text != initial_target.text:
+        if (
+            output_target is None
+            or type(output_target) is not type(initial_target)
+            or _snapshot_target_text(output_target)
+            != _snapshot_target_text(initial_target)
+        ):
             raise DocxError(
                 "edit_verification_failed",
                 "未请求修改的内容块文字发生了变化。",
@@ -846,16 +885,35 @@ def _verify_output(
 
 def _snapshot_text_targets(
     snapshot: DocumentSnapshot,
-) -> dict[str, ParagraphSnapshot | TableCellSnapshot]:
-    targets: dict[str, ParagraphSnapshot | TableCellSnapshot] = {}
+) -> dict[str, _SnapshotTextTarget]:
+    targets: dict[str, _SnapshotTextTarget] = {}
     for block in snapshot.blocks:
         if isinstance(block, ParagraphSnapshot):
             targets[block.block_id] = block
         elif isinstance(block, TableSnapshot):
             for row in block.rows:
                 for cell in row:
-                    targets[cell.block_id] = cell
+                    targets[cell.block_id] = _SnapshotTableCellTarget(
+                        cell=cell,
+                        table=block,
+                    )
     return targets
+
+
+def _snapshot_target_text(target: _SnapshotTextTarget) -> str:
+    """返回段落或带表格上下文的单元格可见文字。"""
+
+    if isinstance(target, ParagraphSnapshot):
+        return target.text
+    return target.cell.text
+
+
+def _snapshot_target_is_editable(target: _SnapshotTextTarget) -> bool:
+    """按 Reader 的父子级结果判断快照目标是否可编辑。"""
+
+    if isinstance(target, ParagraphSnapshot):
+        return target.editable
+    return target.table.editable and target.cell.editable
 
 
 def _snapshot_block_ids(snapshot: DocumentSnapshot) -> set[str]:

@@ -21,11 +21,14 @@ _W_BREAK = f"{{{_W_NS}}}br"
 _W_CARRIAGE_RETURN = f"{{{_W_NS}}}cr"
 _W_TABLE = f"{{{_W_NS}}}tbl"
 _W_TABLE_PROPERTIES = f"{{{_W_NS}}}tblPr"
+_W_TABLE_GRID = f"{{{_W_NS}}}tblGrid"
 _W_SECTION_PROPERTIES = f"{{{_W_NS}}}sectPr"
 _W_ROW = f"{{{_W_NS}}}tr"
 _W_ROW_PROPERTIES = f"{{{_W_NS}}}trPr"
 _W_CELL = f"{{{_W_NS}}}tc"
 _W_CELL_PROPERTIES = f"{{{_W_NS}}}tcPr"
+_W_GRID_BEFORE = f"{{{_W_NS}}}gridBefore"
+_W_GRID_AFTER = f"{{{_W_NS}}}gridAfter"
 _W_GRID_SPAN = f"{{{_W_NS}}}gridSpan"
 _W_HORIZONTAL_MERGE = f"{{{_W_NS}}}hMerge"
 _W_VERTICAL_MERGE = f"{{{_W_NS}}}vMerge"
@@ -76,6 +79,19 @@ _PROPERTY_REVISION_TAGS = frozenset(
 _CELL_REVISION_TAGS = frozenset(
     {_W_CELL_INSERTION, _W_CELL_DELETION, _W_CELL_MERGE}
 )
+_TABLE_REVISION_TAGS = frozenset(
+    {
+        *_CONTENT_REVISION_TAGS,
+        _W_TABLE_PROPERTIES_CHANGE,
+        _W_ROW_PROPERTIES_CHANGE,
+        _W_CELL_PROPERTIES_CHANGE,
+        *_CELL_REVISION_TAGS,
+    }
+)
+_ALLOWED_TABLE_CHILDREN = frozenset(
+    {_W_TABLE_PROPERTIES, _W_TABLE_GRID, _W_ROW}
+)
+_ALLOWED_ROW_CHILDREN = frozenset({_W_ROW_PROPERTIES, _W_CELL})
 _FORBIDDEN_PARAGRAPH_TAGS = frozenset(
     {
         _W_HYPERLINK,
@@ -249,28 +265,7 @@ def is_strictly_editable_paragraph(paragraph: ElementTree.Element) -> bool:
 def is_strictly_editable_table_cell(location: TableCellLocation) -> bool:
     """检查单元格及其表格祖先是否满足严格编辑条件。"""
 
-    if location.revision_ancestor:
-        return False
-    table_properties = location.table.find(_W_TABLE_PROPERTIES)
-    if table_properties is not None and any(
-        element.tag in _CONTENT_REVISION_TAGS
-        or element.tag == _W_TABLE_PROPERTIES_CHANGE
-        for element in table_properties.iter()
-    ):
-        return False
-    row_properties = location.row.find(_W_ROW_PROPERTIES)
-    if row_properties is not None and any(
-        element.tag in _CONTENT_REVISION_TAGS
-        or element.tag == _W_ROW_PROPERTIES_CHANGE
-        for element in row_properties.iter()
-    ):
-        return False
-    if any(
-        element.tag in _CONTENT_REVISION_TAGS
-        or element.tag == _W_CELL_PROPERTIES_CHANGE
-        or element.tag in _CELL_REVISION_TAGS
-        for element in location.cell.iter()
-    ):
+    if location.revision_ancestor or not _has_strict_table_structure(location):
         return False
 
     properties_seen = 0
@@ -331,6 +326,66 @@ def _is_strictly_editable_run(run: ElementTree.Element) -> bool:
         elif len(child) != 0:
             return False
     return True
+
+
+def _has_strict_table_structure(location: TableCellLocation) -> bool:
+    """检查目标所属整张表格是否为规则、无修订的直接结构。"""
+
+    table = location.table
+    if table.tag != _W_TABLE or any(
+        element.tag in _TABLE_REVISION_TAGS for element in table.iter()
+    ):
+        return False
+
+    table_properties_seen = False
+    table_grid_seen = False
+    rows_started = False
+    for child in table:
+        if child.tag not in _ALLOWED_TABLE_CHILDREN:
+            return False
+        if child.tag == _W_TABLE_PROPERTIES:
+            if table_properties_seen or table_grid_seen or rows_started:
+                return False
+            table_properties_seen = True
+        elif child.tag == _W_TABLE_GRID:
+            if table_grid_seen or rows_started:
+                return False
+            table_grid_seen = True
+        else:
+            rows_started = True
+
+    rows, wrapped_rows = visible_table_rows(table)
+    if wrapped_rows or not rows or not any(row is location.row for row in rows):
+        return False
+
+    row_cell_counts: list[int] = []
+    target_cell_found = False
+    for row in rows:
+        row_properties_seen = False
+        cells_started = False
+        for child in row:
+            if child.tag not in _ALLOWED_ROW_CHILDREN:
+                return False
+            if child.tag == _W_ROW_PROPERTIES:
+                if row_properties_seen or cells_started:
+                    return False
+                row_properties_seen = True
+                if (
+                    child.find(_W_GRID_BEFORE) is not None
+                    or child.find(_W_GRID_AFTER) is not None
+                ):
+                    return False
+            else:
+                cells_started = True
+
+        cells, wrapped_cells = visible_row_cells(row)
+        if wrapped_cells or not cells:
+            return False
+        row_cell_counts.append(len(cells))
+        if row is location.row:
+            target_cell_found = any(cell is location.cell for cell in cells)
+
+    return target_cell_found and len(set(row_cell_counts)) == 1
 
 
 def _cell_has_merge(properties: ElementTree.Element) -> bool:
