@@ -925,6 +925,9 @@ class GatewayRunner:
             self.file_transfer_config,
         )
         self._accepted_messages: set[tuple[str, str]] = set()
+        self._mailbox_registration_dispatch_retries: set[
+            tuple[str, str]
+        ] = set()
         self._startup_message_states: dict[tuple[str, str], dict] = {}
         self._adapter_initialized: dict[str, bool] = {}
         self._inbox_restored_adapters: set[str] = set()
@@ -4043,6 +4046,34 @@ class GatewayRunner:
                 entry.steer_id,
             )
 
+    def _close_and_drain_generation_steer(
+        self,
+        ctx,
+        generation: int,
+    ) -> tuple[SteerEntry, ...]:
+        """关闭并收取只属于指定 generation 的未消费 steer。"""
+        if getattr(ctx, "steer_generation", None) != generation:
+            return ()
+        mailbox = getattr(ctx, "active_steer_mailbox", None)
+        if mailbox is None:
+            return ()
+        try:
+            entries = tuple(mailbox.close_and_drain())
+            if any(not isinstance(entry, SteerEntry) for entry in entries):
+                raise TypeError(
+                    "generation steer mailbox returned invalid entries"
+                )
+            return entries
+        except Exception as exc:
+            print(
+                "  [gateway:audit] "
+                "event=steer_exception_drain_failed "
+                f"route={safe_route_digest(ctx.route_key)} "
+                f"generation={generation} "
+                f"exception={type(exc).__name__}"
+            )
+            return ()
+
     async def _restore_user_cancelled_steer(
         self,
         ctx,
@@ -5238,14 +5269,52 @@ class GatewayRunner:
                 f"route={safe_route_digest(route_key)} "
                 f"message={safe_message_digest(event.message_id)}"
             )
+            requeued = False
             try:
-                self.sessions.enqueue_ordered(ctx, event, force=True)
+                already_pending = any(
+                    pending_event.message_id == event.message_id
+                    for pending_event in ctx.pending
+                )
+                requeued = (
+                    True
+                    if already_pending
+                    else self.sessions.enqueue_ordered(
+                        ctx,
+                        event,
+                        force=True,
+                    )
+                )
             except Exception as exc:
                 print(
                     "  [gateway:audit] queued event recovery after mailbox "
                     "registration failure failed "
                     f"route={safe_route_digest(route_key)} "
                     f"exception={type(exc).__name__}"
+                )
+                return
+            if not requeued:
+                print(
+                    "  [gateway:audit] queued event recovery after mailbox "
+                    "registration failure rejected "
+                    f"route={safe_route_digest(route_key)} "
+                    f"message={safe_message_digest(event.message_id)}"
+                )
+                return
+            retry_key = (route_key, event.message_id)
+            if retry_key in self._mailbox_registration_dispatch_retries:
+                print(
+                    "  [gateway:audit] repeated steer mailbox registration "
+                    "failure deferred to durable recovery "
+                    f"route={safe_route_digest(route_key)} "
+                    f"message={safe_message_digest(event.message_id)}"
+                )
+                return
+            self._mailbox_registration_dispatch_retries.add(retry_key)
+            try:
+                await self._dispatch_next(ctx, admission_locked=True)
+            finally:
+                self._mailbox_registration_dispatch_retries.discard(
+                    retry_key
                 )
             return
         await self._mark_processing_best_effort(event)
@@ -5516,6 +5585,23 @@ class GatewayRunner:
             print(f"  [gateway] {route_key}: task cancelled ({cancel_reason})")
         except Exception as exc:
             print(f"  [gateway] {route_key} error: {type(exc).__name__}")
+            drained_steer = self._close_and_drain_generation_steer(
+                ctx,
+                generation,
+            )
+            if drained_steer:
+                pending_by_id = {
+                    entry.steer_id: entry
+                    for entry in agent_result.pending_steer
+                }
+                for entry in drained_steer:
+                    pending_by_id.setdefault(entry.steer_id, entry)
+                agent_result = _GatewayAgentResult(
+                    agent_result.response,
+                    failed=agent_result.failed,
+                    failure_type=agent_result.failure_type,
+                    pending_steer=tuple(pending_by_id.values()),
+                )
             # 已有 outbox 时不能再发送第二条内部错误,否则可能与部分成功
             # 的正式回复重复。只有模型阶段尚未生成 outbox 才补错误回复。
             cancel_reason = self._task_cancel_reason(ctx, generation)
