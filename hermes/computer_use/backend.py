@@ -402,15 +402,20 @@ class ComputerUseBackend(ABC):
 
     @final
     def wait(self, seconds: float) -> ActionResult:
-        """等待至多 30 秒并返回标准动作结果。"""
+        """检查生命周期并将受限等待时间交给 Backend 实现。"""
 
         self._ensure_started()
         bounded_seconds = min(max(float(seconds), 0.0), 30.0)
-        time.sleep(bounded_seconds)
+        return self._wait(bounded_seconds)
+
+    def _wait(self, seconds: float) -> ActionResult:
+        """执行真实等待并返回标准动作结果。"""
+
+        time.sleep(seconds)
         return ActionResult(
             ok=True,
             action=ComputerUseAction.WAIT,
-            message=f"Waited for {bounded_seconds:g} seconds.",
+            message=f"Waited for {seconds:g} seconds.",
             verified=True,
             effect=ActionEffect.CONFIRMED,
         )

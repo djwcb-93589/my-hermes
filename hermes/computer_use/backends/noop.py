@@ -203,3 +203,13 @@ class NoopBackend(ComputerUseBackend):
             ComputerUseAction.SET_VALUE,
             capture_after=capture_after,
         )
+
+    def _wait(self, seconds: float) -> ActionResult:
+        """立即返回且不进行真实等待。"""
+
+        result = self._action_result(ComputerUseAction.WAIT)
+        result.message = (
+            "No real wait was performed by NoopBackend "
+            f"for the requested {seconds:g} seconds."
+        )
+        return result

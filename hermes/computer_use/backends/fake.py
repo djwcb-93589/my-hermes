@@ -396,3 +396,11 @@ class FakeBackend(ComputerUseBackend):
             },
             capture_after=capture_after,
         )
+
+    def _wait(self, seconds: float) -> ActionResult:
+        """记录受限等待时间并立即返回配置结果。"""
+
+        return self._complete_action(
+            ComputerUseAction.WAIT,
+            {"seconds": seconds},
+        )
