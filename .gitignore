@@ -13,6 +13,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+node_modules/
 gateway开发记录（飞书）.md
 1.md
 cache/
@@ -37,3 +38,5 @@ browser/screenshot/
 开发笔记
 自进化机制设计.txt
 scripts/
+!/documents/docx/node_runtime/scripts/
+!/documents/docx/node_runtime/scripts/create.mjs

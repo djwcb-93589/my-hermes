@@ -20,4 +20,11 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["hermes", "hermes.*", "browser", "browser.*"]
+include = ["hermes", "hermes.*", "browser", "browser.*", "documents", "documents.*"]
+
+[tool.setuptools.package-data]
+"documents.docx" = [
+    "node_runtime/package.json",
+    "node_runtime/package-lock.json",
+    "node_runtime/scripts/*.mjs",
+]

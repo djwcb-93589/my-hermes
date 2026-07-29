@@ -1,0 +1,11 @@
+{
+  "name": "myhermes-docx-runtime",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "docx": "9.7.1"
+  }
+}
