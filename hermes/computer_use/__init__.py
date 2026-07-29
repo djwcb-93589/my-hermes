@@ -1,5 +1,6 @@
 """Computer Use 的公开契约入口。"""
 
+from .backend import ComputerUseBackend
 from .contracts import (
     ActionEffect,
     ActionResult,
@@ -13,6 +14,20 @@ from .contracts import (
     EscalationHint,
     UIElement,
     WindowInfo,
+)
+from .errors import (
+    ActionTimeoutError,
+    ActionUnverifiedError,
+    ApprovalDeniedError,
+    BackendDisconnectedError,
+    BackendStartError,
+    BackendUnavailableError,
+    ComputerUseError,
+    InvalidArgumentsError,
+    PermissionDeniedError,
+    SafetyBlockedError,
+    StaleElementError,
+    TargetNotFoundError,
 )
 
 __all__ = [
@@ -28,4 +43,17 @@ __all__ = [
     "ActionResult",
     "ComputerUseResult",
     "ComputerUseExecutor",
+    "ComputerUseBackend",
+    "ComputerUseError",
+    "BackendUnavailableError",
+    "BackendStartError",
+    "BackendDisconnectedError",
+    "ActionTimeoutError",
+    "InvalidArgumentsError",
+    "TargetNotFoundError",
+    "StaleElementError",
+    "PermissionDeniedError",
+    "SafetyBlockedError",
+    "ApprovalDeniedError",
+    "ActionUnverifiedError",
 ]

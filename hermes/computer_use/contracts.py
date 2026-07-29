@@ -139,13 +139,13 @@ class ActionResult:
     code: str | None = None
 
 
+# Computer Use 执行器允许返回的正式结果类型。
 type ComputerUseResult = (
     CaptureResult
     | ActionResult
     | list[AppInfo]
     | list[WindowInfo]
 )
-"""Computer Use 执行器允许返回的正式结果类型。"""
 
 
 @runtime_checkable

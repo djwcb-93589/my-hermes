@@ -6,9 +6,9 @@
 
 ## 当前阶段
 
-当前仅完成 P0 契约冻结。本阶段：
+当前已完成 P0 公开数据契约和 P1 Backend 抽象、统一错误契约。当前仍然：
 
-- 没有真实 Backend；
+- 没有任何真实 Backend；
 - 不能截图；
 - 不能点击；
 - 不能输入；
@@ -46,13 +46,15 @@ ComputerUseExecutor.execute(...)
 
 调用结果必须使用 `ComputerUseResult` 定义的正式返回类型，不能用裸字典替代稳定契约。
 
+未来的 cua-driver Backend、FakeBackend 和 NoopBackend 都必须实现同一个
+`ComputerUseBackend` 接口。Backend 实现负责遵守统一生命周期、操作签名和异常契约。
+
 ## 图片边界
 
 核心模块只保存原始图片字节，不负责转换为 OpenAI、Anthropic 或其他模型厂商的多模态消息格式。模型格式转换属于未来的 Agent 适配层。
 
 ## 后续阶段
 
-- P1：Backend 抽象和错误体系
 - P2：Fake/Noop Backend
 - P3：cua-driver 生命周期与通信
 - P4：只读观察能力
