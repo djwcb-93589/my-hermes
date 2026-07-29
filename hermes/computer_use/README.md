@@ -11,35 +11,33 @@ NoopBackend 和 FakeBackend、P3 cua-driver 进程生命周期和 MCP stdio
 通信层，以及以下阶段：
 
 - P3.6 已完成 Windows 子进程环境继承和启动说明；
-- P4 已完成 cua-driver 只读观察 Backend。
+- P4 已完成 cua-driver 只读观察 Backend；
+- P4.5.1 已修复普通 `data` 字段被误判为图片的问题；
+- P5 已实现 session 隔离、活动目标、点击、文本输入、按键和应用目标选择。
 
 `CuaDriverBackend` 当前支持：
 
 - `capture`
-- `list_apps`
-- `list_windows`
-- `wait`
-
-当前明确不支持：
-
 - `click`
 - `double_click`
 - `right_click`
 - `middle_click`
-- `drag`
-- `scroll`
 - `type`
 - `key`
+- `list_apps`
+- `list_windows`
 - `focus_app`
+- `wait`
+
+当前明确不支持：
+
+- `drag`
+- `scroll`
 - `set_value`
 
-因此当前仍然：
-
-- 不能点击；
-- 不能输入；
-- 不能执行任何会修改电脑状态的动作；
-- 没有 CLI；
-- 没有 Agent 接入。
+点击、文本输入和按键必须先通过 `capture` 或 `focus_app` 选择活动窗口。P5
+不会自动启动应用，也不会因 `focus_app` 抢占真实桌面焦点。当前仍没有 CLI 和
+Agent 接入。
 
 ## 依赖方向
 
@@ -77,8 +75,9 @@ ComputerUseExecutor.execute(...)
 NoopBackend 用于最简单的调用链检查，只返回空捕获或不可验证的动作结果。
 FakeBackend 用于在内存中配置应用、窗口、捕获结果、动作结果和异常，并记录调用。
 两者都不会操作真实电脑。`CuaDriverBackend` 通过 P3 transport 管理 cua-driver
-子进程，并把 P4 支持的应用、窗口、捕获和等待结果转换为正式数据契约。捕获以
-驱动返回的窗口为目标，不会自动聚焦窗口或启动应用。
+子进程，并把观察结果和 P5 基础动作转换为正式数据契约。Backend 为每个实例创建
+独立 session；驱动不支持 session 或启动 session 失败时，会降级为匿名调用。
+捕获以驱动返回的窗口为目标，不会自动聚焦窗口或启动应用。
 
 ## Windows 启动
 
@@ -117,4 +116,4 @@ config = CuaDriverConfig(
 
 ## 后续阶段
 
-- P5/P6：逐步实现会修改电脑状态的动作及其必要边界
+- P6：实现 `drag`、`scroll` 和 `set_value`
