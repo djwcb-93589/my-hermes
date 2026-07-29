@@ -1,6 +1,7 @@
 """Computer Use 的公开契约入口。"""
 
 from .backend import ComputerUseBackend
+from .backends import FakeBackend, FakeCall, NoopBackend
 from .contracts import (
     ActionEffect,
     ActionResult,
@@ -56,4 +57,7 @@ __all__ = [
     "SafetyBlockedError",
     "ApprovalDeniedError",
     "ActionUnverifiedError",
+    "NoopBackend",
+    "FakeBackend",
+    "FakeCall",
 ]

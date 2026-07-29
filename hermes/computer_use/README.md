@@ -6,7 +6,8 @@
 
 ## 当前阶段
 
-当前已完成 P0 公开数据契约和 P1 Backend 抽象、统一错误契约。当前仍然：
+当前已完成 P0 公开数据契约、P1 Backend 抽象与统一错误契约，以及 P2
+NoopBackend 和 FakeBackend。当前仍然：
 
 - 没有任何真实 Backend；
 - 不能截图；
@@ -49,12 +50,15 @@ ComputerUseExecutor.execute(...)
 未来的 cua-driver Backend、FakeBackend 和 NoopBackend 都必须实现同一个
 `ComputerUseBackend` 接口。Backend 实现负责遵守统一生命周期、操作签名和异常契约。
 
+NoopBackend 用于最简单的调用链检查，只返回空捕获或不可验证的动作结果。
+FakeBackend 用于在内存中配置应用、窗口、捕获结果、动作结果和异常，并记录调用。
+两者都不会操作真实电脑；下一阶段才会连接 cua-driver。
+
 ## 图片边界
 
 核心模块只保存原始图片字节，不负责转换为 OpenAI、Anthropic 或其他模型厂商的多模态消息格式。模型格式转换属于未来的 Agent 适配层。
 
 ## 后续阶段
 
-- P2：Fake/Noop Backend
 - P3：cua-driver 生命周期与通信
 - P4：只读观察能力
