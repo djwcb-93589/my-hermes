@@ -408,6 +408,14 @@ def _extract_approval_request(
     }
 
 
+def _build_cancelled_tool_output() -> str:
+    """构造未启动工具的稳定取消结果，不携带输入或工具参数。"""
+    return (
+        "(cancelled: tool call was not started because "
+        "the current run was cancelled)"
+    )
+
+
 def build_assistant_msg_dict(
     assistant_msg,
     *,
@@ -1616,6 +1624,7 @@ class AgentLoop:
                 assistant_msg,
                 preserve_reasoning=finish_reason == "length",
             )
+
             messages.append(msg_dict)
 
             if assistant_msg.tool_calls:
@@ -1623,8 +1632,6 @@ class AgentLoop:
                 # 避免数据库里出现只有 tool_call 没有 tool result 的半截历史。
                 self.on_tool_dispatch_start()
                 # 3) tool 调用前检查取消
-                if self._is_cancelled():
-                    return self._cancel_result(messages)
                 self._record_tool_batch(assistant_msg.tool_calls)
                 try:
                     tool_messages, tool_error = self.process_tool_calls(
@@ -1633,11 +1640,17 @@ class AgentLoop:
                 except Exception as exc:
                     # 工具分发过程中的持久化 / 结构异常
                     return self._persistence_error_result(messages, repr(exc))
+                if self._is_cancelled():
+                    tool_error = self._cancel_result(messages)
                 injected_steer = self._inject_pending_steer(
                     tool_messages,
                     tool_error,
                     has_next_iteration=(iteration + 1 < self.max_iterations),
                 )
+                if self._is_cancelled():
+                    self._restore_injected_steer(injected_steer)
+                    injected_steer = None
+                    tool_error = self._cancel_result(messages)
                 try:
                     self.on_tool_messages_batch(
                         msg_dict,
@@ -1662,6 +1675,8 @@ class AgentLoop:
                 self._emit_post_tool_calls()
                 if tool_error is not None:
                     return tool_error
+                if self._is_cancelled():
+                    return self._cancel_result(messages)
                 continue
 
             # continuation hook(主会话:finish_reason == "length")
@@ -1730,14 +1745,26 @@ class AgentLoop:
         fatal_detail: str | None = None
         fatal_error_type: str | None = None
         approval_request: dict | None = None
+        cancelled_batch = False
         for tc in tool_calls:
             tool_started = time.perf_counter()
             tc_name = self._tool_call_name(tc)
             parsed_call: ParsedToolCall | None = None
-            skipped_due_to_failure = fatal_detail is not None
-            deferred_for_approval = approval_request is not None
+            cancelled_tool = cancelled_batch or self._is_cancelled()
+            if cancelled_tool:
+                cancelled_batch = True
+            skipped_due_to_failure = (
+                not cancelled_tool and fatal_detail is not None
+            )
+            deferred_for_approval = (
+                not cancelled_tool and approval_request is not None
+            )
             hook_blocked = False
-            if skipped_due_to_failure:
+            if cancelled_tool:
+                output = _build_cancelled_tool_output()
+                err_status = "cancelled"
+                err_detail = "tool call was not started because the run was cancelled"
+            elif skipped_due_to_failure:
                 # 前序致命错误后不再执行后续调用，但保留完整 batch 供既有流程持久化。
                 output = "(error: skipped because an earlier tool call failed)"
                 err_status = None
@@ -1748,13 +1775,29 @@ class AgentLoop:
                 err_detail = None
             else:
                 parsed_call = self._parse_tool_call(tc)
-                if not parsed_call.is_dispatchable:
+                if self._is_cancelled():
+                    cancelled_batch = True
+                    cancelled_tool = True
+                    output = _build_cancelled_tool_output()
+                    err_status = "cancelled"
+                    err_detail = "tool call was not started because the run was cancelled"
+                elif not parsed_call.is_dispatchable:
                     output = parsed_call.error_output or "(error: tool call rejected)"
                     err_status = parsed_call.error_status
                     err_detail = parsed_call.error_detail
                 else:
-                    pre_tool_control = self._dispatch_pre_tool_control(parsed_call)
-                    if pre_tool_control is not None and pre_tool_control.blocked:
+                    pre_tool_control = (
+                        None
+                        if self._is_cancelled()
+                        else self._dispatch_pre_tool_control(parsed_call)
+                    )
+                    if self._is_cancelled():
+                        cancelled_batch = True
+                        cancelled_tool = True
+                        output = _build_cancelled_tool_output()
+                        err_status = "cancelled"
+                        err_detail = "tool call was not started because the run was cancelled"
+                    elif pre_tool_control is not None and pre_tool_control.blocked:
                         hook_blocked = True
                         output = (
                             f"(error: tool {tc_name} blocked by Hook: "
@@ -1785,6 +1828,15 @@ class AgentLoop:
             messages.append(tool_msg)
             tool_messages.append(tool_msg)
             self.on_tool_message(tc, tool_msg, output)
+
+            if cancelled_tool:
+                self._record_tool_observation(
+                    tc,
+                    status="skipped",
+                    error_type="cancelled",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
+                continue
 
             if skipped_due_to_failure:
                 self._record_tool_observation(
@@ -1834,6 +1886,9 @@ class AgentLoop:
                 error_type=(err_type or err_status or None),
                 duration_ms=(time.perf_counter() - tool_started) * 1000,
             )
+            if err_type == "cancelled" or err_status == "cancelled":
+                cancelled_batch = True
+                continue
             if fatal:
                 # safety / 权限 / 路径逃逸 / cancelled / persistence:必须终止
                 fatal_detail = (
@@ -1863,6 +1918,9 @@ class AgentLoop:
                         f"{self._tool_error_counts[key]} times; aborting"
                     )
                     fatal_error_type = display_type
+
+        if cancelled_batch or self._is_cancelled():
+            return tool_messages, self._cancel_result(messages)
 
         if approval_request is not None:
             return tool_messages, self._result(
@@ -2504,8 +2562,6 @@ class AsyncAgentLoop(AgentLoop):
 
             if assistant_msg.tool_calls:
                 self.on_tool_dispatch_start()
-                if self._is_cancelled():
-                    return self._cancel_result(messages)
                 self._record_tool_batch(assistant_msg.tool_calls)
                 try:
                     tool_messages, tool_error = await self.process_tool_calls(
@@ -2515,11 +2571,17 @@ class AsyncAgentLoop(AgentLoop):
                     raise
                 except Exception as exc:
                     return self._persistence_error_result(messages, repr(exc))
+                if self._is_cancelled():
+                    tool_error = self._cancel_result(messages)
                 injected_steer = self._inject_pending_steer(
                     tool_messages,
                     tool_error,
                     has_next_iteration=(iteration + 1 < self.max_iterations),
                 )
+                if self._is_cancelled():
+                    self._restore_injected_steer(injected_steer)
+                    injected_steer = None
+                    tool_error = self._cancel_result(messages)
                 try:
                     await self.on_tool_messages_batch(
                         msg_dict,
@@ -2546,6 +2608,8 @@ class AsyncAgentLoop(AgentLoop):
                 await self._emit_post_tool_calls_async()
                 if tool_error is not None:
                     return tool_error
+                if self._is_cancelled():
+                    return self._cancel_result(messages)
                 continue
 
             if self.should_continue(finish_reason, messages):
@@ -2605,14 +2669,26 @@ class AsyncAgentLoop(AgentLoop):
         fatal_detail: str | None = None
         fatal_error_type: str | None = None
         approval_request: dict | None = None
+        cancelled_batch = False
         for tc in tool_calls:
             tool_started = time.perf_counter()
             tc_name = self._tool_call_name(tc)
             parsed_call: ParsedToolCall | None = None
-            skipped_due_to_failure = fatal_detail is not None
-            deferred_for_approval = approval_request is not None
+            cancelled_tool = cancelled_batch or self._is_cancelled()
+            if cancelled_tool:
+                cancelled_batch = True
+            skipped_due_to_failure = (
+                not cancelled_tool and fatal_detail is not None
+            )
+            deferred_for_approval = (
+                not cancelled_tool and approval_request is not None
+            )
             hook_blocked = False
-            if skipped_due_to_failure:
+            if cancelled_tool:
+                output = _build_cancelled_tool_output()
+                err_status = "cancelled"
+                err_detail = "tool call was not started because the run was cancelled"
+            elif skipped_due_to_failure:
                 # 前序致命错误后不再执行后续调用，但保留完整 batch 供既有流程持久化。
                 output = "(error: skipped because an earlier tool call failed)"
                 err_status = None
@@ -2623,15 +2699,29 @@ class AsyncAgentLoop(AgentLoop):
                 err_detail = None
             else:
                 parsed_call = self._parse_tool_call(tc)
-                if not parsed_call.is_dispatchable:
+                if self._is_cancelled():
+                    cancelled_batch = True
+                    cancelled_tool = True
+                    output = _build_cancelled_tool_output()
+                    err_status = "cancelled"
+                    err_detail = "tool call was not started because the run was cancelled"
+                elif not parsed_call.is_dispatchable:
                     output = parsed_call.error_output or "(error: tool call rejected)"
                     err_status = parsed_call.error_status
                     err_detail = parsed_call.error_detail
                 else:
-                    pre_tool_control = await self._dispatch_pre_tool_control_async(
-                        parsed_call
-                    )
-                    if pre_tool_control is not None and pre_tool_control.blocked:
+                    pre_tool_control = None
+                    if not self._is_cancelled():
+                        pre_tool_control = await self._dispatch_pre_tool_control_async(
+                            parsed_call
+                        )
+                    if self._is_cancelled():
+                        cancelled_batch = True
+                        cancelled_tool = True
+                        output = _build_cancelled_tool_output()
+                        err_status = "cancelled"
+                        err_detail = "tool call was not started because the run was cancelled"
+                    elif pre_tool_control is not None and pre_tool_control.blocked:
                         hook_blocked = True
                         output = (
                             f"(error: tool {tc_name} blocked by Hook: "
@@ -2663,6 +2753,15 @@ class AsyncAgentLoop(AgentLoop):
             messages.append(tool_msg)
             tool_messages.append(tool_msg)
             await self.on_tool_message(tc, tool_msg, output)
+
+            if cancelled_tool:
+                self._record_tool_observation(
+                    tc,
+                    status="skipped",
+                    error_type="cancelled",
+                    duration_ms=(time.perf_counter() - tool_started) * 1000,
+                )
+                continue
 
             if skipped_due_to_failure:
                 self._record_tool_observation(
@@ -2712,6 +2811,9 @@ class AsyncAgentLoop(AgentLoop):
                 error_type=(err_type or err_status or None),
                 duration_ms=(time.perf_counter() - tool_started) * 1000,
             )
+            if err_type == "cancelled" or err_status == "cancelled":
+                cancelled_batch = True
+                continue
             if fatal:
                 fatal_detail = (
                     err_detail
@@ -2735,6 +2837,9 @@ class AsyncAgentLoop(AgentLoop):
                         f"{self._tool_error_counts[key]} times; aborting"
                     )
                     fatal_error_type = display_type
+
+        if cancelled_batch or self._is_cancelled():
+            return tool_messages, self._cancel_result(messages)
 
         if approval_request is not None:
             return tool_messages, self._result(
