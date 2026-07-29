@@ -16,6 +16,7 @@ dependencies = [
     "tzdata>=2026.3",
     "playwright>=1.61.0",
     "prompt-toolkit>=3.0.52,<4",
+    "python-docx>=1.2.0",
 ]
 
 [tool.setuptools.packages.find]

@@ -925,7 +925,7 @@ class GatewayRunner:
             self.file_transfer_config,
         )
         self._accepted_messages: set[tuple[str, str]] = set()
-        self._mailbox_registration_dispatch_retries: set[
+        self._mailbox_registration_fallback_events: set[
             tuple[str, str]
         ] = set()
         self._startup_message_states: dict[tuple[str, str], dict] = {}
@@ -4201,6 +4201,9 @@ class GatewayRunner:
         )
         for message_id in message_ids:
             self._accepted_messages.discard((route_key, message_id))
+            self._mailbox_registration_fallback_events.discard(
+                (route_key, message_id)
+            )
 
     async def _drop_events_async(
         self,
@@ -4215,6 +4218,9 @@ class GatewayRunner:
         )
         for event in events:
             self._accepted_messages.discard((route_key, event.message_id))
+            self._mailbox_registration_fallback_events.discard(
+                (route_key, event.message_id)
+            )
             await self._finish_processing_best_effort(
                 event,
                 "cancelled",
@@ -4512,12 +4518,82 @@ class GatewayRunner:
             event.message_id,
         )
         self._accepted_messages.discard((route_key, event.message_id))
+        self._mailbox_registration_fallback_events.discard(
+            (route_key, event.message_id)
+        )
         print(
             "  [gateway:audit] event=approval_resume_rejected "
             f"{safe_route_digest(route_key)} "
             f"{safe_message_digest(event.message_id)} "
             "failure_type=invalid_approval_resume_task"
         )
+
+    async def _start_agent_worker(
+        self,
+        route_key: str,
+        event: MessageEvent,
+        ctx,
+        generation: int,
+        invalidation_event: asyncio.Event,
+        *,
+        approval_resume_id: str | None,
+        delivery_event: MessageEvent,
+        steer_mailbox: SteerMailbox | None,
+    ) -> None:
+        """为正常或无 mailbox fallback run 启动同一套唯一 worker。"""
+        if steer_mailbox is None:
+            ctx.active_steer_mailbox = None
+            ctx.steer_generation = None
+        elif (
+            ctx.active_steer_mailbox is not steer_mailbox
+            or ctx.steer_generation != generation
+        ):
+            raise RuntimeError(
+                "registered steer mailbox does not own task generation"
+            )
+        ctx.active_generation = generation
+
+        await self._mark_processing_best_effort(event)
+        try:
+            await self._mark_event_processing_async(route_key, event)
+        except Exception as exc:
+            # 原始 Queue 记录已经可靠存在；状态标记失败不能让 route
+            # 停在尚未创建 worker 的 busy 状态。
+            print(
+                "  [gateway:audit] "
+                "event=queue_processing_mark_failed "
+                f"route={safe_route_digest(route_key)} "
+                f"message={safe_message_digest(event.message_id)} "
+                f"exception={type(exc).__name__}"
+            )
+
+        delivery_id = str(uuid.uuid4())
+        ctx.delivery_id = delivery_id
+        ctx.delivery_generation = generation
+        # 模型 Task 与串行收尾 worker 分开管理。即使模型 Task 在首次运行前
+        # 就被取消，worker 仍会启动并清理 busy / 持久队列。
+        agent_task = asyncio.create_task(
+            self._run_agent(
+                event,
+                ctx,
+                resume_from_history=approval_resume_id is not None,
+                approval_resume_id=approval_resume_id,
+            ),
+        )
+        ctx.active_task = agent_task
+        worker_task = asyncio.create_task(
+            self._process(
+                route_key,
+                event,
+                delivery_id,
+                agent_task,
+                generation,
+                invalidation_event,
+                delivery_event=delivery_event,
+            ),
+        )
+        ctx.worker_task = worker_task
+        ctx.worker_generation = generation
 
     async def _handle_message_serialized(
         self,
@@ -5255,109 +5331,88 @@ class GatewayRunner:
             ):
                 await self._reject_approval_resume_task(route_key, event)
                 return
+        fallback_key = (route_key, event.message_id)
+        fallback_without_mailbox = (
+            from_queue
+            and fallback_key
+            in self._mailbox_registration_fallback_events
+        )
+        if fallback_without_mailbox:
+            self._mailbox_registration_fallback_events.discard(
+                fallback_key
+            )
         generation, invalidation_event = self.sessions.begin_task(ctx)
-        steer_mailbox = SteerMailbox()
-        if not self.sessions.register_steer_mailbox(
-            ctx,
-            generation,
-            steer_mailbox,
-        ):
-            steer_mailbox.close()
-            self.sessions.rollback_task_begin(ctx, generation)
+        steer_mailbox = None
+        if fallback_without_mailbox:
             print(
-                "  [gateway:audit] steer mailbox registration failed "
+                "  [gateway:audit] "
+                "event=steer_mailbox_fallback_run "
                 f"route={safe_route_digest(route_key)} "
                 f"message={safe_message_digest(event.message_id)}"
             )
-            requeued = False
-            try:
-                already_pending = any(
-                    pending_event.message_id == event.message_id
-                    for pending_event in ctx.pending
-                )
-                requeued = (
-                    True
-                    if already_pending
-                    else self.sessions.enqueue_ordered(
-                        ctx,
-                        event,
-                        force=True,
-                    )
-                )
-            except Exception as exc:
-                print(
-                    "  [gateway:audit] queued event recovery after mailbox "
-                    "registration failure failed "
-                    f"route={safe_route_digest(route_key)} "
-                    f"exception={type(exc).__name__}"
-                )
-                return
-            if not requeued:
-                print(
-                    "  [gateway:audit] queued event recovery after mailbox "
-                    "registration failure rejected "
-                    f"route={safe_route_digest(route_key)} "
-                    f"message={safe_message_digest(event.message_id)}"
-                )
-                return
-            retry_key = (route_key, event.message_id)
-            if retry_key in self._mailbox_registration_dispatch_retries:
-                print(
-                    "  [gateway:audit] repeated steer mailbox registration "
-                    "failure deferred to durable recovery "
-                    f"route={safe_route_digest(route_key)} "
-                    f"message={safe_message_digest(event.message_id)}"
-                )
-                return
-            self._mailbox_registration_dispatch_retries.add(retry_key)
-            try:
-                await self._dispatch_next(ctx, admission_locked=True)
-            finally:
-                self._mailbox_registration_dispatch_retries.discard(
-                    retry_key
-                )
-            return
-        await self._mark_processing_best_effort(event)
-        try:
-            await self._mark_event_processing_async(route_key, event)
-        except Exception as exc:
-            # 原始 Queue 记录已经可靠存在；状态标记失败不能让 route
-            # 停在尚未创建 worker 的 busy 状态。
-            print(
-                "  [gateway:audit] "
-                "event=queue_processing_mark_failed "
-                f"route={safe_route_digest(route_key)} "
-                f"message={safe_message_digest(event.message_id)} "
-                f"exception={type(exc).__name__}"
-            )
-        delivery_id = str(uuid.uuid4())
-        ctx.delivery_id = delivery_id
-        ctx.delivery_generation = generation
-        # 模型 Task 与串行收尾 worker 分开管理。即使模型 Task 在首次运行前
-        # 就被取消,worker 仍会启动并清理 busy / 持久队列。
-        agent_task = asyncio.create_task(
-            self._run_agent(
-                event,
+        else:
+            steer_mailbox = SteerMailbox()
+            if not self.sessions.register_steer_mailbox(
                 ctx,
-                resume_from_history=approval_resume_id is not None,
-                approval_resume_id=approval_resume_id,
-            ),
-        )
-        ctx.active_task = agent_task
-        ctx.active_generation = generation
-        worker_task = asyncio.create_task(
-            self._process(
-                route_key,
-                event,
-                delivery_id,
-                agent_task,
                 generation,
-                invalidation_event,
-                delivery_event=delivery_event,
-            ),
+                steer_mailbox,
+            ):
+                steer_mailbox.close()
+                self.sessions.rollback_task_begin(ctx, generation)
+                print(
+                    "  [gateway:audit] steer mailbox registration failed "
+                    f"route={safe_route_digest(route_key)} "
+                    f"message={safe_message_digest(event.message_id)}"
+                )
+                requeued = False
+                try:
+                    already_pending = any(
+                        pending_event.message_id == event.message_id
+                        for pending_event in ctx.pending
+                    )
+                    requeued = (
+                        True
+                        if already_pending
+                        else self.sessions.enqueue_ordered(
+                            ctx,
+                            event,
+                            force=True,
+                        )
+                    )
+                except Exception as exc:
+                    print(
+                        "  [gateway:audit] queued event recovery after mailbox "
+                        "registration failure failed "
+                        f"route={safe_route_digest(route_key)} "
+                        f"exception={type(exc).__name__}"
+                    )
+                    return
+                if not requeued:
+                    print(
+                        "  [gateway:audit] queued event recovery after mailbox "
+                        "registration failure rejected "
+                        f"route={safe_route_digest(route_key)} "
+                        f"message={safe_message_digest(event.message_id)}"
+                    )
+                    return
+                self._mailbox_registration_fallback_events.add(
+                    fallback_key
+                )
+                await self._dispatch_next(
+                    ctx,
+                    admission_locked=True,
+                )
+                return
+        await self._start_agent_worker(
+            route_key,
+            event,
+            ctx,
+            generation,
+            invalidation_event,
+            approval_resume_id=approval_resume_id,
+            delivery_event=delivery_event,
+            steer_mailbox=steer_mailbox,
         )
-        ctx.worker_task = worker_task
-        ctx.worker_generation = generation
 
     async def _process(
         self,
