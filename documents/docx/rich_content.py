@@ -422,12 +422,17 @@ def prepare_rich_content_plan(
     document_root: ElementTree.Element,
     body: ElementTree.Element,
     snapshot: DocumentSnapshot,
-    content_types_payload: bytes,
+    content_types: ContentTypesManager | None,
 ) -> RichContentPlan:
     """预读全部资源后统一分配 part、relationship、numbering 和 section。"""
 
     if not operations:
         return EMPTY_RICH_CONTENT_PLAN
+    if content_types is None:
+        raise DocxError(
+            "edit_verification_failed",
+            "富内容计划缺少统一 Content Types 管理器。",
+        )
     body_locations = {
         location.block_id: location
         for location in iter_body_children(body)
@@ -482,14 +487,6 @@ def prepare_rich_content_plan(
     ):
         _reject_even_and_odd_headers(package)
 
-    content_types_root = parse_xml_preserving_misc(
-        content_types_payload,
-        _CONTENT_TYPES_PART,
-    )
-    content_types = ContentTypesManager(
-        content_types_root,
-        validate_order=False,
-    )
     relationships_existed = package.has_part(_DOCUMENT_RELATIONSHIPS_PART)
     if relationships_existed:
         relationships_original = package.read_xml_bytes(
@@ -677,12 +674,6 @@ def prepare_rich_content_plan(
         )
         target = replacements if numbering.existed else additions
         target[numbering.part_name] = numbering_payload
-    if content_types.changed:
-        content_types.validate_canonical_order()
-        replacements[_CONTENT_TYPES_PART] = serialize_xml(
-            content_types.root,
-            original_payload=content_types_payload,
-        )
     if relationships.changed:
         relationship_payload = serialize_xml(
             relationships.root,

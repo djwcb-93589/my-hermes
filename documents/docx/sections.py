@@ -254,6 +254,41 @@ def verify_section_structure(
         )
 
 
+def validate_section_page_geometry(
+    section: ElementTree.Element,
+    *,
+    error_type: Literal["block_not_editable", "edit_verification_failed"],
+) -> None:
+    """验证 section 页面尺寸、页边距与正的可用页面区域。"""
+
+    validate_section_child_order(section, error_type=error_type)
+    page_size = section.find(_W_PAGE_SIZE)
+    page_margin = section.find(_W_PAGE_MARGIN)
+    try:
+        width, height, _ = _read_page_dimensions(page_size)
+        margins = {
+            attribute: _read_margin_value(page_margin, attribute, default)
+            for attribute, default in DEFAULT_MARGINS.items()
+        }
+    except DocxError as exc:
+        if error_type == "block_not_editable":
+            raise
+        raise DocxError(
+            error_type,
+            "输出 section 的页面尺寸或页边距属性无效。",
+        ) from exc
+    if (
+        margins[_W_LEFT] + margins[_W_RIGHT] >= width
+        or margins[_W_TOP] + margins[_W_BOTTOM] >= height
+    ):
+        message = (
+            "输出 section 的可用页面区域无效。"
+            if error_type == "edit_verification_failed"
+            else "section 的页边距使可用页面区域无效。"
+        )
+        raise DocxError(error_type, message)
+
+
 def apply_page_setup(
     location: SectionLocation,
     *,

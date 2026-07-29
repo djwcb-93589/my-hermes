@@ -85,6 +85,16 @@ class ValidatedImage:
     alt_text: str | None
 
 
+@dataclass(frozen=True)
+class ImagePayloadInfo:
+    """经基础签名、尺寸和资源上限验证的图片 payload 信息。"""
+
+    image_format: str
+    extension: str
+    width_px: int
+    height_px: int
+
+
 def validate_local_image(
     image_path: object,
     *,
@@ -105,30 +115,14 @@ def validate_local_image(
             "只支持扩展名与真实格式一致的 PNG 或 JPEG 图片。",
         )
     payload = _read_image_bytes(source_path)
-    if payload.startswith(PNG_SIGNATURE):
-        image_format = "png"
-        extension = "png"
-        original_width, original_height = _read_png_dimensions(payload)
-        if suffix != ".png":
-            raise DocxError(
-                "unsupported_image_format",
-                "图片扩展名与真实 PNG 格式不一致。",
-            )
-    elif payload.startswith(JPEG_START):
-        image_format = "jpeg"
-        extension = "jpeg"
-        original_width, original_height = _read_jpeg_dimensions(payload)
-        if suffix not in {".jpg", ".jpeg"}:
-            raise DocxError(
-                "unsupported_image_format",
-                "图片扩展名与真实 JPEG 格式不一致。",
-            )
-    else:
-        raise DocxError(
-            "unsupported_image_format",
-            "图片签名不是受支持的 PNG 或 JPEG。",
-        )
-    _validate_pixel_limits(original_width, original_height)
+    image_info = validate_image_payload(
+        payload,
+        extension=suffix,
+    )
+    image_format = image_info.image_format
+    extension = image_info.extension
+    original_width = image_info.width_px
+    original_height = image_info.height_px
     rendered_width, rendered_height = _calculate_rendered_dimensions(
         original_width,
         original_height,
@@ -148,6 +142,54 @@ def validate_local_image(
         width_emu=rendered_width * EMU_PER_PIXEL,
         height_emu=rendered_height * EMU_PER_PIXEL,
         alt_text=validated_alt_text,
+    )
+
+
+def validate_image_payload(
+    payload: bytes,
+    *,
+    extension: str | None = None,
+) -> ImagePayloadInfo:
+    """验证内存图片的真实格式、扩展名、基础结构与像素限制。"""
+
+    if not isinstance(payload, bytes) or not payload:
+        raise DocxError("invalid_image", "图片 payload 为空或类型无效。")
+    if len(payload) > MAX_IMAGE_FILE_SIZE:
+        raise DocxError("image_limit_exceeded", "图片文件超过 20 MiB 限制。")
+    normalized_extension = (
+        extension.lower().lstrip(".")
+        if isinstance(extension, str)
+        else None
+    )
+    if payload.startswith(PNG_SIGNATURE):
+        image_format = "png"
+        output_extension = "png"
+        original_width, original_height = _read_png_dimensions(payload)
+        if normalized_extension not in {None, "png"}:
+            raise DocxError(
+                "unsupported_image_format",
+                "图片扩展名与真实 PNG 格式不一致。",
+            )
+    elif payload.startswith(JPEG_START):
+        image_format = "jpeg"
+        output_extension = "jpeg"
+        original_width, original_height = _read_jpeg_dimensions(payload)
+        if normalized_extension not in {None, "jpg", "jpeg"}:
+            raise DocxError(
+                "unsupported_image_format",
+                "图片扩展名与真实 JPEG 格式不一致。",
+            )
+    else:
+        raise DocxError(
+            "unsupported_image_format",
+            "图片签名不是受支持的 PNG 或 JPEG。",
+        )
+    _validate_pixel_limits(original_width, original_height)
+    return ImagePayloadInfo(
+        image_format=image_format,
+        extension=output_extension,
+        width_px=original_width,
+        height_px=original_height,
     )
 
 

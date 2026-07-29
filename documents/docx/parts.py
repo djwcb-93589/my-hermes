@@ -262,6 +262,13 @@ class ContentTypesManager:
         default = self._defaults.get(extension)
         return default[0] if default is not None else None
 
+    def override_content_type_for(self, part_name: str) -> str | None:
+        """返回指定 part 的显式 Override Content Type。"""
+
+        normalized_name = normalize_part_name(part_name)
+        override = self._overrides.get(normalized_name)
+        return override[0] if override is not None else None
+
     def _raise_structure_error(
         self,
         message: str,

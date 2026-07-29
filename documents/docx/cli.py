@@ -53,8 +53,18 @@ from .models import (
     UpdateHeaderText,
     UpdatePageSetup,
 )
-from .runtime import NodeRuntime
+from .renderer import (
+    RenderDocumentRequest,
+    RenderDocumentResult,
+    RenderedPage,
+)
+from .runtime import DocxRuntimeStatus, RuntimeComponentStatus
 from .service import DocxService
+from .validation_models import (
+    ValidateDocumentRequest,
+    ValidateDocumentResult,
+    ValidationIssue,
+)
 
 
 _JSON_MODEL_FIELDS: dict[type[object], tuple[str, ...]] = {
@@ -136,6 +146,34 @@ _JSON_MODEL_FIELDS: dict[type[object], tuple[str, ...]] = {
         "editable",
         "warnings",
     ),
+    ValidateDocumentResult: (
+        "source_path",
+        "valid",
+        "revision",
+        "size_bytes",
+        "issues",
+        "checked_parts",
+    ),
+    ValidationIssue: (
+        "code",
+        "message",
+        "part_name",
+        "severity",
+    ),
+    RenderDocumentResult: (
+        "source_path",
+        "pdf_path",
+        "pages",
+        "renderer",
+    ),
+    RenderedPage: ("page_number", "image_path"),
+    DocxRuntimeStatus: ("core_available", "components"),
+    RuntimeComponentStatus: (
+        "name",
+        "available",
+        "version",
+        "detail",
+    ),
 }
 _JSON_BLOCK_TYPES: dict[type[object], str] = {
     ParagraphSnapshot: "paragraph",
@@ -161,6 +199,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = _run_search(args)
         elif args.command == "edit":
             payload = _run_edit(args)
+        elif args.command == "validate":
+            payload = _run_validate(args)
+        elif args.command == "render":
+            payload = _run_render(args)
         else:
             payload = _run_create(args)
         _print_json(payload)
@@ -189,8 +231,12 @@ def _build_parser() -> _JsonArgumentParser:
     parser = _JsonArgumentParser(prog="python -m documents.docx.cli")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    runtime_parser = subparsers.add_parser("runtime-check", help="检查固定 Node runtime")
+    runtime_parser = subparsers.add_parser(
+        "runtime-check",
+        help="检查 DOCX 核心与可选运行组件",
+    )
     runtime_parser.add_argument("--node-executable")
+    runtime_parser.add_argument("--libreoffice-executable")
 
     create_parser = subparsers.add_parser("create", help="根据 JSON 规格创建新 DOCX")
     create_parser.add_argument("--spec", required=True, type=Path)
@@ -221,17 +267,51 @@ def _build_parser() -> _JsonArgumentParser:
     edit_parser.add_argument("--expected-revision", required=True)
     edit_parser.add_argument("--operations", required=True, type=Path)
     edit_parser.add_argument("--overwrite", action="store_true")
+
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="使用纯 Python 验证 DOCX 核心结构",
+    )
+    validate_parser.add_argument("source", type=Path)
+    strict_group = validate_parser.add_mutually_exclusive_group()
+    strict_group.add_argument(
+        "--strict",
+        dest="strict",
+        action="store_true",
+    )
+    strict_group.add_argument(
+        "--no-strict",
+        dest="strict",
+        action="store_false",
+    )
+    validate_parser.set_defaults(strict=True)
+
+    render_parser = subparsers.add_parser(
+        "render",
+        help="使用可选 LibreOffice 将 DOCX 渲染为 PDF",
+    )
+    render_parser.add_argument("source", type=Path)
+    render_parser.add_argument("output_dir", type=Path)
+    render_parser.add_argument("--overwrite", action="store_true")
+    render_parser.add_argument(
+        "--export-page-images",
+        action="store_true",
+    )
+    render_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=120,
+    )
+    render_parser.add_argument("--libreoffice-executable")
     return parser
 
 
 def _run_runtime_check(args: argparse.Namespace) -> dict[str, Any]:
-    runtime = NodeRuntime(node_executable=args.node_executable)
-    runtime.check()
-    return {
-        "ok": True,
-        "node_version": runtime.node_version,
-        "dependencies_ready": True,
-    }
+    result = DocxService(
+        node_executable=args.node_executable,
+        libreoffice_executable=args.libreoffice_executable,
+    ).runtime_check()
+    return {"ok": True, "result": _serialize_json_value(result)}
 
 
 def _run_create(args: argparse.Namespace) -> dict[str, Any]:
@@ -300,6 +380,37 @@ def _run_edit(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(serialized, dict):
         raise DocxError("io_error", "DOCX 编辑结果序列化失败。")
     return {"ok": True, **serialized}
+
+
+def _run_validate(args: argparse.Namespace) -> dict[str, Any]:
+    result = DocxService().validate_document(
+        ValidateDocumentRequest(
+            source_path=args.source,
+            strict=args.strict,
+        )
+    )
+    serialized = _serialize_json_value(result)
+    if not isinstance(serialized, dict):
+        raise DocxError("io_error", "DOCX 验证结果序列化失败。")
+    return {"ok": True, "result": serialized}
+
+
+def _run_render(args: argparse.Namespace) -> dict[str, Any]:
+    result = DocxService(
+        libreoffice_executable=args.libreoffice_executable,
+    ).render_document(
+        RenderDocumentRequest(
+            source_path=args.source,
+            output_dir=args.output_dir,
+            overwrite=args.overwrite,
+            export_page_images=args.export_page_images,
+            timeout_seconds=args.timeout_seconds,
+        )
+    )
+    serialized = _serialize_json_value(result)
+    if not isinstance(serialized, dict):
+        raise DocxError("io_error", "DOCX 渲染结果序列化失败。")
+    return {"ok": True, "result": serialized}
 
 
 def _read_edit_operations(

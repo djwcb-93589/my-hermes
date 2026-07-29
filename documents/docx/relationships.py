@@ -119,6 +119,13 @@ class RelationshipManager:
     def get(self, relationship_id: str) -> ElementTree.Element | None:
         return self._by_id.get(relationship_id)
 
+    def iter_relationships(
+        self,
+    ) -> tuple[tuple[str, ElementTree.Element], ...]:
+        """按 relationship part 原始顺序返回 ID 与元素。"""
+
+        return tuple(self._by_id.items())
+
     def add_internal(self, relationship_type: str, target: str) -> str:
         _validate_relationship_type(relationship_type)
         _validate_new_internal_target(target)
@@ -289,7 +296,7 @@ def validate_relationship_package(package: object) -> None:
     for part_name in package.part_names:
         if not part_name.lower().endswith(".rels"):
             continue
-        source_part = _source_part_from_relationship_part(part_name)
+        source_part = source_part_from_relationship_part(part_name)
         root = package.read_xml(part_name)
         manager = RelationshipManager(root, source_part=source_part)
         for relationship in manager._by_id.values():
@@ -312,7 +319,7 @@ def external_relationships(
     for part_name in package.part_names:
         if not part_name.lower().endswith(".rels"):
             continue
-        source_part = _source_part_from_relationship_part(part_name)
+        source_part = source_part_from_relationship_part(part_name)
         manager = RelationshipManager(
             package.read_xml(part_name),
             source_part=source_part,
@@ -353,7 +360,9 @@ def _validate_relationship_type(relationship_type: str) -> None:
         raise DocxError("relationship_conflict", "relationship Type 无效。")
 
 
-def _source_part_from_relationship_part(part_name: str) -> str:
+def source_part_from_relationship_part(part_name: str) -> str:
+    """将 relationship part 名称映射为其 source part。"""
+
     normalized = normalize_part_name(part_name)
     if normalized == "_rels/.rels":
         return "package-root.xml"

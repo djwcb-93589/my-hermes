@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,24 @@ from .errors import DocxError
 _MINIMUM_NODE_MAJOR = 20
 _DEPENDENCY_CHECK_TIMEOUT_SECONDS = 10.0
 _VERSION_PATTERN = re.compile(r"^v?(?P<major>\d+)(?:\.\d+){0,2}")
+
+
+@dataclass(frozen=True)
+class RuntimeComponentStatus:
+    """一个 DOCX 核心或可选运行组件的稳定状态。"""
+
+    name: str
+    available: bool
+    version: str | None
+    detail: str | None
+
+
+@dataclass(frozen=True)
+class DocxRuntimeStatus:
+    """DOCX 核心能力与各个独立可选组件的状态。"""
+
+    core_available: bool
+    components: list[RuntimeComponentStatus]
 
 
 class NodeRuntime:
@@ -43,8 +62,10 @@ class NodeRuntime:
         self._checked = False
         self._resolved_executable = None
         self._node_version = None
-        executable = self._resolve_executable()
-        version = self._check_version(executable)
+        version = self.check_node()
+        executable = self._resolved_executable
+        if executable is None:
+            raise DocxError("node_runtime_unavailable", "Node 运行时不可用。")
         required_files = (
             self._runtime_dir / "package.json",
             self._runtime_dir / "package-lock.json",
@@ -65,6 +86,18 @@ class NodeRuntime:
         self._resolved_executable = executable
         self._node_version = version
         self._checked = True
+
+    def check_node(self) -> str:
+        """只检查 Node 可执行文件和主版本，不加载 docx 依赖。"""
+
+        self._checked = False
+        self._resolved_executable = None
+        self._node_version = None
+        executable = self._resolve_executable()
+        version = self._check_version(executable)
+        self._resolved_executable = executable
+        self._node_version = version
+        return version
 
     def run_create(
         self,
@@ -271,3 +304,122 @@ class NodeRuntime:
             if isinstance(payload, dict) and isinstance(payload.get("error_type"), str):
                 return payload["error_type"]
         return None
+
+
+def check_docx_runtime(
+    *,
+    node_runtime: NodeRuntime | None = None,
+    libreoffice_executable: str | Path | None = None,
+) -> DocxRuntimeStatus:
+    """分别检查 Python 核心、Node 创建和可选渲染组件。"""
+
+    components: list[RuntimeComponentStatus] = []
+    python_available = True
+    try:
+        from .editor import DocxEditor
+        from .reader import DocxReader
+        from .search import DocxSearcher
+        from .validator import DocxValidator
+
+        reader = DocxReader()
+        DocxSearcher(reader=reader)
+        DocxEditor(reader=reader)
+        DocxValidator(reader=reader)
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        python_available = False
+    components.append(
+        RuntimeComponentStatus(
+            name="python_core",
+            available=python_available,
+            version=None,
+            detail=None if python_available else "runtime_check_failed",
+        )
+    )
+
+    runtime = node_runtime or NodeRuntime()
+    node_available = False
+    node_version: str | None = None
+    node_detail: str | None = None
+    try:
+        node_version = runtime.check_node()
+        node_available = True
+    except DocxError as exc:
+        node_detail = exc.error_type
+    components.append(
+        RuntimeComponentStatus(
+            name="node_runtime",
+            available=node_available,
+            version=node_version,
+            detail=node_detail,
+        )
+    )
+
+    dependency_available = False
+    dependency_detail: str | None = (
+        None if node_available else "node_runtime_unavailable"
+    )
+    if node_available:
+        try:
+            runtime.check()
+            dependency_available = True
+        except DocxError as exc:
+            dependency_detail = exc.error_type
+    components.append(
+        RuntimeComponentStatus(
+            name="node_docx_dependency",
+            available=dependency_available,
+            version=None,
+            detail=dependency_detail,
+        )
+    )
+
+    libreoffice_available = False
+    libreoffice_version: str | None = None
+    libreoffice_detail: str | None = None
+    try:
+        from .renderer import (
+            find_libreoffice_executable,
+            read_libreoffice_version,
+        )
+
+        executable = find_libreoffice_executable(
+            libreoffice_executable
+        )
+        libreoffice_version = read_libreoffice_version(executable)
+        libreoffice_available = True
+    except DocxError as exc:
+        libreoffice_detail = exc.error_type
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        libreoffice_detail = "runtime_check_failed"
+    components.append(
+        RuntimeComponentStatus(
+            name="libreoffice_renderer",
+            available=libreoffice_available,
+            version=libreoffice_version,
+            detail=libreoffice_detail,
+        )
+    )
+
+    pdf_available = False
+    pdf_version: str | None = None
+    pdf_detail: str | None = None
+    try:
+        from .renderer import pdf_page_renderer_status
+
+        pdf_available, pdf_version = pdf_page_renderer_status()
+        if not pdf_available:
+            pdf_detail = "pdf_renderer_unavailable"
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        pdf_detail = "runtime_check_failed"
+    components.append(
+        RuntimeComponentStatus(
+            name="pdf_page_renderer",
+            available=pdf_available,
+            version=pdf_version,
+            detail=pdf_detail,
+        )
+    )
+    return DocxRuntimeStatus(
+        core_available=python_available,
+        components=components,
+    )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 from xml.etree import ElementTree
@@ -66,6 +66,7 @@ from .package_mutation import (
     validate_package_mutation,
     verify_package_mutation,
 )
+from .parts import ContentTypesManager
 from .reader import DocxReader
 from .rich_content import (
     EMPTY_RICH_CONTENT_PLAN,
@@ -101,7 +102,6 @@ from .writer import (
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 _DC_NS = "http://purl.org/dc/elements/1.1/"
-_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 _PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 _W_BODY = f"{{{_W_NS}}}body"
@@ -127,8 +127,6 @@ _W_UNDERLINE = f"{{{_W_NS}}}u"
 _W_VAL = f"{{{_W_NS}}}val"
 
 _CORE_PROPERTIES = f"{{{_CP_NS}}}coreProperties"
-_CONTENT_TYPES = f"{{{_CONTENT_TYPES_NS}}}Types"
-_CONTENT_TYPE_OVERRIDE = f"{{{_CONTENT_TYPES_NS}}}Override"
 _RELATIONSHIPS = f"{{{_PACKAGE_REL_NS}}}Relationships"
 _RELATIONSHIP = f"{{{_PACKAGE_REL_NS}}}Relationship"
 
@@ -136,7 +134,6 @@ _CORE_PART = "docProps/core.xml"
 _DOCUMENT_PART = "word/document.xml"
 _CONTENT_TYPES_PART = "[Content_Types].xml"
 _ROOT_RELATIONSHIPS_PART = "_rels/.rels"
-_CORE_PART_NAME = "/docProps/core.xml"
 _CORE_CONTENT_TYPE = "application/vnd.openxmlformats-package.core-properties+xml"
 _CORE_RELATIONSHIP_TYPE = (
     "http://schemas.openxmlformats.org/package/2006/relationships/"
@@ -412,10 +409,7 @@ class _MetadataContext:
     operation: _ValidatedMetadataOperation
     core_root: ElementTree.Element
     core_original: bytes | None
-    core_exists: bool
-    content_types_root: ElementTree.Element
-    content_types_original: bytes
-    core_override: ElementTree.Element | None
+    content_types: ContentTypesManager
     relationships_root: ElementTree.Element
     relationships_original: bytes
     core_relationship: ElementTree.Element | None
@@ -489,35 +483,68 @@ class DocxEditor:
                 body=body,
                 snapshot=initial_snapshot,
             )
-            metadata_context = _prepare_metadata_context(package, operations)
+            rich_operations = [
+                operation
+                for operation in operations
+                if isinstance(operation, RICH_OPERATION_TYPES)
+            ]
+            needs_content_types = bool(rich_operations) or any(
+                isinstance(operation, _ValidatedMetadataOperation)
+                for operation in operations
+            )
+            content_types_original: bytes | None = None
+            content_types: ContentTypesManager | None = None
+            if needs_content_types:
+                content_types_original = package.read_xml_bytes(
+                    _CONTENT_TYPES_PART
+                )
+                content_types = ContentTypesManager(
+                    parse_xml_preserving_misc(
+                        content_types_original,
+                        _CONTENT_TYPES_PART,
+                    ),
+                    validate_order=False,
+                )
+            metadata_context = _prepare_metadata_context(
+                package,
+                operations,
+                content_types=content_types,
+            )
             if metadata_context is not None:
                 for part_name, payload in _apply_metadata_edit(
                     metadata_context
                 ).items():
                     target = replacements if package.has_part(part_name) else additions
                     target[part_name] = payload
-            content_types_payload = replacements.get(
-                _CONTENT_TYPES_PART,
-                package.read_xml_bytes(_CONTENT_TYPES_PART),
-            )
-            rich_operations = [
-                operation
-                for operation in operations
-                if isinstance(operation, RICH_OPERATION_TYPES)
-            ]
             rich_plan = prepare_rich_content_plan(
                 package=package,
                 operations=rich_operations,
                 document_root=document_root,
                 body=body,
                 snapshot=initial_snapshot,
-                content_types_payload=content_types_payload,
+                content_types=content_types,
             )
+            if content_types is not None:
+                rich_plan = replace(
+                    rich_plan,
+                    content_types_changed=content_types.changed,
+                )
             _merge_rich_package_changes(
                 replacements,
                 additions,
                 rich_plan,
             )
+            if content_types is not None and content_types.changed:
+                if content_types_original is None:
+                    raise DocxError(
+                        "edit_verification_failed",
+                        "Content Types 修改计划缺少原始 payload。",
+                    )
+                content_types.validate_canonical_order()
+                replacements[_CONTENT_TYPES_PART] = serialize_xml(
+                    content_types.root,
+                    original_payload=content_types_original,
+                )
             extended_plan = _plan_extended_edits(
                 operations,
                 body=body,
@@ -2083,6 +2110,8 @@ def _locate_format_match_span(
 def _prepare_metadata_context(
     package: DocxPackage,
     operations: list[_ValidatedOperation],
+    *,
+    content_types: ContentTypesManager | None,
 ) -> _MetadataContext | None:
     metadata_operation = next(
         (
@@ -2094,6 +2123,11 @@ def _prepare_metadata_context(
     )
     if metadata_operation is None:
         return None
+    if content_types is None:
+        raise DocxError(
+            "edit_verification_failed",
+            "metadata 计划缺少统一 Content Types 管理器。",
+        )
 
     core_exists = package.has_part(_CORE_PART)
     if core_exists:
@@ -2120,34 +2154,10 @@ def _prepare_metadata_context(
                 f"core properties 包含重复字段：{field_name}。",
             )
 
-    content_types_original = package.read_xml_bytes(_CONTENT_TYPES_PART)
-    content_types_root = parse_xml_preserving_misc(
-        content_types_original,
-        _CONTENT_TYPES_PART,
-    )
-    if content_types_root.tag != _CONTENT_TYPES:
+    core_content_type = content_types.override_content_type_for(_CORE_PART)
+    if core_content_type is not None and core_content_type != _CORE_CONTENT_TYPE:
         raise DocxError(
-            "edit_operation_conflict",
-            "[Content_Types].xml 根节点无效。",
-        )
-    matching_overrides = [
-        child
-        for child in content_types_root
-        if child.tag == _CONTENT_TYPE_OVERRIDE
-        and child.attrib.get("PartName") == _CORE_PART_NAME
-    ]
-    if len(matching_overrides) > 1:
-        raise DocxError(
-            "edit_operation_conflict",
-            "core properties content type 存在重复定义。",
-        )
-    core_override = matching_overrides[0] if matching_overrides else None
-    if (
-        core_override is not None
-        and core_override.attrib.get("ContentType") != _CORE_CONTENT_TYPE
-    ):
-        raise DocxError(
-            "edit_operation_conflict",
+            "package_mutation_conflict",
             "core properties content type 与标准定义冲突。",
         )
 
@@ -2194,10 +2204,7 @@ def _prepare_metadata_context(
         operation=metadata_operation,
         core_root=core_root,
         core_original=core_original,
-        core_exists=core_exists,
-        content_types_root=content_types_root,
-        content_types_original=content_types_original,
-        core_override=core_override,
+        content_types=content_types,
         relationships_root=relationships_root,
         relationships_original=relationships_original,
         core_relationship=core_relationship,
@@ -2598,19 +2605,10 @@ def _apply_metadata_edit(context: _MetadataContext) -> dict[str, bytes]:
     else:
         return replacements
 
-    if context.core_override is None:
-        ElementTree.SubElement(
-            context.content_types_root,
-            _CONTENT_TYPE_OVERRIDE,
-            {
-                "PartName": _CORE_PART_NAME,
-                "ContentType": _CORE_CONTENT_TYPE,
-            },
-        )
-        replacements[_CONTENT_TYPES_PART] = serialize_xml(
-            context.content_types_root,
-            original_payload=context.content_types_original,
-        )
+    context.content_types.ensure_override(
+        _CORE_PART,
+        _CORE_CONTENT_TYPE,
+    )
 
     if context.core_relationship is None:
         ElementTree.SubElement(
@@ -2908,6 +2906,11 @@ def _verify_temporary_package(
             output_package,
             mutation,
         )
+        if rich_plan.content_types_changed and not verify_rich:
+            ContentTypesManager(
+                output_package.read_xml(_CONTENT_TYPES_PART),
+                error_type="edit_verification_failed",
+            )
         if verify_rich:
             verify_rich_content_output(
                 package=output_package,

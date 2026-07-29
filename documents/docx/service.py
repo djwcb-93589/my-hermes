@@ -1,4 +1,4 @@
-"""独立 DOCX 创建、读取、搜索与安全编辑服务。"""
+"""独立 DOCX 创建、读取、搜索、编辑、验证与可选渲染服务。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,8 @@ import json
 import math
 import os
 import tempfile
-import zipfile
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any
-from xml.etree import ElementTree
 
 from .atomic import (
     best_effort_unlink as _best_effort_unlink,
@@ -36,26 +34,54 @@ from .models import (
     TextRunSpec,
 )
 from .reader import DocxReader
-from .runtime import NodeRuntime
+from .renderer import (
+    DocxRenderer,
+    RenderDocumentRequest,
+    RenderDocumentResult,
+)
+from .runtime import (
+    DocxRuntimeStatus,
+    NodeRuntime,
+    check_docx_runtime,
+)
 from .search import DocxSearcher
+from .validation_models import (
+    ValidateDocumentRequest,
+    ValidateDocumentResult,
+)
+from .validator import DocxValidator
 
 
 _ALLOWED_ALIGNMENTS = frozenset({"left", "center", "right", "justify"})
-_REQUIRED_DOCX_ENTRIES = (
-    "[Content_Types].xml",
-    "_rels/.rels",
-    "word/document.xml",
-)
 
 
 class DocxService:
-    """提供 Node 创建能力及纯 Python 读取、搜索与安全编辑能力。"""
+    """统一提供核心 DOCX 能力及按需检查的可选创建、渲染能力。"""
 
-    def __init__(self, node_executable: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        node_executable: str | Path | None = None,
+        *,
+        libreoffice_executable: str | Path | None = None,
+    ) -> None:
         self._runtime = NodeRuntime(node_executable=node_executable)
         self._reader = DocxReader()
         self._searcher = DocxSearcher(reader=self._reader)
         self._editor = DocxEditor(reader=self._reader)
+        self._validator = DocxValidator(reader=self._reader)
+        self._renderer = DocxRenderer(
+            validator=self._validator,
+            libreoffice_executable=libreoffice_executable,
+        )
+        self._libreoffice_executable = libreoffice_executable
+
+    def runtime_check(self) -> DocxRuntimeStatus:
+        """分别报告 Python 核心、Node 与可选渲染组件状态。"""
+
+        return check_docx_runtime(
+            node_runtime=self._runtime,
+            libreoffice_executable=self._libreoffice_executable,
+        )
 
     def inspect_document(self, request: InspectDocumentRequest) -> DocumentSnapshot:
         """读取现有 DOCX；该路径不检查或调用 Node runtime。"""
@@ -74,6 +100,22 @@ class DocxService:
         """搜索现有 DOCX；该路径只读取当前可见文字。"""
 
         return self._searcher.search(request)
+
+    def validate_document(
+        self,
+        request: ValidateDocumentRequest,
+    ) -> ValidateDocumentResult:
+        """使用纯 Python 验证 DOCX package 和受支持 OOXML 结构。"""
+
+        return self._validator.validate(request)
+
+    def render_document(
+        self,
+        request: RenderDocumentRequest,
+    ) -> RenderDocumentResult:
+        """按需调用可选 LibreOffice，将已验证 DOCX 渲染为 PDF。"""
+
+        return self._renderer.render(request)
 
     def create_document(
         self,
@@ -111,7 +153,17 @@ class DocxService:
                     "Node runtime 返回的内容块数量不一致。",
                 )
 
-            _validate_docx(temporary_output)
+            validation_result = self._validator.validate(
+                ValidateDocumentRequest(
+                    source_path=temporary_output,
+                    strict=True,
+                )
+            )
+            if not validation_result.valid:
+                raise DocxError(
+                    "output_invalid",
+                    "生成的 DOCX 未通过核心结构验证。",
+                )
             size_bytes = _read_file_size(temporary_output)
             sha256 = _calculate_sha256(temporary_output)
             if request.overwrite:
@@ -303,47 +355,6 @@ def _write_temporary_spec(payload: dict[str, Any]) -> Path:
     except (OSError, TypeError, ValueError) as exc:
         _best_effort_unlink(temporary_path)
         raise DocxError("io_error", "无法创建临时 DOCX 规格文件。") from exc
-
-
-def _validate_docx(path: Path) -> None:
-    try:
-        if not path.is_file() or path.stat().st_size <= 0:
-            raise DocxError("output_invalid", "生成的 DOCX 为空或不可用。")
-        with zipfile.ZipFile(path, mode="r") as archive:
-            names = set()
-            for entry in archive.infolist():
-                entry_name = entry.filename
-                normalized = entry_name.replace("\\", "/")
-                posix_path = PurePosixPath(normalized)
-                windows_path = PureWindowsPath(entry_name)
-                if (
-                    posix_path.is_absolute()
-                    or windows_path.is_absolute()
-                    or ".." in posix_path.parts
-                    or ".." in windows_path.parts
-                ):
-                    raise DocxError("output_invalid", "DOCX ZIP 包含不安全的 entry 路径。")
-                names.add(normalized)
-
-            if any(required not in names for required in _REQUIRED_DOCX_ENTRIES):
-                raise DocxError("output_invalid", "DOCX 缺少必要的 OOXML 文件。")
-            for required in _REQUIRED_DOCX_ENTRIES:
-                xml_content = archive.read(required)
-                uppercase_content = xml_content.upper()
-                if b"<!DOCTYPE" in uppercase_content or b"<!ENTITY" in uppercase_content:
-                    raise DocxError("output_invalid", "DOCX 包含不安全的 XML 声明。")
-                ElementTree.fromstring(xml_content)
-    except DocxError:
-        raise
-    except (
-        zipfile.BadZipFile,
-        zipfile.LargeZipFile,
-        ElementTree.ParseError,
-        KeyError,
-        OSError,
-        RuntimeError,
-    ) as exc:
-        raise DocxError("output_invalid", "生成的 DOCX 结构无效。") from exc
 
 
 def _read_file_size(path: Path) -> int:

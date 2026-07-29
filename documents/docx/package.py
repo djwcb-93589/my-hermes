@@ -31,6 +31,7 @@ class DocxLimits:
     max_entry_uncompressed_size: int = 64 * 1024 * 1024
     max_total_uncompressed_size: int = 256 * 1024 * 1024
     max_xml_size: int = 16 * 1024 * 1024
+    max_xml_nodes: int = 500_000
     max_compression_ratio: float = 200.0
     max_blocks: int = 10_000
     max_text_chars: int = 5_000_000
@@ -296,18 +297,28 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
 
 
 def _normalize_entry_name(entry_name: str) -> str:
-    if not entry_name or "\x00" in entry_name:
+    if (
+        not entry_name
+        or "\x00" in entry_name
+        or "\\" in entry_name
+    ):
         raise DocxError("invalid_docx_package", "DOCX ZIP 包含无效的 entry 路径。")
-    normalized_name = entry_name.replace("\\", "/")
+    normalized_name = entry_name
+    path_value = (
+        normalized_name[:-1]
+        if normalized_name.endswith("/")
+        else normalized_name
+    )
+    segments = path_value.split("/")
     posix_path = PurePosixPath(normalized_name)
     windows_path = PureWindowsPath(entry_name)
     if (
-        normalized_name.startswith("//")
+        not path_value
+        or normalized_name.startswith("//")
+        or any(not segment or segment in {".", ".."} for segment in segments)
         or posix_path.is_absolute()
         or windows_path.is_absolute()
         or bool(windows_path.drive)
-        or ".." in posix_path.parts
-        or ".." in windows_path.parts
     ):
         raise DocxError("invalid_docx_package", "DOCX ZIP 包含不安全的 entry 路径。")
     return normalized_name

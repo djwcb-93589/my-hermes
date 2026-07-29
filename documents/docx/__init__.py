@@ -1,4 +1,4 @@
-"""独立 DOCX 创建、读取、搜索与安全编辑模块的稳定公共接口。"""
+"""独立 DOCX 创建、读取、搜索、编辑、验证与可选渲染公共接口。"""
 
 from .errors import DocxError
 from .models import (
@@ -47,9 +47,23 @@ from .models import (
     UpdatePageSetup,
 )
 from .reader import DocxReader, inspect_document
+from .renderer import (
+    DocxRenderer,
+    RenderDocumentRequest,
+    RenderDocumentResult,
+    RenderedPage,
+    render_document,
+)
+from .runtime import DocxRuntimeStatus, RuntimeComponentStatus
 from .search import DocxSearcher, search_document
 from .editor import DocxEditor, edit_document
 from .service import DocxService, create_document
+from .validation_models import (
+    ValidateDocumentRequest,
+    ValidateDocumentResult,
+    ValidationIssue,
+)
+from .validator import DocxValidator, validate_document
 
 __all__ = [
     "AppliedEdit",
@@ -66,8 +80,11 @@ __all__ = [
     "DocxError",
     "DocxEditor",
     "DocxReader",
+    "DocxRenderer",
+    "DocxRuntimeStatus",
     "DocxSearcher",
     "DocxService",
+    "DocxValidator",
     "EditDocumentRequest",
     "EditDocumentResult",
     "FormatTextMatch",
@@ -86,6 +103,10 @@ __all__ = [
     "ReplaceParagraphText",
     "ReplaceTableCellText",
     "ReplaceTextMatch",
+    "RenderDocumentRequest",
+    "RenderDocumentResult",
+    "RenderedPage",
+    "RuntimeComponentStatus",
     "SearchDocumentRequest",
     "SearchDocumentResult",
     "TableCellSnapshot",
@@ -100,8 +121,13 @@ __all__ = [
     "UpdateFooterText",
     "UpdateHeaderText",
     "UpdatePageSetup",
+    "ValidateDocumentRequest",
+    "ValidateDocumentResult",
+    "ValidationIssue",
     "create_document",
     "edit_document",
     "inspect_document",
+    "render_document",
     "search_document",
+    "validate_document",
 ]

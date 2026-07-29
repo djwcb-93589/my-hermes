@@ -49,6 +49,13 @@ DOCX_ERROR_TYPES = frozenset(
         "package_mutation_conflict",
         "relationship_conflict",
         "part_name_conflict",
+        "validation_failed",
+        "renderer_unavailable",
+        "render_failed",
+        "render_timeout",
+        "render_output_invalid",
+        "pdf_renderer_unavailable",
+        "runtime_check_failed",
     }
 )
 
