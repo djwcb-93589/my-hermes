@@ -32,7 +32,11 @@ from hermes.config import (
     PATH_ACCESS_POLICY,
     load_gateway_busy_input_mode,
 )
-from hermes.hooks import AsyncHookRegistry, SyncHookRegistry
+from hermes.hooks import (
+    AsyncHookRegistry,
+    SyncObservationBridge,
+    build_sync_observation_bridge,
+)
 from hermes.db import (
     add_final_message_with_gateway_outbox,
     add_messages,
@@ -873,18 +877,13 @@ class GatewayRunner:
         idle_timeout = gateway_cfg.get("session_idle_timeout", 86400)
         max_pending = gateway_cfg.get("max_pending_messages", 20)
         max_concurrent = gateway_cfg.get("max_concurrent_llm_requests", 4)
-        self._cron_hook_registry: SyncHookRegistry | None = None
+        self._cron_observation_bridge: SyncObservationBridge | None = None
         if hook_registry is not None:
             from hermes.persistence.observation import (
                 configure_sqlite_observation_sink,
             )
 
             configure_sqlite_observation_sink(hook_registry, db_path)
-            self._cron_hook_registry = SyncHookRegistry()
-            configure_sqlite_observation_sink(
-                self._cron_hook_registry,
-                db_path,
-            )
         self.persistence = GatewayPersistence(db_path)
         self._runtime_lease = GatewayRuntimeLease(
             self.persistence,
@@ -948,7 +947,6 @@ class GatewayRunner:
             llm_semaphore=self._llm_semaphore,
             lease_fence_provider=self._cron_runtime_fence,
             lease_is_valid=lambda: self._runtime_lease_valid,
-            hook_registry=self._cron_hook_registry,
             poll_seconds=self.cron_poll_seconds,
             max_concurrent=self.cron_max_concurrent,
             misfire_grace_seconds=self.cron_misfire_grace_seconds,
@@ -2691,10 +2689,31 @@ class GatewayRunner:
                     "  [gateway] runtime lease release failed: "
                     f"{type(exc).__name__}"
                 )
+        self._close_cron_observation_bridge()
 
     async def tick_cron(self) -> None:
         """供受控手工入口复用同一 lease、claim 与无重入边界。"""
         await self._cron_scheduler.tick()
+
+    def _bind_cron_observation_bridge(self) -> None:
+        """把 Cron 同步 Observation 一次性接入 Gateway 公共 Hook 链。"""
+        if self._hook_registry is None:
+            return
+        if self._cron_observation_bridge is not None:
+            raise RuntimeError("Cron observation bridge is already bound")
+        bridge = build_sync_observation_bridge(self._hook_registry)
+        try:
+            self._cron_scheduler.bind_hook_registry(bridge)
+        except Exception:
+            bridge.close()
+            raise
+        self._cron_observation_bridge = bridge
+
+    def _close_cron_observation_bridge(self) -> None:
+        """关闭 Gateway 生命周期持有的 Cron Observation 桥。"""
+        bridge = self._cron_observation_bridge
+        if bridge is not None:
+            bridge.close()
 
     async def start(self):
         """按初始化、终态收敛、持久恢复、接收阶段启动 Gateway。"""
@@ -2703,6 +2722,7 @@ class GatewayRunner:
                 "GatewayRunner instances are single-use; create a new "
                 "instance after stop or failed startup."
             )
+        self._bind_cron_observation_bridge()
         self._startup_in_progress = True
         self._accepting_external_messages = False
         self._inbox_restored_adapters.clear()
@@ -2715,6 +2735,7 @@ class GatewayRunner:
         except Exception as exc:
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
+            self._close_cron_observation_bridge()
             print(
                 "  [gateway] runtime lease acquisition failed: "
                 f"{type(exc).__name__}"
@@ -2723,6 +2744,7 @@ class GatewayRunner:
         if not acquired:
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
+            self._close_cron_observation_bridge()
             print(
                 "  [gateway] startup blocked: another active Gateway "
                 "instance holds the runtime lease"
@@ -2763,7 +2785,7 @@ class GatewayRunner:
                 await asyncio.to_thread(
                     CronExecutor(
                         self.db_path,
-                        hook_registry=self._cron_hook_registry,
+                        hook_registry=self._cron_observation_bridge,
                         **self._cron_runtime_fence(),
                     ).execute,
                     CronJob.from_record(item["job"]),
@@ -2962,7 +2984,10 @@ class GatewayRunner:
             self._receiving_adapters.clear()
             self._inbox_restored_adapters.clear()
             self._startup_in_progress = False
-            await self.persistence.close()
+            try:
+                await self.persistence.close()
+            finally:
+                self._close_cron_observation_bridge()
             self._lifecycle_phase = "stopped"
 
     # ----- 消息路由 -----

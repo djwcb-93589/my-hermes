@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -14,12 +15,7 @@ from hermes.observability.contracts import (
     ToolCallObservation,
 )
 from hermes.observability.hooks import register_observation_sink
-from hermes.observability.monitoring import (
-    ModelCallObservationView,
-    ObservationEventType,
-    RunObservationView,
-    ToolCallObservationView,
-)
+from hermes.redaction import redact_explicit_secrets
 
 from .database import DBError, _immediate_transaction
 from .schema import init_db
@@ -91,8 +87,77 @@ _EVENT_COLUMNS = (
     "prompt_tokens, completion_tokens, total_tokens, duration_ms, "
     "stop_reason, iterations, has_final_reply"
 )
-# 写入时间在首次插入时生成；此固定值仅用于复用中立安全投影校验。
-_SAFE_PROJECTION_TIMESTAMP = 0.0
+_MAX_PERSISTED_IDENTIFIER_LENGTH = 256
+_MAX_PERSISTED_LABEL_LENGTH = 128
+_PERSISTED_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$"
+)
+_PERSISTED_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+)
+_CONTROL_TEXT_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _persisted_text(
+    value: object,
+    field_name: str,
+    *,
+    label: bool = False,
+) -> str:
+    """校验 Writer 自身的紧凑字段边界，不依赖读取展示模型。"""
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"observation {field_name} is invalid")
+    limit = (
+        _MAX_PERSISTED_LABEL_LENGTH
+        if label
+        else _MAX_PERSISTED_IDENTIFIER_LENGTH
+    )
+    pattern = _PERSISTED_LABEL_RE if label else _PERSISTED_IDENTIFIER_RE
+    if (
+        len(value) > limit
+        or _CONTROL_TEXT_RE.search(value)
+        or not pattern.fullmatch(value)
+        or value.startswith(("/", "\\"))
+        or _WINDOWS_ABSOLUTE_PATH_RE.match(value)
+        or redact_explicit_secrets(value) != value
+    ):
+        raise ValueError(f"observation {field_name} is invalid")
+    return value
+
+
+def _optional_persisted_text(
+    value: object,
+    field_name: str,
+    *,
+    label: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    return _persisted_text(value, field_name, label=label)
+
+
+def _persisted_bool(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"observation {field_name} must be a boolean")
+    return value
+
+
+def _persisted_count(value: object, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(
+            f"observation {field_name} must be a non-negative integer"
+        )
+    return value
+
+
+def _optional_persisted_count(
+    value: object,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    return _persisted_count(value, field_name)
 
 
 class SQLiteObservationSink:
@@ -112,31 +177,44 @@ class SQLiteObservationSink:
         """持久化工具调用摘要，不保存参数或结果。"""
         if not isinstance(observation, ToolCallObservation):
             raise TypeError("observation must be a ToolCallObservation")
-        safe = ToolCallObservationView(
-            observation_id=observation.observation_id,
-            event_type=ObservationEventType.TOOL_CALL,
-            run_id=observation.run_id,
-            parent_run_id=observation.parent_run_id,
-            created_at=_SAFE_PROJECTION_TIMESTAMP,
-            tool_call_id=observation.tool_call_id,
-            tool_name=observation.tool_name,
-            status=observation.status,
-            success=observation.success,
-            error_type=observation.error_type,
-            duration_ms=observation.duration_ms,
-        )
         self._record(
             _PersistedObservation(
-                observation_id=safe.observation_id,
+                observation_id=_persisted_text(
+                    observation.observation_id,
+                    "observation_id",
+                ),
                 event_type="tool_call",
-                run_id=safe.run_id,
-                parent_run_id=safe.parent_run_id,
-                tool_call_id=safe.tool_call_id,
-                tool_name=safe.tool_name,
-                status=safe.status,
-                success=int(safe.success),
-                error_type=safe.error_type,
-                duration_ms=safe.duration_ms,
+                run_id=_persisted_text(observation.run_id, "run_id"),
+                parent_run_id=_optional_persisted_text(
+                    observation.parent_run_id,
+                    "parent_run_id",
+                ),
+                tool_call_id=_persisted_text(
+                    observation.tool_call_id,
+                    "tool_call_id",
+                ),
+                tool_name=_persisted_text(
+                    observation.tool_name,
+                    "tool_name",
+                    label=True,
+                ),
+                status=_persisted_text(
+                    observation.status,
+                    "status",
+                    label=True,
+                ),
+                success=int(
+                    _persisted_bool(observation.success, "success")
+                ),
+                error_type=_optional_persisted_text(
+                    observation.error_type,
+                    "error_type",
+                    label=True,
+                ),
+                duration_ms=_persisted_count(
+                    observation.duration_ms,
+                    "duration_ms",
+                ),
             )
         )
 
@@ -144,33 +222,46 @@ class SQLiteObservationSink:
         """持久化模型调用计数，不保存 Prompt 或模型输出。"""
         if not isinstance(observation, ModelCallObservation):
             raise TypeError("observation must be a ModelCallObservation")
-        safe = ModelCallObservationView(
-            observation_id=observation.observation_id,
-            event_type=ObservationEventType.MODEL_CALL,
-            run_id=observation.run_id,
-            parent_run_id=observation.parent_run_id,
-            created_at=_SAFE_PROJECTION_TIMESTAMP,
-            finish_reason=observation.finish_reason,
-            has_text=observation.has_text,
-            tool_call_count=observation.tool_call_count,
-            prompt_tokens=observation.prompt_tokens,
-            completion_tokens=observation.completion_tokens,
-            total_tokens=observation.total_tokens,
-            duration_ms=observation.duration_ms,
-        )
         self._record(
             _PersistedObservation(
-                observation_id=safe.observation_id,
+                observation_id=_persisted_text(
+                    observation.observation_id,
+                    "observation_id",
+                ),
                 event_type="model_call",
-                run_id=safe.run_id,
-                parent_run_id=safe.parent_run_id,
-                finish_reason=safe.finish_reason,
-                has_text=int(safe.has_text),
-                tool_call_count=safe.tool_call_count,
-                prompt_tokens=safe.prompt_tokens,
-                completion_tokens=safe.completion_tokens,
-                total_tokens=safe.total_tokens,
-                duration_ms=safe.duration_ms,
+                run_id=_persisted_text(observation.run_id, "run_id"),
+                parent_run_id=_optional_persisted_text(
+                    observation.parent_run_id,
+                    "parent_run_id",
+                ),
+                finish_reason=_optional_persisted_text(
+                    observation.finish_reason,
+                    "finish_reason",
+                    label=True,
+                ),
+                has_text=int(
+                    _persisted_bool(observation.has_text, "has_text")
+                ),
+                tool_call_count=_persisted_count(
+                    observation.tool_call_count,
+                    "tool_call_count",
+                ),
+                prompt_tokens=_optional_persisted_count(
+                    observation.prompt_tokens,
+                    "prompt_tokens",
+                ),
+                completion_tokens=_optional_persisted_count(
+                    observation.completion_tokens,
+                    "completion_tokens",
+                ),
+                total_tokens=_optional_persisted_count(
+                    observation.total_tokens,
+                    "total_tokens",
+                ),
+                duration_ms=_persisted_count(
+                    observation.duration_ms,
+                    "duration_ms",
+                ),
             )
         )
 
@@ -178,29 +269,42 @@ class SQLiteObservationSink:
         """持久化运行结束摘要，不保存最终回答。"""
         if not isinstance(observation, RunObservation):
             raise TypeError("observation must be a RunObservation")
-        safe = RunObservationView(
-            observation_id=observation.observation_id,
-            event_type=ObservationEventType.RUN_END,
-            run_id=observation.run_id,
-            parent_run_id=observation.parent_run_id,
-            created_at=_SAFE_PROJECTION_TIMESTAMP,
-            status=observation.status,
-            stop_reason=observation.stop_reason,
-            iterations=observation.iterations,
-            tool_call_count=observation.tool_call_count,
-            has_final_reply=observation.has_final_reply,
-        )
         self._record(
             _PersistedObservation(
-                observation_id=safe.observation_id,
+                observation_id=_persisted_text(
+                    observation.observation_id,
+                    "observation_id",
+                ),
                 event_type="run_end",
-                run_id=safe.run_id,
-                parent_run_id=safe.parent_run_id,
-                status=safe.status,
-                tool_call_count=safe.tool_call_count,
-                stop_reason=safe.stop_reason,
-                iterations=safe.iterations,
-                has_final_reply=int(safe.has_final_reply),
+                run_id=_persisted_text(observation.run_id, "run_id"),
+                parent_run_id=_optional_persisted_text(
+                    observation.parent_run_id,
+                    "parent_run_id",
+                ),
+                status=_persisted_text(
+                    observation.status,
+                    "status",
+                    label=True,
+                ),
+                tool_call_count=_persisted_count(
+                    observation.tool_call_count,
+                    "tool_call_count",
+                ),
+                stop_reason=_persisted_text(
+                    observation.stop_reason,
+                    "stop_reason",
+                    label=True,
+                ),
+                iterations=_persisted_count(
+                    observation.iterations,
+                    "iterations",
+                ),
+                has_final_reply=int(
+                    _persisted_bool(
+                        observation.has_final_reply,
+                        "has_final_reply",
+                    )
+                ),
             )
         )
 

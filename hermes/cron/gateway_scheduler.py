@@ -84,6 +84,25 @@ class GatewayCronScheduler:
         self._wakeup = asyncio.Event()
         self._accepting = False
 
+    def bind_hook_registry(
+        self,
+        hook_registry: SyncHookRegistry,
+    ) -> None:
+        """在调度启动前绑定 Gateway 统一提供的同步 Hook 边界。"""
+        if not isinstance(hook_registry, SyncHookRegistry):
+            raise TypeError("hook_registry must be a SyncHookRegistry")
+        if (
+            self._accepting
+            or self._dispatch_task is not None
+            or self._running
+        ):
+            raise RuntimeError(
+                "hook_registry must be bound before Cron scheduling starts"
+            )
+        if self._hook_registry is not None:
+            raise RuntimeError("hook_registry is already bound")
+        self._hook_registry = hook_registry
+
     async def _schedule_retry_if_eligible(
         self,
         job: CronJob,

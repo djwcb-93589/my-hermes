@@ -1,4 +1,4 @@
-"""将异步 Hook 安全桥接给同步 Delegate。"""
+"""将公共异步 Hook 安全桥接给同步运行路径。"""
 
 from __future__ import annotations
 
@@ -42,6 +42,169 @@ _OBSERVATION_EVENTS = frozenset({
 _BRIDGE_DEFAULT_TIMEOUT_SECONDS = 5.0
 _BRIDGE_OVERHEAD_SECONDS = 1.0
 DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS = 15.0
+
+
+def _observation_failure_result(event: HookEvent) -> HookDispatchResult:
+    """构造不会改变同步运行业务结果的观察桥接失败摘要。"""
+    return HookDispatchResult(
+        event=event,
+        results=(
+            HookInvocationResult(
+                hook_id="observation_bridge",
+                success=False,
+                error_type="HookObservationBridgeError",
+                error_message="hook observation bridge failed",
+            ),
+        ),
+    )
+
+
+def _consume_observation_future(
+    future: concurrent.futures.Future[HookDispatchResult],
+) -> None:
+    """消费已脱离等待的观察分发结果，不记录异常正文。"""
+    def consume(
+        completed: concurrent.futures.Future[HookDispatchResult],
+    ) -> None:
+        try:
+            completed.result()
+        except Exception:
+            return
+
+    future.add_done_callback(consume)
+
+
+def _forward_observation_event(
+    event: HookEvent,
+    *,
+    registry: AsyncHookRegistry | None,
+    event_loop: asyncio.AbstractEventLoop | None,
+    closed: bool,
+    timeout_seconds: float,
+) -> HookDispatchResult:
+    """把一个同步观察事件安全提交到指定 Async Registry。"""
+    try:
+        if asyncio.get_running_loop() is event_loop:
+            return _observation_failure_result(event)
+    except RuntimeError:
+        pass
+    if (
+        closed
+        or registry is None
+        or event_loop is None
+        or event_loop.is_closed()
+        or not event_loop.is_running()
+    ):
+        return _observation_failure_result(event)
+
+    coroutine = registry.emit(event)
+    try:
+        future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
+    except Exception as exc:
+        coroutine.close()
+        logger.warning(
+            "Observation Hook bridge submission failed: "
+            "event=%s exception=%s",
+            event.name,
+            type(exc).__name__,
+        )
+        return _observation_failure_result(event)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        _consume_observation_future(future)
+        logger.warning(
+            "Observation Hook bridge timed out: event=%s",
+            event.name,
+        )
+        return _observation_failure_result(event)
+    except Exception as exc:
+        _consume_observation_future(future)
+        logger.warning(
+            "Observation Hook bridge dispatch failed: "
+            "event=%s exception=%s",
+            event.name,
+            type(exc).__name__,
+        )
+        return _observation_failure_result(event)
+
+
+class SyncObservationBridge(SyncHookRegistry):
+    """只把同步运行产生的观察事件转发到公共 Async Registry。"""
+
+    def __init__(
+        self,
+        registry: AsyncHookRegistry,
+        event_loop: asyncio.AbstractEventLoop,
+        *,
+        bridge_total_timeout_seconds: float = (
+            DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS
+        ),
+    ) -> None:
+        super().__init__()
+        if not isinstance(registry, AsyncHookRegistry):
+            raise TypeError("registry must be an AsyncHookRegistry")
+        if event_loop.is_closed() or not event_loop.is_running():
+            raise RuntimeError("event_loop must be running")
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SyncObservationBridge must be created on event_loop"
+            ) from exc
+        if current_loop is not event_loop:
+            raise RuntimeError(
+                "SyncObservationBridge must be created on event_loop"
+            )
+        normalized_total_timeout = _normalize_timeout(
+            bridge_total_timeout_seconds
+        )
+        if normalized_total_timeout is None:
+            raise HookRegistrationError(
+                "bridge_total_timeout_seconds must be a positive number"
+            )
+        self._state_lock = RLock()
+        self._registry: AsyncHookRegistry | None = registry
+        self._event_loop: asyncio.AbstractEventLoop | None = event_loop
+        self._closed = False
+        self._bridge_total_timeout_seconds = normalized_total_timeout
+
+    def register(
+        self,
+        event_name: HookName,
+        callback,
+        *,
+        hook_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> HookRegistration:
+        """桥接链路不可变，不在 Cron 侧附加本地 Hook。"""
+        raise HookRegistrationError("SyncObservationBridge is immutable")
+
+    def emit(self, event: HookEvent) -> HookDispatchResult:
+        """只转发三类 Observation，其他事件保持空分发。"""
+        if not isinstance(event, HookEvent):
+            raise TypeError("event must be a HookEvent")
+        if event.name not in _OBSERVATION_EVENTS:
+            return HookDispatchResult(event=event, results=())
+        with self._state_lock:
+            registry = self._registry
+            event_loop = self._event_loop
+            closed = self._closed
+        return _forward_observation_event(
+            event,
+            registry=registry,
+            event_loop=event_loop,
+            closed=closed,
+            timeout_seconds=self._bridge_total_timeout_seconds,
+        )
+
+    def close(self) -> None:
+        """清除公共 Registry 与事件循环引用，不遗留桥接资源。"""
+        with self._state_lock:
+            self._closed = True
+            self._registry = None
+            self._event_loop = None
 
 
 class SyncControlBridge(SyncHookRegistry):
@@ -179,56 +342,17 @@ class SyncControlBridge(SyncHookRegistry):
             raise TypeError("event must be a HookEvent")
         if event.name not in _OBSERVATION_EVENTS:
             return HookDispatchResult(event=event, results=())
-        try:
-            if asyncio.get_running_loop() is self._event_loop:
-                return self._observation_failure_result(event)
-        except RuntimeError:
-            pass
-
         with self._state_lock:
             registry = self._registry
             event_loop = self._event_loop
             closed = self._closed
-        if (
-            closed
-            or registry is None
-            or event_loop is None
-            or event_loop.is_closed()
-            or not event_loop.is_running()
-        ):
-            return self._observation_failure_result(event)
-
-        coroutine = registry.emit(event)
-        try:
-            future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
-        except Exception as exc:
-            coroutine.close()
-            logger.warning(
-                "Observation Hook bridge submission failed: "
-                "event=%s exception=%s",
-                event.name,
-                type(exc).__name__,
-            )
-            return self._observation_failure_result(event)
-        try:
-            return future.result(timeout=self._bridge_total_timeout_seconds)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            self._consume_observation_future(future)
-            logger.warning(
-                "Observation Hook bridge timed out: event=%s",
-                event.name,
-            )
-            return self._observation_failure_result(event)
-        except Exception as exc:
-            self._consume_observation_future(future)
-            logger.warning(
-                "Observation Hook bridge dispatch failed: "
-                "event=%s exception=%s",
-                event.name,
-                type(exc).__name__,
-            )
-            return self._observation_failure_result(event)
+        return _forward_observation_event(
+            event,
+            registry=registry,
+            event_loop=event_loop,
+            closed=closed,
+            timeout_seconds=self._bridge_total_timeout_seconds,
+        )
 
     async def _dispatch_snapshot(
         self,
@@ -265,15 +389,7 @@ class SyncControlBridge(SyncHookRegistry):
         future: concurrent.futures.Future[HookDispatchResult],
     ) -> None:
         """消费已脱离等待的观察分发结果，不记录异常正文。"""
-        def consume(
-            completed: concurrent.futures.Future[HookDispatchResult],
-        ) -> None:
-            try:
-                completed.result()
-            except Exception:
-                return
-
-        future.add_done_callback(consume)
+        _consume_observation_future(future)
 
     @staticmethod
     def _failure_result(event: HookEvent) -> HookControlDispatchResult:
@@ -294,17 +410,7 @@ class SyncControlBridge(SyncHookRegistry):
     @staticmethod
     def _observation_failure_result(event: HookEvent) -> HookDispatchResult:
         """构造不会改变子 Agent 业务结果的观察桥接失败摘要。"""
-        return HookDispatchResult(
-            event=event,
-            results=(
-                HookInvocationResult(
-                    hook_id="observation_bridge",
-                    success=False,
-                    error_type="HookObservationBridgeError",
-                    error_message="hook observation bridge failed",
-                ),
-            ),
-        )
+        return _observation_failure_result(event)
 
     def close(self) -> None:
         """释放本次子运行持有的 Registry、快照和事件循环引用。"""
@@ -336,6 +442,19 @@ def build_sync_control_bridge(
 ) -> SyncControlBridge:
     """在当前 Gateway 事件循环中创建一次同步 Delegate 控制快照。"""
     return SyncControlBridge(
+        registry,
+        asyncio.get_running_loop(),
+        bridge_total_timeout_seconds=bridge_total_timeout_seconds,
+    )
+
+
+def build_sync_observation_bridge(
+    registry: AsyncHookRegistry,
+    *,
+    bridge_total_timeout_seconds: float = DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS,
+) -> SyncObservationBridge:
+    """在当前 Gateway 事件循环中创建生命周期级观察桥。"""
+    return SyncObservationBridge(
         registry,
         asyncio.get_running_loop(),
         bridge_total_timeout_seconds=bridge_total_timeout_seconds,
