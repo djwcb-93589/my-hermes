@@ -32,6 +32,8 @@ from .errors import (
     StaleElementError,
     TargetNotFoundError,
 )
+from .readiness import check_cua_driver_readiness
+from .transport import build_cua_driver_env
 
 __all__ = [
     "ComputerUseAction",
@@ -65,4 +67,6 @@ __all__ = [
     "NoopBackend",
     "FakeBackend",
     "FakeCall",
+    "build_cua_driver_env",
+    "check_cua_driver_readiness",
 ]

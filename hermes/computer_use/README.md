@@ -112,6 +112,12 @@ config = CuaDriverConfig(
 也不会自动安装、下载或查找 cua-driver，更不会修改系统 `PATH`。`env` 仅表示在
 父进程环境基础上覆盖或增加的变量。
 
+## P6.5 驱动边界安全
+
+P6.5 会在启动 cua-driver 前清理其子进程环境中继承的模型 API Key、访问令牌和客户端密钥；即使这些变量出现在 `CuaDriverConfig.env` 覆盖项中，也会在最终启动前再次移除。驱动仍会继承 `PATH`、`SystemRoot`、`TEMP` 等启动所需环境变量。
+
+可通过 `check_cua_driver_readiness()` 独立检查 cua-driver 的安装和健康状态。该检查不会自动安装驱动、修改 `PATH` 或请求系统权限。解释器退出时，transport 会尽力关闭仍登记为活动状态的 cua-driver 子进程。
+
 ## 图片边界
 
 核心模块只保存原始图片字节，不负责转换为 OpenAI、Anthropic 或其他模型厂商的多模态消息格式。模型格式转换属于未来的 Agent 适配层。

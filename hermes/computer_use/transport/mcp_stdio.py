@@ -1,10 +1,11 @@
 """cua-driver 进程生命周期和 MCP stdio 通信。"""
 
+import atexit
 import json
 import math
-import os
 import subprocess
 import threading
+import weakref
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,12 +21,47 @@ from ..errors import (
     DriverNotFoundError,
     ProtocolError,
 )
+from .environment import build_cua_driver_env
 
 
 _MCP_PROTOCOL_VERSION = "2025-11-25"
 _MAX_STDERR_LINES = 100
 _MAX_STDERR_LINE_CHARS = 2_048
 _MAX_EXPIRED_REQUEST_IDS = 256
+_ACTIVE_CLIENTS: weakref.WeakSet[Any] = weakref.WeakSet()
+_ACTIVE_CLIENTS_LOCK = threading.Lock()
+
+
+def _register_active_client(client: Any) -> None:
+    """登记已完成初始化的客户端，供进程退出时尽力清理。"""
+
+    with _ACTIVE_CLIENTS_LOCK:
+        _ACTIVE_CLIENTS.add(client)
+
+
+def _unregister_active_client(client: Any) -> None:
+    """移除已停止或启动失败的客户端登记。"""
+
+    with _ACTIVE_CLIENTS_LOCK:
+        _ACTIVE_CLIENTS.discard(client)
+
+
+def _stop_active_clients_at_exit() -> None:
+    """在解释器退出时逐个尽力关闭仍然活动的驱动客户端。"""
+
+    try:
+        with _ACTIVE_CLIENTS_LOCK:
+            clients = tuple(_ACTIVE_CLIENTS)
+    except BaseException:
+        return
+    for client in clients:
+        try:
+            client.stop()
+        except BaseException:
+            continue
+
+
+atexit.register(_stop_active_clients_at_exit)
 
 
 @dataclass(slots=True)
@@ -125,7 +161,7 @@ class CuaDriverClient:
                     errors="replace",
                     bufsize=1,
                     cwd=self._config.cwd,
-                    env=self._build_child_env(),
+                    env=build_cua_driver_env(self._config.env),
                     shell=False,
                 )
                 self._process = process
@@ -167,6 +203,7 @@ class CuaDriverClient:
                 ) from exc
             else:
                 self._started = True
+                _register_active_client(self)
 
     def stop(self) -> None:
         """安全关闭 cua-driver；重复调用不会产生副作用。"""
@@ -271,35 +308,6 @@ class CuaDriverClient:
                 "cua-driver working directory is unavailable.",
                 details={"reason": "invalid_cwd"},
             )
-
-    def _build_child_env(self) -> dict[str, str] | None:
-        """继承父进程环境并应用独立配置的覆盖项。"""
-
-        overrides = self._config.env
-        if not overrides:
-            return None
-
-        child_env = os.environ.copy()
-        if os.name != "nt":
-            child_env.update(overrides)
-            return child_env
-
-        normalized_keys: dict[str, str] = {}
-        for key in list(child_env):
-            normalized = key.upper()
-            if normalized in normalized_keys:
-                child_env.pop(key, None)
-            else:
-                normalized_keys[normalized] = key
-
-        for key, value in overrides.items():
-            normalized = key.upper()
-            previous_key = normalized_keys.get(normalized)
-            if previous_key is not None and previous_key != key:
-                child_env.pop(previous_key, None)
-            child_env[key] = value
-            normalized_keys[normalized] = key
-        return child_env
 
     def _start_reader_threads(
         self,
@@ -760,37 +768,42 @@ class CuaDriverClient:
     def _stop_locked(self) -> None:
         """在生命周期锁内关闭进程并清空所有运行时状态。"""
 
-        self._started = False
-        process = self._process
-        stop_event = self._stop_event
-        if stop_event is not None:
-            stop_event.set()
+        try:
+            self._started = False
+            process = self._process
+            stop_event = self._stop_event
+            if stop_event is not None:
+                stop_event.set()
 
-        self._fail_pending_requests(
-            BackendDisconnectedError("cua-driver client has stopped.")
-        )
+            self._fail_pending_requests(
+                BackendDisconnectedError("cua-driver client has stopped.")
+            )
 
-        if process is not None:
-            self._close_stdin(process)
-            if not self._wait_for_exit(
-                process,
-                self._config.shutdown_timeout,
-            ):
-                self._terminate_process(process)
+            if process is not None:
+                self._close_stdin(process)
                 if not self._wait_for_exit(
                     process,
                     self._config.shutdown_timeout,
                 ):
-                    self._kill_process(process)
-                    self._wait_for_exit(
+                    self._terminate_process(process)
+                    if not self._wait_for_exit(
                         process,
-                        max(self._config.shutdown_timeout, 1.0),
-                    )
-            self._close_output_streams(process)
+                        self._config.shutdown_timeout,
+                    ):
+                        self._kill_process(process)
+                        self._wait_for_exit(
+                            process,
+                            max(self._config.shutdown_timeout, 1.0),
+                        )
+                self._close_output_streams(process)
 
-        self._join_reader(self._stdout_thread)
-        self._join_reader(self._stderr_thread)
-        self._clear_runtime_state()
+            self._join_reader(self._stdout_thread)
+            self._join_reader(self._stderr_thread)
+        finally:
+            try:
+                self._clear_runtime_state()
+            finally:
+                _unregister_active_client(self)
 
     def _fail_pending_requests(self, error: ComputerUseError) -> None:
         """使所有等待请求立即收到统一异常。"""
