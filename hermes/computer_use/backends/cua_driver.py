@@ -176,7 +176,7 @@ class CuaDriverBackend(ComputerUseBackend):
     ) -> CaptureResult:
         """选择目标窗口并转换驱动捕获结果。"""
 
-        self._element_targets.clear()
+        self._clear_active_target()
         windows = self._list_windows()
         target = self._select_target_window(
             windows,
@@ -709,6 +709,7 @@ class CuaDriverBackend(ComputerUseBackend):
     ) -> ActionResult:
         """仅选择应用窗口，不改变真实桌面焦点。"""
 
+        self._clear_active_target()
         if not isinstance(app, str) or not app:
             raise InvalidArgumentsError(
                 "app must be a non-empty string.",
@@ -731,7 +732,6 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_pid = target.pid
         self._active_window_id = target.window_id
         self._active_app = target.app
-        self._element_targets.clear()
         return ActionResult(
             ok=True,
             action=ComputerUseAction.FOCUS_APP,
@@ -782,13 +782,18 @@ class CuaDriverBackend(ComputerUseBackend):
         """清空 transport 会话关联的所有运行状态。"""
 
         self._session_enabled = False
+        self._clear_active_target()
+        self._tool_names.clear()
+        self._tool_argument_names.clear()
+        self._capture_tool = None
+
+    def _clear_active_target(self) -> None:
+        """清空活动窗口及其最近一次元素映射。"""
+
         self._active_pid = None
         self._active_window_id = None
         self._active_app = ""
         self._element_targets.clear()
-        self._tool_names.clear()
-        self._tool_argument_names.clear()
-        self._capture_tool = None
 
     def _call_driver_tool(
         self,
@@ -969,6 +974,7 @@ class CuaDriverBackend(ComputerUseBackend):
             return dict(structured)
 
         content = raw_result.get("content")
+        plain_text: str | None = None
         if isinstance(content, list):
             for item in content:
                 if (
@@ -982,9 +988,16 @@ class CuaDriverBackend(ComputerUseBackend):
                 try:
                     decoded = json.loads(text)
                 except json.JSONDecodeError:
+                    if plain_text is None:
+                        plain_text = text
                     continue
                 if isinstance(decoded, Mapping):
                     return dict(decoded)
+                if plain_text is None:
+                    plain_text = text
+
+        if plain_text is not None:
+            return {"message": plain_text}
 
         if raw_result.get("isError") is True:
             return {}
