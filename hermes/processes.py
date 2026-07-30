@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import inspect
 import math
 import secrets
 import threading
@@ -277,10 +278,52 @@ class ProcessManager:
             handle = starter()
             if handle is None:
                 raise TypeError("starter returned no process handle")
+        except Exception as start_error:
+            # 延迟导入 Backend 公共异常，避免模块加载阶段形成循环依赖。
+            try:
+                from hermes.backends import BackgroundProcessStartCleanupError
+            except Exception as import_error:
+                import_error.add_note(
+                    "Original process start error: "
+                    f"{type(start_error).__name__}"
+                )
+                self._mark_start_failed(record)
+                raise ProcessStartError(
+                    "Process start failed"
+                ) from import_error
 
-            with record.record_lock:
-                record.handle = handle
+            if not isinstance(
+                start_error,
+                BackgroundProcessStartCleanupError,
+            ):
+                self._mark_start_failed(record)
+                raise ProcessStartError(
+                    "Process start failed"
+                ) from start_error
 
+            try:
+                self._adopt_failed_start_cleanup_handle(
+                    record,
+                    start_error.handle,
+                )
+            except Exception as protocol_error:
+                protocol_error.add_note(
+                    "Recoverable backend start error: "
+                    f"{type(start_error).__name__}"
+                )
+                self._mark_start_failed(record)
+                raise ProcessStartError(
+                    "Process start failed"
+                ) from protocol_error
+
+            raise ProcessStartError(
+                "Process start failed and cleanup could not be confirmed"
+            ) from start_error
+
+        with record.record_lock:
+            record.handle = handle
+
+        try:
             pid = self._handle_pid(record)
             if pid is not None and (
                 isinstance(pid, bool) or not isinstance(pid, int)
@@ -308,24 +351,30 @@ class ProcessManager:
                 reader_thread.start()
                 record.startup_event.set()
         except Exception as start_error:
-            cleanup_error: Exception | None = None
-            if self._get_handle(record) is not None:
-                try:
-                    self._dispose_failed_start_handle(record)
-                except Exception as error:
-                    cleanup_error = error
-
-            if cleanup_error is None:
-                self._mark_start_failed(record)
-                raise ProcessStartError("Process start failed") from start_error
-
+            self._prepare_failed_start_cleanup_record(record)
             try:
-                self._retain_failed_start_cleanup_record(record)
-            except Exception:
-                pass
-            raise ProcessStartError(
-                "Process start failed and cleanup could not be confirmed"
-            ) from cleanup_error
+                self._dispose_failed_start_handle(record)
+            except Exception as cleanup_error:
+                cleanup_error.add_note(
+                    "Original process start error: "
+                    f"{type(start_error).__name__}"
+                )
+                try:
+                    self._retain_failed_start_cleanup_record(record)
+                except Exception:
+                    record.startup_event.set()
+                raise ProcessStartError(
+                    (
+                        "Process start failed and cleanup could not "
+                        "be confirmed"
+                    )
+                ) from cleanup_error
+            else:
+                # 清理确认、failed_start 迁移和 close 已在同一流程中完成。
+                record.startup_event.set()
+                raise ProcessStartError(
+                    "Process start failed"
+                ) from start_error
 
         # 与正在进入的 cleanup 串行，避免返回一个已被清理请求接管的 running 快照。
         with record.termination_lock:
@@ -609,6 +658,60 @@ class ProcessManager:
         with record.record_lock:
             return record.handle
 
+    def _adopt_failed_start_cleanup_handle(
+        self,
+        record: ProcessRecord,
+        handle: object,
+    ) -> None:
+        """接管 Backend 无法确认清理、但仍可管理的后台句柄。"""
+
+        if handle is None:
+            raise TypeError("recoverable start error has no process handle")
+
+        for operation in (
+            "poll",
+            "read_available",
+            "wait",
+            "interrupt",
+            "kill",
+            "close",
+        ):
+            try:
+                member = getattr(handle, operation)
+            except Exception as error:
+                raise TypeError(
+                    "recoverable process handle does not satisfy protocol"
+                ) from error
+            if not callable(member):
+                raise TypeError(
+                    "recoverable process handle does not satisfy protocol"
+                )
+
+        try:
+            inspect.getattr_static(handle, "pid")
+        except AttributeError as error:
+            raise TypeError(
+                "recoverable process handle does not satisfy protocol"
+            ) from error
+
+        with record.record_lock:
+            record.handle = handle
+
+        try:
+            pid = self._handle_pid(record)
+        except Exception:
+            # PID 仅供诊断；读取失败不能导致进程树控制权丢失。
+            pid = None
+        if pid is not None and (
+            isinstance(pid, bool) or not isinstance(pid, int)
+        ):
+            pid = None
+
+        with record.record_lock:
+            record.pid = pid
+
+        self._retain_failed_start_cleanup_record(record)
+
     def _handle_pid(self, record: ProcessRecord) -> int | None:
         """在 Handle 操作锁下读取启动阶段的进程标识。"""
 
@@ -850,6 +953,15 @@ class ProcessManager:
         with record.record_lock:
             termination_signal_sent = record.termination_signal_sent
             termination_source = record.termination_source
+        if termination_source == "failed_start_cleanup":
+            self._finalize_record(
+                record,
+                ProcessStatus.FAILED_START,
+                exit_code=None,
+                completion_reason="failed_start",
+                termination_source="failed_start_cleanup",
+            )
+            return
         if termination_signal_sent:
             self._finalize_record(
                 record,
@@ -872,6 +984,8 @@ class ProcessManager:
 
         with record.record_lock:
             termination_source = record.termination_source
+        if termination_source == "failed_start_cleanup":
+            return
         self._finalize_record(
             record,
             ProcessStatus.LOST,
@@ -898,6 +1012,9 @@ class ProcessManager:
         self._drain_final_output(record)
         self._complete_observed_exit(record, exit_code)
         snapshot = self._snapshot(record)
+        if snapshot.status is ProcessStatus.FAILED_START:
+            self._handle_close(record)
+            return self._snapshot(record)
         if snapshot.status not in (
             ProcessStatus.EXITED,
             ProcessStatus.KILLED,
@@ -931,7 +1048,12 @@ class ProcessManager:
         self._move_to_finished(record)
         return transitioned
 
-    def _mark_start_failed(self, record: ProcessRecord) -> None:
+    def _mark_start_failed(
+        self,
+        record: ProcessRecord,
+        *,
+        termination_source: str | None = None,
+    ) -> None:
         """将启动过程中的异常转换为 failed_start 终态。"""
 
         with record.record_lock:
@@ -940,7 +1062,7 @@ class ProcessManager:
                 ProcessStatus.FAILED_START,
                 exit_code=None,
                 completion_reason="failed_start",
-                termination_source=None,
+                termination_source=termination_source,
             )
             record.completion_event.set()
         record.startup_event.set()
@@ -988,73 +1110,102 @@ class ProcessManager:
                 self._finished[record.process_id] = record
 
     def _dispose_failed_start_handle(self, record: ProcessRecord) -> None:
-        """确认注册失败后的句柄已退出，再释放其关联资源。"""
+        """确认注册失败后的句柄已退出，再写入终态并释放资源。"""
 
         with record.termination_lock:
             self._set_termination_in_progress(record, True)
-            last_error: Exception | None = None
             try:
+                snapshot = self._snapshot(record)
+                if snapshot.status is ProcessStatus.FAILED_START:
+                    return
+                if snapshot.status in _TERMINAL_STATUSES:
+                    raise ProcessTerminationError(
+                        "Could not confirm process termination"
+                    )
                 if self._get_handle(record) is None:
                     raise ProcessError("Process handle is unavailable")
 
                 self._request_failed_start_cleanup(record)
-                confirmed, exit_code = self._try_confirm_exit(record)
-                termination_result_confirmed = False
-
-                for wait_seconds in (
-                    _FAILED_START_DISPOSE_WAIT_SECONDS,
-                    _FAILED_START_DISPOSE_RETRY_WAIT_SECONDS,
-                ):
-                    # 即使根进程已退出，也让后端有机会收敛其受管进程树。
-                    try:
-                        signal_sent, immediate_exit_code = self._handle_kill(
-                            record
-                        )
-                    except Exception as error:
-                        last_error = error
-                    else:
-                        termination_result_confirmed = True
-                        if (
-                            not signal_sent
-                            and immediate_exit_code is not None
-                        ):
-                            confirmed = True
-                            exit_code = immediate_exit_code
-
-                    if not confirmed:
-                        confirmed, exit_code = (
-                            self._wait_for_exit_confirmation(
-                                record,
-                                wait_seconds,
-                            )
-                        )
-                    if confirmed and termination_result_confirmed:
-                        break
-
-                if not confirmed:
-                    confirmed, exit_code = self._try_confirm_exit(record)
-                if (
-                    not confirmed
-                    or exit_code is None
-                    or not termination_result_confirmed
-                ):
-                    cleanup_error = ProcessTerminationError(
-                        "Could not confirm process termination"
-                    )
-                    if last_error is not None:
-                        raise cleanup_error from last_error
-                    raise cleanup_error
-
-                self._drain_final_output(record)
-                self._handle_close(record)
+                self._confirm_failed_start_handle_stopped(record)
+                self._complete_failed_start_record(record)
             finally:
                 self._set_termination_in_progress(record, False)
+
+    def _confirm_failed_start_handle_stopped(
+        self,
+        record: ProcessRecord,
+    ) -> None:
+        """通过最多两轮树级强杀与有限等待确认启动失败句柄已停止。"""
+
+        confirmed, exit_code = self._try_confirm_exit(record)
+        termination_result_confirmed = False
+        last_error: Exception | None = None
+
+        for wait_seconds in (
+            _FAILED_START_DISPOSE_WAIT_SECONDS,
+            _FAILED_START_DISPOSE_RETRY_WAIT_SECONDS,
+        ):
+            # 即使根进程已退出，也让后端有机会收敛其受管进程树。
+            try:
+                signal_sent, immediate_exit_code = self._handle_kill(record)
+            except Exception as error:
+                last_error = error
+            else:
+                termination_result_confirmed = True
+                if not signal_sent and immediate_exit_code is not None:
+                    confirmed = True
+                    exit_code = immediate_exit_code
+
+            if not confirmed:
+                confirmed, exit_code = self._wait_for_exit_confirmation(
+                    record,
+                    wait_seconds,
+                )
+            if confirmed and termination_result_confirmed:
+                break
+
+        if not confirmed:
+            confirmed, exit_code = self._try_confirm_exit(record)
+        if (
+            not confirmed
+            or exit_code is None
+            or not termination_result_confirmed
+        ):
+            cleanup_error = ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+            if last_error is not None:
+                raise cleanup_error from last_error
+            raise cleanup_error
+
+    def _complete_failed_start_record(
+        self,
+        record: ProcessRecord,
+    ) -> ProcessSnapshot:
+        """排空日志后先稳定写入 failed_start，再尽力关闭句柄。"""
+
+        self._drain_final_output(record)
+        self._mark_start_failed(
+            record,
+            termination_source="failed_start_cleanup",
+        )
+        self._handle_close(record)
+        return self._snapshot(record)
 
     def _retain_failed_start_cleanup_record(
         self,
         record: ProcessRecord,
     ) -> None:
         """保留无法确认清理的记录，使后续会话清理仍能找到它。"""
+
+        self._prepare_failed_start_cleanup_record(record)
+        self._start_failed_start_recovery_reader(record)
+
+    def _prepare_failed_start_cleanup_record(
+        self,
+        record: ProcessRecord,
+    ) -> None:
+        """在终止尝试前公开可管理状态，避免并发清理误走普通终止路径。"""
 
         with record.record_lock:
             if record.status is ProcessStatus.STARTING:
@@ -1063,7 +1214,6 @@ class ProcessManager:
                 record.termination_requested = True
                 record.termination_source = "failed_start_cleanup"
         record.startup_event.set()
-        self._start_failed_start_recovery_reader(record)
 
     def _start_failed_start_recovery_reader(
         self,
@@ -1141,7 +1291,7 @@ class ProcessManager:
             time.sleep(_READER_POLL_INTERVAL_SECONDS)
 
     def _finish_failed_start_recovery(self, record: ProcessRecord) -> bool:
-        """确认保留记录已退出后关闭句柄并写入 failed_start。"""
+        """确认保留记录已退出后写入 failed_start 并关闭句柄。"""
 
         with record.termination_lock:
             self._set_termination_in_progress(record, True)
@@ -1151,9 +1301,7 @@ class ProcessManager:
                 confirmed, exit_code = self._try_confirm_exit(record)
                 if not confirmed or exit_code is None:
                     return False
-                self._drain_final_output(record)
-                self._handle_close(record)
-                self._mark_start_failed(record)
+                self._complete_failed_start_record(record)
                 return True
             finally:
                 self._set_termination_in_progress(record, False)
@@ -1170,21 +1318,37 @@ class ProcessManager:
         with record.termination_lock:
             self._set_termination_in_progress(record, True)
             try:
+                if self._is_failed_start_cleanup_pending(record):
+                    return self._terminate_failed_start_record(
+                        record,
+                        source=source,
+                    )
+
                 snapshot = self._snapshot(record)
                 if snapshot.status in _TERMINAL_STATUSES:
                     return snapshot
 
-                if snapshot.status is ProcessStatus.STARTING:
+                if not record.startup_event.is_set():
                     self._request_termination(record, source)
-                    # 启动还在外部 starter 中，不能在持锁状态下无限等待。
+                    # 注册尚未结束时等待统一启动事件，避免抢先写入普通终态。
                     record.startup_event.wait(_STARTUP_CLEANUP_WAIT_SECONDS)
                     snapshot = self._snapshot(record)
                     if snapshot.status in _TERMINAL_STATUSES:
                         return snapshot
-                    if snapshot.status is ProcessStatus.STARTING:
+                    if self._is_failed_start_cleanup_pending(record):
+                        return self._terminate_failed_start_record(
+                            record,
+                            source=source,
+                        )
+                    if not record.startup_event.is_set():
                         raise ProcessTerminationError(
                             "Could not confirm process termination"
                         )
+
+                if snapshot.status is ProcessStatus.STARTING:
+                    raise ProcessTerminationError(
+                        "Could not confirm process termination"
+                    )
 
                 if self._get_handle(record) is None:
                     self._request_termination(record, source)
@@ -1246,6 +1410,28 @@ class ProcessManager:
                 )
             finally:
                 self._set_termination_in_progress(record, False)
+
+    def _terminate_failed_start_record(
+        self,
+        record: ProcessRecord,
+        *,
+        source: str,
+    ) -> ProcessSnapshot:
+        """收敛仍需接管的启动失败记录，并保持 failed_start 历史语义。"""
+
+        snapshot = self._snapshot(record)
+        if snapshot.status in _TERMINAL_STATUSES:
+            return snapshot
+        if self._get_handle(record) is None:
+            self._request_failed_start_cleanup(record)
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+
+        # source 仅表示本次触发者；公开终止来源不被它覆盖。
+        self._request_failed_start_cleanup(record)
+        self._confirm_failed_start_handle_stopped(record)
+        return self._complete_failed_start_record(record)
 
     def _request_termination(self, record: ProcessRecord, source: str) -> None:
         """记录终止意图，但尚不改变运行状态。"""

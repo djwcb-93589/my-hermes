@@ -25,6 +25,7 @@ from pathlib import Path
 
 from hermes.backends import (
     BackgroundProcessCancelledError,
+    BackgroundProcessStartCleanupError,
     BaseExecutionEnvironment,
     filter_local_subprocess_environment,
 )
@@ -972,6 +973,19 @@ class LocalBackend(BaseExecutionEnvironment):
                     startup_gate_path=startup_gate_path,
                 )
             except BackgroundProcessCleanupError as cleanup_error:
+                if handle is not None:
+                    handoff_error = BackgroundProcessStartCleanupError(
+                        (
+                            "Background process start failed and cleanup "
+                            "could not be confirmed"
+                        ),
+                        handle=handle,
+                    )
+                    handoff_error.add_note(
+                        "Cleanup confirmation error: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+                    raise handoff_error from start_error
                 raise cleanup_error from start_error
             raise
 

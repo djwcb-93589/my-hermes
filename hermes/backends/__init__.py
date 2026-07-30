@@ -186,6 +186,19 @@ class BackgroundProcessCancelledError(RuntimeError):
     """后台进程在成功返回 Handle 前被取消。"""
 
 
+class BackgroundProcessStartCleanupError(RuntimeError):
+    """后台启动失败，清理无法确认，Handle 仍需由上层接管。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        handle: BackgroundProcessHandle,
+    ) -> None:
+        super().__init__(message)
+        self.handle = handle
+
+
 class BaseExecutionEnvironment(ABC):
     """
     所有 terminal 后端必须满足的契约。
@@ -632,3 +645,19 @@ def cleanup_all_backends() -> None:
             b.cleanup()
         except Exception:
             pass
+
+
+__all__ = [
+    "INFRASTRUCTURE_CREDENTIAL_ENV_VARS",
+    "BackgroundProcessHandle",
+    "BackgroundProcessCancelledError",
+    "BackgroundProcessStartCleanupError",
+    "BackgroundProcessUnsupportedError",
+    "BaseExecutionEnvironment",
+    "UnsupportedBackendError",
+    "cleanup_all_backends",
+    "cleanup_backend",
+    "create_backend",
+    "filter_local_subprocess_environment",
+    "get_backend",
+]
