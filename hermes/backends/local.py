@@ -567,7 +567,9 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         job_assigned: bool = False,
         snapshot_path: Path | None = None,
         startup_gate_path: Path | None = None,
+        started_cwd: str | None = None,
     ) -> None:
+        self._started_cwd = started_cwd
         self._proc: subprocess.Popen | None = None
         self._job_handle = job_handle
         self._job_assigned = job_assigned
@@ -681,6 +683,12 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                     )
             self._output_eof_event.set()
             raise
+
+    @property
+    def started_cwd(self) -> str | None:
+        """返回创建 Handle 时冻结的后台进程启动目录。"""
+
+        return self._started_cwd
 
     @property
     def pid(self) -> int | None:
@@ -1471,8 +1479,9 @@ class LocalBackend(BaseExecutionEnvironment):
             with self._execute_lock:
                 if not self._snapshot_ready:
                     self.init_session()
+                started_cwd = self.cwd
                 snapshot_copy = self._copy_background_snapshot_locked()
-                cwd_shell = self._cwd_to_shell(self.cwd)
+                cwd_shell = self._cwd_to_shell(started_cwd)
                 env = filter_local_subprocess_environment(
                     os.environ,
                     env_passthrough=self._env_passthrough,
@@ -1517,6 +1526,7 @@ class LocalBackend(BaseExecutionEnvironment):
                 job_assigned=False,
                 snapshot_path=snapshot_copy,
                 startup_gate_path=startup_gate_path,
+                started_cwd=started_cwd,
             )
             proc = self._run_background_bash(
                 wrapped,

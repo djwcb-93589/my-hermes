@@ -50,8 +50,8 @@ TOOL_DECLARATIONS = (
                 "Set background=true for long-running commands that should be "
                 "registered and return immediately without waiting for command "
                 "completion. A successful background start returns a "
-                "process_id intended for a later process-management tool; this "
-                "stage does not expose process control operations. "
+                "process_id that the process tool uses for status, logs, "
+                "waiting, and termination. "
                 "Local terminal path enforcement is best-effort and is not a "
                 "sandbox. Commands that clearly reference a path blocked by "
                 "the shared filesystem policy are rejected before approval, "
@@ -70,8 +70,8 @@ TOOL_DECLARATIONS = (
                         "description": (
                             "Start a long-running command in the background "
                             "and return immediately after registration. The "
-                            "response includes a process_id for a later "
-                            "process-management tool."
+                            "response includes a process_id for the process "
+                            "management tool."
                         ),
                     },
                 },

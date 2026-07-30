@@ -604,6 +604,7 @@ def register_all(
         active_process_manager = default_process_manager
     staging_registry = ToolRegistry()
     from hermes.tools.terminal import register as _terminal
+    from hermes.tools.process import register as _process
     from hermes.tools.file import register as _file
     from hermes.tools.memory import register as _memory
     from hermes.tools.delegate import register as _delegate
@@ -613,6 +614,10 @@ def register_all(
     from hermes.cron.tool import register as _cron
 
     _terminal(
+        staging_registry,
+        process_manager=active_process_manager,
+    )
+    _process(
         staging_registry,
         process_manager=active_process_manager,
     )

@@ -372,6 +372,11 @@ class ProcessManager:
         with record.record_lock:
             record.handle = handle
 
+        started_cwd = self._read_optional_started_cwd(handle)
+        if started_cwd is not None:
+            with record.record_lock:
+                record.cwd = started_cwd
+
         try:
             pid = self._handle_pid(record)
             if pid is not None and (
@@ -707,6 +712,20 @@ class ProcessManager:
 
         with record.record_lock:
             return record.handle
+
+    @staticmethod
+    def _read_optional_started_cwd(
+        handle: BackgroundProcessHandle,
+    ) -> str | None:
+        """尽力读取 Handle 提供的启动目录，失败时保留调用方元数据。"""
+
+        try:
+            started_cwd = getattr(handle, "started_cwd")
+            if not isinstance(started_cwd, str) or not started_cwd.strip():
+                return None
+        except BaseException:
+            return None
+        return started_cwd
 
     def _adopt_failed_start_cleanup_handle(
         self,

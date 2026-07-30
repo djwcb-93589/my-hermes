@@ -17,6 +17,7 @@ from hermes.processes import (
     ProcessError,
     ProcessLimitError,
     ProcessStartError,
+    ProcessStatus,
     ProcessTerminationError,
 )
 from hermes.redaction import redact_terminal_output
@@ -180,14 +181,59 @@ def _run_terminal_background(
             error="Background process could not be started.",
         )
 
-    status = getattr(snapshot.status, "value", snapshot.status)
-    return json.dumps({
-        "ok": True,
-        "status": str(status),
-        "output": "Background process started",
+    status = snapshot.status
+    if not isinstance(status, ProcessStatus):
+        return json.dumps({
+            "ok": False,
+            "error_type": "background_start_incomplete",
+            "error": "Background process registration did not complete",
+        }, ensure_ascii=False)
+    common = {
+        "status": status.value,
         "process_id": snapshot.process_id,
         "pid": snapshot.pid,
-        "error": None,
+    }
+    if status is ProcessStatus.RUNNING:
+        return json.dumps({
+            "ok": True,
+            **common,
+            "output": "Background process started",
+            "error": None,
+        }, ensure_ascii=False)
+    if status is ProcessStatus.EXITED:
+        return json.dumps({
+            "ok": True,
+            **common,
+            "exit_code": snapshot.exit_code,
+            "command_succeeded": snapshot.exit_code == 0,
+            "output": "Background process started and already exited",
+            "error": None,
+        }, ensure_ascii=False)
+    if status is ProcessStatus.KILLED:
+        return json.dumps({
+            "ok": False,
+            "error_type": "background_start_interrupted",
+            **common,
+            "error": "Background process was terminated during startup",
+        }, ensure_ascii=False)
+    if status is ProcessStatus.LOST:
+        return json.dumps({
+            "ok": False,
+            "error_type": "background_start_lost",
+            **common,
+            "error": "Background process state could not be confirmed",
+        }, ensure_ascii=False)
+    if status is ProcessStatus.FAILED_START:
+        return json.dumps({
+            "ok": False,
+            "error_type": "background_start_failed",
+            **common,
+            "error": "Background process failed to start",
+        }, ensure_ascii=False)
+    return json.dumps({
+        "ok": False,
+        "error_type": "background_start_incomplete",
+        "error": "Background process registration did not complete",
     }, ensure_ascii=False)
 
 
