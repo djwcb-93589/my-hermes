@@ -271,11 +271,13 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
         raise DocxError("docx_limit_exceeded", "DOCX ZIP entry 数量超过限制。")
 
     parts: dict[str, zipfile.ZipInfo] = {}
+    entry_names: set[str] = set()
     total_uncompressed_size = 0
     for info in entries:
         normalized_name = _normalize_entry_name(info.filename)
-        if normalized_name in parts:
+        if normalized_name in entry_names:
             raise DocxError("invalid_docx_package", "DOCX ZIP 包含重复的 entry 路径。")
+        entry_names.add(normalized_name)
         if info.flag_bits & 0x1:
             raise DocxError("invalid_docx_package", "不支持加密的 DOCX ZIP entry。")
         if info.file_size > DOCX_LIMITS.max_entry_uncompressed_size:
@@ -289,6 +291,8 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
             ratio = info.file_size / info.compress_size
             if ratio > DOCX_LIMITS.max_compression_ratio:
                 raise DocxError("docx_limit_exceeded", "DOCX ZIP entry 压缩率超过限制。")
+        if info.is_dir():
+            continue
         parts[normalized_name] = info
 
     if any(required not in parts for required in _REQUIRED_PARTS):

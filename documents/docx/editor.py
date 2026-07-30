@@ -2566,10 +2566,21 @@ def _paragraph_properties_are_stable(
 
 def _row_is_header(row: ElementTree.Element) -> bool:
     properties = row.find(_W_ROW_PROPERTIES)
-    return (
-        properties is not None
-        and properties.find(_W_TABLE_HEADER) is not None
-    )
+    if properties is None:
+        return False
+    table_header = properties.find(_W_TABLE_HEADER)
+    if table_header is None:
+        return False
+    value = _property_value(table_header)
+    if value is None:
+        return True
+    normalized_value = value.strip().lower()
+    if normalized_value in {"true", "1", "on"}:
+        return True
+    if normalized_value in {"false", "0", "off"}:
+        return False
+    # 非法 On/Off 值按启用处理，避免误删可能的表头行。
+    return True
 
 
 def _apply_metadata_edit(context: _MetadataContext) -> dict[str, bytes]:

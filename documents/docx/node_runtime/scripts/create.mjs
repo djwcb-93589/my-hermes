@@ -199,23 +199,29 @@ function createHeading(block) {
 function createTable(block) {
   return new Table({
     rows: block.rows.map(
-      (row, rowIndex) => new TableRow({
-        tableHeader: block.header_row && rowIndex === 0,
-        children: row.map(
-          (cell) => new TableCell({
-            children: [
-              new Paragraph({
-                children: [
-                  new TextRun({
-                    text: cell,
-                    bold: block.header_row && rowIndex === 0,
-                  }),
-                ],
-              }),
-            ],
-          }),
-        ),
-      }),
+      (row, rowIndex) => {
+        const isHeaderRow = block.header_row && rowIndex === 0;
+        const options = {
+          children: row.map(
+            (cell) => new TableCell({
+              children: [
+                new Paragraph({
+                  children: [
+                    new TextRun({
+                      text: cell,
+                      bold: isHeaderRow,
+                    }),
+                  ],
+                }),
+              ],
+            }),
+          ),
+        };
+        if (isHeaderRow) {
+          options.tableHeader = true;
+        }
+        return new TableRow(options);
+      },
     ),
   });
 }
