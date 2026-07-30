@@ -11,6 +11,9 @@ from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
 )
+from hermes.persistence.database_diagnostics import (
+    SQLiteDatabaseDiagnosticsRepository,
+)
 from hermes.persistence.monitoring import (
     SQLiteObservationReadRepository,
     SQLiteToolExecutionReadRepository,
@@ -21,6 +24,9 @@ from hermes.persistence.monitoring_aggregation import (
 from hermes.tool_declarations.catalog import build_toolset_catalog_snapshot
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
+from hermes.web.database_diagnostics_service import (
+    DatabaseDiagnosticsService,
+)
 from hermes.web.monitoring_aggregation_service import (
     MonitoringAggregationService,
 )
@@ -39,6 +45,7 @@ from hermes.web.redaction import DashboardRedactor
 from hermes.web.routes import (
     catalog,
     cron,
+    database_diagnostics,
     monitoring,
     monitoring_aggregation,
     sessions,
@@ -98,6 +105,13 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         if config.db_path is not None
         else None
     )
+    database_diagnostics_service = (
+        DatabaseDiagnosticsService(
+            SQLiteDatabaseDiagnosticsRepository(config.db_path),
+        )
+        if config.db_path is not None
+        else None
+    )
     read_service = ReadService(
         context=read_context,
         redactor=redactor,
@@ -114,6 +128,7 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         catalog_read_service=catalog_read_service,
         monitoring_read_service=monitoring_read_service,
         monitoring_aggregation_service=monitoring_aggregation_service,
+        database_diagnostics_service=database_diagnostics_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
         access_policy=access_policy,
@@ -141,6 +156,7 @@ def create_app(
     catalog_read_service: CatalogReadService | None = None,
     monitoring_read_service: MonitoringReadService | None = None,
     monitoring_aggregation_service: MonitoringAggregationService | None = None,
+    database_diagnostics_service: DatabaseDiagnosticsService | None = None,
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
@@ -176,6 +192,9 @@ def create_app(
     application.state.monitoring_read_service = monitoring_read_service
     application.state.monitoring_aggregation_service = (
         monitoring_aggregation_service
+    )
+    application.state.database_diagnostics_service = (
+        database_diagnostics_service
     )
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
@@ -320,6 +339,7 @@ def create_app(
     application.include_router(catalog.router)
     application.include_router(monitoring.router)
     application.include_router(monitoring_aggregation.router)
+    application.include_router(database_diagnostics.router)
     return application
 
 

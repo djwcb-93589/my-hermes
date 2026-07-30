@@ -7,6 +7,16 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hermes.observability.database_diagnostics import (
+    DATABASE_DIAGNOSTICS_BUDGET_MS,
+    MAX_DATABASE_DIAGNOSTIC_PROBES,
+    MAX_DATABASE_PROBE_ROW_COUNT,
+    DatabaseDiagnosticReason,
+    DatabaseHealthStatus,
+    DatabaseJournalMode,
+    DatabaseProbeName,
+    DatabaseProbeStatus,
+)
 from hermes.observability.monitoring_aggregation import (
     MAX_MONITORING_TIME_BUCKETS,
     MAX_MONITORING_TOOL_STATS,
@@ -223,6 +233,7 @@ _Rate = Annotated[
     float,
     Field(strict=True, ge=0, le=1, allow_inf_nan=False),
 ]
+_StrictBool = Annotated[bool, Field(strict=True)]
 
 
 class MonitoringPaginationResponse(PaginationMetadata):
@@ -478,6 +489,100 @@ class MonitoringTimeSeriesResponse(_MonitoringResponseModel):
     buckets: list[MonitoringTimeBucketResponse] = Field(
         max_length=MAX_MONITORING_TIME_BUCKETS,
     )
+
+
+class DatabaseSchemaMetricsResponse(_MonitoringResponseModel):
+    """数据库项目版本、SQLite user_version 与兼容性摘要。"""
+
+    current_version: _NonNegativeInt | None = None
+    expected_version: Annotated[int, Field(strict=True, gt=0)]
+    user_version: _NonNegativeInt | None = None
+    compatible: _StrictBool
+    required_structures_available: _StrictBool
+
+
+class DatabaseStorageMetricsResponse(_MonitoringResponseModel):
+    """不包含文件路径的数据库页和可选 WAL 空间指标。"""
+
+    page_size_bytes: Annotated[int, Field(strict=True, gt=0)]
+    page_count: _NonNegativeInt
+    freelist_page_count: _NonNegativeInt
+    database_size_bytes: _NonNegativeInt
+    free_space_bytes: _NonNegativeInt
+    used_space_bytes: _NonNegativeInt
+    database_file_size_bytes: _NonNegativeInt | None = None
+    wal_present: _StrictBool | None = None
+    wal_size_bytes: _NonNegativeInt | None = None
+
+
+class DatabaseJournalMetricsResponse(_MonitoringResponseModel):
+    """本次 Dashboard 诊断连接的有限 PRAGMA 状态。"""
+
+    journal_mode: DatabaseJournalMode
+    query_only: _StrictBool
+    foreign_keys: _StrictBool
+    busy_timeout_ms: _NonNegativeInt
+
+
+class DatabaseProbeResponse(_MonitoringResponseModel):
+    """单个固定查询探针的状态、耗时和有界结果数。"""
+
+    probe_name: DatabaseProbeName
+    status: DatabaseProbeStatus
+    duration_ms: _NonNegativeFiniteFloat
+    returned_row_count: Annotated[
+        int,
+        Field(
+            strict=True,
+            ge=0,
+            le=MAX_DATABASE_PROBE_ROW_COUNT,
+        ),
+    ] | None = None
+    reason: DatabaseDiagnosticReason | None = None
+
+
+class DatabaseProbeSetResponse(_MonitoringResponseModel):
+    """一次请求中按固定顺序执行的有限探针集合。"""
+
+    checked_at: datetime
+    total_duration_ms: _NonNegativeFiniteFloat
+    budget_ms: Annotated[
+        int,
+        Field(
+            strict=True,
+            gt=0,
+            le=DATABASE_DIAGNOSTICS_BUDGET_MS,
+        ),
+    ]
+    budget_exhausted: _StrictBool
+    probes: list[DatabaseProbeResponse] = Field(
+        min_length=1,
+        max_length=MAX_DATABASE_DIAGNOSTIC_PROBES,
+    )
+
+    @model_validator(mode="after")
+    def validate_budget(self) -> Self:
+        """响应只能公开固定预算和完整的固定探针顺序。"""
+        if self.budget_ms != DATABASE_DIAGNOSTICS_BUDGET_MS:
+            raise ValueError("budget_ms must use the fixed diagnostic budget")
+        if tuple(probe.probe_name for probe in self.probes) != tuple(
+            DatabaseProbeName
+        ):
+            raise ValueError(
+                "probes must contain the complete fixed probe sequence"
+            )
+        return self
+
+
+class DatabaseHealthResponse(_MonitoringResponseModel):
+    """按请求推导且不持久化的数据库诊断快照。"""
+
+    checked_at: datetime
+    status: DatabaseHealthStatus
+    schema: DatabaseSchemaMetricsResponse
+    storage: DatabaseStorageMetricsResponse | None = None
+    journal: DatabaseJournalMetricsResponse | None = None
+    probes: DatabaseProbeSetResponse
 
 
 class CronControlResponse(BaseModel):
