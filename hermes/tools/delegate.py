@@ -31,7 +31,13 @@ from hermes.config import (
 from hermes.delegate_jobs import get_delegate_job_manager
 from hermes.hooks import SyncControlBridge, SyncHookRegistry
 from hermes.tool_declarations.delegate import TOOL_DECLARATIONS
-from hermes.tools import ExecutionEnvironment, ToolPolicy, ToolResolution, registry
+from hermes.tools import (
+    ExecutionEnvironment,
+    ToolPolicy,
+    ToolResolution,
+    register_declared_handlers,
+    registry,
+)
 
 
 _DEFAULT_TOOLSETS = ["terminal", "file"]
@@ -651,11 +657,13 @@ def handle_delegate_cancel(args, **kwargs) -> str:
 
 def register(registry):
     """注册 Delegate 的真实 handler。"""
-    handlers = (
-        handle_delegate,
-        handle_delegate_status,
-        handle_delegate_result,
-        handle_delegate_cancel,
+    register_declared_handlers(
+        registry,
+        TOOL_DECLARATIONS,
+        {
+            "delegate_task": handle_delegate,
+            "delegate_status": handle_delegate_status,
+            "delegate_result": handle_delegate_result,
+            "delegate_cancel": handle_delegate_cancel,
+        },
     )
-    for declaration, handler in zip(TOOL_DECLARATIONS, handlers, strict=True):
-        registry.register_declaration(declaration, handler)

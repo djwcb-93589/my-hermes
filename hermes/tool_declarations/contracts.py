@@ -11,6 +11,14 @@ from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
 )
+from hermes.tool_policy import (
+    ApprovalMode,
+    ExecutionEnvironment,
+    ToolRiskLevel,
+    normalize_approval_mode,
+    normalize_execution_environment,
+    normalize_tool_risk_level,
+)
 
 
 def _required_text(value: object, field_name: str) -> str:
@@ -25,6 +33,47 @@ def _string_tuple(value: object, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, (tuple, list, set, frozenset)):
         raise TypeError(f"{field_name} must be a collection of strings")
     return tuple(sorted({_required_text(item, field_name) for item in value}))
+
+
+def _environment_tuple(
+    value: object,
+    field_name: str,
+    *,
+    required: bool,
+) -> tuple[str, ...]:
+    """按共享策略定义校验并规范化执行环境。"""
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        raise TypeError(f"{field_name} must be a collection of environments")
+    normalized: set[str] = set()
+    for item in value:
+        if isinstance(item, ExecutionEnvironment):
+            environment = item
+        else:
+            environment = normalize_execution_environment(
+                _required_text(item, field_name)
+            )
+        normalized.add(environment.value)
+    if required and not normalized:
+        raise ValueError(f"{field_name} must not be empty")
+    return tuple(sorted(normalized))
+
+
+def _approval_mode(value: object) -> str:
+    """按共享策略定义校验审批模式。"""
+    if isinstance(value, ApprovalMode):
+        return value.value
+    return normalize_approval_mode(
+        _required_text(value, "approval_mode").lower()
+    ).value
+
+
+def _risk_level(value: object) -> str:
+    """按共享策略定义校验风险等级。"""
+    if isinstance(value, ToolRiskLevel):
+        return value.value
+    return normalize_tool_risk_level(
+        _required_text(value, "risk_level").lower()
+    ).value
 
 
 def _required_bool(value: object, field_name: str) -> bool:
@@ -128,19 +177,28 @@ class ToolDeclaration:
         object.__setattr__(
             self,
             "execution_environments",
-            _string_tuple(
+            _environment_tuple(
                 self.execution_environments,
                 "execution_environments",
+                required=True,
             ),
         )
         object.__setattr__(
             self,
             "default_enabled_environments",
-            _string_tuple(
+            _environment_tuple(
                 self.default_enabled_environments,
                 "default_enabled_environments",
+                required=False,
             ),
         )
+        if not set(self.default_enabled_environments).issubset(
+            self.execution_environments
+        ):
+            raise ValueError(
+                "default_enabled_environments must be a subset of "
+                "execution_environments"
+            )
         object.__setattr__(
             self,
             "required_trusted_context",
@@ -180,12 +238,12 @@ class ToolDeclaration:
         object.__setattr__(
             self,
             "approval_mode",
-            _required_text(self.approval_mode, "approval_mode").lower(),
+            _approval_mode(self.approval_mode),
         )
         object.__setattr__(
             self,
             "risk_level",
-            _required_text(self.risk_level, "risk_level").lower(),
+            _risk_level(self.risk_level),
         )
         if self.retry_safe and self.unknown_on_crash:
             raise ValueError(

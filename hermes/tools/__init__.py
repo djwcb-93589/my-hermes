@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Callable, Iterable
 
 from hermes.observability.contracts import (
@@ -17,39 +17,15 @@ from hermes.tool_declarations.contracts import (
     capability_from_declaration,
     toolsets_from_capabilities,
 )
-
-
-class ExecutionEnvironment(str, Enum):
-    """工具可被解析到的运行入口。"""
-
-    CLI = "cli"
-    GATEWAY = "gateway"
-    CRON = "cron"
-    DELEGATE = "delegate"
-    BACKGROUND_REVIEW = "background_review"
-
-
-class ApprovalMode(str, Enum):
-    """工具在运行时可能采用的审批方式。"""
-
-    NONE = "none"
-    INTERACTIVE_OR_REMOTE = "interactive_or_remote"
-    REMOTE_ONCE = "remote_once"
-
-
-class ToolRiskLevel(str, Enum):
-    """工具在声明层面的最高副作用风险。"""
-
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-
-_TOOL_RISK_RANK = {
-    ToolRiskLevel.LOW: 1,
-    ToolRiskLevel.MEDIUM: 2,
-    ToolRiskLevel.HIGH: 3,
-}
+from hermes.tool_policy import (
+    ApprovalMode,
+    ExecutionEnvironment,
+    ToolRiskLevel,
+    normalize_approval_mode,
+    normalize_execution_environment,
+    normalize_tool_risk_level,
+    tool_risk_rank,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -59,9 +35,7 @@ def _normalize_environment(
     value: ExecutionEnvironment | str,
 ) -> ExecutionEnvironment:
     """兼容枚举值和外部传入的小写环境名称。"""
-    if isinstance(value, ExecutionEnvironment):
-        return value
-    return ExecutionEnvironment(str(value).lower())
+    return normalize_execution_environment(value)
 
 
 @dataclass(frozen=True)
@@ -102,10 +76,10 @@ class ToolPolicy:
             object.__setattr__(
                 self,
                 "max_risk_level",
-                (
+                normalize_tool_risk_level(
                     self.max_risk_level
                     if isinstance(self.max_risk_level, ToolRiskLevel)
-                    else ToolRiskLevel(str(self.max_risk_level).lower())
+                    else str(self.max_risk_level).lower()
                 ),
             )
 
@@ -194,14 +168,10 @@ class ToolRegistry:
                 str(item).strip() for item in required_trusted_context
             ),
             approval_mode=(
-                approval_mode
-                if isinstance(approval_mode, ApprovalMode)
-                else ApprovalMode(str(approval_mode))
+                normalize_approval_mode(approval_mode)
             ),
             risk_level=(
-                risk_level
-                if isinstance(risk_level, ToolRiskLevel)
-                else ToolRiskLevel(str(risk_level))
+                normalize_tool_risk_level(risk_level)
             ),
             default_enabled_environments=frozenset(
                 _normalize_environment(item)
@@ -360,8 +330,8 @@ class ToolRegistry:
                 continue
             if (
                 policy.max_risk_level is not None
-                and _TOOL_RISK_RANK[entry.risk_level]
-                > _TOOL_RISK_RANK[policy.max_risk_level]
+                and tool_risk_rank(entry.risk_level)
+                > tool_risk_rank(policy.max_risk_level)
             ):
                 continue
             if policy.enabled_toolsets is None:
@@ -475,6 +445,59 @@ class ToolRegistry:
             )
         )
         return list(resolution.definitions)
+
+
+def register_declared_handlers(
+    target_registry: ToolRegistry,
+    declarations: Iterable[ToolDeclaration],
+    handlers_by_name: Mapping[str, Callable],
+) -> None:
+    """完整校验名称绑定后注册一组共享声明。"""
+    register_declaration = getattr(
+        target_registry,
+        "register_declaration",
+        None,
+    )
+    if not callable(register_declaration):
+        raise TypeError("target_registry must support register_declaration")
+
+    declaration_items = tuple(declarations)
+    if not declaration_items or not all(
+        isinstance(item, ToolDeclaration)
+        for item in declaration_items
+    ):
+        raise TypeError("declarations must contain ToolDeclaration")
+    declaration_names = tuple(
+        declaration.name
+        for declaration in declaration_items
+    )
+    if len(declaration_names) != len(set(declaration_names)):
+        raise ValueError("tool declarations contain duplicate names")
+    if not isinstance(handlers_by_name, Mapping):
+        raise TypeError("handlers_by_name must be a mapping")
+    if any(
+        type(name) is not str or not name
+        for name in handlers_by_name
+    ):
+        raise TypeError("handler names must be non-empty strings")
+
+    expected_names = set(declaration_names)
+    handler_names = set(handlers_by_name)
+    if expected_names - handler_names:
+        raise ValueError("tool declarations have missing handlers")
+    if handler_names - expected_names:
+        raise ValueError("tool declarations have extra handlers")
+    if any(
+        not callable(handlers_by_name[name])
+        for name in declaration_names
+    ):
+        raise TypeError("tool declaration handlers must be callable")
+
+    for declaration in declaration_items:
+        register_declaration(
+            declaration,
+            handlers_by_name[declaration.name],
+        )
 
 
 registry = ToolRegistry()

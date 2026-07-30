@@ -6,6 +6,7 @@ import json
 
 from hermes.config import HERMES_HOME
 from hermes.tool_declarations.skill import TOOL_DECLARATIONS
+from hermes.tools import register_declared_handlers
 
 
 # 保留此变量以兼容既有调用方和临时目录 monkeypatch。
@@ -122,10 +123,12 @@ def handle_skill_manage(args, **kwargs):
 
 def register(registry):
     """注册 skill_view / skills_list / skill_manage 三个工具。"""
-    handlers = (
-        handle_skill_view,
-        handle_skill_list,
-        handle_skill_manage,
+    register_declared_handlers(
+        registry,
+        TOOL_DECLARATIONS,
+        {
+            "skill_view": handle_skill_view,
+            "skills_list": handle_skill_list,
+            "skill_manage": handle_skill_manage,
+        },
     )
-    for declaration, handler in zip(TOOL_DECLARATIONS, handlers, strict=True):
-        registry.register_declaration(declaration, handler)

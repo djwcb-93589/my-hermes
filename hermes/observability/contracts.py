@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-import math
+import ipaddress
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from hermes.redaction import redact_explicit_secrets
 
 
-_MAX_METADATA_DEPTH = 8
 _MAX_METADATA_ITEMS = 256
 _MAX_METADATA_TEXT_CHARS = 16_384
+_MAX_METADATA_TAGS = 16
+_MAX_METADATA_TAG_LENGTH = 64
+_MAX_METADATA_URL_LENGTH = 512
 _SENSITIVE_METADATA_KEYS = frozenset({
     "access_key",
     "api_key",
@@ -47,56 +50,49 @@ _DISALLOWED_METADATA_KEY_PARTS = frozenset({
     "traceback",
 })
 _ERROR_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
-_ABSOLUTE_PATH_TEXT_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/])")
-_PRIVATE_KEY_TEXT_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
-_SAFE_METADATA_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
+_WINDOWS_DRIVE_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_PRIVATE_KEY_TEXT_RE = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
+    re.IGNORECASE,
+)
+_MULTI_LINE_OR_CONTROL_TEXT_RE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u2028\u2029]"
+)
+_OBVIOUS_CREDENTIAL_TEXT_RE = re.compile(
+    r"(?:"
+    r"(?i:\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,})"
+    r"|(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])(?:xox[baprs]-|glpat-)"
+    r"[A-Za-z0-9_-]{12,}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}"
+    r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"(?![A-Za-z0-9_-])"
+    r")"
+)
+_SAFE_METADATA_TEXT_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$"
+)
+_SAFE_METADATA_TAG_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$"
+)
+_URI_OR_URL_LIKE_TEXT_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9+.-]*:|https?(?:/+|\\+))",
+    re.IGNORECASE,
+)
+_DNS_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+_AMBIGUOUS_NUMERIC_HOST_RE = re.compile(
+    r"^(?:0[xX][A-Fa-f0-9]+|[0-9]+)"
+    r"(?:\.(?:0[xX][A-Fa-f0-9]+|[0-9]+))*$"
+)
+_SAFE_URL_PATH_RE = re.compile(
+    r"^(?:/[A-Za-z0-9._~!$&'()*+,;=:@+-]*)*$"
+)
 
-# 只允许摘要身份、计数和状态类字段。发布方不能使用任意业务键把正文伪装成
-# metadata；Runtime 与 Artifact 再在此基础上使用各自更小的字段白名单。
-_COMMON_METADATA_FIELDS = frozenset({
-    "adapter",
-    "artifact_kind",
-    "attempt",
-    "attempt_count",
-    "capability",
-    "category",
-    "checksum_algorithm",
-    "component",
-    "component_id",
-    "component_type",
-    "component_version",
-    "count",
-    "duration_ms",
-    "enabled",
-    "environment",
-    "event",
-    "feature",
-    "format",
-    "has_storage_ref",
-    "healthy",
-    "instance_id",
-    "kind",
-    "mode",
-    "operation",
-    "phase",
-    "provider",
-    "queue_depth",
-    "reason_code",
-    "region",
-    "retry_count",
-    "role",
-    "service",
-    "size_bytes",
-    "source",
-    "state",
-    "status",
-    "status_code",
-    "tag",
-    "tags",
-    "type",
-    "version",
-    "worker_count",
-})
 _RUNTIME_METADATA_FIELDS = frozenset({
     "adapter",
     "attempt_count",
@@ -133,6 +129,19 @@ _ARTIFACT_METADATA_FIELDS = frozenset({
     "status_code",
     "tags",
     "type",
+})
+_RUNTIME_BOOLEAN_METADATA_FIELDS = frozenset({"enabled"})
+_RUNTIME_INTEGER_METADATA_FIELDS = frozenset({
+    "attempt_count",
+    "queue_depth",
+    "retry_count",
+    "status_code",
+    "worker_count",
+})
+_ARTIFACT_BOOLEAN_METADATA_FIELDS = frozenset({"has_storage_ref"})
+_ARTIFACT_INTEGER_METADATA_FIELDS = frozenset({
+    "size_bytes",
+    "status_code",
 })
 
 
@@ -175,42 +184,83 @@ def _normalize_string_tuple(value: object, field_name: str) -> tuple[str, ...]:
     return tuple(sorted(normalized))
 
 
-def freeze_safe_metadata(
+@dataclass(frozen=True, slots=True)
+class _MetadataDomainRules:
+    """一个领域专用 metadata 入口的固定字段类型规则。"""
+
+    allowed_fields: frozenset[str]
+    boolean_fields: frozenset[str]
+    integer_fields: frozenset[str]
+
+
+_RUNTIME_METADATA_RULES = _MetadataDomainRules(
+    allowed_fields=_RUNTIME_METADATA_FIELDS,
+    boolean_fields=_RUNTIME_BOOLEAN_METADATA_FIELDS,
+    integer_fields=_RUNTIME_INTEGER_METADATA_FIELDS,
+)
+_ARTIFACT_METADATA_RULES = _MetadataDomainRules(
+    allowed_fields=_ARTIFACT_METADATA_FIELDS,
+    boolean_fields=_ARTIFACT_BOOLEAN_METADATA_FIELDS,
+    integer_fields=_ARTIFACT_INTEGER_METADATA_FIELDS,
+)
+
+
+def _freeze_domain_metadata(
     value: Mapping[str, object],
     *,
-    field_name: str = "metadata",
-    allowed_keys: frozenset[str] | None = None,
+    field_name: str,
+    rules: _MetadataDomainRules,
 ) -> Mapping[str, object]:
-    """深复制并冻结经字段白名单和文本清理后的有限摘要元数据。"""
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{field_name} must be a mapping")
-    normalized_allowed_keys = _normalize_allowed_metadata_keys(
-        _COMMON_METADATA_FIELDS if allowed_keys is None else allowed_keys
-    )
+    """按内部固定领域规则复制并冻结有限摘要元数据。"""
+    if type(value) is not dict and not isinstance(value, MappingProxyType):
+        raise TypeError(f"{field_name} must be a plain mapping")
     budget = _MetadataBudget(
         remaining_items=_MAX_METADATA_ITEMS,
         remaining_text_chars=_MAX_METADATA_TEXT_CHARS,
     )
-    frozen = _freeze_safe_value(
-        value,
-        field_name,
-        set(),
-        budget,
-        normalized_allowed_keys,
-        depth=0,
-    )
-    assert isinstance(frozen, Mapping)
-    return frozen
+    frozen: dict[str, object] = {}
+    normalized_keys: set[str] = set()
+    for key, child in value.items():
+        if type(key) is not str:
+            raise TypeError(f"{field_name} mapping keys must be strings")
+        normalized_key = _validate_metadata_key(
+            key,
+            field_name,
+            rules.allowed_fields,
+        )
+        if normalized_key in normalized_keys:
+            raise ValueError(
+                f"{field_name} contains duplicate normalized keys"
+            )
+        normalized_keys.add(normalized_key)
+        budget.consume_item(field_name)
+        budget.consume_text(key, field_name)
+        frozen[key] = _freeze_metadata_field(
+            child,
+            f"{field_name}.{key}",
+            normalized_key,
+            rules,
+            budget,
+        )
+    return MappingProxyType(frozen)
 
 
 def freeze_runtime_metadata(value: Mapping[str, object]) -> Mapping[str, object]:
     """冻结 Runtime Snapshot 允许发布的摘要字段。"""
-    return freeze_safe_metadata(value, allowed_keys=_RUNTIME_METADATA_FIELDS)
+    return _freeze_domain_metadata(
+        value,
+        field_name="metadata",
+        rules=_RUNTIME_METADATA_RULES,
+    )
 
 
 def freeze_artifact_metadata(value: Mapping[str, object]) -> Mapping[str, object]:
     """冻结 Artifact Record 允许发布的摘要字段。"""
-    return freeze_safe_metadata(value, allowed_keys=_ARTIFACT_METADATA_FIELDS)
+    return _freeze_domain_metadata(
+        value,
+        field_name="metadata",
+        rules=_ARTIFACT_METADATA_RULES,
+    )
 
 
 @dataclass(slots=True)
@@ -231,76 +281,29 @@ class _MetadataBudget:
         self.remaining_text_chars -= len(value)
 
 
-def _freeze_safe_value(
+def _freeze_metadata_field(
     value: object,
     path: str,
-    ancestors: set[int],
+    normalized_key: str,
+    rules: _MetadataDomainRules,
     budget: _MetadataBudget,
-    allowed_keys: frozenset[str],
-    *,
-    depth: int,
 ) -> object:
-    """拒绝自定义对象、循环引用和非有限数字。"""
-    if depth > _MAX_METADATA_DEPTH:
-        raise ValueError(f"{path} exceeds the metadata nesting limit")
-    if value is None or type(value) in (bool, int):
+    """按字段规则拒绝隐式类型转换和任意嵌套载荷。"""
+    if normalized_key in rules.boolean_fields:
+        if type(value) is not bool:
+            raise TypeError(f"{path} must be a boolean")
         return value
-    if type(value) is str:
-        return _freeze_metadata_text(value, path, budget)
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError(f"{path} must not contain a non-finite number")
+    if normalized_key in rules.integer_fields:
+        if type(value) is not int:
+            raise TypeError(f"{path} must be a non-negative integer")
+        if value < 0:
+            raise ValueError(f"{path} must be a non-negative integer")
         return value
-
-    if type(value) is dict or isinstance(value, MappingProxyType):
-        value_id = id(value)
-        if value_id in ancestors:
-            raise ValueError(f"{path} must not contain cyclic containers")
-        ancestors.add(value_id)
-        try:
-            frozen_mapping: dict[str, object] = {}
-            for key, child in value.items():
-                if not isinstance(key, str):
-                    raise TypeError(f"{path} mapping keys must be strings")
-                _validate_metadata_key(key, path, allowed_keys)
-                budget.consume_item(path)
-                budget.consume_text(key, path)
-                frozen_mapping[key] = _freeze_safe_value(
-                    child,
-                    f"{path}.{key}",
-                    ancestors,
-                    budget,
-                    allowed_keys,
-                    depth=depth + 1,
-                )
-            return MappingProxyType(frozen_mapping)
-        finally:
-            ancestors.remove(value_id)
-
-    if type(value) in (list, tuple):
-        value_id = id(value)
-        if value_id in ancestors:
-            raise ValueError(f"{path} must not contain cyclic containers")
-        ancestors.add(value_id)
-        try:
-            frozen_values: list[object] = []
-            for index, item in enumerate(value):
-                budget.consume_item(path)
-                frozen_values.append(
-                    _freeze_safe_value(
-                        item,
-                        f"{path}[{index}]",
-                        ancestors,
-                        budget,
-                        allowed_keys,
-                        depth=depth + 1,
-                    )
-                )
-            return tuple(frozen_values)
-        finally:
-            ancestors.remove(value_id)
-
-    raise TypeError(f"{path} contains an unsupported value type")
+    if normalized_key == "tags":
+        return _freeze_metadata_tags(value, path, budget)
+    if type(value) is not str:
+        raise TypeError(f"{path} must be a string")
+    return _freeze_metadata_text(value, path, budget)
 
 
 def _normalize_metadata_key(key: str) -> str:
@@ -310,19 +313,33 @@ def _normalize_metadata_key(key: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
 
 
-def _normalize_allowed_metadata_keys(
-    allowed_keys: object,
-) -> frozenset[str]:
-    """校验发布方声明的字段白名单，避免其退化为任意键。"""
-    if not isinstance(allowed_keys, (frozenset, set, tuple, list)):
-        raise TypeError("allowed_keys must be a collection of strings")
-    normalized = frozenset(
-        _normalize_metadata_key(_require_text(key, "allowed_keys"))
-        for key in allowed_keys
-    )
-    if not normalized or "" in normalized:
-        raise ValueError("allowed_keys must contain non-empty field names")
-    return normalized
+def _freeze_metadata_tags(
+    value: object,
+    path: str,
+    budget: _MetadataBudget,
+) -> tuple[str, ...]:
+    """冻结数量和内容受限的稳定标签集合。"""
+    if type(value) not in (list, tuple):
+        raise TypeError(f"{path} must be a list or tuple of tags")
+    if len(value) > _MAX_METADATA_TAGS:
+        raise ValueError(f"{path} exceeds the metadata tag limit")
+    frozen: list[str] = []
+    for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
+        budget.consume_item(item_path)
+        if type(item) is not str:
+            raise TypeError(f"{item_path} must be a string")
+        if (
+            not item
+            or item != item.strip()
+            or len(item) > _MAX_METADATA_TAG_LENGTH
+            or not _SAFE_METADATA_TAG_RE.fullmatch(item)
+        ):
+            raise ValueError(f"{item_path} must be a compact metadata tag")
+        _reject_sensitive_metadata_text(item, item_path)
+        budget.consume_text(item, item_path)
+        frozen.append(item)
+    return tuple(frozen)
 
 
 def _freeze_metadata_text(
@@ -330,27 +347,141 @@ def _freeze_metadata_text(
     path: str,
     budget: _MetadataBudget,
 ) -> str:
-    """只保留短的单行摘要文本，并移除可识别凭证值。"""
-    if "\r" in value or "\n" in value:
-        raise ValueError(f"{path} must not contain multi-line text")
-    redacted = redact_explicit_secrets(value)
-    if redacted != value:
-        raise ValueError(f"{path} must not contain credential text")
-    if _PRIVATE_KEY_TEXT_RE.search(value):
-        raise ValueError(f"{path} must not contain private key text")
-    if _ABSOLUTE_PATH_TEXT_RE.match(value.strip()):
+    """只保留短的单行摘要标签或经严格解析的安全 URL。"""
+    if not value or value != value.strip():
+        raise ValueError(f"{path} must contain a compact metadata label")
+    _reject_sensitive_metadata_text(value, path)
+    if _URI_OR_URL_LIKE_TEXT_RE.match(value):
+        _validate_metadata_url(value, path)
+    elif _is_absolute_or_device_path(value):
         raise ValueError(f"{path} must not contain an absolute path")
-    if not _SAFE_METADATA_TEXT_RE.fullmatch(value):
+    elif not _SAFE_METADATA_TEXT_RE.fullmatch(value):
         raise ValueError(f"{path} must contain a compact metadata label")
     budget.consume_text(value, path)
     return value
 
 
+def _reject_sensitive_metadata_text(value: str, path: str) -> None:
+    """拒绝多行、私钥和高置信凭证文本。"""
+    if _MULTI_LINE_OR_CONTROL_TEXT_RE.search(value):
+        raise ValueError(f"{path} must not contain multi-line text")
+    if _PRIVATE_KEY_TEXT_RE.search(value):
+        raise ValueError(f"{path} must not contain private key text")
+    if (
+        redact_explicit_secrets(value) != value
+        or _OBVIOUS_CREDENTIAL_TEXT_RE.search(value)
+    ):
+        raise ValueError(f"{path} must not contain credential text")
+
+
+def _is_absolute_or_device_path(value: str) -> bool:
+    """识别 POSIX、UNC、盘符绝对路径和 Windows device path。"""
+    if value.startswith(("/", "\\")):
+        return True
+    if _WINDOWS_DRIVE_ABSOLUTE_PATH_RE.match(value):
+        return True
+    normalized = value.replace("/", "\\")
+    return normalized.startswith(("\\\\?\\", "\\\\.\\", "\\??\\"))
+
+
+def _validate_metadata_url(value: str, path: str) -> None:
+    """只接收无凭证、查询和片段的可确定 HTTP(S) URL。"""
+    if len(value) > _MAX_METADATA_URL_LENGTH or "\\" in value:
+        raise ValueError(f"{path} contains an invalid URL")
+    try:
+        parsed = urlsplit(value)
+        username = parsed.username
+        password = parsed.password
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError(f"{path} contains an invalid URL") from None
+
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in {"http", "https"}
+        or not value.lower().startswith(f"{scheme}://")
+        or not parsed.netloc
+        or not hostname
+    ):
+        raise ValueError(f"{path} contains an invalid URL")
+    if username is not None or password is not None:
+        raise ValueError(f"{path} URL must not contain user information")
+    if "?" in value or parsed.query:
+        raise ValueError(f"{path} URL must not contain a query")
+    if "#" in value or parsed.fragment:
+        raise ValueError(f"{path} URL must not contain a fragment")
+    if port is not None and not 1 <= port <= 65_535:
+        raise ValueError(f"{path} URL contains an invalid port")
+    if not _SAFE_URL_PATH_RE.fullmatch(parsed.path):
+        raise ValueError(f"{path} contains an invalid URL")
+
+    authority = parsed.netloc
+    bracketed_host = authority.startswith("[")
+    if bracketed_host:
+        closing_bracket = authority.find("]")
+        suffix = authority[closing_bracket + 1:]
+        if closing_bracket < 0 or (
+            suffix
+            and (
+                not suffix.startswith(":")
+                or not suffix[1:]
+                or not suffix[1:].isdigit()
+            )
+        ):
+            raise ValueError(f"{path} contains an invalid URL")
+    else:
+        if authority.count(":") > 1:
+            raise ValueError(f"{path} contains an invalid URL")
+        if ":" in authority and not authority.rsplit(":", 1)[1]:
+            raise ValueError(f"{path} URL contains an invalid port")
+
+    _validate_metadata_hostname(hostname, path, bracketed_host)
+
+
+def _validate_metadata_hostname(
+    hostname: str,
+    path: str,
+    bracketed: bool,
+) -> None:
+    """在不执行 DNS 查询的前提下校验 IP 或 DNS hostname。"""
+    if "%" in hostname:
+        raise ValueError(f"{path} contains an invalid URL hostname")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        if bracketed:
+            raise ValueError(
+                f"{path} contains an invalid URL hostname"
+            ) from None
+    else:
+        if bracketed and address.version != 6:
+            raise ValueError(f"{path} contains an invalid URL hostname")
+        return
+
+    if _AMBIGUOUS_NUMERIC_HOST_RE.fullmatch(hostname):
+        raise ValueError(f"{path} contains an invalid URL hostname")
+    if not hostname.isascii():
+        raise ValueError(f"{path} contains an invalid URL hostname")
+    ascii_hostname = hostname
+    if (
+        not ascii_hostname
+        or len(ascii_hostname) > 253
+        or ascii_hostname.startswith(".")
+        or ascii_hostname.endswith(".")
+        or any(
+            not _DNS_LABEL_RE.fullmatch(label)
+            for label in ascii_hostname.split(".")
+        )
+    ):
+        raise ValueError(f"{path} contains an invalid URL hostname")
+
+
 def _validate_metadata_key(
     key: str,
     path: str,
-    allowed_keys: frozenset[str],
-) -> None:
+    allowed_fields: frozenset[str],
+) -> str:
     """仅允许白名单摘要键，并按组成部分拒绝正文和凭证承载字段。"""
     normalized = _normalize_metadata_key(key)
     if not normalized:
@@ -362,8 +493,11 @@ def _validate_metadata_key(
         or parts & _DISALLOWED_METADATA_KEY_PARTS
     ):
         raise ValueError(f"{path} contains a sensitive metadata key")
-    if normalized not in allowed_keys:
+    if key != normalized:
+        raise ValueError(f"{path} contains a non-canonical metadata key")
+    if normalized not in allowed_fields:
         raise ValueError(f"{path} contains a metadata key outside the allowed set")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)

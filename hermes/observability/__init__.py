@@ -24,7 +24,8 @@ from .contracts import (
     RunObservation,
     ToolCallObservation,
     ToolsetDescriptor,
-    freeze_safe_metadata,
+    freeze_artifact_metadata,
+    freeze_runtime_metadata,
 )
 from .extensions import DashboardExtensionDescriptor, DashboardExtensionRegistry
 from .hooks import register_observation_sink
@@ -60,7 +61,8 @@ __all__ = [
     "ToolCallObservation",
     "ToolExecutionSummary",
     "ToolsetDescriptor",
-    "freeze_safe_metadata",
+    "freeze_artifact_metadata",
+    "freeze_runtime_metadata",
     "project_artifact",
     "project_tool_execution",
     "register_observation_sink",

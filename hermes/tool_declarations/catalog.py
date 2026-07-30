@@ -90,14 +90,24 @@ def build_toolset_catalog_snapshot() -> ToolsetCatalogSnapshot:
     """按来源隔离加载声明，单个失败不会阻断其他 Toolset。"""
     capabilities: list[CapabilityDescriptor] = []
     unavailable_toolsets: set[str] = set()
+    loaded_tool_names: set[str] = set()
     for source in _SOURCES:
         try:
             declarations = _load_source_declarations(source)
+            source_tool_names = {
+                declaration.name
+                for declaration in declarations
+            }
+            if source_tool_names & loaded_tool_names:
+                raise ValueError(
+                    "tool declaration source has cross-source name conflicts"
+                )
             source_capabilities = tuple(
                 capability_from_declaration(declaration)
                 for declaration in declarations
             )
             capabilities.extend(source_capabilities)
+            loaded_tool_names.update(source_tool_names)
         except Exception as exc:
             unavailable_toolsets.update(source.toolsets)
             logger.warning(
@@ -141,6 +151,9 @@ def _load_source_declarations(
         raise TypeError("tool declarations must be a non-empty tuple")
     if not all(isinstance(item, ToolDeclaration) for item in declarations):
         raise TypeError("tool declarations must contain ToolDeclaration")
+    declaration_names = tuple(item.name for item in declarations)
+    if len(declaration_names) != len(set(declaration_names)):
+        raise ValueError("tool declaration source contains duplicate names")
     declared_toolsets = {item.toolset for item in declarations}
     if declared_toolsets != set(source.toolsets):
         raise ValueError("tool declaration source toolsets do not match")
