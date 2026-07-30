@@ -9,6 +9,8 @@ Windows 上明确优先使用 Git Bash，绝不回退到 WSL 的
 
 from __future__ import annotations
 
+import codecs
+from collections import deque
 import os
 import shlex
 import signal
@@ -51,23 +53,34 @@ if sys.platform == "win32":
     _kernel32.CloseHandle.restype = wintypes.BOOL
 
 
-def _create_windows_job(proc: subprocess.Popen) -> object | None:
-    """为后台进程创建必须成功加入的独立 Windows Job。"""
+def _create_windows_job() -> object | None:
+    """创建独立 Windows Job，但不在此处假定目标进程已经存在。"""
 
     if sys.platform != "win32":
         return None
     job_handle = _kernel32.CreateJobObjectW(None, None)
     if not job_handle:
         raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    return job_handle
+
+
+def _assign_windows_job(
+    proc: subprocess.Popen,
+    job_handle: object | None,
+) -> None:
+    """将已启动的根进程加入既有 Windows Job。"""
+
+    if sys.platform != "win32":
+        return
+    if not job_handle:
+        raise RuntimeError("Windows Job handle is unavailable")
     assigned = _kernel32.AssignProcessToJobObject(
         job_handle,
         wintypes.HANDLE(int(proc._handle)),
     )
     if not assigned:
         error = ctypes.get_last_error()
-        _kernel32.CloseHandle(job_handle)
         raise OSError(error, "AssignProcessToJobObject failed")
-    return job_handle
 
 
 def _close_windows_job(job_handle: object | None) -> None:
@@ -82,9 +95,12 @@ def _attach_windows_job(proc: subprocess.Popen) -> None:
 
     if sys.platform != "win32":
         return
+    job_handle: object | None = None
     try:
-        job_handle = _create_windows_job(proc)
-    except OSError:
+        job_handle = _create_windows_job()
+        _assign_windows_job(proc, job_handle)
+    except (OSError, RuntimeError):
+        _close_windows_job(job_handle)
         return
     proc._hermes_job_handle = job_handle
 
@@ -92,76 +108,175 @@ def _attach_windows_job(proc: subprocess.Popen) -> None:
 def _interrupt_local_process(proc: subprocess.Popen) -> None:
     """向本地进程组发送协作式中断；已退出时保持幂等。"""
 
+    if proc.poll() is not None:
+        return
     try:
         if sys.platform == "win32":
             proc.send_signal(signal.CTRL_BREAK_EVENT)
             return
         os.killpg(proc.pid, signal.SIGINT)
-    except (OSError, ProcessLookupError, ValueError):
-        pass
+    except (OSError, ValueError):
+        if proc.poll() is not None:
+            return
+        raise
 
 
 def _kill_local_process_tree(
     proc: subprocess.Popen,
     job_handle: object | None = None,
+    *,
+    job_assigned: bool = False,
 ) -> None:
-    """强制终止本地进程树；Windows 优先使用 Job Object。"""
+    """强制终止本地进程树；真实失败必须反馈给调用方。"""
+
+    if proc.poll() is not None:
+        return
 
     if sys.platform == "win32":
-        if job_handle and _kernel32.TerminateJobObject(job_handle, 130):
-            return
+        job_terminated = False
+        taskkill_succeeded = False
+        root_killed = False
+        failures: list[BaseException] = []
+
+        if job_handle and job_assigned:
+            try:
+                job_result = _kernel32.TerminateJobObject(job_handle, 130)
+            except Exception as error:
+                failures.append(error)
+            else:
+                if job_result:
+                    job_terminated = True
+                else:
+                    failures.append(
+                        OSError(
+                            ctypes.get_last_error(),
+                            "TerminateJobObject failed",
+                        )
+                    )
+
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=5,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
-            pass
-        try:
-            if proc.poll() is None:
+        except Exception as error:
+            failures.append(error)
+        else:
+            if result.returncode == 0:
+                taskkill_succeeded = True
+            elif proc.poll() is None:
+                failures.append(
+                    subprocess.SubprocessError(
+                        f"taskkill failed with return code {result.returncode}"
+                    )
+                )
+
+        if proc.poll() is None:
+            try:
                 proc.kill()
-        except (OSError, ValueError):
-            pass
-        return
+            except Exception as error:
+                if proc.poll() is None:
+                    failures.append(error)
+            else:
+                root_killed = True
+
+        if proc.poll() is not None or any(
+            (job_terminated, taskkill_succeeded, root_killed)
+        ):
+            return
+        if failures:
+            raise failures[-1]
+        raise RuntimeError("Could not terminate local Windows process tree")
 
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
+        return
+    except (OSError, ValueError) as group_error:
+        if proc.poll() is not None:
+            return
         try:
             proc.kill()
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as process_error:
+            if proc.poll() is not None:
+                return
+            raise process_error from group_error
+
+
+def _remove_local_path(path: Path | None) -> None:
+    """幂等删除后台进程私有的临时文件。"""
+
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 class LocalBackgroundProcessHandle(BackgroundProcessHandle):
     """由 LocalBackend 启动的本地后台进程及其独立资源。"""
 
-    _FINAL_OUTPUT_JOIN_SECONDS = 0.05
+    _OUTPUT_READ_CHUNK_BYTES = 8192
+    _MAX_PENDING_OUTPUT_CHARS = 256_000
+    _FINAL_OUTPUT_WAIT_SECONDS = 0.5
+    _CLOSE_OUTPUT_WAIT_SECONDS = 0.5
 
     def __init__(
         self,
         proc: subprocess.Popen,
         *,
         job_handle: object | None = None,
+        job_assigned: bool | None = None,
+        snapshot_path: Path | None = None,
+        startup_gate_path: Path | None = None,
     ) -> None:
         if proc.stdout is None:
             raise RuntimeError("Background process stdout pipe is unavailable")
 
         self._proc = proc
         self._job_handle = job_handle
+        self._job_assigned = (
+            job_handle is not None if job_assigned is None else job_assigned
+        )
+        self._snapshot_path = snapshot_path
+        self._startup_gate_path = startup_gate_path
         self._operation_lock = threading.Lock()
         self._output_lock = threading.Lock()
-        self._output_chunks: list[str] = []
+        self._pending_output: deque[str] = deque()
+        self._pending_chars = 0
+        self._pending_output_truncated = False
         self._stdout = proc.stdout
+        self._output_eof_event = threading.Event()
+        self._output_error: Exception | None = None
         self._closed = False
-        self._output_thread = threading.Thread(
-            target=self._collect_output,
-            name=f"hermes-local-background-output-{proc.pid}",
-            daemon=True,
-        )
-        self._output_thread.start()
+        self._output_thread: threading.Thread | None = None
+
+    def start_output_reader(self) -> None:
+        """在 Handle 已可清理后启动唯一的后台输出读取线程。"""
+
+        with self._operation_lock:
+            if self._closed:
+                raise RuntimeError("Background process handle is closed")
+            if self._output_thread is not None:
+                return
+            output_thread = threading.Thread(
+                target=self._collect_output,
+                name=f"hermes-local-background-output-{self._proc.pid}",
+                daemon=True,
+            )
+            self._output_eof_event.clear()
+            self._output_thread = output_thread
+        try:
+            output_thread.start()
+        except BaseException:
+            with self._operation_lock:
+                if self._output_thread is output_thread:
+                    self._output_thread = None
+            self._output_eof_event.set()
+            raise
 
     @property
     def pid(self) -> int | None:
@@ -178,17 +293,14 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
     def read_available(self) -> str:
         """立即返回输出线程已收集的增量文本。"""
 
-        # 已退出时给内部读取器一个很短的收尾机会，帮助上层排空尾部日志。
-        if (
-            self.poll() is not None
-            and threading.current_thread() is not self._output_thread
-        ):
-            self._output_thread.join(timeout=self._FINAL_OUTPUT_JOIN_SECONDS)
+        if self.poll() is not None and not self._has_pending_output():
+            self._wait_output_eof(self._FINAL_OUTPUT_WAIT_SECONDS)
         with self._output_lock:
-            if not self._output_chunks:
+            if not self._pending_output:
                 return ""
-            output = "".join(self._output_chunks)
-            self._output_chunks.clear()
+            output = "".join(self._pending_output)
+            self._pending_output.clear()
+            self._pending_chars = 0
             return output
 
     def wait(self, timeout: float | None = None) -> int | None:
@@ -211,7 +323,11 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         """强制终止整个本地进程树。"""
 
         with self._operation_lock:
-            _kill_local_process_tree(self._proc, self._job_handle)
+            _kill_local_process_tree(
+                self._proc,
+                self._job_handle,
+                job_assigned=self._job_assigned,
+            )
 
     def close(self) -> None:
         """释放管道、输出读取线程所用资源和 Windows Job。"""
@@ -224,35 +340,105 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
             self._stdout = None
             job_handle = self._job_handle
             self._job_handle = None
-
-        if stdout is not None:
+            snapshot_path = self._snapshot_path
+            self._snapshot_path = None
+            startup_gate_path = self._startup_gate_path
+            self._startup_gate_path = None
+            output_thread = self._output_thread
             try:
-                stdout.close()
-            except (OSError, ValueError):
+                process_exited = self._proc.poll() is not None
+            except Exception:
+                process_exited = False
+
+        if output_thread is None:
+            self._output_eof_event.set()
+        if process_exited:
+            try:
+                self._wait_output_eof(self._CLOSE_OUTPUT_WAIT_SECONDS)
+            except BaseException:
                 pass
-        _close_windows_job(job_handle)
-        if threading.current_thread() is not self._output_thread:
-            self._output_thread.join(timeout=0.1)
+        try:
+            if stdout is not None:
+                try:
+                    stdout.close()
+                except BaseException:
+                    pass
+            if (
+                output_thread is not None
+                and threading.current_thread() is not output_thread
+            ):
+                try:
+                    output_thread.join(timeout=self._CLOSE_OUTPUT_WAIT_SECONDS)
+                except BaseException:
+                    pass
+            try:
+                _close_windows_job(job_handle)
+            except BaseException:
+                pass
+        finally:
+            _remove_local_path(snapshot_path)
+            _remove_local_path(startup_gate_path)
 
     def _collect_output(self) -> None:
-        """阻塞读取 stdout，并把增量文本交给非阻塞读取接口。"""
+        """分块读取 stdout，并把增量文本交给非阻塞读取接口。"""
 
         stdout = self._stdout
-        if stdout is None:
-            return
+        decoder = None
         try:
+            if stdout is None:
+                return
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             while True:
-                # 不能等待换行符，否则长时间运行且无换行的命令会延迟日志可见性。
-                output = stdout.read(1)
+                output = os.read(stdout.fileno(), self._OUTPUT_READ_CHUNK_BYTES)
                 if not output:
                     return
-                with self._output_lock:
-                    self._output_chunks.append(output)
-        except (OSError, ValueError):
-            return
-        except Exception:
+                self._append_pending_output(decoder.decode(output, final=False))
+        except Exception as error:
             # 输出读取器异常不能使后台进程或主流程崩溃。
+            with self._output_lock:
+                self._output_error = error
+        finally:
+            try:
+                if decoder is not None:
+                    self._append_pending_output(decoder.decode(b"", final=True))
+            except Exception as error:
+                with self._output_lock:
+                    if self._output_error is None:
+                        self._output_error = error
+            finally:
+                self._output_eof_event.set()
+
+    def _append_pending_output(self, output: str) -> None:
+        """追加尚未被 ProcessManager 读取的有限增量输出。"""
+
+        if not output:
             return
+        with self._output_lock:
+            self._pending_output.append(output)
+            self._pending_chars += len(output)
+            excess = self._pending_chars - self._MAX_PENDING_OUTPUT_CHARS
+            while excess > 0 and self._pending_output:
+                oldest = self._pending_output[0]
+                if len(oldest) <= excess:
+                    self._pending_output.popleft()
+                    self._pending_chars -= len(oldest)
+                    excess -= len(oldest)
+                else:
+                    self._pending_output[0] = oldest[excess:]
+                    self._pending_chars -= excess
+                    excess = 0
+                self._pending_output_truncated = True
+
+    def _has_pending_output(self) -> bool:
+        """在不消费输出的前提下查询是否已有待取日志。"""
+
+        with self._output_lock:
+            return bool(self._pending_output)
+
+    def _wait_output_eof(self, timeout: float) -> bool:
+        """有限等待输出线程确认 EOF，避免固定 join 导致尾部日志丢失。"""
+
+        return self._output_eof_event.wait(timeout=max(0.0, timeout))
 
 
 # ---------------------------------------------------------------------------
@@ -410,8 +596,10 @@ class LocalBackend(BaseExecutionEnvironment):
             )
 
         snapshot_copy: Path | None = None
+        startup_gate_path: Path | None = None
         proc: subprocess.Popen | None = None
         job_handle: object | None = None
+        job_assigned = False
         handle: LocalBackgroundProcessHandle | None = None
         try:
             # 只在复制当前会话状态时占用前台锁；后台进程运行期间不持有它。
@@ -434,17 +622,48 @@ class LocalBackend(BaseExecutionEnvironment):
                 )
 
             snapshot_shell = self._cwd_to_shell(str(snapshot_copy))
+            if sys.platform == "win32":
+                startup_gate_path = self._new_background_start_gate_path(
+                    snapshot_copy
+                )
             wrapped = self._wrap_background_command(
                 command,
                 cwd_shell=cwd_shell,
                 snapshot_shell=snapshot_shell,
+                startup_gate_shell=(
+                    self._cwd_to_shell(str(startup_gate_path))
+                    if startup_gate_path is not None
+                    else None
+                ),
             )
-            proc = self._run_background_bash(wrapped, env=env)
-            job_handle = _create_windows_job(proc)
+            launch_env = env
+            if sys.platform == "win32":
+                # 非交互 Bash 会在脚本前执行 BASH_ENV；先移除它，避免绕过启动闸门。
+                launch_env = dict(env)
+                launch_env.pop("BASH_ENV", None)
+                job_handle = _create_windows_job()
+            if self._cancel_requested(cancel_checker):
+                raise BackgroundProcessCancelledError(
+                    "Background process start cancelled"
+                )
+            proc = self._run_background_bash(wrapped, env=launch_env)
+            if self._cancel_requested(cancel_checker):
+                raise BackgroundProcessCancelledError(
+                    "Background process start cancelled"
+                )
+            if sys.platform == "win32":
+                _assign_windows_job(proc, job_handle)
+                job_assigned = True
             handle = LocalBackgroundProcessHandle(
                 proc,
                 job_handle=job_handle,
+                job_assigned=job_assigned,
+                snapshot_path=snapshot_copy,
+                startup_gate_path=startup_gate_path,
             )
+            handle.start_output_reader()
+            if startup_gate_path is not None:
+                self._release_background_start_gate(startup_gate_path)
 
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
@@ -455,9 +674,19 @@ class LocalBackend(BaseExecutionEnvironment):
             if handle is not None:
                 self._dispose_background_handle(handle)
             elif proc is not None:
-                self._dispose_unmanaged_background_process(proc, job_handle)
+                self._dispose_unmanaged_background_process(
+                    proc,
+                    job_handle,
+                    job_assigned=job_assigned,
+                )
+            elif job_handle is not None:
+                try:
+                    _close_windows_job(job_handle)
+                except BaseException:
+                    pass
             if snapshot_copy is not None:
                 self._remove_background_snapshot(snapshot_copy)
+            _remove_local_path(startup_gate_path)
             raise
 
     def _copy_background_snapshot_locked(self) -> Path:
@@ -479,11 +708,27 @@ class LocalBackend(BaseExecutionEnvironment):
         *,
         cwd_shell: str,
         snapshot_shell: str,
+        startup_gate_shell: str | None,
     ) -> str:
         """恢复一次性快照并运行命令，但不写回共享 cwd 或环境。"""
 
         quoted_snapshot = shlex.quote(snapshot_shell)
-        return "; ".join(
+        parts: list[str] = []
+        if startup_gate_shell is not None:
+            quoted_gate = shlex.quote(startup_gate_shell)
+            # Popen 不稳定暴露主线程句柄时，使用纯 Bash 内建的启动闸门。
+            # 根 Bash 在加入 Job 前只会自旋，不会启动用户命令或外部子进程。
+            parts.extend(
+                [
+                    (
+                        f"while :; do IFS= read -r _hermes_gate < "
+                        f"{quoted_gate} || _hermes_gate=; "
+                        "[[ $_hermes_gate == ready ]] && break; done"
+                    ),
+                    f"rm -f {quoted_gate}",
+                ]
+            )
+        parts.extend(
             [
                 f"source {quoted_snapshot} 2>/dev/null",
                 f"rm -f {quoted_snapshot}",
@@ -491,6 +736,7 @@ class LocalBackend(BaseExecutionEnvironment):
                 command,
             ]
         )
+        return "; ".join(parts)
 
     def _run_background_bash(
         self,
@@ -510,31 +756,54 @@ class LocalBackend(BaseExecutionEnvironment):
             [bash, "-c", cmd_string],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
             env=env,
             **process_group_options,
         )
 
     @staticmethod
+    def _new_background_start_gate_path(snapshot_copy: Path) -> Path:
+        """原子创建尚未放行的 Windows 后台启动闸门。"""
+
+        while True:
+            gate_path = snapshot_copy.with_name(
+                f"hermes-background-gate-{uuid.uuid4().hex}.ready"
+            )
+            try:
+                with gate_path.open("x", encoding="ascii") as gate_file:
+                    gate_file.write("pending\n")
+            except FileExistsError:
+                continue
+            else:
+                return gate_path
+
+    @staticmethod
+    def _release_background_start_gate(startup_gate_path: Path) -> None:
+        """仅在根 Bash 加入 Job 后放行其执行用户命令。"""
+
+        startup_gate_path.write_text("ready\n", encoding="ascii")
+
+    @staticmethod
     def _remove_background_snapshot(snapshot_copy: Path) -> None:
         """尽力清理未被新 Bash 自行删除的一次性快照文件。"""
 
-        try:
-            snapshot_copy.unlink()
-        except OSError:
-            pass
+        _remove_local_path(snapshot_copy)
 
     @staticmethod
     def _dispose_unmanaged_background_process(
         proc: subprocess.Popen,
         job_handle: object | None,
+        *,
+        job_assigned: bool,
     ) -> None:
         """Handle 构造前失败时终止并释放已启动的本地进程。"""
 
         try:
-            _kill_local_process_tree(proc, job_handle)
+            _kill_local_process_tree(
+                proc,
+                job_handle,
+                job_assigned=job_assigned,
+            )
         except BaseException:
             pass
         try:
@@ -582,10 +851,17 @@ class LocalBackend(BaseExecutionEnvironment):
     def _kill_process_tree(self, proc: subprocess.Popen) -> None:
         """软中断无效时强制结束本地命令的进程树。"""
 
-        _kill_local_process_tree(
-            proc,
-            getattr(proc, "_hermes_job_handle", None),
-        )
+        try:
+            _kill_local_process_tree(
+                proc,
+                getattr(proc, "_hermes_job_handle", None),
+                job_assigned=(
+                    getattr(proc, "_hermes_job_handle", None) is not None
+                ),
+            )
+        except (OSError, ValueError, subprocess.SubprocessError, RuntimeError):
+            # 前台取消沿用既有的尽力而为语义；后台 Handle 则必须保留真实失败。
+            pass
 
     def _release_process_resources(self, proc: subprocess.Popen) -> None:
         """关闭 Windows Job 句柄；正常结束时不终止后台子进程。"""
