@@ -1,6 +1,6 @@
 ---
 name: docx
-description: 使用 MyHermes 独立 DOCX CLI 安全创建、检查、搜索、编辑、验证和渲染 Word 文档，并编排逐页视觉质量检查。
+description: 处理 Word、Word 文档、DOCX 或 .docx 文件的首选 Skill；必须通过 MyHermes 独立 DOCX CLI 创建、读取、搜索、编辑、验证和渲染 Word 文件，并完成逐页视觉质量检查。
 version: 1.0.0
 platforms:
 - linux
@@ -17,9 +17,21 @@ metadata:
 
 # DOCX 标准工作流
 
+## 强制执行边界
+
+凡用户要求创建、读取、检查、搜索、编辑、验证或渲染 Word、Word 文档、DOCX 或 `.docx` 文件，必须使用 `documents.docx` 的公开 CLI 工作流：
+
+- 不得导入或使用 `python-docx`，包括直接 `import docx`；
+- 不得为常规 Word/DOCX 任务安装或调用其他 DOCX 库；
+- 不得编写或运行绕过公开 CLI 的 Python、Node 或其他 DOCX 生成、读取、修改脚本；
+- 不得直接解压、读取或修改 OOXML 来完成文档任务；
+- 不得跳过或绕过 strict validation 以及本 Skill 定义的输出质量验证流程。
+
+只有用户明确要求开发、调试或修改 `documents/docx` 模块内部实现时，才允许在该请求范围内接触底层实现。
+
 ## 何时使用
 
-用户要求创建、读取、搜索、修改、验证或渲染 `.docx` 时使用本 Skill。仅调用 `documents.docx` 已公开的 Python CLI；不要直接解压、改写 OOXML，不要新增 DOCX Tool，也不要把这里的编排逻辑移入 `DocxService`、validator 或 renderer。
+用户要求创建、读取、搜索、编辑、验证或渲染 Word 文件时使用本 Skill。仅调用 `documents.docx` 已公开的 Python CLI；不要新增 DOCX Tool，也不要把这里的编排逻辑移入 `DocxService`、validator 或 renderer。
 
 当前能力不覆盖 tracked changes、comments、TOC、模板和其他高级 Word 功能。遇到这些结构时保留原文件并明确报告限制。
 

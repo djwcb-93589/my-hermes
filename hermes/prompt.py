@@ -33,6 +33,27 @@ _CRON_ROUTING_GUIDANCE = (
     "cron arguments."
 )
 
+_SKILL_FIRST_GUIDANCE = (
+    "## Skill-First Workflow\n"
+    "When a task clearly matches a discovered Skill above, the first "
+    "domain-specific tool call in the execution context must be `skill_view` "
+    "for that Skill. Read its instructions before taking any related action. "
+    "Until the matching Skill has been read, do not install third-party "
+    "packages, create temporary or replacement implementation scripts, or "
+    "directly manipulate the domain file format. An available Skill is the "
+    "primary supported workflow for its domain.\n"
+    "Fall back only when the Skill is unavailable, cannot satisfy the request, "
+    "or the user explicitly asks for another implementation. State the reason "
+    "before using the fallback. This rule governs domain execution and does "
+    "not expand toolsets, path access, network access, or approval authority. "
+    "If a required capability is unavailable, report or follow the Skill's "
+    "documented fallback; never bypass the boundary.\n"
+    "For future, delayed, or recurring work, the existing cron routing remains "
+    "first: do not call `skill_view` or begin domain work in the scheduling "
+    "turn. Include the exact discovered Skill name in the routed execution's "
+    "`skills` input so it is loaded before the work."
+)
+
 
 def _script_workspace_guidance() -> str:
     """给可使用本地工具的会话提供统一的临时脚本落盘位置。"""
@@ -96,14 +117,24 @@ def build_system_prompt(
         if memory_section is not None:
             parts.append(memory_section)
 
-    skill_enabled = (
+    skill_catalog_enabled = (
         selected_toolsets is None
         or bool({"skill_read", "skill_manage"} & set(selected_toolsets))
     )
-    if skill_enabled:
+    skill_read_enabled = (
+        selected_toolsets is None
+        or "skill_read" in selected_toolsets
+    )
+    if skill_catalog_enabled:
         skills_section = render_skills_section()
         if skills_section is not None:
-            parts.append(skills_section)
+            parts.append(
+                (
+                    f"{skills_section}\n\n{_SKILL_FIRST_GUIDANCE}"
+                    if skill_read_enabled
+                    else skills_section
+                )
+            )
 
     if selected_toolsets is None:
         # None 保持 CLI 原有完整工具提示。
