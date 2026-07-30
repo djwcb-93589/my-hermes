@@ -104,6 +104,7 @@ from hermes.approval_policy import (
     issue_trusted_approval_grant,
 )
 from hermes.gateway.adapters import BasePlatformAdapter
+from hermes.gateway.constants import GATEWAY_RUNTIME_LEASE_NAME
 from hermes.gateway.file_transfer import load_file_transfer_config
 from hermes.gateway.outbound_delivery import OutboundDeliveryService
 from hermes.gateway.observability import (
@@ -180,7 +181,6 @@ _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
         "include_project_context": False,
     },
 }
-_GATEWAY_RUNTIME_LEASE_NAME = "gateway-main"
 _FILE_UPLOAD_CONCURRENCY = 2
 _FILE_DELIVERY_POLL_SECONDS = 0.5
 _SAFE_MODEL_TIMEOUT_REPLY = "处理失败：模型响应超时，请稍后重试。"
@@ -876,7 +876,7 @@ class GatewayRunner:
         self.persistence = GatewayPersistence(db_path)
         self._runtime_lease = GatewayRuntimeLease(
             self.persistence,
-            lease_name=_GATEWAY_RUNTIME_LEASE_NAME,
+            lease_name=GATEWAY_RUNTIME_LEASE_NAME,
             ttl_seconds=self.runtime_lease_ttl_seconds,
             heartbeat_seconds=self.runtime_lease_heartbeat_seconds,
             on_lost=self._on_runtime_lease_lost,

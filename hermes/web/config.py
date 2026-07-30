@@ -10,7 +10,11 @@ from pathlib import Path
 import yaml
 
 from hermes.config_values import hermes_home
-from hermes.web.security import ControlAuthenticator, is_loopback_host
+from hermes.web.security import (
+    ControlAuthenticator,
+    is_loopback_host,
+    normalize_dashboard_host,
+)
 
 
 _DEFAULT_HOST = "127.0.0.1"
@@ -223,7 +227,15 @@ def _parse_host(value: object) -> str:
         or _ENV_REFERENCE.search(value)
     ):
         raise DashboardConfigurationError("dashboard.host must be a non-empty string")
-    return value
+    normalized = normalize_dashboard_host(value)
+    if normalized is None:
+        raise DashboardConfigurationError("dashboard.host must be a non-empty string")
+    if value.startswith("[") or value.endswith("]"):
+        if normalized != "::1":
+            raise DashboardConfigurationError(
+                "dashboard.host only accepts brackets for [::1]"
+            )
+    return normalized
 
 
 def _parse_port(value: object) -> int:

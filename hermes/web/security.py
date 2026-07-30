@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import re
 import secrets
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from urllib.parse import urlparse
 
 
 TOKEN_HEADER = "X-Hermes-Control-Token"
+_DASHBOARD_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class ControlUnavailable(Exception):
@@ -182,21 +182,24 @@ class DashboardAccessPolicy:
 
 def is_loopback_host(host: object) -> bool:
     """只把明确的回环地址或名称视为无需强制读取认证的绑定。"""
+    return normalize_dashboard_host(host) in _DASHBOARD_LOOPBACK_HOSTS
+
+
+def normalize_dashboard_host(host: object) -> str | None:
+    """统一规范化 Dashboard 绑定和 Origin 比较使用的主机名。"""
     if not isinstance(host, str):
-        return False
+        return None
     normalized = host.strip().lower()
-    if normalized == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        # 不做 DNS 解析；未知主机名按非回环地址 fail-closed。
-        return False
+    if normalized.startswith("[") and normalized.endswith("]"):
+        bracketed_host = normalized[1:-1]
+        if ":" in bracketed_host:
+            normalized = bracketed_host
+    return normalized or None
 
 
 def cors_origin_regex(bound_host: str) -> str:
     """只允许与安全绑定规则相符的浏览器 Origin。"""
-    normalized = _normalized_host(bound_host)
+    normalized = normalize_dashboard_host(bound_host)
     if is_loopback_host(normalized):
         hosts = r"localhost|127\.0\.0\.1|\[::1\]"
     elif normalized and normalized not in {"0.0.0.0", "::"}:
@@ -215,10 +218,10 @@ def is_allowed_dashboard_origin(origin: str, bound_host: str) -> bool:
     parsed = _parse_http_origin(origin)
     if parsed is None:
         return False
-    origin_host = _normalized_host(parsed.hostname)
+    origin_host = normalize_dashboard_host(parsed.hostname)
     if origin_host is None:
         return False
-    bound = _normalized_host(bound_host)
+    bound = normalize_dashboard_host(bound_host)
     if bound in {None, "0.0.0.0", "::"}:
         return False
     if is_loopback_host(bound):
@@ -251,13 +254,3 @@ def _parse_http_origin(origin: str):
     ):
         return None
     return parsed
-
-
-def _normalized_host(host: object) -> str | None:
-    """统一比较 hostname，IPv6 以不带方括号的形式保存。"""
-    if not isinstance(host, str) or not host:
-        return None
-    normalized = host.strip().lower()
-    if normalized.startswith("[") and normalized.endswith("]"):
-        normalized = normalized[1:-1]
-    return normalized or None

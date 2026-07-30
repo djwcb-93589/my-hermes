@@ -8,6 +8,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from hermes.gateway.constants import GATEWAY_RUNTIME_LEASE_NAME
 from hermes.persistence.read_only import readonly_connection
 from hermes.persistence.schema import LATEST_SCHEMA_VERSION
 from hermes.web.schemas import DatabaseHealth, GatewayHealth
@@ -117,37 +118,29 @@ def inspect_gateway_health(db_path: str | None) -> GatewayHealth:
                         status="unavailable",
                         reason_code="lease_table_missing",
                     )
-                rows = conn.execute(
-                    "SELECT heartbeat_at, expires_at FROM gateway_runtime_lease "
-                    "ORDER BY expires_at DESC"
-                ).fetchall()
+                row = conn.execute(
+                    "SELECT heartbeat_at, expires_at "
+                    "FROM gateway_runtime_lease WHERE lease_name = ?",
+                    (GATEWAY_RUNTIME_LEASE_NAME,),
+                ).fetchone()
             except sqlite3.Error:
                 return GatewayHealth(status="unavailable", reason_code="lease_query_failed")
     except (sqlite3.Error, OSError, ValueError):
         return GatewayHealth(status="unavailable", reason_code="db_open_failed")
 
-    if not rows:
+    if row is None:
         return GatewayHealth(status="stopped", reason_code="lease_not_found")
 
     now = time.time()
-    snapshots = [_lease_snapshot(row) for row in rows]
-    valid = [snapshot for snapshot in snapshots if _lease_is_valid(snapshot, now)]
-    if valid:
-        selected = max(valid, key=lambda snapshot: snapshot[1])
+    heartbeat_at, expires_at = _lease_snapshot(row)
+    if _lease_is_valid((heartbeat_at, expires_at), now):
         return GatewayHealth(
             status="running",
             reason_code=None,
-            heartbeat_at=_timestamp_to_utc(selected[0]),
-            expires_at=_timestamp_to_utc(selected[1]),
+            heartbeat_at=_timestamp_to_utc(heartbeat_at),
+            expires_at=_timestamp_to_utc(expires_at),
         )
 
-    selected = max(
-        snapshots,
-        key=lambda snapshot: (
-            snapshot[1] if snapshot[1] is not None else float("-inf")
-        ),
-    )
-    heartbeat_at, expires_at = selected
     if expires_at is not None and expires_at <= 0:
         return GatewayHealth(
             status="stopped",
