@@ -18,6 +18,9 @@ from hermes.config import HERMES_HOME
 
 
 SKILLS_DIR = HERMES_HOME / "skills"
+BUNDLED_SKILLS_DIR = (
+    Path(__file__).resolve().parent / "bundled" / "skills"
+)
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ALLOWED_FM_FIELDS = {"name", "description", "version", "platforms", "metadata"}
 _GOVERNANCE_FILE = ".myhermes.json"
@@ -27,10 +30,19 @@ _PROTECTED_SKILL_FILES = frozenset({"SKILL.md", _GOVERNANCE_FILE})
 
 
 class SkillRepository:
-    """只负责 Skill 文件的解析、读取和原子化修改。"""
+    """读取独立的用户与 bundled Skill，并只修改用户 Skill。"""
 
-    def __init__(self, skills_dir: Path | None = None):
+    def __init__(
+        self,
+        skills_dir: Path | None = None,
+        bundled_skills_dir: Path | None = None,
+    ):
         self.skills_dir = skills_dir if skills_dir is not None else SKILLS_DIR
+        self.bundled_skills_dir = (
+            bundled_skills_dir
+            if bundled_skills_dir is not None
+            else BUNDLED_SKILLS_DIR
+        )
 
     def _validate_name(self, name: str) -> tuple[bool, str]:
         if not name:
@@ -42,11 +54,28 @@ class SkillRepository:
         return True, ""
 
     def _resolve_skill_dir(self, name: str) -> tuple[Path | None, str]:
+        """解析可写的用户 Skill；所有写操作继续使用这一根目录。"""
+
+        return self._resolve_skill_dir_in(self.skills_dir, name)
+
+    def _resolve_bundled_skill_dir(
+        self,
+        name: str,
+    ) -> tuple[Path | None, str]:
+        """解析随发布物交付的只读 bundled Skill。"""
+
+        return self._resolve_skill_dir_in(self.bundled_skills_dir, name)
+
+    def _resolve_skill_dir_in(
+        self,
+        root: Path,
+        name: str,
+    ) -> tuple[Path | None, str]:
         ok, reason = self._validate_name(name)
         if not ok:
             return None, reason
-        root_real = self.skills_dir.resolve()
-        target_real = (self.skills_dir / name).resolve()
+        root_real = root.resolve()
+        target_real = (root / name).resolve()
         if target_real == root_real:
             return None, "name resolves to skills root"
         if not str(target_real).startswith(str(root_real) + os.sep):
@@ -55,11 +84,46 @@ class SkillRepository:
             return None, "name must be a direct child of skills root"
         return target_real, ""
 
-    def _resolve_support_file(self, name: str, relative_path: str) -> tuple[Path | None, str]:
-        """解析允许的 package 文件，并拒绝路径与符号链接逃逸。"""
+    def _resolve_read_skill_dir(
+        self,
+        name: str,
+    ) -> tuple[Path | None, str | None, str]:
+        """按用户优先、bundled 回退规则解析当前可见 Skill。"""
+
+        local_dir, reason = self._resolve_skill_dir(name)
+        if local_dir is None:
+            return None, None, reason
+        if (local_dir / "SKILL.md").is_file():
+            return local_dir, "local", ""
+        bundled_dir, reason = self._resolve_bundled_skill_dir(name)
+        if bundled_dir is None:
+            return None, None, reason
+        if (bundled_dir / "SKILL.md").is_file():
+            return bundled_dir, "bundled", ""
+        return None, None, ""
+
+    def _resolve_support_file(
+        self,
+        name: str,
+        relative_path: str,
+    ) -> tuple[Path | None, str]:
+        """解析可写用户 Skill 的 supporting file。"""
+
         skill_dir, reason = self._resolve_skill_dir(name)
         if skill_dir is None:
             return None, reason
+        return self._resolve_support_file_in(
+            skill_dir,
+            relative_path,
+        )
+
+    def _resolve_support_file_in(
+        self,
+        skill_dir: Path,
+        relative_path: str,
+    ) -> tuple[Path | None, str]:
+        """解析允许的 package 文件，并拒绝路径与符号链接逃逸。"""
+
         if not isinstance(relative_path, str) or not relative_path:
             return None, "relative_path is required"
         normalized = relative_path.replace("\\", "/")
@@ -149,14 +213,29 @@ class SkillRepository:
         return f"---\n{fm_text}\n---\n\n{body}"
 
     def discover(self) -> list[dict]:
-        if not self.skills_dir.exists():
+        """合并 bundled 与用户目录；同名用户 Skill 稳定覆盖 bundled。"""
+
+        discovered: dict[str, dict] = {}
+        for root in (self.bundled_skills_dir, self.skills_dir):
+            for directory_name, entry in self._discover_root(root):
+                discovered[directory_name] = entry
+        return [discovered[name] for name in sorted(discovered)]
+
+    def _discover_root(self, root: Path) -> list[tuple[str, dict]]:
+        if not root.exists() or not root.is_dir():
             return []
-        out: list[dict] = []
-        for skill_dir in sorted(self.skills_dir.iterdir()):
+        out: list[tuple[str, dict]] = []
+        for skill_dir in sorted(root.iterdir()):
             if not skill_dir.is_dir() or not self._validate_name(skill_dir.name)[0]:
                 continue
+            resolved_dir, _ = self._resolve_skill_dir_in(
+                root,
+                skill_dir.name,
+            )
+            if resolved_dir is None or resolved_dir != skill_dir.resolve():
+                continue
             skill_file = skill_dir / "SKILL.md"
-            if not skill_file.exists():
+            if not skill_file.is_file():
                 continue
             text = skill_file.read_text(encoding="utf-8")
             metadata, _, error = self.parse_frontmatter_safe(text)
@@ -170,16 +249,25 @@ class SkillRepository:
                 for key in ("version", "platforms", "metadata"):
                     if key in metadata:
                         entry[key] = metadata[key]
-            out.append(entry)
+            out.append((skill_dir.name, entry))
         return out
 
     def load(self, name: str) -> dict:
-        skill_dir, reason = self._resolve_skill_dir(name)
+        skill_dir, _, reason = self._resolve_read_skill_dir(name)
         if skill_dir is None:
-            return {"ok": False, "error_type": "invalid_name", "error": reason}
+            if reason:
+                return {
+                    "ok": False,
+                    "error_type": "invalid_name",
+                    "error": reason,
+                }
+            return {
+                "ok": False,
+                "error_type": "not_found",
+                "error": f"skill {name!r} does not exist",
+                "name": name,
+            }
         skill_file = skill_dir / "SKILL.md"
-        if not skill_file.exists():
-            return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
         try:
             text = skill_file.read_text(encoding="utf-8")
         except OSError as exc:
@@ -195,13 +283,18 @@ class SkillRepository:
                 "revision": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
     def resolve_source(self, name: str) -> dict:
-        """根据实际 Skill 位置解析来源，为后续安装来源保留扩展点。"""
-        skill_dir, reason = self._resolve_skill_dir(name)
+        """返回覆盖规则选中的实际 Skill 来源。"""
+
+        skill_dir, source, reason = self._resolve_read_skill_dir(name)
         if skill_dir is None:
-            return {"ok": False, "error_type": "invalid_name", "error": reason}
-        if not (skill_dir / "SKILL.md").exists():
+            if reason:
+                return {
+                    "ok": False,
+                    "error_type": "invalid_name",
+                    "error": reason,
+                }
             return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
-        return {"ok": True, "source": "local"}
+        return {"ok": True, "source": source}
 
     def _read_governance_record(self, skill_dir: Path, name: str) -> dict:
         sidecar = skill_dir / _GOVERNANCE_FILE
@@ -236,11 +329,14 @@ class SkillRepository:
 
     def load_governance_record(self, name: str) -> dict:
         """读取治理 sidecar；缺失时显式标记为 legacy，绝不自动写入。"""
-        skill_dir, reason = self._resolve_skill_dir(name)
+        skill_dir, _, reason = self._resolve_read_skill_dir(name)
         if skill_dir is None:
-            return {"ok": False, "error_type": "invalid_name", "error": reason}
-        skill_file = skill_dir / "SKILL.md"
-        if not skill_file.exists():
+            if reason:
+                return {
+                    "ok": False,
+                    "error_type": "invalid_name",
+                    "error": reason,
+                }
             return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
         return self._read_governance_record(skill_dir, name)
 
@@ -290,10 +386,14 @@ class SkillRepository:
 
     def list_support_files(self, name: str) -> dict:
         """返回允许 package 目录中的安全相对文件路径。"""
-        skill_dir, reason = self._resolve_skill_dir(name)
+        skill_dir, _, reason = self._resolve_read_skill_dir(name)
         if skill_dir is None:
-            return {"ok": False, "error_type": "invalid_name", "error": reason}
-        if not (skill_dir / "SKILL.md").exists():
+            if reason:
+                return {
+                    "ok": False,
+                    "error_type": "invalid_name",
+                    "error": reason,
+                }
             return {"ok": False, "error_type": "not_found", "error": f"skill {name!r} does not exist", "name": name}
         files: list[str] = []
         try:
@@ -304,7 +404,10 @@ class SkillRepository:
                 for path in root.rglob("*"):
                     if not path.is_file():
                         continue
-                    resolved, _ = self._resolve_support_file(name, path.relative_to(skill_dir).as_posix())
+                    resolved, _ = self._resolve_support_file_in(
+                        skill_dir,
+                        path.relative_to(skill_dir).as_posix(),
+                    )
                     if resolved is not None and resolved == path.resolve():
                         files.append(path.relative_to(skill_dir).as_posix())
         except OSError as exc:
@@ -313,7 +416,25 @@ class SkillRepository:
 
     def read_support_file(self, name: str, relative_path: str) -> dict:
         """读取一个 UTF-8 supporting file，并从本次读取生成 revision。"""
-        target, reason = self._resolve_support_file(name, relative_path)
+        skill_dir, _, reason = self._resolve_read_skill_dir(name)
+        if skill_dir is None:
+            if reason:
+                return {
+                    "ok": False,
+                    "error_type": "invalid_path",
+                    "error": reason,
+                    "name": name,
+                }
+            return {
+                "ok": False,
+                "error_type": "not_found",
+                "error": f"skill {name!r} does not exist",
+                "name": name,
+            }
+        target, reason = self._resolve_support_file_in(
+            skill_dir,
+            relative_path,
+        )
         if target is None:
             return {"ok": False, "error_type": "invalid_path", "error": reason, "name": name}
         if not target.exists() or not target.is_file():

@@ -33,3 +33,15 @@ include = ["hermes", "hermes.*", "browser", "browser.*", "documents", "documents
     "node_runtime/scripts/check.mjs",
     "node_runtime/scripts/create.mjs",
 ]
+"hermes.skills.bundled" = [
+    "skills/*/SKILL.md",
+    "skills/*/.myhermes.json",
+    "skills/*/references/*",
+    "skills/*/references/**/*",
+    "skills/*/templates/*",
+    "skills/*/templates/**/*",
+    "skills/*/scripts/*",
+    "skills/*/scripts/**/*",
+    "skills/*/assets/*",
+    "skills/*/assets/**/*",
+]

@@ -86,6 +86,8 @@ python -m documents.docx.cli validate output/report.docx --strict
 
 ## Render
 
+render 的输出目录必须使用当前会话 backend cwd 内的相对路径，并确认解析结果仍位于 cwd 内。即使 source 或最终 DOCX 位于 cwd 外，也要使用 cwd 内的 QA 目录；不得传入绝对 QA 路径，也不得使用 `..` 越过 cwd。
+
 ```bash
 python -m documents.docx.cli render output/report.docx output/report-qa --export-page-images
 ```

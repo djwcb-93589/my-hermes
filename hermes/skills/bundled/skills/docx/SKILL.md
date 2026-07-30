@@ -46,8 +46,8 @@ metadata:
 ## 输出约定
 
 - 最终 DOCX 写入用户指定路径；没有指定时写入当前工作目录的 `output/`。
-- 质量验证文件写入最终 DOCX 同级的 `<文件名>-qa/`，其中 PDF 由 renderer 命名，页面图片为 `page-0001.png`、`page-0002.png` 等。
-- spec 和 operations JSON 放在 `<文件名>-qa/requests/`，不要与最终文件混在一起。
+- 质量验证产物必须生成在当前会话 backend cwd 范围内；默认使用 cwd 相对目录 `output/<文件名>-qa/`。即使最终 DOCX 位于 cwd 外，也不得把 QA 目录放到最终 DOCX 同级。
+- spec 和 operations JSON 放在上述 cwd 内 QA 目录的 `requests/`，不要与最终文件混在一起。
 - 只在用户明确允许覆盖，或目标是本次流程创建的中间产物时使用 `--overwrite`。
 
 ## 不可省略的安全规则
@@ -57,4 +57,5 @@ metadata:
 - edit 成功后使用返回的新 revision 和 `block_remap`；旧 block_id 不再视为稳定。
 - strict validate 的 `valid` 不为 true 时禁止交付。
 - Renderer 拒绝外部资源或失败时，不尝试下载资源，也不绕过验证。
+- 传给 `media_analyze` 的页面路径必须是当前 backend cwd 内的普通相对路径；禁止绝对路径、包含 `..` 的越界路径或任何解析后位于 cwd 外的路径。
 - 视觉检查不可用时，明确标记“仅完成结构验证，未完成视觉验证”，不能声称质量闭环已经完成。

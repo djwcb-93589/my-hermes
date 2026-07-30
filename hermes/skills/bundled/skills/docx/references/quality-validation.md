@@ -15,20 +15,20 @@ create 或 edit
 
 ## 渲染
 
-为最终 DOCX 创建独立 QA 目录，然后执行：
+在当前会话 backend cwd 内创建独立 QA 目录，并在调用 render 前确认其相对路径解析后仍位于 cwd 内，然后执行：
 
 ```bash
 python -m documents.docx.cli validate output/report.docx --strict
 python -m documents.docx.cli render output/report.docx output/report-qa --export-page-images --overwrite
 ```
 
-先检查 render JSON 中的 `pdf_path` 和 `pages`，再用 `file` 列出 QA 目录。页码必须从 1 连续到返回页数，且每个路径都存在。不要把“生成了 PDF”当作已经完成视觉检查。
+先检查 render JSON 中的 `pdf_path` 和 `pages`，再用 `file` 通过 cwd 相对路径列出 QA 目录。页码必须从 1 连续到返回页数，且每个路径都存在。render JSON 中的绝对路径只用于核对结果，不得直接传给 `media_analyze`；视觉调用应从已知 QA 目录构造 cwd 相对页面路径。不要把“生成了 PDF”当作已经完成视觉检查。
 
 视觉检查前也要对可见文字分别搜索 `{{`、`${`、`[TODO]`、`TBD` 和 `Lorem ipsum` 等常见占位标记。命中后结合上下文判断是否为用户有意保留的文字；不要使用正则或直接扫描 OOXML。
 
 ## 逐页视觉检查
 
-使用 `media_analyze` 检查所有 `page-*.png`。每次最多 20 页；超过 20 页时按连续页码分批，批次之间保留页码范围。提示词至少要求逐页报告：
+使用 `media_analyze` 检查所有 `page-*.png`，并且只传入 cwd 内的相对路径，例如 `output/report-qa/page-0001.png`。禁止传入绝对路径、包含 `..` 的越界路径或 cwd 外路径。每次最多 20 页；超过 20 页时按连续页码分批，批次之间保留页码范围。提示词至少要求逐页报告：
 
 1. 表格是否越过页边距、列宽是否异常、文字是否被截断或重叠；
 2. 分页是否异常，包括孤立标题、段落被不合理拆分、意外分页和多余空白页；
@@ -44,7 +44,7 @@ python -m documents.docx.cli render output/report.docx output/report-qa --export
 - 先记录页码、对象和可见症状，再选择现有 create/edit 能力修正。
 - 不支持的复杂结构不直接改 XML；保留文件并报告限制。
 - 每次修正后重新执行 strict validate、render 和全部页面检查，不能只看发生变化的页面。
-- 使用同一 QA 目录覆盖时，renderer 只管理严格命名的页面图片；不要删除目录中的其他文件。
+- 使用上述 cwd 内 QA 目录覆盖时，renderer 只管理严格命名的页面图片；不要删除目录中的其他文件。
 - 多次修正仍无法稳定排版时，交付前明确列出未解决问题和受影响页码，不声称验证通过。
 
 ## 降级

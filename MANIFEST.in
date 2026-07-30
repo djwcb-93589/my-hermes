@@ -1,0 +1,2 @@
+recursive-include hermes/skills/bundled/skills *
+recursive-include hermes/skills/bundled/skills .myhermes.json
