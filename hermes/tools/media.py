@@ -8,33 +8,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hermes.tools import _metadata_registration_import_active
-
-
-__hermes_metadata_only__ = _metadata_registration_import_active()
-
-
-if not __hermes_metadata_only__:
-    from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
-    from hermes.approval import build_assessment_response, is_remote_approval
-    from hermes.tools.media_approval import (
-        approved_media_snapshots_candidate,
-        approved_media_state_matches,
-        assess_media_path_policy_denial,
-        assess_media_analysis,
-        has_symlink_component,
-        is_sensitive_media_path,
-        register_media_approval_handler,
-    )
-    from hermes.backends import get_backend
-    from hermes.backends.local import LocalBackend
-    from hermes.file_state import FileStateSnapshotError, capture_file_state_snapshot
-    from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessDeniedError
+from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
+from hermes.approval import build_assessment_response, is_remote_approval
+from hermes.backends import get_backend
+from hermes.backends.local import LocalBackend
+from hermes.file_state import FileStateSnapshotError, capture_file_state_snapshot
+from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessDeniedError
+from hermes.tool_declarations.media import MAX_MEDIA_FILES, TOOL_DECLARATIONS
+from hermes.tools.media_approval import (
+    approved_media_snapshots_candidate,
+    approved_media_state_matches,
+    assess_media_analysis,
+    assess_media_path_policy_denial,
+    has_symlink_component,
+    is_sensitive_media_path,
+    register_media_approval_handler,
+)
 
 
 _ALLOWED_FIELDS = frozenset({"paths", "prompt", "media_type", "timeout_ms"})
 _MEDIA_TYPES = frozenset({"auto", "image", "audio"})
-_MAX_MEDIA_FILES = 20
+_MAX_MEDIA_FILES = MAX_MEDIA_FILES
 _EXTERNAL_MEDIA_APPROVAL_SUMMARY = (
     "这些本地媒体文件将被发送给外部多模态模型服务，并可能产生费用。"
 )
@@ -315,60 +309,5 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
 
 def register(registry) -> None:
     """注册仅供交互式 CLI 会话调用的高成本媒体分析能力。"""
-    if not getattr(registry, "metadata_only", False):
-        register_media_approval_handler()
-    registry.register(
-        name="media_analyze",
-        toolset="media",
-        schema={
-            "name": "media_analyze",
-            "description": (
-                "Analyze 1 to 20 local media files with the configured Doubao "
-                "multimodal model. Supported formats: PNG, JPEG, WEBP, MP3, "
-                "WAV, AAC, and M4A. Every path must be relative to the current "
-                "session cwd and pass the shared filesystem policy. Use one "
-                "call for a single item or several related images/audio files. "
-                "This sends media to an external model service and may incur "
-                "cost. Do not automatically repeat a request after timeout, "
-                "network failure, or an unknown result."
-            ),
-            "parameters": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": _MAX_MEDIA_FILES,
-                        "items": {"type": "string"},
-                        "description": "Media paths relative to the current session cwd.",
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "What to extract, describe, compare, or summarize.",
-                    },
-                    "media_type": {
-                        "type": "string",
-                        "enum": ["auto", "image", "audio"],
-                        "default": "auto",
-                        "description": "Restrict all inputs to image or audio, or detect automatically.",
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Optional model request timeout in milliseconds.",
-                    },
-                },
-                "required": ["paths", "prompt"],
-            },
-        },
-        handler=handle_media_analyze,
-        execution_environments=("cli", "gateway"),
-        unattended_allowed=False,
-        approval_mode="interactive_or_remote",
-        risk_level="high",
-        default_enabled_environments=("cli",),
-        retry_safe=False,
-        unknown_on_crash=True,
-    )
+    register_media_approval_handler()
+    registry.register_declaration(TOOL_DECLARATIONS[0], handle_media_analyze)

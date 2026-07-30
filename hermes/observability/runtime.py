@@ -12,7 +12,7 @@ from typing import Protocol
 
 from hermes.observability.contracts import (
     _optional_error_type,
-    freeze_safe_metadata,
+    freeze_runtime_metadata,
 )
 
 
@@ -87,7 +87,7 @@ class RuntimeComponentSnapshot:
         object.__setattr__(
             self,
             "metadata",
-            freeze_safe_metadata(self.metadata),
+            freeze_runtime_metadata(self.metadata),
         )
 
 
@@ -125,7 +125,7 @@ class RuntimeComponentReporter:
         self._publisher = (
             publisher if publisher is not None else NullRuntimeStatusPublisher()
         )
-        self._metadata = freeze_safe_metadata(
+        self._metadata = freeze_runtime_metadata(
             {} if metadata is None else metadata
         )
         self._started_at: float | None = None

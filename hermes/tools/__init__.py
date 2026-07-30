@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import json
-import importlib
 import logging
-import sys
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable
@@ -14,6 +11,11 @@ from typing import Callable, Iterable
 from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
+)
+from hermes.tool_declarations.contracts import (
+    ToolDeclaration,
+    capability_from_declaration,
+    toolsets_from_capabilities,
 )
 
 
@@ -51,31 +53,6 @@ _TOOL_RISK_RANK = {
 
 
 logger = logging.getLogger(__name__)
-
-
-_METADATA_IMPORT_DEPTH = 0
-
-
-@contextmanager
-def _metadata_registration_import_scope():
-    """标记仅声明元数据的工具模块导入，避免其导入运行时配置。"""
-    global _METADATA_IMPORT_DEPTH
-    _METADATA_IMPORT_DEPTH += 1
-    try:
-        yield
-    finally:
-        _METADATA_IMPORT_DEPTH -= 1
-
-
-def _metadata_registration_import_active() -> bool:
-    """供工具模块在导入期判断是否只能加载声明内容。"""
-    return _METADATA_IMPORT_DEPTH > 0
-
-
-def _metadata_only_handler(*args, **kwargs) -> str:
-    """防止 Metadata-only Registry 的条目被直接当作可执行工具调用。"""
-    del args, kwargs
-    raise RuntimeError("metadata-only tool registry cannot execute tools")
 
 
 def _normalize_environment(
@@ -166,16 +143,8 @@ class ToolEntry:
 class ToolRegistry:
     """全局工具注册表；会话入口只能通过解析结果取得能力。"""
 
-    def __init__(self, *, metadata_only: bool = False):
-        if not isinstance(metadata_only, bool):
-            raise TypeError("metadata_only must be a boolean")
+    def __init__(self):
         self._tools: dict[str, ToolEntry] = {}
-        self._metadata_only = metadata_only
-
-    @property
-    def metadata_only(self) -> bool:
-        """标识此 Registry 只能提供声明快照，不能执行工具。"""
-        return self._metadata_only
 
     def register(
         self,
@@ -215,9 +184,7 @@ class ToolRegistry:
             name=name,
             toolset=str(toolset).strip().lower(),
             schema=schema,
-            handler=(
-                _metadata_only_handler if self._metadata_only else handler
-            ),
+            handler=handler,
             execution_environments=frozenset(
                 _normalize_environment(item)
                 for item in execution_environments
@@ -242,9 +209,42 @@ class ToolRegistry:
             ),
             retry_safe=normalized_retry_safe,
             unknown_on_crash=normalized_unknown_on_crash,
-            status_check=None if self._metadata_only else status_check,
+            status_check=status_check,
             supports_cancellation=supports_cancellation,
             has_status_check=status_check is not None,
+        )
+
+    def register_declaration(
+        self,
+        declaration: ToolDeclaration,
+        handler: Callable,
+        *,
+        status_check: Callable | None = None,
+    ) -> None:
+        """以共享轻量声明注册真实 handler，不创建第二套 schema。"""
+        if not isinstance(declaration, ToolDeclaration):
+            raise TypeError("declaration must be a ToolDeclaration")
+        if not callable(handler):
+            raise ValueError("handler must be callable")
+        if declaration.has_status_check != (status_check is not None):
+            raise ValueError("status_check must match the tool declaration")
+        self.register(
+            name=declaration.name,
+            toolset=declaration.toolset,
+            schema=declaration.runtime_schema(),
+            handler=handler,
+            execution_environments=declaration.execution_environments,
+            unattended_allowed=declaration.unattended_allowed,
+            required_trusted_context=declaration.required_trusted_context,
+            approval_mode=declaration.approval_mode,
+            risk_level=declaration.risk_level,
+            default_enabled_environments=(
+                declaration.default_enabled_environments
+            ),
+            retry_safe=declaration.retry_safe,
+            unknown_on_crash=declaration.unknown_on_crash,
+            status_check=status_check,
+            supports_cancellation=declaration.supports_cancellation,
         )
 
     def merge_from(self, other_registry: "ToolRegistry") -> None:
@@ -254,7 +254,7 @@ class ToolRegistry:
         if other_registry is self:
             return
 
-        validated_registry = ToolRegistry(metadata_only=self.metadata_only)
+        validated_registry = ToolRegistry()
         for name, entry in other_registry._tools.items():
             if (
                 not isinstance(name, str)
@@ -309,11 +309,6 @@ class ToolRegistry:
                 status_check=entry.status_check,
                 supports_cancellation=entry.supports_cancellation,
             )
-            if self._metadata_only:
-                validated_registry._tools[entry.name].has_status_check = (
-                    entry.has_status_check
-                )
-
         conflicts = self._tools.keys() & validated_registry._tools.keys()
         if conflicts:
             names = ", ".join(sorted(conflicts))
@@ -330,7 +325,7 @@ class ToolRegistry:
     def describe_capabilities(self) -> tuple[CapabilityDescriptor, ...]:
         """返回当前声明能力的稳定不可变快照，不进行会话级授权过滤。"""
         descriptors = tuple(
-            _capability_descriptor(entry)
+            capability_from_declaration(_declaration_from_entry(entry))
             for entry in self._tools.values()
         )
         return tuple(
@@ -342,28 +337,7 @@ class ToolRegistry:
 
     def describe_toolsets(self) -> tuple[ToolsetDescriptor, ...]:
         """按能力快照聚合工具集，不调用 Handler 或 status_check。"""
-        grouped: dict[str, list[CapabilityDescriptor]] = {}
-        for descriptor in self.describe_capabilities():
-            grouped.setdefault(descriptor.toolset, []).append(descriptor)
-        return tuple(
-            ToolsetDescriptor(
-                name=toolset,
-                tool_names=tuple(
-                    sorted(item.name for item in descriptors)
-                ),
-                execution_environments=tuple(sorted({
-                    environment
-                    for item in descriptors
-                    for environment in item.execution_environments
-                })),
-                default_enabled_environments=tuple(sorted({
-                    environment
-                    for item in descriptors
-                    for environment in item.default_enabled_environments
-                })),
-            )
-            for toolset, descriptors in sorted(grouped.items())
-        )
+        return toolsets_from_capabilities(self.describe_capabilities())
 
     def resolve(self, policy: ToolPolicy) -> ToolResolution:
         """按环境、toolset 和可信上下文生成统一的会话能力边界。"""
@@ -424,8 +398,6 @@ class ToolRegistry:
 
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
         """查找工具并调用 handler；调用方必须先执行会话级授权。"""
-        if self._metadata_only:
-            raise RuntimeError("metadata-only tool registry cannot dispatch tools")
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
@@ -438,8 +410,6 @@ class ToolRegistry:
         **kwargs,
     ) -> str:
         """仅供已完成 AgentLoop 策略校验的内部调用复用注册条目。"""
-        if self._metadata_only:
-            raise RuntimeError("metadata-only tool registry cannot dispatch tools")
         if not isinstance(entry, ToolEntry):
             raise TypeError("entry must be a ToolEntry")
         return self._dispatch_entry_core(entry, args, **kwargs)
@@ -451,8 +421,6 @@ class ToolRegistry:
         **kwargs,
     ) -> str:
         """统一执行注册条目及其不可绕过的运行时安全检查。"""
-        if self._metadata_only:
-            raise RuntimeError("metadata-only tool registry cannot dispatch tools")
         if not isinstance(entry, ToolEntry):
             raise TypeError("entry must be a ToolEntry")
         name = entry.name
@@ -543,21 +511,13 @@ def _validate_tool_schema(schema: object) -> None:
         raise ValueError("tool schema required names must exist in properties")
 
 
-def _capability_descriptor(entry: ToolEntry) -> CapabilityDescriptor:
-    """从单个 ToolEntry 提取不含 Callable 或 schema 引用的能力描述。"""
+def _declaration_from_entry(entry: ToolEntry) -> ToolDeclaration:
+    """将运行时条目投影为共享的轻量声明，再复用统一描述转换。"""
     _validate_tool_schema(entry.schema)
-    parameters = entry.schema.get("parameters", {})
-    assert isinstance(parameters, dict)
-    properties = parameters.get("properties", {})
-    required = parameters.get("required", ())
-    assert isinstance(properties, dict)
-    assert isinstance(required, (list, tuple))
-    return CapabilityDescriptor(
+    return ToolDeclaration(
         name=entry.name,
         toolset=entry.toolset,
-        description=entry.schema.get("description", ""),
-        parameter_names=tuple(sorted(properties)),
-        required_parameters=tuple(sorted(required)),
+        schema=entry.schema,
         execution_environments=tuple(sorted(
             environment.value for environment in entry.execution_environments
         )),
@@ -571,52 +531,31 @@ def _capability_descriptor(entry: ToolEntry) -> CapabilityDescriptor:
         retry_safe=entry.retry_safe,
         unknown_on_crash=entry.unknown_on_crash,
         supports_cancellation=entry.supports_cancellation,
-        has_status_check=(
-            entry.has_status_check or entry.status_check is not None
-        ),
+        has_status_check=entry.has_status_check or entry.status_check is not None,
+        required_trusted_context=tuple(sorted(entry.required_trusted_context)),
     )
-
-
-def _registration_module(
-    module_name: str,
-    target: ToolRegistry,
-):
-    """按目标模式加载工具声明模块，必要时把声明导入重载为运行时导入。"""
-    if target.metadata_only:
-        with _metadata_registration_import_scope():
-            return importlib.import_module(module_name)
-    module = importlib.import_module(module_name)
-    package_name = module_name.rpartition(".")[0]
-    package = sys.modules.get(package_name)
-    if package is not None and getattr(package, "__hermes_metadata_only__", False):
-        importlib.reload(package)
-    if getattr(module, "__hermes_metadata_only__", False):
-        return importlib.reload(module)
-    return module
 
 
 def register_all(target_registry: ToolRegistry | None = None) -> None:
     """导入并注册所有工具；重复调用不会改变最终注册表。"""
     target = registry if target_registry is None else target_registry
-    _terminal = _registration_module("hermes.tools.terminal", target)
-    _file = _registration_module("hermes.tools.file", target)
-    _memory = _registration_module("hermes.tools.memory", target)
-    _delegate = _registration_module("hermes.tools.delegate", target)
-    _gateway_send_file = _registration_module(
-        "hermes.tools.gateway_send_file",
-        target,
-    )
-    _media = _registration_module("hermes.tools.media", target)
-    _browser = _registration_module("hermes.tools.browser", target)
-    _cron = _registration_module("hermes.cron.tool", target)
+    from hermes.tools.terminal import register as _terminal
+    from hermes.tools.file import register as _file
+    from hermes.tools.memory import register as _memory
+    from hermes.tools.delegate import register as _delegate
+    from hermes.tools.gateway_send_file import register as _gateway_send_file
+    from hermes.tools.media import register as _media
+    from hermes.tools.browser import register as _browser
+    from hermes.cron.tool import register as _cron
 
-    _terminal.register(target)
-    _file.register(target)
-    _memory.register(target)
+    _terminal(target)
+    _file(target)
+    _memory(target)
     try:
-        skill_registry = ToolRegistry(metadata_only=target.metadata_only)
-        _skill = _registration_module("hermes.tools.skill", target)
-        _skill.register(skill_registry)
+        skill_registry = ToolRegistry()
+        from hermes.tools.skill import register as _skill
+
+        _skill(skill_registry)
         if all(
             target.get_entry(name) == entry
             for name, entry in skill_registry._tools.items()
@@ -626,15 +565,13 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
         else:
             target.merge_from(skill_registry)
     except Exception as exc:
-        if target.metadata_only:
-            raise
         logger.warning(
             "Skill tools unavailable; Skill capability was skipped: %s",
             type(exc).__name__,
             exc_info=True,
         )
-    _delegate.register(target)
-    _gateway_send_file.register(target)
-    _media.register(target)
-    _browser.register(target)
-    _cron.register(target)
+    _delegate(target)
+    _gateway_send_file(target)
+    _media(target)
+    _browser(target)
+    _cron(target)

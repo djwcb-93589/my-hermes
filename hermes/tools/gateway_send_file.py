@@ -6,24 +6,16 @@ import hashlib
 import json
 from collections.abc import Mapping
 
-from hermes.tools import _metadata_registration_import_active
-
-
-__hermes_metadata_only__ = _metadata_registration_import_active()
-
-
-if not __hermes_metadata_only__:
-    from hermes.approval import build_assessment_response, is_remote_approval
-    from hermes.tools.gateway_send_file_approval import (
-        assess_gateway_send_file,
-        gateway_send_file_grant_matches_runtime,
-        register_gateway_send_file_approval_handler,
-    )
-    from hermes.db import DBError
-    from hermes.gateway.outbound_delivery import OutboundDeliveryService
-    from hermes.outbound_file import (
-        OutboundFileValidationError,
-    )
+from hermes.approval import build_assessment_response, is_remote_approval
+from hermes.db import DBError
+from hermes.gateway.outbound_delivery import OutboundDeliveryService
+from hermes.outbound_file import OutboundFileValidationError
+from hermes.tool_declarations.messaging import TOOL_DECLARATIONS
+from hermes.tools.gateway_send_file_approval import (
+    assess_gateway_send_file,
+    gateway_send_file_grant_matches_runtime,
+    register_gateway_send_file_approval_handler,
+)
 
 
 _INTERNAL_ARGUMENT_FIELDS = frozenset({
@@ -213,46 +205,6 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
 
 
 def register(registry) -> None:
-    if not getattr(registry, "metadata_only", False):
-        register_gateway_send_file_approval_handler()
-    registry.register(
-        name="gateway_send_file",
-        toolset="messaging",
-        schema={
-            "name": "gateway_send_file",
-            "description": (
-                "Create an approved persistent task to send one local file "
-                "to the current Gateway conversation. This tool is only "
-                "available in Gateway sessions. Every call requires a once "
-                "approval, and approval binds the file path, size, SHA-256, "
-                "stable file state, and current platform target. The current "
-                "stage creates a pending delivery only; it does not upload or "
-                "send the file. Paths must pass the shared filesystem policy "
-                "and gateway.file_transfer.outbound_allowed_roots."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Local path of the regular file to send.",
-                    },
-                    "display_name": {
-                        "type": "string",
-                        "description": (
-                            "Optional plain file name shown to the recipient."
-                        ),
-                    },
-                },
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        },
-        handler=handle_gateway_send_file,
-        execution_environments=("gateway",),
-        unattended_allowed=False,
-        required_trusted_context=("gateway_file_delivery",),
-        approval_mode="remote_once",
-        risk_level="high",
-        default_enabled_environments=(),
-    )
+    """注册 Gateway 文件投递的运行时 handler 和审批处理器。"""
+    register_gateway_send_file_approval_handler()
+    registry.register_declaration(TOOL_DECLARATIONS[0], handle_gateway_send_file)

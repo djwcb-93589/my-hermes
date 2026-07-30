@@ -4,17 +4,12 @@ from __future__ import annotations
 
 import json
 
-from hermes.tools import _metadata_registration_import_active
-
-
-__hermes_metadata_only__ = _metadata_registration_import_active()
+from hermes.config import HERMES_HOME
+from hermes.tool_declarations.skill import TOOL_DECLARATIONS
 
 
 # 保留此变量以兼容既有调用方和临时目录 monkeypatch。
-if not __hermes_metadata_only__:
-    from hermes.config import HERMES_HOME
-
-    SKILLS_DIR = HERMES_HOME / "skills"
+SKILLS_DIR = HERMES_HOME / "skills"
 _default_service: SkillService | None = None
 
 
@@ -127,115 +122,10 @@ def handle_skill_manage(args, **kwargs):
 
 def register(registry):
     """注册 skill_view / skills_list / skill_manage 三个工具。"""
-    registry.register(
-        name="skill_view",
-        toolset="skill_read",
-        schema={
-            "name": "skill_view",
-            "description": (
-                "Load full content of a skill by name (frontmatter + body). "
-                "Returns structured JSON with name/description/version/platforms/"
-                "metadata/body fields plus risk and content-bound trust state. "
-                "Skills live under skills/<name>/SKILL.md."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "skill name; must match [A-Za-z0-9_-]+",
-                    },
-                    "relative_path": {
-                        "type": "string",
-                        "description": "optional support file path under references/, templates/, scripts/, or assets/",
-                    },
-                },
-                "required": ["name"],
-            },
-        },
-        handler=handle_skill_view,
-        execution_environments=("cli", "gateway", "cron", "delegate", "background_review"),
-        unattended_allowed=True,
-        approval_mode="none",
-        risk_level="low",
-        default_enabled_environments=("cli", "cron"),
+    handlers = (
+        handle_skill_view,
+        handle_skill_list,
+        handle_skill_manage,
     )
-    registry.register(
-        name="skills_list",
-        toolset="skill_read",
-        schema={
-            "name": "skills_list",
-            "description": (
-                "List all available skills with name, description, version, "
-                "relative_path and metadata summary."
-            ),
-            "parameters": {"type": "object", "properties": {}},
-        },
-        handler=handle_skill_list,
-        execution_environments=("cli", "gateway", "cron", "delegate", "background_review"),
-        unattended_allowed=True,
-        approval_mode="none",
-        risk_level="low",
-        default_enabled_environments=("cli", "cron"),
-    )
-    registry.register(
-        name="skill_manage",
-        toolset="skill_manage",
-        schema={
-            "name": "skill_manage",
-            "description": (
-                "Create / edit / delete / patch a skill, or write / remove an allowed support file. Names must match "
-                "[A-Za-z0-9_-]+; path traversal is rejected. Writes are "
-                "serialized via a per-skill operation lock and applied atomically."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "edit", "delete", "patch", "write_file", "remove_file"],
-                    },
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "version": {"type": "string"},
-                    "platforms": {"type": "array", "items": {"type": "string"}},
-                    "metadata": {"type": "object"},
-                    "body": {
-                        "type": "string",
-                        "description": "create/edit: full Markdown body",
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "patch: unique substring to find",
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "patch: replacement text",
-                    },
-                    "relative_path": {
-                        "type": "string",
-                        "description": "write_file/remove_file: allowed support-file relative path",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "write_file: full UTF-8 text content",
-                    },
-                    "expected_revision": {
-                        "type": "string",
-                        "description": "edit/patch: SKILL.md revision; write_file/remove_file: target support-file revision; omit for write_file creation",
-                    },
-                    "expected_governance_revision": {
-                        "type": "string",
-                        "description": "optional expected governance revision; required for background_review mutations",
-                    },
-                },
-                "required": ["action", "name"],
-            },
-        },
-        handler=handle_skill_manage,
-        execution_environments=("cli", "gateway", "cron", "background_review"),
-        unattended_allowed=True,
-        approval_mode="none",
-        risk_level="medium",
-        default_enabled_environments=("cli", "cron"),
-    )
+    for declaration, handler in zip(TOOL_DECLARATIONS, handlers, strict=True):
+        registry.register_declaration(declaration, handler)

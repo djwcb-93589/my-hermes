@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
 
+from hermes.redaction import redact_explicit_secrets
+
 
 _MAX_METADATA_DEPTH = 8
 _MAX_METADATA_ITEMS = 256
@@ -45,6 +47,93 @@ _DISALLOWED_METADATA_KEY_PARTS = frozenset({
     "traceback",
 })
 _ERROR_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
+_ABSOLUTE_PATH_TEXT_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/])")
+_PRIVATE_KEY_TEXT_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
+_SAFE_METADATA_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
+
+# 只允许摘要身份、计数和状态类字段。发布方不能使用任意业务键把正文伪装成
+# metadata；Runtime 与 Artifact 再在此基础上使用各自更小的字段白名单。
+_COMMON_METADATA_FIELDS = frozenset({
+    "adapter",
+    "artifact_kind",
+    "attempt",
+    "attempt_count",
+    "capability",
+    "category",
+    "checksum_algorithm",
+    "component",
+    "component_id",
+    "component_type",
+    "component_version",
+    "count",
+    "duration_ms",
+    "enabled",
+    "environment",
+    "event",
+    "feature",
+    "format",
+    "has_storage_ref",
+    "healthy",
+    "instance_id",
+    "kind",
+    "mode",
+    "operation",
+    "phase",
+    "provider",
+    "queue_depth",
+    "reason_code",
+    "region",
+    "retry_count",
+    "role",
+    "service",
+    "size_bytes",
+    "source",
+    "state",
+    "status",
+    "status_code",
+    "tag",
+    "tags",
+    "type",
+    "version",
+    "worker_count",
+})
+_RUNTIME_METADATA_FIELDS = frozenset({
+    "adapter",
+    "attempt_count",
+    "capability",
+    "component_version",
+    "enabled",
+    "environment",
+    "feature",
+    "mode",
+    "phase",
+    "provider",
+    "queue_depth",
+    "reason_code",
+    "region",
+    "retry_count",
+    "role",
+    "service",
+    "state",
+    "status_code",
+    "tags",
+    "version",
+    "worker_count",
+})
+_ARTIFACT_METADATA_FIELDS = frozenset({
+    "artifact_kind",
+    "checksum_algorithm",
+    "category",
+    "format",
+    "has_storage_ref",
+    "operation",
+    "producer",
+    "size_bytes",
+    "source",
+    "status_code",
+    "tags",
+    "type",
+})
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -90,17 +179,38 @@ def freeze_safe_metadata(
     value: Mapping[str, object],
     *,
     field_name: str = "metadata",
+    allowed_keys: frozenset[str] | None = None,
 ) -> Mapping[str, object]:
-    """深复制并冻结仅包含安全基础类型的有限元数据。"""
+    """深复制并冻结经字段白名单和文本清理后的有限摘要元数据。"""
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
+    normalized_allowed_keys = _normalize_allowed_metadata_keys(
+        _COMMON_METADATA_FIELDS if allowed_keys is None else allowed_keys
+    )
     budget = _MetadataBudget(
         remaining_items=_MAX_METADATA_ITEMS,
         remaining_text_chars=_MAX_METADATA_TEXT_CHARS,
     )
-    frozen = _freeze_safe_value(value, field_name, set(), budget, depth=0)
+    frozen = _freeze_safe_value(
+        value,
+        field_name,
+        set(),
+        budget,
+        normalized_allowed_keys,
+        depth=0,
+    )
     assert isinstance(frozen, Mapping)
     return frozen
+
+
+def freeze_runtime_metadata(value: Mapping[str, object]) -> Mapping[str, object]:
+    """冻结 Runtime Snapshot 允许发布的摘要字段。"""
+    return freeze_safe_metadata(value, allowed_keys=_RUNTIME_METADATA_FIELDS)
+
+
+def freeze_artifact_metadata(value: Mapping[str, object]) -> Mapping[str, object]:
+    """冻结 Artifact Record 允许发布的摘要字段。"""
+    return freeze_safe_metadata(value, allowed_keys=_ARTIFACT_METADATA_FIELDS)
 
 
 @dataclass(slots=True)
@@ -126,16 +236,17 @@ def _freeze_safe_value(
     path: str,
     ancestors: set[int],
     budget: _MetadataBudget,
+    allowed_keys: frozenset[str],
     *,
     depth: int,
 ) -> object:
     """拒绝自定义对象、循环引用和非有限数字。"""
     if depth > _MAX_METADATA_DEPTH:
         raise ValueError(f"{path} exceeds the metadata nesting limit")
-    if value is None or type(value) in (str, bool, int):
-        if type(value) is str:
-            budget.consume_text(value, path)
+    if value is None or type(value) in (bool, int):
         return value
+    if type(value) is str:
+        return _freeze_metadata_text(value, path, budget)
     if type(value) is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must not contain a non-finite number")
@@ -151,7 +262,7 @@ def _freeze_safe_value(
             for key, child in value.items():
                 if not isinstance(key, str):
                     raise TypeError(f"{path} mapping keys must be strings")
-                _validate_metadata_key(key, path)
+                _validate_metadata_key(key, path, allowed_keys)
                 budget.consume_item(path)
                 budget.consume_text(key, path)
                 frozen_mapping[key] = _freeze_safe_value(
@@ -159,6 +270,7 @@ def _freeze_safe_value(
                     f"{path}.{key}",
                     ancestors,
                     budget,
+                    allowed_keys,
                     depth=depth + 1,
                 )
             return MappingProxyType(frozen_mapping)
@@ -180,6 +292,7 @@ def _freeze_safe_value(
                         f"{path}[{index}]",
                         ancestors,
                         budget,
+                        allowed_keys,
                         depth=depth + 1,
                     )
                 )
@@ -190,17 +303,67 @@ def _freeze_safe_value(
     raise TypeError(f"{path} contains an unsupported value type")
 
 
-def _validate_metadata_key(key: str, path: str) -> None:
-    """仅允许摘要型 metadata 键，拒绝凭证和正文载荷的常见承载字段。"""
-    normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+def _normalize_metadata_key(key: str) -> str:
+    """统一分隔大小写和符号混写的 metadata 字段名。"""
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", key)
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", separated)
+    return re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
+
+
+def _normalize_allowed_metadata_keys(
+    allowed_keys: object,
+) -> frozenset[str]:
+    """校验发布方声明的字段白名单，避免其退化为任意键。"""
+    if not isinstance(allowed_keys, (frozenset, set, tuple, list)):
+        raise TypeError("allowed_keys must be a collection of strings")
+    normalized = frozenset(
+        _normalize_metadata_key(_require_text(key, "allowed_keys"))
+        for key in allowed_keys
+    )
+    if not normalized or "" in normalized:
+        raise ValueError("allowed_keys must contain non-empty field names")
+    return normalized
+
+
+def _freeze_metadata_text(
+    value: str,
+    path: str,
+    budget: _MetadataBudget,
+) -> str:
+    """只保留短的单行摘要文本，并移除可识别凭证值。"""
+    if "\r" in value or "\n" in value:
+        raise ValueError(f"{path} must not contain multi-line text")
+    redacted = redact_explicit_secrets(value)
+    if redacted != value:
+        raise ValueError(f"{path} must not contain credential text")
+    if _PRIVATE_KEY_TEXT_RE.search(value):
+        raise ValueError(f"{path} must not contain private key text")
+    if _ABSOLUTE_PATH_TEXT_RE.match(value.strip()):
+        raise ValueError(f"{path} must not contain an absolute path")
+    if not _SAFE_METADATA_TEXT_RE.fullmatch(value):
+        raise ValueError(f"{path} must contain a compact metadata label")
+    budget.consume_text(value, path)
+    return value
+
+
+def _validate_metadata_key(
+    key: str,
+    path: str,
+    allowed_keys: frozenset[str],
+) -> None:
+    """仅允许白名单摘要键，并按组成部分拒绝正文和凭证承载字段。"""
+    normalized = _normalize_metadata_key(key)
+    if not normalized:
+        raise ValueError(f"{path} contains an invalid metadata key")
     parts = frozenset(part for part in normalized.split("_") if part)
     if (
         normalized in _SENSITIVE_METADATA_KEYS
         or parts & _SENSITIVE_METADATA_KEY_PARTS
+        or parts & _DISALLOWED_METADATA_KEY_PARTS
     ):
         raise ValueError(f"{path} contains a sensitive metadata key")
-    if normalized in _DISALLOWED_METADATA_KEY_PARTS:
-        raise ValueError(f"{path} contains a disallowed metadata key")
+    if normalized not in allowed_keys:
+        raise ValueError(f"{path} contains a metadata key outside the allowed set")
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +446,7 @@ class ToolsetDescriptor:
     tool_names: tuple[str, ...]
     execution_environments: tuple[str, ...]
     default_enabled_environments: tuple[str, ...]
+    available: bool = True
 
     def __post_init__(self) -> None:
         """规范化所有聚合集合的排序和不可变性。"""
@@ -308,6 +472,8 @@ class ToolsetDescriptor:
                 "default_enabled_environments",
             ),
         )
+        if not isinstance(self.available, bool):
+            raise TypeError("available must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)

@@ -536,7 +536,7 @@ class CatalogReadService(_ReadServiceBase):
                 descriptor.name,
                 limit=self._redactor.limits.preview_text_limit,
             ),
-            available=True,
+            available=descriptor.available,
             environments=[
                 self._redactor.structure_text(
                     value,

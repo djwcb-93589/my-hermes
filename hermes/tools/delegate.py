@@ -20,32 +20,18 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
-from hermes.tools import _metadata_registration_import_active
-
-
-__hermes_metadata_only__ = _metadata_registration_import_active()
-
-
-if not __hermes_metadata_only__:
-    from hermes.agent_loop import AgentLoop, ParsedToolCall
-    from hermes.backends import cleanup_backend
-    from hermes.config import (
-        MAX_CHILD_ITERATIONS,
-        MODEL,
-        MODEL_MAX_OUTPUT_TOKENS,
-        client as _default_client,
-    )
-    from hermes.delegate_jobs import get_delegate_job_manager
-    from hermes.hooks import SyncControlBridge, SyncHookRegistry
-    from hermes.tools import (
-        ExecutionEnvironment,
-        ToolPolicy,
-        ToolResolution,
-        registry,
-    )
-else:
-    # 仅声明能力时不导入 AgentLoop，类基底仅用于让处理函数定义保持可加载。
-    AgentLoop = object
+from hermes.agent_loop import AgentLoop, ParsedToolCall
+from hermes.backends import cleanup_backend
+from hermes.config import (
+    MAX_CHILD_ITERATIONS,
+    MODEL,
+    MODEL_MAX_OUTPUT_TOKENS,
+    client as _default_client,
+)
+from hermes.delegate_jobs import get_delegate_job_manager
+from hermes.hooks import SyncControlBridge, SyncHookRegistry
+from hermes.tool_declarations.delegate import TOOL_DECLARATIONS
+from hermes.tools import ExecutionEnvironment, ToolPolicy, ToolResolution, registry
 
 
 _DEFAULT_TOOLSETS = ["terminal", "file"]
@@ -664,147 +650,12 @@ def handle_delegate_cancel(args, **kwargs) -> str:
 
 
 def register(registry):
-    registry.register(
-        name="delegate_task",
-        toolset="delegate",
-        schema={
-            "name": "delegate_task",
-            "description": (
-                "Delegate a leaf sub-task to an isolated child agent. The "
-                "child gets its own session_key (terminal / file backend "
-                "isolated from the parent), cannot call delegate / memory / "
-                "skill_manage / cron (no recursion, no persistent side "
-                "effects across rounds), and only sees the goal + optional "
-                "context. background=false (default) blocks until the child "
-                "finishes and returns {ok, status, summary, iterations, "
-                "tools_used, tool_batches, tool_call_count, "
-                "child_session_key, error, error_type}. background=true "
-                "submits a background job and immediately returns "
-                "{ok, status='submitted', job_id, child_session_key}; poll "
-                "with delegate_status / delegate_result / delegate_cancel."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "goal": {
-                        "type": "string",
-                        "description": "Task description for the child agent.",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "Optional context to inject into the child system prompt.",
-                    },
-                    "toolsets": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Allowed child toolsets. Each item must be one "
-                            "of {terminal, file, skill_read}. Unknown or "
-                            "disallowed values (memory / delegate / cron) "
-                            "cause invalid_args. Default "
-                            "['terminal', 'file']."
-                        ),
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "false (default): synchronous — block until the "
-                            "child finishes. true: submit a background job "
-                            "and return immediately with job_id."
-                        ),
-                    },
-                },
-                "required": ["goal"],
-            },
-        },
-        handler=handle_delegate,
-        execution_environments=("cli", "gateway", "cron"),
-        unattended_allowed=True,
-        approval_mode="none",
-        risk_level="high",
-        default_enabled_environments=("cli", "cron"),
-        supports_cancellation=True,
+    """注册 Delegate 的真实 handler。"""
+    handlers = (
+        handle_delegate,
+        handle_delegate_status,
+        handle_delegate_result,
+        handle_delegate_cancel,
     )
-    registry.register(
-        name="delegate_status",
-        toolset="delegate",
-        schema={
-            "name": "delegate_status",
-            "description": (
-                "Lightweight status probe for a background delegate job. "
-                "Returns {ok, job_id, status ∈ queued|running|completed|"
-                "failed|cancelled, child_status, cancel_requested, "
-                "iterations, tools_used, error, timestamps}. Does NOT "
-                "include summary (use delegate_result for that). Use this "
-                "to check whether the job is still running or how it ended."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {"type": "string"},
-                },
-                "required": ["job_id"],
-            },
-        },
-        handler=handle_delegate_status,
-        execution_environments=("cli", "gateway"),
-        unattended_allowed=False,
-        approval_mode="none",
-        risk_level="low",
-        default_enabled_environments=("cli",),
-    )
-    registry.register(
-        name="delegate_result",
-        toolset="delegate",
-        schema={
-            "name": "delegate_result",
-            "description": (
-                "Fetch the full result of a background delegate job. "
-                "Non-blocking: if still queued/running, returns ok=false "
-                "with error='Job is still running' and empty summary. If "
-                "completed/failed/cancelled, returns ok (true only when "
-                "status=completed), summary, iterations, tools_used, "
-                "child_session_key, child_status, error."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {"type": "string"},
-                },
-                "required": ["job_id"],
-            },
-        },
-        handler=handle_delegate_result,
-        execution_environments=("cli", "gateway"),
-        unattended_allowed=False,
-        approval_mode="none",
-        risk_level="low",
-        default_enabled_environments=("cli",),
-    )
-    registry.register(
-        name="delegate_cancel",
-        toolset="delegate",
-        schema={
-            "name": "delegate_cancel",
-            "description": (
-                "Cooperatively cancel a background delegate job. Sets the "
-                "cancel_requested flag; the worker checks it at the next "
-                "iteration boundary and exits with status=cancelled. Does "
-                "not forcibly kill the worker thread."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {"type": "string"},
-                },
-                "required": ["job_id"],
-            },
-        },
-        handler=handle_delegate_cancel,
-        execution_environments=("cli", "gateway"),
-        unattended_allowed=False,
-        approval_mode="none",
-        risk_level="medium",
-        default_enabled_environments=("cli",),
-    )
+    for declaration, handler in zip(TOOL_DECLARATIONS, handlers, strict=True):
+        registry.register_declaration(declaration, handler)

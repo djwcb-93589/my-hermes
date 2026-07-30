@@ -11,7 +11,7 @@ from typing import Protocol
 
 from hermes.observability.contracts import (
     _optional_error_type,
-    freeze_safe_metadata,
+    freeze_artifact_metadata,
 )
 
 
@@ -145,7 +145,7 @@ class ArtifactRecord:
         object.__setattr__(
             self,
             "metadata",
-            freeze_safe_metadata(self.metadata),
+            freeze_artifact_metadata(self.metadata),
         )
 
 

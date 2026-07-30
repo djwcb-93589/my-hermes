@@ -1,6 +1,7 @@
 """与 Dashboard UI 无关的通用可观测契约与纯转换接口。
 
-接入规则：普通工具只需注册到 ToolRegistry，能力目录会由声明快照自动聚合；
+接入规则：普通工具以轻量 ToolDeclaration 共享 schema 和策略，再由运行时注册 handler；
+能力目录只聚合声明快照；
 后台组件可选发布 RuntimeComponentSnapshot；文件类结果可选发布 ArtifactRecord。
 只有需要专用 UI 交互语义的模块才应注册 DashboardExtensionDescriptor，普通工具
 和普通文件输出不需要反向依赖 Dashboard。

@@ -11,6 +11,7 @@ from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
 )
+from hermes.tool_declarations.catalog import build_toolset_catalog_snapshot
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
 from hermes.web.read_context import DashboardReadContext
@@ -88,19 +89,9 @@ def _build_toolset_catalog_snapshot() -> tuple[
     tuple[CapabilityDescriptor, ...] | None,
     tuple[ToolsetDescriptor, ...] | None,
 ]:
-    """在应用装配期构建一次仅声明能力快照，目录失败不影响其他 Dashboard 服务。"""
-    try:
-        from hermes.tools import ToolRegistry, register_all
-
-        catalog_registry = ToolRegistry(metadata_only=True)
-        register_all(catalog_registry)
-        return (
-            catalog_registry.describe_capabilities(),
-            catalog_registry.describe_toolsets(),
-        )
-    except Exception:
-        # 不泄露导入或注册失败的内部细节；CatalogReadService 会稳定返回 503。
-        return None, None
+    """在应用装配期构建一次轻量声明快照，不导入工具运行时模块。"""
+    snapshot = build_toolset_catalog_snapshot()
+    return snapshot.capabilities, snapshot.toolsets
 
 
 def create_app(
