@@ -153,6 +153,50 @@ class DashboardRedactor:
             ),
         )
 
+    def redact_value_list(
+        self,
+        values: list[object],
+        *,
+        text_limit: int | None = None,
+    ) -> list[object]:
+        """递归脱敏一组结构值，使所有可见项共享同一个文本预算。"""
+        budget = _StructuredBudget(self.limits.structured_value_limit)
+        safe_text_limit = (
+            self.limits.structured_value_limit
+            if text_limit is None
+            else text_limit
+        )
+        item_limit = max(1, self.limits.max_list_items)
+        visible_limit = (
+            len(values)
+            if len(values) <= item_limit
+            else item_limit - 1
+        )
+        truncated = len(values) > visible_limit
+        result: list[object] = []
+        for index, value in enumerate(values[:visible_limit]):
+            if budget.exhausted:
+                truncated = True
+                break
+            budget_before = budget.remaining
+            try:
+                result.append(self._redact_value(
+                    value,
+                    depth=0,
+                    budget=budget,
+                    text_limit=safe_text_limit,
+                ))
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                # 单项无法安全处理时恢复预算，由调用方决定其降级表示。
+                budget.remaining = budget_before
+                result.append(REDACTED_VALUE)
+            if budget.exhausted and index + 1 < visible_limit:
+                truncated = True
+                break
+        if truncated:
+            result.append(TRUNCATED_VALUE)
+        return result
+
     def _redact_value(
         self,
         value: object,
@@ -162,6 +206,8 @@ class DashboardRedactor:
         text_limit: int,
     ) -> object:
         if depth >= self.limits.max_depth:
+            return TRUNCATED_VALUE
+        if budget.exhausted:
             return TRUNCATED_VALUE
         if value is None or isinstance(value, (bool, int)):
             return value
@@ -177,11 +223,18 @@ class DashboardRedactor:
                 if len(value) <= item_limit
                 else item_limit - 1
             )
+            truncated = len(value) > visible_limit
             for index, (key, item) in enumerate(value.items()):
                 if index >= visible_limit:
                     break
+                if budget.exhausted:
+                    truncated = True
+                    break
                 raw_key = _coerce_text(key)
                 safe_key = budget.take(self.redact_text(raw_key, limit=text_limit))
+                if budget.exhausted:
+                    truncated = True
+                    break
                 if _is_sensitive_field_name(raw_key):
                     result[safe_key] = REDACTED_VALUE
                 else:
@@ -191,7 +244,10 @@ class DashboardRedactor:
                         budget=budget,
                         text_limit=text_limit,
                     )
-            if len(value) > item_limit:
+                if budget.exhausted and index + 1 < visible_limit:
+                    truncated = True
+                    break
+            if truncated:
                 result[TRUNCATED_VALUE] = TRUNCATED_VALUE
             return result
         if isinstance(value, (list, tuple)):
@@ -202,14 +258,21 @@ class DashboardRedactor:
                 if len(value) <= item_limit
                 else item_limit - 1
             )
-            for item in value[:visible_limit]:
+            truncated = len(value) > visible_limit
+            for index, item in enumerate(value[:visible_limit]):
+                if budget.exhausted:
+                    truncated = True
+                    break
                 result.append(self._redact_value(
                     item,
                     depth=depth + 1,
                     budget=budget,
                     text_limit=text_limit,
                 ))
-            if len(value) > item_limit:
+                if budget.exhausted and index + 1 < visible_limit:
+                    truncated = True
+                    break
+            if truncated:
                 result.append(TRUNCATED_VALUE)
             return result
         return REDACTED_VALUE
@@ -268,8 +331,13 @@ class _StructuredBudget:
 
     remaining: int
 
+    @property
+    def exhausted(self) -> bool:
+        """标识文本预算是否已经无法继续分配。"""
+        return self.remaining <= 0
+
     def take(self, value: str) -> str:
-        if self.remaining <= 0:
+        if self.exhausted:
             return TRUNCATED_VALUE
         if len(value) <= self.remaining:
             self.remaining -= len(value)
