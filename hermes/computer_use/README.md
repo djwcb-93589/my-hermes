@@ -118,6 +118,8 @@ P6.5 会在启动 cua-driver 前清理其子进程环境中继承的模型 API K
 
 可通过 `check_cua_driver_readiness()` 独立检查 cua-driver 的安装和健康状态。该检查不会自动安装驱动、修改 `PATH` 或请求系统权限。解释器退出时，transport 会尽力关闭仍登记为活动状态的 cua-driver 子进程。
 
+P6.5.1 的 readiness 优先使用临时 cua-driver MCP 会话中的 `health_report`。旧版本或 `health_report` 被拒绝时，会回退到 `check_permissions`、`list_apps` 和 `--version`。它不会启动正式 Computer Use Backend；临时诊断进程无论成功或失败都会在结束后清理，也不会自动安装驱动、请求权限或修改 `PATH`。
+
 ## 图片边界
 
 核心模块只保存原始图片字节，不负责转换为 OpenAI、Anthropic 或其他模型厂商的多模态消息格式。模型格式转换属于未来的 Agent 适配层。
