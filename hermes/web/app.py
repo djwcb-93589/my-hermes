@@ -1,4 +1,4 @@
-"""独立 FastAPI 应用工厂。"""
+"""Dashboard FastAPI 应用装配与应用级认证边界。"""
 
 from __future__ import annotations
 
@@ -7,45 +7,104 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
 from hermes.web.read_service import ReadDataUnavailable, ReadService, ResourceNotFound
 from hermes.web.routes import catalog, cron, sessions, status
 from hermes.web.schemas import ErrorResponse
 from hermes.web.security import (
+    TOKEN_HEADER,
     ControlAuthenticator,
     ControlBadRequest,
     ControlConflict,
     ControlForbidden,
     ControlNotFound,
     ControlUnavailable,
+    DashboardAccessPolicy,
+    DashboardPermission,
+    cors_origin_regex,
 )
+
+
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def build_dashboard_app(config: DashboardConfig) -> FastAPI:
+    """使用已校验配置装配唯一的正式 Dashboard 应用实例。"""
+    validate_dashboard_config(config)
+    authenticator = ControlAuthenticator.from_digest(config.control_token_digest)
+    access_policy = DashboardAccessPolicy(
+        authenticator,
+        read_auth_required=config.auth_required,
+        bound_host=config.host,
+    )
+    return create_app(
+        read_service=ReadService(config.db_path),
+        control_service=CronControlService(config.db_path),
+        control_authenticator=authenticator,
+        access_policy=access_policy,
+    )
 
 
 def create_app(
     read_service: ReadService | None = None,
     control_service: CronControlService | None = None,
     control_authenticator: ControlAuthenticator | None = None,
+    *,
+    access_policy: DashboardAccessPolicy | None = None,
 ) -> FastAPI:
-    """创建没有后台任务、没有认证副作用的只读应用。"""
+    """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
+    authenticator = control_authenticator or ControlAuthenticator()
+    policy = access_policy or DashboardAccessPolicy(
+        authenticator,
+        read_auth_required=False,
+        bound_host="127.0.0.1",
+    )
     application = FastAPI(title="MyHermes Dashboard API")
     application.state.read_service = read_service or ReadService()
     application.state.control_service = control_service
-    application.state.control_authenticator = control_authenticator
+    application.state.control_authenticator = authenticator
+    application.state.dashboard_access_policy = policy
 
-    # 未来认证应添加在此处的应用级 middleware，而不是分散到每条路由。
+    # 不允许任意 Origin；通配绑定没有可安全推导的远程浏览器 Origin。
     application.add_middleware(
         CORSMiddleware,
         allow_origins=[],
-        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_origin_regex=cors_origin_regex(policy.bound_host),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
         allow_headers=[
             "Accept",
             "Content-Type",
-            "X-Hermes-Control-Token",
+            TOKEN_HEADER,
             "Idempotency-Key",
         ],
     )
+
+    @application.middleware("http")
+    async def authorize_dashboard_api(
+        request: Request,
+        call_next,
+    ) -> JSONResponse:
+        # CORS 预检和最小存活探针不包含业务数据，也不需要 Token。
+        if request.method == "OPTIONS" or request.url.path == "/healthz":
+            return await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+
+        permission = (
+            DashboardPermission.READ
+            if request.method in _READ_METHODS
+            else DashboardPermission.CONTROL
+        )
+        decision = policy.authorize(
+            permission,
+            token=request.headers.get(TOKEN_HEADER),
+            origin=request.headers.get("Origin"),
+        )
+        if decision.allowed:
+            return await call_next(request)
+        return _authorization_error_response(decision.status_code, decision.error_code)
 
     @application.exception_handler(ReadDataUnavailable)
     async def handle_unavailable(
@@ -132,4 +191,21 @@ def create_app(
     return application
 
 
+def _authorization_error_response(
+    status_code: int | None,
+    error_code: str | None,
+) -> JSONResponse:
+    """生成不泄漏 Token 配置或请求详情的统一认证错误。"""
+    resolved_status = status_code or 401
+    if error_code == "control_unavailable":
+        message = "控制接口当前不可用。"
+    elif resolved_status == 403:
+        message = "请求未获授权。"
+    else:
+        message = "需要有效认证。"
+    body = ErrorResponse(code=error_code or "authentication_required", message=message)
+    return JSONResponse(status_code=resolved_status, content=jsonable_encoder(body))
+
+
+# 导入兼容对象：不注入数据库、控制服务或正式认证配置，不能作为生产启动路径。
 app = create_app()

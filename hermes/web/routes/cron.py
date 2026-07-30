@@ -1,4 +1,4 @@
-"""Cron 只读路由。"""
+"""Cron 查询与控制路由。认证由应用级中间件统一执行。"""
 
 from fastapi import APIRouter, Header, Request, status
 
@@ -10,7 +10,7 @@ from hermes.web.schemas import (
     CronJobListResponse,
     CronRunRequestResponse,
 )
-from hermes.web.security import ControlAuthenticator, ControlUnavailable
+from hermes.web.security import ControlUnavailable
 
 
 router = APIRouter(prefix="/api/cron/jobs", tags=["cron"])
@@ -27,16 +27,6 @@ def _control_service(request: Request) -> CronControlService:
     return service
 
 
-def _authorize(
-    request: Request,
-    control_token: str | None,
-) -> None:
-    authenticator: ControlAuthenticator | None = request.app.state.control_authenticator
-    if authenticator is None:
-        raise ControlUnavailable()
-    authenticator.require(control_token, request.headers.get("Origin"))
-
-
 @router.get("", response_model=CronJobListResponse)
 def list_cron_jobs(request: Request) -> CronJobListResponse:
     return _service(request).list_cron_jobs()
@@ -51,9 +41,7 @@ def get_cron_job(request: Request, job_id: str) -> CronJobDetailResponse:
 def pause_cron_job(
     request: Request,
     job_id: str,
-    control_token: str | None = Header(default=None, alias="X-Hermes-Control-Token"),
 ) -> CronControlResponse:
-    _authorize(request, control_token)
     return _control_service(request).pause_cron_job(job_id)
 
 
@@ -61,9 +49,7 @@ def pause_cron_job(
 def resume_cron_job(
     request: Request,
     job_id: str,
-    control_token: str | None = Header(default=None, alias="X-Hermes-Control-Token"),
 ) -> CronControlResponse:
-    _authorize(request, control_token)
     return _control_service(request).resume_cron_job(job_id)
 
 
@@ -75,8 +61,6 @@ def resume_cron_job(
 def request_cron_run(
     request: Request,
     job_id: str,
-    control_token: str | None = Header(default=None, alias="X-Hermes-Control-Token"),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> CronRunRequestResponse:
-    _authorize(request, control_token)
     return _control_service(request).request_cron_run(job_id, idempotency_key)

@@ -19,7 +19,8 @@ from hermes.persistence.core import (
 )
 from hermes.persistence.cron import get_cron_job, list_cron_jobs, list_cron_runs
 from hermes.persistence.database import DBError
-from hermes.persistence.read_only import database_is_readable, readonly_connection
+from hermes.persistence.read_only import readonly_connection
+from hermes.web.health import inspect_database_health, inspect_gateway_health
 
 from hermes.web.schemas import (
     CronJobDetailResponse,
@@ -52,27 +53,25 @@ class ReadService:
         self._db_path = db_path
 
     def get_status(self) -> StatusResponse:
-        """返回不触发 Agent、Gateway 或调度器的进程状态。"""
+        """返回只读数据库与 Gateway lease 状态，不探测真实运行进程。"""
         try:
             project_version: str | None = version("my-hermes")
         except PackageNotFoundError:
             project_version = None
 
-        database_status = "unavailable"
-        if self._db_path:
-            try:
-                if database_is_readable(self._db_path):
-                    database_status = "available"
-            except (sqlite3.Error, OSError, ValueError):
-                pass
-
-        # Gateway 的可读运行状态没有不竞争 lease 的公开接口。
+        database = inspect_database_health(self._db_path)
+        gateway = inspect_gateway_health(self._db_path)
         return StatusResponse(
             application_name="MyHermes",
             project_version=project_version,
             web_status="running",
-            gateway_status="unavailable",
-            database_status=database_status,
+            database=database,
+            gateway=gateway,
+            # 兼容旧客户端；新客户端必须读取嵌套状态模型。
+            gateway_status=gateway.status,
+            database_status=(
+                "available" if database.status == "healthy" else database.status
+            ),
             current_time=datetime.now(UTC),
         )
 

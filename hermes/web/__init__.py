@@ -1,5 +1,5 @@
-"""MyHermes 只读 Web 管理 API。
+"""MyHermes Dashboard 管理 API。
 
-本包不会在导入时加载 FastAPI、数据库连接或 Agent 运行时。请通过
-``python -m hermes.web`` 启动独立服务。
+正式启动请使用 ``python main.py dashboard``；``python -m hermes.web`` 保留
+为兼容入口。导入本包本身不会加载数据库连接或 Agent 运行时。
 """

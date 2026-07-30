@@ -10,6 +10,34 @@ import os
 import sys
 
 
+def _selected_runtime_modes(args: list[str]) -> frozenset[str]:
+    """识别互斥运行模式，避免依赖分支顺序静默选择入口。"""
+    selected: set[str] = set()
+    is_plugins_command = bool(args) and args[0] == "plugins"
+    if not is_plugins_command and "dashboard" in args:
+        selected.add("dashboard")
+    if is_plugins_command:
+        selected.add("plugins")
+    if "--gateway" in args or "--gateway-unified" in args:
+        selected.add("gateway")
+    if "--gateway-console" in args:
+        selected.add("gateway-console")
+    if "--weixin-login" in args:
+        selected.add("weixin-login")
+    if "--simulate" in args:
+        selected.add("simulate")
+    return frozenset(selected)
+
+
+def _reject_incompatible_runtime_modes(args: list[str]) -> frozenset[str]:
+    """在导入任意运行时模块前拒绝多个不兼容模式。"""
+    selected = _selected_runtime_modes(args)
+    if len(selected) > 1:
+        modes = ", ".join(sorted(selected))
+        raise SystemExit(f"incompatible runtime modes: {modes}")
+    return selected
+
+
 
 def _cli_tool_policy() -> ToolPolicy:
     from hermes.config import BROWSER_CONFIG
@@ -108,26 +136,35 @@ def cli_loop() -> None:
 
 
 def main() -> None:
-    if len(sys.argv) >= 2 and sys.argv[1] == "plugins":
+    args = sys.argv[1:]
+    selected = _reject_incompatible_runtime_modes(args)
+
+    if selected == {"plugins"}:
         from hermes.plugins.cli import run_plugins_command
 
-        raise SystemExit(run_plugins_command(sys.argv[2:]))
-    if "--gateway" in sys.argv or "--gateway-unified" in sys.argv:
+        raise SystemExit(run_plugins_command(args[1:]))
+    if selected == {"dashboard"}:
+        if args != ["dashboard"]:
+            raise SystemExit("dashboard does not accept additional arguments")
+        from hermes.web.main import run_dashboard
+
+        run_dashboard()
+    elif selected == {"gateway"}:
         # 统一 Gateway 入口（读取 config.yaml gateway.platforms）
         from hermes.gateway_entry import run_gateway
 
         asyncio.run(run_gateway())
-    elif "--weixin-login" in sys.argv:
+    elif selected == {"weixin-login"}:
         # 个人微信二维码登录
         from hermes.gateway_weixin_login import run as run_weixin_login
 
         run_weixin_login()
-    elif "--gateway-console" in sys.argv:
+    elif selected == {"gateway-console"}:
         # ConsoleAdapter Gateway 入口（保留向后兼容）
         from hermes.gateway_console import run_gateway_console
 
         asyncio.run(run_gateway_console())
-    elif "--simulate" in sys.argv:
+    elif selected == {"simulate"}:
         from hermes.gateway_simulated import run_gateway_simulated
 
         asyncio.run(run_gateway_simulated())

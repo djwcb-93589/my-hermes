@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -14,14 +15,42 @@ class ErrorResponse(BaseModel):
     message: str
 
 
+class HealthzResponse(BaseModel):
+    """无需认证的最小存活探针，不暴露运行环境细节。"""
+
+    status: Literal["ok"] = "ok"
+
+
+class DatabaseHealth(BaseModel):
+    """数据库只读健康结果。"""
+
+    status: Literal["healthy", "degraded", "unavailable"]
+    schema_expected: int
+    schema_actual: int | None = None
+    required_tables_available: bool
+    reason_code: str | None = None
+
+
+class GatewayHealth(BaseModel):
+    """Gateway runtime lease 的公开健康摘要。"""
+
+    status: Literal["running", "stale", "stopped", "unavailable"]
+    reason_code: str | None = None
+    heartbeat_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
 class StatusResponse(BaseModel):
     """服务和可安全读取依赖的状态摘要。"""
 
     application_name: str
     project_version: str | None = None
     web_status: str
-    gateway_status: str | None = None
-    database_status: str
+    database: DatabaseHealth
+    gateway: GatewayHealth
+    # 保留旧字段以便旧面板平滑迁移；新代码应读取 database / gateway。
+    gateway_status: str | None = Field(default=None, deprecated=True)
+    database_status: str = Field(default="unavailable", deprecated=True)
     current_time: datetime
 
 

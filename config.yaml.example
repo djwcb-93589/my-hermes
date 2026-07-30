@@ -129,6 +129,17 @@ security:
 
 # SQLite 状态数据库路径；相对路径以 Hermes 配置目录为基准解析。
 db_path: database/hermes.db
+
+# Dashboard 管理 API；正式启动命令为 `uv run python main.py dashboard`。
+# 环境变量 HERMES_DASHBOARD_HOST / PORT / AUTH_REQUIRED 的优先级更高。
+# 非回环地址（包括 0.0.0.0、::、局域网和公网地址）会强制启用认证，
+# 且必须通过 HERMES_WEB_CONTROL_TOKEN 提供至少 32 字符的无首尾空格 Token。
+# 通配绑定不会自动放行浏览器 Origin；需要浏览器访问时请使用明确的绑定地址。
+dashboard:
+  host: 127.0.0.1
+  port: 8000
+  auth_required: false
+
 # 浏览器工具运行配置；enabled 为 false 时不会向 CLI 或 Gateway 会话公开 browser 工具。
 browser:
   enabled: false

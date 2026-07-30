@@ -1,4 +1,4 @@
-"""只读 Web 管理 API 的模块启动入口。"""
+"""Dashboard 的兼容模块启动入口。"""
 
 from hermes.web.main import main
 

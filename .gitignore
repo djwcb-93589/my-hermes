@@ -41,3 +41,5 @@ scripts/
 !/documents/docx/node_runtime/scripts/
 !/documents/docx/node_runtime/scripts/check.mjs
 !/documents/docx/node_runtime/scripts/create.mjs
+computer_use_tests/
+tests_docx/
