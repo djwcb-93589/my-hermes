@@ -1,4 +1,4 @@
-"""基于 cua-driver 的 P5 基础操作 Backend。"""
+"""基于 cua-driver 的 P6 基础操作 Backend。"""
 
 import base64
 import binascii
@@ -6,7 +6,7 @@ import json
 import math
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any, NoReturn
+from typing import Any
 
 from ..backend import ComputerUseBackend
 from ..contracts import (
@@ -37,6 +37,9 @@ _REQUIRED_OBSERVATION_TOOLS = frozenset(
 )
 _REQUIRED_P5_ACTION_TOOLS = frozenset(
     {"click", "double_click", "type_text", "press_key", "hotkey"}
+)
+_REQUIRED_P6_ACTION_TOOLS = frozenset(
+    {"drag", "scroll", "set_value"}
 )
 _CAPTURE_TOOLS = ("get_window_state", "screenshot")
 _KEY_ALIASES = {
@@ -132,6 +135,17 @@ class CuaDriverBackend(ComputerUseBackend):
                     details={
                         "reason": "missing_required_tools",
                         "tools": missing_actions,
+                    },
+                )
+            missing_p6_actions = sorted(
+                _REQUIRED_P6_ACTION_TOOLS - self._tool_names
+            )
+            if missing_p6_actions:
+                raise BackendUnavailableError(
+                    "cua-driver does not provide required P6 action tools.",
+                    details={
+                        "reason": "missing_required_tools",
+                        "tools": missing_p6_actions,
                     },
                 )
             self._try_start_session()
@@ -499,13 +513,9 @@ class CuaDriverBackend(ComputerUseBackend):
             "window_id": window_id,
         }
         if element is not None:
-            target = self._element_targets.get(element)
-            if target is None:
-                raise StaleElementError(
-                    "The element does not belong to the latest capture.",
-                    details={"reason": "stale_element"},
-                )
-            driver_index, element_token = target
+            driver_index, element_token = self._resolve_element_target(
+                element
+            )
             arguments["element_index"] = driver_index
             if (
                 element_token is not None
@@ -568,9 +578,137 @@ class CuaDriverBackend(ComputerUseBackend):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """拒绝 P5 尚未实现的拖动动作。"""
+        """在同类元素目标或坐标目标之间执行拖动。"""
 
-        self._raise_action_unavailable(ComputerUseAction.DRAG)
+        has_from_element = from_element is not None
+        has_to_element = to_element is not None
+        has_from_coordinate = from_coordinate is not None
+        has_to_coordinate = to_coordinate is not None
+        has_element_target = has_from_element or has_to_element
+        has_coordinate_target = (
+            has_from_coordinate or has_to_coordinate
+        )
+        if (
+            has_element_target == has_coordinate_target
+            or has_from_element != has_to_element
+            or has_from_coordinate != has_to_coordinate
+        ):
+            raise InvalidArgumentsError(
+                "Drag requires either two elements or two coordinates.",
+                details={"reason": "invalid_drag_targets"},
+            )
+
+        if not isinstance(button, str):
+            raise InvalidArgumentsError(
+                "button must be left, right, or middle.",
+                details={"reason": "invalid_button"},
+            )
+        normalized_button = button.casefold()
+        if normalized_button not in {"left", "right", "middle"}:
+            raise InvalidArgumentsError(
+                "button must be left, right, or middle.",
+                details={"reason": "invalid_button"},
+            )
+        normalized_modifiers = self._validate_modifiers(modifiers)
+
+        if has_element_target:
+            if (
+                type(from_element) is not int
+                or from_element <= 0
+                or type(to_element) is not int
+                or to_element <= 0
+            ):
+                raise InvalidArgumentsError(
+                    "Drag elements must be positive integers.",
+                    details={"reason": "invalid_element"},
+                )
+        elif (
+            from_coordinate is None
+            or to_coordinate is None
+            or not self._is_valid_coordinate(from_coordinate)
+            or not self._is_valid_coordinate(to_coordinate)
+        ):
+            raise InvalidArgumentsError(
+                "Drag coordinates must each contain two integers.",
+                details={"reason": "invalid_coordinate"},
+            )
+
+        pid, window_id = self._require_active_target()
+        arguments: dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+        }
+        argument_names = self._tool_argument_names.get("drag", set())
+        if has_element_target:
+            from_driver_index, from_token = (
+                self._resolve_element_target(from_element)
+            )
+            to_driver_index, to_token = (
+                self._resolve_element_target(to_element)
+            )
+            arguments["from_element"] = from_driver_index
+            arguments["to_element"] = to_driver_index
+            if (
+                from_token is not None
+                and "from_element_token" in argument_names
+            ):
+                arguments["from_element_token"] = from_token
+            if (
+                to_token is not None
+                and "to_element_token" in argument_names
+            ):
+                arguments["to_element_token"] = to_token
+        else:
+            arguments.update(
+                {
+                    "from_x": from_coordinate[0],
+                    "from_y": from_coordinate[1],
+                    "to_x": to_coordinate[0],
+                    "to_y": to_coordinate[1],
+                }
+            )
+
+        if "button" in argument_names:
+            arguments["button"] = normalized_button
+        elif normalized_button != "left":
+            return ActionResult(
+                ok=False,
+                action=ComputerUseAction.DRAG,
+                message="cua-driver does not support this drag button.",
+                delivery_mode=delivery_mode,
+                code="drag_button_unsupported",
+            )
+
+        if normalized_modifiers is not None:
+            if "modifier" not in argument_names:
+                return ActionResult(
+                    ok=False,
+                    action=ComputerUseAction.DRAG,
+                    message=(
+                        "cua-driver does not support drag modifiers."
+                    ),
+                    delivery_mode=delivery_mode,
+                    code="modifiers_unsupported",
+                )
+            arguments["modifier"] = normalized_modifiers
+
+        unsupported = self._apply_delivery_options(
+            "drag",
+            arguments,
+            action=ComputerUseAction.DRAG,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+        )
+        if unsupported is not None:
+            return unsupported
+
+        raw_result = self._call_driver_tool("drag", arguments)
+        result = self._parse_action_result(
+            raw_result,
+            action=ComputerUseAction.DRAG,
+            requested_delivery=delivery_mode,
+        )
+        return self._apply_capture_after(result, capture_after)
 
     def _scroll(
         self,
@@ -583,9 +721,107 @@ class CuaDriverBackend(ComputerUseBackend):
         bring_to_front: bool = False,
         capture_after: bool = False,
     ) -> ActionResult:
-        """拒绝 P5 尚未实现的滚动动作。"""
+        """在活动窗口、元素或坐标附近执行滚动。"""
 
-        self._raise_action_unavailable(ComputerUseAction.SCROLL)
+        if not isinstance(direction, str):
+            raise InvalidArgumentsError(
+                "direction must be up, down, left, or right.",
+                details={"reason": "invalid_scroll_direction"},
+            )
+        normalized_direction = direction.casefold()
+        if normalized_direction not in {"up", "down", "left", "right"}:
+            raise InvalidArgumentsError(
+                "direction must be up, down, left, or right.",
+                details={"reason": "invalid_scroll_direction"},
+            )
+        if type(amount) is not int or amount <= 0:
+            raise InvalidArgumentsError(
+                "amount must be a positive integer.",
+                details={"reason": "invalid_scroll_amount"},
+            )
+        if element is not None and coordinate is not None:
+            raise InvalidArgumentsError(
+                "Scroll accepts at most one target.",
+                details={"reason": "multiple_scroll_targets"},
+            )
+        if (
+            coordinate is not None
+            and not self._is_valid_coordinate(coordinate)
+        ):
+            raise InvalidArgumentsError(
+                "coordinate must contain exactly two integers.",
+                details={"reason": "invalid_coordinate"},
+            )
+        if element is not None and (
+            type(element) is not int or element <= 0
+        ):
+            raise InvalidArgumentsError(
+                "element must be a positive integer.",
+                details={"reason": "invalid_element"},
+            )
+        normalized_modifiers = self._validate_modifiers(modifiers)
+
+        pid, window_id = self._require_active_target()
+        arguments: dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "direction": normalized_direction,
+            "amount": min(amount, 50),
+        }
+        argument_names = self._tool_argument_names.get("scroll", set())
+        coordinate_degraded = False
+        if element is not None:
+            driver_index, element_token = (
+                self._resolve_element_target(element)
+            )
+            arguments["element_index"] = driver_index
+            if (
+                element_token is not None
+                and "element_token" in argument_names
+            ):
+                arguments["element_token"] = element_token
+        elif coordinate is not None:
+            if {"x", "y"}.issubset(argument_names):
+                arguments["x"] = coordinate[0]
+                arguments["y"] = coordinate[1]
+            else:
+                coordinate_degraded = True
+
+        if normalized_modifiers is not None:
+            if "modifier" not in argument_names:
+                return ActionResult(
+                    ok=False,
+                    action=ComputerUseAction.SCROLL,
+                    message=(
+                        "cua-driver does not support scroll modifiers."
+                    ),
+                    delivery_mode=delivery_mode,
+                    code="modifiers_unsupported",
+                )
+            arguments["modifier"] = normalized_modifiers
+
+        unsupported = self._apply_delivery_options(
+            "scroll",
+            arguments,
+            action=ComputerUseAction.SCROLL,
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+        )
+        if unsupported is not None:
+            return unsupported
+
+        raw_result = self._call_driver_tool("scroll", arguments)
+        result = self._parse_action_result(
+            raw_result,
+            action=ComputerUseAction.SCROLL,
+            requested_delivery=delivery_mode,
+        )
+        if coordinate_degraded:
+            result.degraded = True
+            result.code = (
+                result.code or "coordinate_scroll_unsupported"
+            )
+        return self._apply_capture_after(result, capture_after)
 
     def _type_text(
         self,
@@ -753,9 +989,43 @@ class CuaDriverBackend(ComputerUseBackend):
         element: int | None = None,
         capture_after: bool = False,
     ) -> ActionResult:
-        """拒绝 P5 尚未实现的元素值设置。"""
+        """设置最近一次捕获中的元素值。"""
 
-        self._raise_action_unavailable(ComputerUseAction.SET_VALUE)
+        if not isinstance(value, str):
+            raise InvalidArgumentsError(
+                "value must be a string.",
+                details={"reason": "invalid_value"},
+            )
+        if type(element) is not int or element <= 0:
+            raise InvalidArgumentsError(
+                "element must be a positive integer.",
+                details={"reason": "invalid_element"},
+            )
+
+        pid, window_id = self._require_active_target()
+        driver_index, element_token = self._resolve_element_target(
+            element
+        )
+        arguments: dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "element_index": driver_index,
+            "value": value,
+        }
+        if (
+            element_token is not None
+            and "element_token"
+            in self._tool_argument_names.get("set_value", set())
+        ):
+            arguments["element_token"] = element_token
+
+        raw_result = self._call_driver_tool("set_value", arguments)
+        result = self._parse_action_result(
+            raw_result,
+            action=ComputerUseAction.SET_VALUE,
+            requested_delivery=None,
+        )
+        return self._apply_capture_after(result, capture_after)
 
     def _try_start_session(self) -> None:
         """尽力启动独立 session，失败时降级为匿名调用。"""
@@ -820,6 +1090,56 @@ class CuaDriverBackend(ComputerUseBackend):
             )
         return self._active_pid, self._active_window_id
 
+    def _resolve_element_target(
+        self,
+        element: int,
+    ) -> tuple[int, str | None]:
+        """解析最近一次捕获保存的驱动元素索引和 token。"""
+
+        if type(element) is not int or element <= 0:
+            raise InvalidArgumentsError(
+                "element must be a positive integer.",
+                details={"reason": "invalid_element"},
+            )
+        target = self._element_targets.get(element)
+        if target is None:
+            raise StaleElementError(
+                "The element does not belong to the latest capture.",
+                details={"reason": "stale_element"},
+            )
+        return target
+
+    @staticmethod
+    def _is_valid_coordinate(value: Any) -> bool:
+        """判断坐标是否为两个整数构成的元组。"""
+
+        return (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and all(type(item) is int for item in value)
+        )
+
+    @staticmethod
+    def _validate_modifiers(
+        modifiers: Sequence[str] | None,
+    ) -> list[str] | None:
+        """复制合法修饰键列表，拒绝空值或非字符串元素。"""
+
+        if modifiers is None:
+            return None
+        if (
+            isinstance(modifiers, (str, bytes))
+            or any(
+                not isinstance(modifier, str) or not modifier
+                for modifier in modifiers
+            )
+        ):
+            raise InvalidArgumentsError(
+                "modifiers must contain non-empty strings.",
+                details={"reason": "invalid_modifiers"},
+            )
+        return list(modifiers)
+
     def _apply_delivery_options(
         self,
         tool_name: str,
@@ -868,7 +1188,7 @@ class CuaDriverBackend(ComputerUseBackend):
         raw_result: Mapping[str, Any],
         *,
         action: ComputerUseAction,
-        requested_delivery: DeliveryMode,
+        requested_delivery: DeliveryMode | None,
     ) -> ActionResult:
         """将驱动动作结果转换为正式 ActionResult。"""
 
@@ -1711,17 +2031,3 @@ class CuaDriverBackend(ComputerUseBackend):
             except ValueError:
                 pass
         return None
-
-    @staticmethod
-    def _raise_action_unavailable(
-        action: ComputerUseAction,
-    ) -> NoReturn:
-        """统一拒绝 P5 尚未实现的写操作。"""
-
-        raise BackendUnavailableError(
-            "This Computer Use action is not available in the P5 backend.",
-            details={
-                "reason": "action_not_available_in_p5",
-                "action": action.value,
-            },
-        )
