@@ -12,6 +12,15 @@ import time
 from typing import Callable, Final, Protocol
 
 
+@dataclass(frozen=True, slots=True)
+class BackgroundProcessOutput:
+    """Handle 一次原子输出读取的结果。"""
+
+    text: str
+    discarded_chars: int = 0
+    read_error: Exception | None = None
+
+
 class BackgroundProcessHandle(Protocol):
     """ProcessManager 管理后台进程所需的最小句柄能力。"""
 
@@ -22,8 +31,8 @@ class BackgroundProcessHandle(Protocol):
     def poll(self) -> int | None:
         """仍在运行时返回 None，结束后返回退出码。"""
 
-    def read_available(self) -> str:
-        """返回当前可读取的新输出；没有新输出时返回空字符串。"""
+    def read_available(self) -> BackgroundProcessOutput:
+        """返回新输出、此前丢弃的字符数以及输出读取错误。"""
 
     def wait(self, timeout: float | None = None) -> int | None:
         """等待结束；超时时返回 None，结束后返回退出码。"""
@@ -77,6 +86,37 @@ class ProcessTerminationError(ProcessError):
 
 class ProcessWaitCancelled(ProcessError):
     """调用方取消了等待，但没有终止后台进程。"""
+
+
+class _ProcessStartFailureContext(Exception):
+    """保存启动与清理异常对象，但只呈现脱敏的异常类型。"""
+
+    def __init__(
+        self,
+        *,
+        start_error: BaseException,
+        cleanup_error: BaseException | None = None,
+    ) -> None:
+        self._start_error = start_error
+        self._cleanup_error = cleanup_error
+        start_error_type = type(start_error).__name__
+        cleanup_error_type = (
+            None
+            if cleanup_error is None
+            else type(cleanup_error).__name__
+        )
+        if cleanup_error_type is None:
+            message = (
+                "Process start diagnostics: "
+                f"start_error={start_error_type}"
+            )
+        else:
+            message = (
+                "Process start diagnostics: "
+                f"start_error={start_error_type}, "
+                f"cleanup_error={cleanup_error_type}"
+            )
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,14 +323,13 @@ class ProcessManager:
             try:
                 from hermes.backends import BackgroundProcessStartCleanupError
             except Exception as import_error:
-                import_error.add_note(
-                    "Original process start error: "
-                    f"{type(start_error).__name__}"
-                )
                 self._mark_start_failed(record)
                 raise ProcessStartError(
                     "Process start failed"
-                ) from import_error
+                ) from _ProcessStartFailureContext(
+                    start_error=start_error,
+                    cleanup_error=import_error,
+                )
 
             if not isinstance(
                 start_error,
@@ -299,7 +338,9 @@ class ProcessManager:
                 self._mark_start_failed(record)
                 raise ProcessStartError(
                     "Process start failed"
-                ) from start_error
+                ) from _ProcessStartFailureContext(
+                    start_error=start_error,
+                )
 
             try:
                 self._adopt_failed_start_cleanup_handle(
@@ -307,18 +348,19 @@ class ProcessManager:
                     start_error.handle,
                 )
             except Exception as protocol_error:
-                protocol_error.add_note(
-                    "Recoverable backend start error: "
-                    f"{type(start_error).__name__}"
-                )
                 self._mark_start_failed(record)
                 raise ProcessStartError(
                     "Process start failed"
-                ) from protocol_error
+                ) from _ProcessStartFailureContext(
+                    start_error=start_error,
+                    cleanup_error=protocol_error,
+                )
 
             raise ProcessStartError(
                 "Process start failed and cleanup could not be confirmed"
-            ) from start_error
+            ) from _ProcessStartFailureContext(
+                start_error=start_error,
+            )
 
         with record.record_lock:
             record.handle = handle
@@ -355,10 +397,6 @@ class ProcessManager:
             try:
                 self._dispose_failed_start_handle(record)
             except Exception as cleanup_error:
-                cleanup_error.add_note(
-                    "Original process start error: "
-                    f"{type(start_error).__name__}"
-                )
                 try:
                     self._retain_failed_start_cleanup_record(record)
                 except Exception:
@@ -368,13 +406,18 @@ class ProcessManager:
                         "Process start failed and cleanup could not "
                         "be confirmed"
                     )
-                ) from cleanup_error
+                ) from _ProcessStartFailureContext(
+                    start_error=start_error,
+                    cleanup_error=cleanup_error,
+                )
             else:
                 # 清理确认、failed_start 迁移和 close 已在同一流程中完成。
                 record.startup_event.set()
                 raise ProcessStartError(
                     "Process start failed"
-                ) from start_error
+                ) from _ProcessStartFailureContext(
+                    start_error=start_error,
+                )
 
         # 与正在进入的 cleanup 串行，避免返回一个已被清理请求接管的 running 快照。
         with record.termination_lock:
@@ -720,16 +763,68 @@ class ProcessManager:
             self._assert_handle_open_locked(record, handle)
             return handle.pid
 
-    def _handle_read_available(self, record: ProcessRecord) -> str:
-        """串行读取一次当前可用输出。"""
+    @staticmethod
+    def _validate_handle_output(
+        result: object,
+    ) -> BackgroundProcessOutput:
+        """校验 Handle 返回的公共输出批次。"""
 
-        handle = self._require_handle(record)
+        if not isinstance(result, BackgroundProcessOutput):
+            raise TypeError(
+                "process handle output must be BackgroundProcessOutput"
+            )
+        if not isinstance(result.text, str):
+            raise TypeError("process handle output text must be a string")
+        if (
+            isinstance(result.discarded_chars, bool)
+            or not isinstance(result.discarded_chars, int)
+            or result.discarded_chars < 0
+        ):
+            raise TypeError(
+                "process handle discarded_chars must be a nonnegative integer"
+            )
+        if (
+            result.read_error is not None
+            and not isinstance(result.read_error, Exception)
+        ):
+            raise TypeError(
+                "process handle read_error must be an exception or None"
+            )
+        return result
+
+    def _consume_available_output(
+        self,
+        record: ProcessRecord,
+    ) -> tuple[bool, bool]:
+        """原子消费输出并按真实顺序更新 cursor 与读取错误状态。"""
+
+        try:
+            handle = self._require_handle(record)
+        except Exception:
+            self._record_log_read_failure(record)
+            raise
         with record.handle_lock:
-            self._assert_handle_open_locked(record, handle)
-            output = handle.read_available()
-        if not isinstance(output, str):
-            raise TypeError("process handle output must be a string")
-        return output
+            try:
+                self._assert_handle_open_locked(record, handle)
+                result = self._validate_handle_output(
+                    handle.read_available()
+                )
+                self._append_output(
+                    record,
+                    result.text,
+                    discarded_chars=result.discarded_chars,
+                )
+                if result.read_error is None:
+                    self._clear_log_read_failures(record)
+                else:
+                    self._record_log_read_failure(record)
+            except Exception:
+                self._record_log_read_failure(record)
+                raise
+        return (
+            bool(result.text or result.discarded_chars),
+            result.read_error is not None,
+        )
 
     def _handle_poll(self, record: ProcessRecord) -> int | None:
         """串行查询一次进程退出状态。"""
@@ -798,7 +893,7 @@ class ProcessManager:
             return False, exit_code
 
     def _handle_close(self, record: ProcessRecord) -> None:
-        """串行关闭句柄，并保证 close 最多执行一次。"""
+        """串行关闭句柄；仅在成功后禁止重复调用。"""
 
         handle = self._get_handle(record)
         if handle is None:
@@ -807,11 +902,23 @@ class ProcessManager:
             with record.record_lock:
                 if record.close_called or record.handle is not handle:
                     return
-                record.close_called = True
             try:
                 handle.close()
-            except Exception:
-                pass
+            except Exception as error:
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                ) from error
+            with record.record_lock:
+                if record.handle is handle:
+                    record.close_called = True
+
+    def _handle_close_best_effort(self, record: ProcessRecord) -> None:
+        """普通终态沿用尽力释放语义，failed-start 使用严格关闭入口。"""
+
+        try:
+            self._handle_close(record)
+        except Exception:
+            pass
 
     def _require_handle(self, record: ProcessRecord) -> BackgroundProcessHandle:
         """短暂读取句柄引用，随后由调用方取得 Handle 操作锁。"""
@@ -873,14 +980,9 @@ class ProcessManager:
                     return
 
                 try:
-                    self._append_output(
-                        record,
-                        self._handle_read_available(record),
-                    )
+                    self._consume_available_output(record)
                 except Exception:
-                    self._record_log_read_failure(record)
-                else:
-                    self._clear_log_read_failures(record)
+                    pass
 
                 try:
                     exit_code = self._handle_poll(record)
@@ -897,7 +999,18 @@ class ProcessManager:
                     self._clear_poll_failures(record)
                     if exit_code is not None:
                         if self._is_failed_start_cleanup_pending(record):
-                            if self._finish_failed_start_recovery(record):
+                            try:
+                                if self._finish_failed_start_recovery(record):
+                                    return
+                            except Exception:
+                                # close 失败时保留可重试记录，且不留下失效线程引用。
+                                self._record_cleanup_failure(record)
+                                with record.record_lock:
+                                    if (
+                                        record.reader_thread
+                                        is threading.current_thread()
+                                    ):
+                                        record.reader_thread = None
                                 return
                         else:
                             self._finish_confirmed_exit(record, exit_code)
@@ -913,14 +1026,25 @@ class ProcessManager:
             ):
                 self._complete_lost(record)
             if self._snapshot(record).status in _TERMINAL_STATUSES:
-                self._handle_close(record)
+                self._handle_close_best_effort(record)
 
-    def _append_output(self, record: ProcessRecord, output: str) -> None:
+    def _append_output(
+        self,
+        record: ProcessRecord,
+        output: str,
+        *,
+        discarded_chars: int = 0,
+    ) -> None:
         """追加输出，并在需要时从缓冲区头部滚动裁剪。"""
 
-        if not output:
+        if not output and not discarded_chars:
             return
         with record.record_lock:
+            if discarded_chars:
+                # Backend 丢失造成不可表示的 cursor 缺口，只能保留其后的连续后缀。
+                record.output_end_cursor += discarded_chars
+                record.output_buffer = ""
+                record.output_base_cursor = record.output_end_cursor
             record.output_buffer += output
             record.output_end_cursor += len(output)
             excess = len(record.output_buffer) - self._max_output_chars
@@ -936,12 +1060,11 @@ class ProcessManager:
 
         for _ in range(_FINAL_DRAIN_READ_LIMIT):
             try:
-                output = self._handle_read_available(record)
+                consumed, _ = self._consume_available_output(record)
             except Exception:
                 return
-            if not output:
+            if not consumed:
                 return
-            self._append_output(record, output)
 
     def _complete_observed_exit(
         self,
@@ -953,15 +1076,6 @@ class ProcessManager:
         with record.record_lock:
             termination_signal_sent = record.termination_signal_sent
             termination_source = record.termination_source
-        if termination_source == "failed_start_cleanup":
-            self._finalize_record(
-                record,
-                ProcessStatus.FAILED_START,
-                exit_code=None,
-                completion_reason="failed_start",
-                termination_source="failed_start_cleanup",
-            )
-            return
         if termination_signal_sent:
             self._finalize_record(
                 record,
@@ -1009,12 +1123,14 @@ class ProcessManager:
                 "Could not confirm process termination"
             )
 
+        if self._is_failed_start_cleanup_pending(record):
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+
         self._drain_final_output(record)
         self._complete_observed_exit(record, exit_code)
         snapshot = self._snapshot(record)
-        if snapshot.status is ProcessStatus.FAILED_START:
-            self._handle_close(record)
-            return self._snapshot(record)
         if snapshot.status not in (
             ProcessStatus.EXITED,
             ProcessStatus.KILLED,
@@ -1022,7 +1138,7 @@ class ProcessManager:
             raise ProcessTerminationError(
                 "Could not confirm process termination"
             )
-        self._handle_close(record)
+        self._handle_close_best_effort(record)
         return self._snapshot(record)
 
     def _finalize_record(
@@ -1057,6 +1173,10 @@ class ProcessManager:
         """将启动过程中的异常转换为 failed_start 终态。"""
 
         with record.record_lock:
+            if record.handle is not None and not record.close_called:
+                raise RuntimeError(
+                    "Process handle must be closed before failed_start"
+                )
             self._transition_locked(
                 record,
                 ProcessStatus.FAILED_START,
@@ -1182,14 +1302,14 @@ class ProcessManager:
         self,
         record: ProcessRecord,
     ) -> ProcessSnapshot:
-        """排空日志后先稳定写入 failed_start，再尽力关闭句柄。"""
+        """排空日志并成功关闭句柄后，再稳定写入 failed_start。"""
 
         self._drain_final_output(record)
+        self._handle_close(record)
         self._mark_start_failed(
             record,
             termination_source="failed_start_cleanup",
         )
-        self._handle_close(record)
         return self._snapshot(record)
 
     def _retain_failed_start_cleanup_record(
@@ -1269,14 +1389,9 @@ class ProcessManager:
                 return
 
             try:
-                self._append_output(
-                    record,
-                    self._handle_read_available(record),
-                )
+                self._consume_available_output(record)
             except Exception:
-                self._record_log_read_failure(record)
-            else:
-                self._clear_log_read_failures(record)
+                pass
 
             try:
                 exit_code = self._handle_poll(record)
@@ -1285,7 +1400,18 @@ class ProcessManager:
             else:
                 self._clear_poll_failures(record)
                 if exit_code is not None:
-                    if self._finish_failed_start_recovery(record):
+                    try:
+                        if self._finish_failed_start_recovery(record):
+                            return
+                    except Exception:
+                        # 严格 close 失败时保留 running 记录，等待显式清理重试。
+                        self._record_cleanup_failure(record)
+                        with record.record_lock:
+                            if (
+                                record.reader_thread
+                                is threading.current_thread()
+                            ):
+                                record.reader_thread = None
                         return
 
             time.sleep(_READER_POLL_INTERVAL_SECONDS)
@@ -1640,6 +1766,7 @@ process_manager = ProcessManager()
 
 __all__ = [
     "BackgroundProcessHandle",
+    "BackgroundProcessOutput",
     "ProcessError",
     "ProcessLimitError",
     "ProcessLogResult",

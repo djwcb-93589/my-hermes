@@ -42,7 +42,7 @@ from hermes.config import (
     _config,
 )
 from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessPolicy
-from hermes.processes import BackgroundProcessHandle
+from hermes.processes import BackgroundProcessHandle, BackgroundProcessOutput
 from hermes.redaction import is_explicit_credential_env_name
 
 
@@ -194,9 +194,20 @@ class BackgroundProcessStartCleanupError(RuntimeError):
         message: str,
         *,
         handle: BackgroundProcessHandle,
+        start_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
     ) -> None:
         super().__init__(message)
         self.handle = handle
+        # 原始对象仅供内部诊断，公共消息始终保持稳定和脱敏。
+        self._start_error = start_error
+        self._cleanup_error = cleanup_error
+        self.start_error_type = (
+            None if start_error is None else type(start_error).__name__
+        )
+        self.cleanup_error_type = (
+            None if cleanup_error is None else type(cleanup_error).__name__
+        )
 
 
 class BaseExecutionEnvironment(ABC):
@@ -650,6 +661,7 @@ def cleanup_all_backends() -> None:
 __all__ = [
     "INFRASTRUCTURE_CREDENTIAL_ENV_VARS",
     "BackgroundProcessHandle",
+    "BackgroundProcessOutput",
     "BackgroundProcessCancelledError",
     "BackgroundProcessStartCleanupError",
     "BackgroundProcessUnsupportedError",

@@ -34,7 +34,7 @@ from hermes.path_utils import (
     git_bash_to_windows_path as _bash_to_win_path,
     windows_to_git_bash_path as _win_to_bash_path,
 )
-from hermes.processes import BackgroundProcessHandle
+from hermes.processes import BackgroundProcessHandle, BackgroundProcessOutput
 
 
 if sys.platform == "win32":
@@ -42,6 +42,7 @@ if sys.platform == "win32":
     from ctypes import wintypes
 
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
     class _LargeInteger(ctypes.Structure):
@@ -80,6 +81,18 @@ if sys.platform == "win32":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    class _JobObjectBasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", _LargeInteger),
+            ("TotalKernelTime", _LargeInteger),
+            ("ThisPeriodTotalUserTime", _LargeInteger),
+            ("ThisPeriodTotalKernelTime", _LargeInteger),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -97,6 +110,14 @@ if sys.platform == "win32":
         wintypes.DWORD,
     )
     _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     _kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -146,11 +167,44 @@ def _assign_windows_job(
         raise OSError(error, "AssignProcessToJobObject failed")
 
 
+def _query_windows_job_active_processes(job_handle: object | None) -> int:
+    """查询 Windows Job 当前仍活动的进程数量，失败时明确抛错。"""
+
+    if sys.platform != "win32":
+        return 0
+    if not job_handle:
+        raise RuntimeError("Windows Job handle is unavailable")
+    accounting = _JobObjectBasicAccountingInformation()
+    returned_length = wintypes.DWORD()
+    queried = _kernel32.QueryInformationJobObject(
+        job_handle,
+        _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+        ctypes.byref(accounting),
+        ctypes.sizeof(accounting),
+        ctypes.byref(returned_length),
+    )
+    if not queried:
+        raise OSError(
+            ctypes.get_last_error(),
+            "QueryInformationJobObject failed",
+        )
+    return int(accounting.ActiveProcesses)
+
+
 def _close_windows_job(job_handle: object | None) -> None:
     """释放由后台 Handle 持有的 Windows Job 句柄。"""
 
     if sys.platform == "win32" and job_handle:
         _kernel32.CloseHandle(job_handle)
+
+
+def _close_windows_job_strict(job_handle: object | None) -> None:
+    """严格关闭 Windows Job；失败时保留给调用方重试。"""
+
+    if sys.platform != "win32" or not job_handle:
+        return
+    if not _kernel32.CloseHandle(job_handle):
+        raise OSError(ctypes.get_last_error(), "CloseHandle failed")
 
 
 def _attach_windows_job(proc: subprocess.Popen) -> None:
@@ -201,7 +255,6 @@ def _background_process_tree_has_exited(
     job_handle: object | None,
     job_assigned: bool,
     process_group_id: int | None,
-    tree_termination_sent: bool = False,
 ) -> bool:
     """确认受管后台进程树是否已按平台语义完成收敛。"""
 
@@ -211,9 +264,8 @@ def _background_process_tree_has_exited(
         if not job_assigned:
             return True
         if not job_handle:
-            return False
-        # 后台 Job 已收到树级终止请求后，close 的 kill-on-close 会兜底剩余成员。
-        return tree_termination_sent
+            raise RuntimeError("Windows Job handle is unavailable")
+        return _query_windows_job_active_processes(job_handle) == 0
     if process_group_id is None:
         return False
     try:
@@ -292,6 +344,12 @@ def _kill_local_process_tree(
         if root_exited and not terminate_job_after_root_exit:
             return False
         job_is_assigned = bool(job_handle and job_assigned)
+        if (
+            job_is_assigned
+            and root_exited
+            and _query_windows_job_active_processes(job_handle) == 0
+        ):
+            return False
         if root_exited and not job_is_assigned:
             return False
 
@@ -408,8 +466,37 @@ def _remove_local_path(path: Path | None) -> None:
         pass
 
 
+def _remove_local_path_strict(path: Path | None) -> None:
+    """严格删除后台私有临时文件，仅忽略文件已经不存在。"""
+
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 class BackgroundProcessCleanupError(RuntimeError):
     """后台启动失败后，无法确认已创建进程完成清理。"""
+
+
+class _BackgroundProcessStartCleanupContext(RuntimeError):
+    """保留原始异常对象，仅在消息中呈现脱敏类型。"""
+
+    def __init__(
+        self,
+        *,
+        start_error: BaseException,
+        cleanup_error: BaseException,
+    ) -> None:
+        self._start_error = start_error
+        self._cleanup_error = cleanup_error
+        super().__init__(
+            "Background process start cleanup diagnostics: "
+            f"start_error={type(start_error).__name__}, "
+            f"cleanup_error={type(cleanup_error).__name__}"
+        )
 
 
 _BACKGROUND_DISPOSE_WAIT_SECONDS = 5.0
@@ -427,37 +514,72 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
 
     def __init__(
         self,
-        proc: subprocess.Popen,
         *,
         job_handle: object | None = None,
-        job_assigned: bool | None = None,
+        job_assigned: bool = False,
         snapshot_path: Path | None = None,
         startup_gate_path: Path | None = None,
     ) -> None:
-        if proc.stdout is None:
-            raise RuntimeError("Background process stdout pipe is unavailable")
-
-        self._proc = proc
+        self._proc: subprocess.Popen | None = None
         self._job_handle = job_handle
-        self._job_assigned = (
-            job_handle is not None if job_assigned is None else job_assigned
-        )
-        self._process_group_id = (
-            proc.pid if sys.platform != "win32" else None
-        )
-        self._tree_termination_sent = False
+        self._job_assigned = job_assigned
+        self._process_group_id: int | None = None
         self._snapshot_path = snapshot_path
         self._startup_gate_path = startup_gate_path
         self._operation_lock = threading.Lock()
         self._output_lock = threading.Lock()
         self._pending_output: deque[str] = deque()
         self._pending_chars = 0
-        self._pending_output_truncated = False
-        self._stdout = proc.stdout
+        self._discarded_chars = 0
+        self._stdout = None
         self._output_eof_event = threading.Event()
         self._output_error: Exception | None = None
         self._closed = False
+        self._stdin_closed = True
         self._output_thread: threading.Thread | None = None
+
+    def attach_process(self, proc: subprocess.Popen) -> None:
+        """把刚创建的 Popen 绑定到最小 Handle；同一进程可安全重入。"""
+
+        with self._operation_lock:
+            if self._closed:
+                raise RuntimeError("Background process handle is closed")
+            if self._proc is not None and self._proc is not proc:
+                raise RuntimeError("Background process handle is initialized")
+            # 根进程和 PGID 必须最先落入 Handle，后续管道读取失败也不丢失树级控制权。
+            self._proc = proc
+            if sys.platform != "win32":
+                self._process_group_id = proc.pid
+            self._stdin_closed = False
+            self._stdout = proc.stdout
+            self._stdin_closed = proc.stdin is None
+
+    def owns_process(self) -> bool:
+        """返回最小 Handle 是否已经接管一个成功创建的 Popen。"""
+
+        with self._operation_lock:
+            return self._proc is not None
+
+    def _require_process_locked(self) -> subprocess.Popen:
+        """在 operation_lock 内取得根进程。"""
+
+        if self._proc is None:
+            raise RuntimeError("Background process handle is not initialized")
+        return self._proc
+
+    def assign_windows_job(self) -> None:
+        """在 Handle 已建立所有权后，把根进程加入后台 Job。"""
+
+        if sys.platform != "win32":
+            return
+        with self._operation_lock:
+            if self._closed:
+                raise RuntimeError("Background process handle is closed")
+            if self._job_assigned:
+                return
+            proc = self._require_process_locked()
+            _assign_windows_job(proc, self._job_handle)
+            self._job_assigned = True
 
     def start_output_reader(self) -> None:
         """在 Handle 已可清理后启动唯一的后台输出读取线程。"""
@@ -467,9 +589,17 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 raise RuntimeError("Background process handle is closed")
             if self._output_thread is not None:
                 return
+            if self._stdout is None:
+                output_error = RuntimeError(
+                    "Background process stdout pipe is unavailable"
+                )
+                with self._output_lock:
+                    self._output_error = output_error
+                raise output_error
+            proc = self._require_process_locked()
             output_thread = threading.Thread(
                 target=self._collect_output,
-                name=f"hermes-local-background-output-{self._proc.pid}",
+                name=f"hermes-local-background-output-{proc.pid}",
                 daemon=True,
             )
             self._output_eof_event.clear()
@@ -480,6 +610,11 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
             with self._operation_lock:
                 if self._output_thread is output_thread:
                     self._output_thread = None
+            with self._output_lock:
+                if self._output_error is None:
+                    self._output_error = RuntimeError(
+                        "Background output reader could not start"
+                    )
             self._output_eof_event.set()
             raise
 
@@ -487,26 +622,39 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
     def pid(self) -> int | None:
         """返回受管宿主进程的 PID，供诊断使用。"""
 
-        return self._proc.pid
+        with self._operation_lock:
+            if self._proc is None:
+                return None
+            return self._proc.pid
 
     def poll(self) -> int | None:
         """非阻塞查询本地进程是否结束。"""
 
         with self._operation_lock:
+            self._require_process_locked()
             return self._poll_process_tree_locked()
 
-    def read_available(self) -> str:
-        """立即返回输出线程已收集的增量文本。"""
+    def read_available(self) -> BackgroundProcessOutput:
+        """原子返回增量文本、丢弃字符计数和读取错误。"""
 
-        if self.poll() is not None and not self._has_pending_output():
+        if (
+            not self._has_pending_output_state()
+            and self.poll() is not None
+        ):
             self._wait_output_eof(self._FINAL_OUTPUT_WAIT_SECONDS)
         with self._output_lock:
-            if not self._pending_output:
-                return ""
             output = "".join(self._pending_output)
             self._pending_output.clear()
             self._pending_chars = 0
-            return output
+            discarded_chars = self._discarded_chars
+            self._discarded_chars = 0
+            read_error = self._output_error
+            self._output_error = None
+            return BackgroundProcessOutput(
+                text=output,
+                discarded_chars=discarded_chars,
+                read_error=read_error,
+            )
 
     def wait(self, timeout: float | None = None) -> int | None:
         """有限等待本地进程；超时不向上泄漏 TimeoutExpired。"""
@@ -516,8 +664,8 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         )
         while True:
             with self._operation_lock:
+                proc = self._require_process_locked()
                 exit_code = self._poll_process_tree_locked()
-                proc = self._proc
                 root_process_exited = proc.poll() is not None
             if exit_code is not None:
                 return exit_code
@@ -545,117 +693,181 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         """请求整个本地进程组协作式退出，并返回是否真正发送了信号。"""
 
         with self._operation_lock:
-            return _interrupt_local_process(
-                self._proc,
-                process_group_id=self._process_group_id,
+            proc = self._require_process_locked()
+            process_group_id = self._process_group_id
+            if sys.platform != "win32" and process_group_id is None:
+                raise RuntimeError("Local process group is unavailable")
+            if (
+                sys.platform == "win32"
+                and self._job_assigned
+                and proc.poll() is not None
+            ):
+                if (
+                    _query_windows_job_active_processes(self._job_handle)
+                    == 0
+                ):
+                    return False
+                raise RuntimeError(
+                    "Could not interrupt local Windows process tree"
+                )
+            signal_sent = _interrupt_local_process(
+                proc,
+                process_group_id=process_group_id,
                 interrupt_group_after_root_exit=True,
             )
+            if (
+                not signal_sent
+                and sys.platform == "win32"
+                and self._job_assigned
+                and _query_windows_job_active_processes(self._job_handle) > 0
+            ):
+                raise RuntimeError(
+                    "Could not interrupt local Windows process tree"
+                )
+            return signal_sent
 
     def kill(self) -> bool:
         """强制终止整个本地进程树，并返回是否真正执行了终止操作。"""
 
         with self._operation_lock:
-            signal_sent = _kill_local_process_tree(
-                self._proc,
+            proc = self._require_process_locked()
+            process_group_id = self._process_group_id
+            if sys.platform != "win32" and process_group_id is None:
+                raise RuntimeError("Local process group is unavailable")
+            return _kill_local_process_tree(
+                proc,
                 self._job_handle,
                 job_assigned=self._job_assigned,
-                process_group_id=self._process_group_id,
+                process_group_id=process_group_id,
                 terminate_job_after_root_exit=True,
                 terminate_group_after_root_exit=True,
             )
-            if signal_sent:
-                self._tree_termination_sent = True
-            return signal_sent
 
     def process_tree_is_terminated(self) -> bool:
         """确认当前 Handle 受管的本地进程树是否已经结束。"""
 
         with self._operation_lock:
+            self._require_process_locked()
             return self._process_tree_is_terminated_locked()
 
     def close(self) -> None:
-        """释放管道、输出读取线程所用资源和 Windows Job。"""
+        """逐项释放资源；失败的资源保留引用以支持后续重试。"""
 
         with self._operation_lock:
             if self._closed:
                 return
-            self._closed = True
-            try:
-                process_exited = _root_process_has_exited(self._proc)
-            except Exception:
-                process_exited = False
-            stdout = self._stdout
-            self._stdout = None
-            job_handle = self._job_handle
-            self._job_handle = None
-            snapshot_path = self._snapshot_path
-            self._snapshot_path = None
-            startup_gate_path = self._startup_gate_path
-            self._startup_gate_path = None
-            output_thread = self._output_thread
-            try:
-                stdin = self._proc.stdin
-            except BaseException:
-                stdin = None
 
-        try:
-            try:
-                # 后台 Job 的最后一个句柄关闭会终止尚未退出的成员进程。
-                _close_windows_job(job_handle)
-            except BaseException:
-                pass
+            errors: list[BaseException] = []
+            output_thread = self._output_thread
             if output_thread is None:
                 self._output_eof_event.set()
-            if process_exited or job_handle is not None:
+            elif threading.current_thread() is not output_thread:
+                self._wait_output_eof(self._CLOSE_OUTPUT_WAIT_SECONDS)
+
+            if not self._stdin_closed:
                 try:
-                    self._wait_output_eof(self._CLOSE_OUTPUT_WAIT_SECONDS)
-                except BaseException:
-                    pass
-            if stdin is not None:
+                    proc = self._proc
+                    stdin = None if proc is None else proc.stdin
+                    if stdin is not None:
+                        stdin.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._stdin_closed = True
+
+            if self._stdout is not None:
                 try:
-                    stdin.close()
-                except BaseException:
-                    pass
-            if stdout is not None:
-                try:
-                    stdout.close()
-                except BaseException:
-                    pass
+                    self._stdout.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._stdout = None
+
             if (
                 output_thread is not None
                 and threading.current_thread() is not output_thread
             ):
                 try:
-                    output_thread.join(timeout=self._CLOSE_OUTPUT_WAIT_SECONDS)
-                except BaseException:
-                    pass
-        finally:
-            _remove_local_path(snapshot_path)
-            _remove_local_path(startup_gate_path)
+                    output_thread.join(
+                        timeout=self._CLOSE_OUTPUT_WAIT_SECONDS
+                    )
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    if output_thread.is_alive():
+                        errors.append(
+                            RuntimeError(
+                                "Background output reader did not stop"
+                            )
+                        )
+                    elif self._output_thread is output_thread:
+                        self._output_thread = None
+
+            if self._snapshot_path is not None:
+                try:
+                    _remove_local_path_strict(self._snapshot_path)
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._snapshot_path = None
+
+            if self._startup_gate_path is not None:
+                try:
+                    _remove_local_path_strict(self._startup_gate_path)
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._startup_gate_path = None
+
+            # Job 最后关闭，确保其他资源失败时仍保留树级控制能力。
+            if not errors and self._job_handle is not None:
+                try:
+                    _close_windows_job_strict(self._job_handle)
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._job_handle = None
+                    self._job_assigned = False
+
+            if errors:
+                close_error = RuntimeError(
+                    "Background process handle close failed"
+                )
+                close_error._resource_errors = tuple(errors)
+                raise close_error
+
+            self._closed = True
 
     def _poll_process_tree_locked(self) -> int | None:
-        """仅在受管 POSIX 进程组消失后报告根进程退出。"""
+        """仅在受管 Windows Job 或 POSIX 进程组结束后报告退出。"""
 
-        exit_code = self._proc.poll()
+        proc = self._require_process_locked()
+        exit_code = proc.poll()
+        if sys.platform == "win32" and self._job_assigned:
+            active_processes = _query_windows_job_active_processes(
+                self._job_handle
+            )
+            if active_processes > 0:
+                return None
         if exit_code is None:
             return None
-        if (
-            sys.platform != "win32"
-            and self._process_group_id is not None
-            and _posix_process_group_exists(self._process_group_id)
-        ):
-            return None
+        if sys.platform != "win32":
+            process_group_id = self._process_group_id
+            if process_group_id is None:
+                raise RuntimeError("Local process group is unavailable")
+            if _posix_process_group_exists(process_group_id):
+                return None
         return exit_code
 
     def _process_tree_is_terminated_locked(self) -> bool:
         """在操作锁内确认根进程与其受管进程树均已结束。"""
 
+        proc = self._require_process_locked()
         return _background_process_tree_has_exited(
-            self._proc,
+            proc,
             job_handle=self._job_handle,
             job_assigned=self._job_assigned,
             process_group_id=self._process_group_id,
-            tree_termination_sent=self._tree_termination_sent,
         )
 
     def _collect_output(self) -> None:
@@ -663,6 +875,7 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
 
         stdout = self._stdout
         decoder = None
+        output_error: Exception | None = None
         try:
             if stdout is None:
                 return
@@ -673,18 +886,20 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                     return
                 self._append_pending_output(decoder.decode(output, final=False))
         except Exception as error:
-            # 输出读取器异常不能使后台进程或主流程崩溃。
-            with self._output_lock:
-                self._output_error = error
+            # 先保存到线程局部，decoder 尾部刷新后再原子发布错误。
+            output_error = error
         finally:
             try:
                 if decoder is not None:
                     self._append_pending_output(decoder.decode(b"", final=True))
             except Exception as error:
-                with self._output_lock:
-                    if self._output_error is None:
-                        self._output_error = error
+                if output_error is None:
+                    output_error = error
             finally:
+                if output_error is not None:
+                    with self._output_lock:
+                        if self._output_error is None:
+                            self._output_error = output_error
                 self._output_eof_event.set()
 
     def _append_pending_output(self, output: str) -> None:
@@ -701,18 +916,23 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 if len(oldest) <= excess:
                     self._pending_output.popleft()
                     self._pending_chars -= len(oldest)
+                    self._discarded_chars += len(oldest)
                     excess -= len(oldest)
                 else:
                     self._pending_output[0] = oldest[excess:]
                     self._pending_chars -= excess
+                    self._discarded_chars += excess
                     excess = 0
-                self._pending_output_truncated = True
 
-    def _has_pending_output(self) -> bool:
-        """在不消费输出的前提下查询是否已有待取日志。"""
+    def _has_pending_output_state(self) -> bool:
+        """查询是否有文本、丢弃计数或读取错误尚需上报。"""
 
         with self._output_lock:
-            return bool(self._pending_output)
+            return bool(
+                self._pending_output
+                or self._discarded_chars
+                or self._output_error is not None
+            )
 
     def _wait_output_eof(self, timeout: float) -> bool:
         """有限等待输出线程确认 EOF，避免固定 join 导致尾部日志丢失。"""
@@ -925,29 +1145,30 @@ class LocalBackend(BaseExecutionEnvironment):
                 raise BackgroundProcessCancelledError(
                     "Background process start cancelled"
                 )
+            # 先建立资源所有者；Popen 一旦成功即绑定，消除无 Handle 的存活分支。
+            handle = LocalBackgroundProcessHandle(
+                job_handle=job_handle,
+                job_assigned=False,
+                snapshot_path=snapshot_copy,
+                startup_gate_path=startup_gate_path,
+            )
             proc = self._run_background_bash(
                 wrapped,
                 env=launch_env,
                 wait_for_start_gate=startup_gate_path is not None,
             )
+            handle.attach_process(proc)
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
                     "Background process start cancelled"
                 )
             if sys.platform == "win32":
-                _assign_windows_job(proc, job_handle)
+                handle.assign_windows_job()
                 job_assigned = True
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
                     "Background process start cancelled"
                 )
-            handle = LocalBackgroundProcessHandle(
-                proc,
-                job_handle=job_handle,
-                job_assigned=job_assigned,
-                snapshot_path=snapshot_copy,
-                startup_gate_path=startup_gate_path,
-            )
             handle.start_output_reader()
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
@@ -963,6 +1184,13 @@ class LocalBackend(BaseExecutionEnvironment):
                 )
             return handle
         except BaseException as start_error:
+            if proc is not None and handle is not None:
+                try:
+                    # 覆盖 Popen 返回后、首个绑定调用前被异步异常打断的极窄窗口。
+                    handle.attach_process(proc)
+                except BaseException:
+                    # 后续清理会根据 owns_process 选择 Handle 或原始 Popen 路径。
+                    pass
             try:
                 self._force_dispose_background_before_return(
                     proc=proc,
@@ -973,20 +1201,28 @@ class LocalBackend(BaseExecutionEnvironment):
                     startup_gate_path=startup_gate_path,
                 )
             except BackgroundProcessCleanupError as cleanup_error:
-                if handle is not None:
+                if handle is not None and handle.owns_process():
                     handoff_error = BackgroundProcessStartCleanupError(
                         (
                             "Background process start failed and cleanup "
                             "could not be confirmed"
                         ),
                         handle=handle,
+                        start_error=start_error,
+                        cleanup_error=cleanup_error,
                     )
-                    handoff_error.add_note(
-                        "Cleanup confirmation error: "
-                        f"{type(cleanup_error).__name__}"
+                    raise handoff_error from (
+                        _BackgroundProcessStartCleanupContext(
+                            start_error=start_error,
+                            cleanup_error=cleanup_error,
+                        )
                     )
-                    raise handoff_error from start_error
-                raise cleanup_error from start_error
+                raise cleanup_error from (
+                    _BackgroundProcessStartCleanupContext(
+                        start_error=start_error,
+                        cleanup_error=cleanup_error,
+                    )
+                )
             raise
 
     def _copy_background_snapshot_locked(self) -> Path:
@@ -1115,7 +1351,6 @@ class LocalBackend(BaseExecutionEnvironment):
         job_handle: object | None,
         job_assigned: bool,
         process_group_id: int | None,
-        tree_termination_sent: bool,
     ) -> bool:
         """按本地后端的受管进程树语义确认清理完成。"""
 
@@ -1129,7 +1364,6 @@ class LocalBackend(BaseExecutionEnvironment):
             job_handle=job_handle,
             job_assigned=job_assigned,
             process_group_id=process_group_id,
-            tree_termination_sent=tree_termination_sent,
         )
 
     @staticmethod
@@ -1211,6 +1445,16 @@ class LocalBackend(BaseExecutionEnvironment):
         """在后台启动失败后确认整个受管进程树退出，随后释放资源。"""
 
         if proc is None:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as close_error:
+                    cleanup_error = BackgroundProcessCleanupError(
+                        "Could not confirm background process cleanup"
+                    )
+                    cleanup_error._close_error = close_error
+                    raise cleanup_error
+                return
             try:
                 _close_windows_job(job_handle)
             except BaseException:
@@ -1222,79 +1466,80 @@ class LocalBackend(BaseExecutionEnvironment):
         process_group_id = (
             proc.pid if sys.platform != "win32" else None
         )
-        tree_termination_sent = False
+        managed_handle = handle
+        if managed_handle is not None:
+            try:
+                if not managed_handle.owns_process():
+                    managed_handle = None
+            except BaseException:
+                managed_handle = None
 
         if not self._background_process_tree_has_exited(
             proc,
-            handle=handle,
+            handle=managed_handle,
             job_handle=job_handle,
             job_assigned=job_assigned,
             process_group_id=process_group_id,
-            tree_termination_sent=tree_termination_sent,
         ):
             try:
-                tree_termination_sent = (
-                    self._force_terminate_background_tree(
-                        proc,
-                        handle=handle,
-                        job_handle=job_handle,
-                        job_assigned=job_assigned,
-                        process_group_id=process_group_id,
-                    )
-                    or tree_termination_sent
+                self._force_terminate_background_tree(
+                    proc,
+                    handle=managed_handle,
+                    job_handle=job_handle,
+                    job_assigned=job_assigned,
+                    process_group_id=process_group_id,
                 )
             except BaseException:
                 pass
             self._wait_for_background_process_exit(
                 proc,
                 _BACKGROUND_DISPOSE_WAIT_SECONDS,
-                handle=handle,
+                handle=managed_handle,
             )
 
         if not self._background_process_tree_has_exited(
             proc,
-            handle=handle,
+            handle=managed_handle,
             job_handle=job_handle,
             job_assigned=job_assigned,
             process_group_id=process_group_id,
-            tree_termination_sent=tree_termination_sent,
         ):
             try:
-                tree_termination_sent = (
-                    self._force_terminate_background_tree(
-                        proc,
-                        handle=handle,
-                        job_handle=job_handle,
-                        job_assigned=job_assigned,
-                        process_group_id=process_group_id,
-                    )
-                    or tree_termination_sent
+                self._force_terminate_background_tree(
+                    proc,
+                    handle=managed_handle,
+                    job_handle=job_handle,
+                    job_assigned=job_assigned,
+                    process_group_id=process_group_id,
                 )
             except BaseException:
                 pass
             self._wait_for_background_process_exit(
                 proc,
                 _BACKGROUND_DISPOSE_RETRY_WAIT_SECONDS,
-                handle=handle,
+                handle=managed_handle,
             )
 
         if not self._background_process_tree_has_exited(
             proc,
-            handle=handle,
+            handle=managed_handle,
             job_handle=job_handle,
             job_assigned=job_assigned,
             process_group_id=process_group_id,
-            tree_termination_sent=tree_termination_sent,
         ):
             raise BackgroundProcessCleanupError(
                 "Could not confirm background process cleanup"
             )
 
-        if handle is not None:
+        if managed_handle is not None:
             try:
-                handle.close()
-            except BaseException:
-                pass
+                managed_handle.close()
+            except BaseException as close_error:
+                cleanup_error = BackgroundProcessCleanupError(
+                    "Could not confirm background process cleanup"
+                )
+                cleanup_error._close_error = close_error
+                raise cleanup_error
             return
 
         self._release_unmanaged_background_resources(
