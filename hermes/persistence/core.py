@@ -54,14 +54,17 @@ def session_exists(
     return conn.execute(query, params).fetchone() is not None
 
 
-def list_cli_sessions(
+def list_cli_session_summaries(
     conn: sqlite3.Connection,
-    limit: int = 10,
-    offset: int = 0,
+    *,
+    limit: int,
+    offset: int,
 ) -> list[dict]:
-    """列出有用户消息的 CLI 会话摘要。"""
-    normalized_limit = max(1, min(100, int(limit)))
-    normalized_offset = max(0, int(offset))
+    """按稳定顺序读取 CLI 会话原始摘要，供只读展示层自行脱敏。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
     rows = conn.execute(
         """
         SELECT session.id, message.content, message.timestamp
@@ -83,11 +86,37 @@ def list_cli_sessions(
         ORDER BY message.timestamp DESC, message.id DESC, session.id ASC
         LIMIT ? OFFSET ?
         """,
-        (normalized_limit, normalized_offset),
+        (limit, offset),
     ).fetchall()
 
+    return [
+        {
+            "session_id": session_id,
+            "preview": content,
+            "timestamp": timestamp,
+        }
+        for session_id, content, timestamp in rows
+    ]
+
+
+def list_cli_sessions(
+    conn: sqlite3.Connection,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[dict]:
+    """列出有用户消息的 CLI 会话摘要。"""
+    normalized_limit = max(1, min(100, int(limit)))
+    normalized_offset = max(0, int(offset))
+    records = list_cli_session_summaries(
+        conn,
+        limit=normalized_limit,
+        offset=normalized_offset,
+    )
     summaries: list[dict] = []
-    for session_id, content, timestamp in rows:
+    for record in records:
+        session_id = record["session_id"]
+        content = record["preview"]
+        timestamp = record["timestamp"]
         preview = " ".join(str(content or "").split())
         if len(preview) > 120:
             preview = f"{preview[:117]}..."

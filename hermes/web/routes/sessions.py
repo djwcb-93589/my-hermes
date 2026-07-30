@@ -1,25 +1,25 @@
 """会话只读路由。"""
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Request
 
-from hermes.web.read_service import ReadService
+from hermes.web.pagination import PageParams, page_params
+from hermes.web.read_service import SessionReadService
 from hermes.web.schemas import SessionDetailResponse, SessionListResponse
 
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
-def _service(request: Request) -> ReadService:
-    return request.app.state.read_service
+def _service(request: Request) -> SessionReadService:
+    return request.app.state.session_read_service
 
 
 @router.get("", response_model=SessionListResponse)
 def list_sessions(
     request: Request,
-    limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    page: PageParams = Depends(page_params),
 ) -> SessionListResponse:
-    return _service(request).list_sessions(limit=limit, offset=offset)
+    return _service(request).list_sessions(page=page)
 
 
 @router.get("/{conversation_id}", response_model=SessionDetailResponse)

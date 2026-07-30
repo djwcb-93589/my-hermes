@@ -9,7 +9,17 @@ from fastapi.responses import JSONResponse
 
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
-from hermes.web.read_service import ReadDataUnavailable, ReadService, ResourceNotFound
+from hermes.web.read_context import DashboardReadContext
+from hermes.web.read_service import (
+    CatalogReadService,
+    CronReadService,
+    HealthReadService,
+    ReadDataUnavailable,
+    ReadService,
+    ResourceNotFound,
+    SessionReadService,
+)
+from hermes.web.redaction import DashboardRedactor
 from hermes.web.routes import catalog, cron, sessions, status
 from hermes.web.schemas import ErrorResponse
 from hermes.web.security import (
@@ -38,8 +48,26 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         read_auth_required=config.auth_required,
         bound_host=config.host,
     )
+    read_context = DashboardReadContext(config.db_path)
+    redactor = DashboardRedactor()
+    health_read_service = HealthReadService(read_context, redactor)
+    session_read_service = SessionReadService(read_context, redactor)
+    cron_read_service = CronReadService(read_context, redactor)
+    catalog_read_service = CatalogReadService(read_context, redactor)
+    read_service = ReadService(
+        context=read_context,
+        redactor=redactor,
+        health_read_service=health_read_service,
+        session_read_service=session_read_service,
+        cron_read_service=cron_read_service,
+        catalog_read_service=catalog_read_service,
+    )
     return create_app(
-        read_service=ReadService(config.db_path),
+        read_service=read_service,
+        health_read_service=health_read_service,
+        session_read_service=session_read_service,
+        cron_read_service=cron_read_service,
+        catalog_read_service=catalog_read_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
         access_policy=access_policy,
@@ -52,6 +80,10 @@ def create_app(
     control_authenticator: ControlAuthenticator | None = None,
     *,
     access_policy: DashboardAccessPolicy | None = None,
+    health_read_service: HealthReadService | None = None,
+    session_read_service: SessionReadService | None = None,
+    cron_read_service: CronReadService | None = None,
+    catalog_read_service: CatalogReadService | None = None,
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
@@ -60,8 +92,30 @@ def create_app(
         read_auth_required=False,
         bound_host="127.0.0.1",
     )
+    compatibility_read_service = read_service or ReadService(
+        health_read_service=health_read_service,
+        session_read_service=session_read_service,
+        cron_read_service=cron_read_service,
+        catalog_read_service=catalog_read_service,
+    )
+    resolved_health_service = (
+        health_read_service or compatibility_read_service.health
+    )
+    resolved_session_service = (
+        session_read_service or compatibility_read_service.sessions
+    )
+    resolved_cron_service = cron_read_service or compatibility_read_service.cron
+    resolved_catalog_service = (
+        catalog_read_service or compatibility_read_service.catalog
+    )
+
     application = FastAPI(title="MyHermes Dashboard API")
-    application.state.read_service = read_service or ReadService()
+    # 保留兼容门面，但新路由必须使用各自领域服务。
+    application.state.read_service = compatibility_read_service
+    application.state.health_read_service = resolved_health_service
+    application.state.session_read_service = resolved_session_service
+    application.state.cron_read_service = resolved_cron_service
+    application.state.catalog_read_service = resolved_catalog_service
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
     application.state.dashboard_access_policy = policy
@@ -111,9 +165,9 @@ def create_app(
         request: Request,
         exc: ReadDataUnavailable,
     ) -> JSONResponse:
-        del request, exc
+        del request
         body = ErrorResponse(
-            code="data_unavailable",
+            code=exc.reason_code,
             message="请求的数据当前不可通过只读公开接口获得。",
         )
         return JSONResponse(status_code=503, content=jsonable_encoder(body))
@@ -123,8 +177,11 @@ def create_app(
         request: Request,
         exc: ResourceNotFound,
     ) -> JSONResponse:
-        del request, exc
-        body = ErrorResponse(code="not_found", message="请求的资源不存在。")
+        del request
+        body = ErrorResponse(
+            code=exc.reason_code,
+            message="请求的资源不存在。",
+        )
         return JSONResponse(status_code=404, content=jsonable_encoder(body))
 
     @application.exception_handler(ControlUnavailable)

@@ -422,18 +422,23 @@ def list_cron_jobs(
     conn: sqlite3.Connection,
     *,
     include_paused: bool = True,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict]:
     """按下次运行和创建时间稳定列出任务定义。"""
     clause = "WHERE deleted_at IS NULL"
     if not include_paused:
         clause += " AND paused=0"
+    pagination, params = _read_pagination(limit=limit, offset=offset)
     rows = conn.execute(
         f"""
         SELECT {_CRON_JOB_COLUMNS}
         FROM cron_jobs
         {clause}
         ORDER BY (next_run_at IS NULL), next_run_at, created_at, job_id
-        """
+        {pagination}
+        """,
+        params,
     ).fetchall()
     return [item for row in rows if (item := _cron_job_row(row)) is not None]
 
@@ -1360,17 +1365,42 @@ def get_cron_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
 def list_cron_runs(
     conn: sqlite3.Connection,
     job_id: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict]:
     """按计划时间倒序读取任务的独立运行历史。"""
+    pagination, pagination_params = _read_pagination(
+        limit=limit,
+        offset=offset,
+    )
     rows = conn.execute(
         f"""
         SELECT {_CRON_RUN_COLUMNS}
         FROM cron_runs WHERE job_id=?
         ORDER BY scheduled_for DESC, run_id
+        {pagination}
         """,
-        (job_id,),
+        (job_id, *pagination_params),
     ).fetchall()
     return [item for row in rows if (item := _cron_run_row(row)) is not None]
+
+
+def _read_pagination(
+    *,
+    limit: int | None,
+    offset: int,
+) -> tuple[str, tuple[int, ...]]:
+    """为只读列表查询添加可选分页，不改变既有未分页调用的语义。"""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise DBError("Cron offset must be a non-negative integer")
+    if limit is None:
+        if offset == 0:
+            return "", ()
+        return "LIMIT -1 OFFSET ?", (offset,)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise DBError("Cron limit must be a positive integer")
+    return "LIMIT ? OFFSET ?", (limit, offset)
 
 
 def transition_cron_run(

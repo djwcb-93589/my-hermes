@@ -1,27 +1,32 @@
-"""Web 管理 API 的集中只读适配层。"""
+"""Dashboard 领域只读服务及兼容门面。"""
 
 from __future__ import annotations
 
 import math
-import sqlite3
-from contextlib import contextmanager
+import re
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
-from typing import Iterator
+from pathlib import Path
 
 from pydantic import ValidationError
 import yaml
 
+from hermes.config_values import hermes_home
 from hermes.persistence.core import (
     get_session_messages,
-    list_cli_sessions,
+    list_cli_session_summaries,
     session_exists,
 )
 from hermes.persistence.cron import get_cron_job, list_cron_jobs, list_cron_runs
-from hermes.persistence.database import DBError
-from hermes.persistence.read_only import readonly_connection
 from hermes.web.health import inspect_database_health, inspect_gateway_health
-
+from hermes.web.pagination import DEFAULT_PAGE_LIMIT, PageParams, split_page
+from hermes.web.read_context import (
+    DashboardReadContext,
+    DashboardReadError,
+    ReadDataUnavailable,
+    ResourceNotFound,
+)
+from hermes.web.redaction import DashboardRedactor, TRUNCATED_VALUE
 from hermes.web.schemas import (
     CronJobDetailResponse,
     CronJobListResponse,
@@ -38,19 +43,60 @@ from hermes.web.schemas import (
 )
 
 
-class ReadDataUnavailable(Exception):
-    """现有公开接口不足以保证无副作用读取时使用的受控异常。"""
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_SKILL_FRONTMATTER_CHARS = 16_384
 
 
-class ResourceNotFound(Exception):
-    """为以后可安全启用的只读资源保留的受控未找到异常。"""
+class _ReadServiceBase:
+    """领域读取服务共享的只读上下文、脱敏器和数据校验 helper。"""
+
+    def __init__(
+        self,
+        context: DashboardReadContext | str | Path | None = None,
+        redactor: DashboardRedactor | None = None,
+    ):
+        if isinstance(context, DashboardReadContext):
+            self._context = context
+        elif context is None or isinstance(context, (str, Path)):
+            self._context = DashboardReadContext(context)
+        else:
+            raise TypeError("context must be DashboardReadContext, path, or None")
+        self._redactor = redactor or DashboardRedactor()
+
+    @staticmethod
+    def _timestamp(value: object) -> datetime | None:
+        """将公开 Unix 时间戳转换为带 UTC 时区的时间。"""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("timestamp is invalid")
+        timestamp = float(value)
+        if not math.isfinite(timestamp):
+            raise ValueError("timestamp is invalid")
+        return datetime.fromtimestamp(timestamp, UTC)
+
+    @staticmethod
+    def _required_text(record: object, field_name: str) -> str:
+        """只允许领域记录中的必需文本字段进入响应构造。"""
+        if not isinstance(record, dict):
+            raise ValueError("record is invalid")
+        value = record.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field_name} is invalid")
+        return value
+
+    @staticmethod
+    def _optional_text(value: object) -> str | None:
+        """避免将持久化层内部对象表示直接暴露到 HTTP 响应。"""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("text is invalid")
+        return value or None
 
 
-class ReadService:
-    """把现有公开读取能力转换为 Web schema，不保存业务状态。"""
-
-    def __init__(self, db_path: str | None = None):
-        self._db_path = db_path
+class HealthReadService(_ReadServiceBase):
+    """仅提供 M1 已有的数据库、Gateway 和项目状态读取。"""
 
     def get_status(self) -> StatusResponse:
         """返回只读数据库与 Gateway lease 状态，不探测真实运行进程。"""
@@ -59,15 +105,15 @@ class ReadService:
         except PackageNotFoundError:
             project_version = None
 
-        database = inspect_database_health(self._db_path)
-        gateway = inspect_gateway_health(self._db_path)
+        database = inspect_database_health(self._context.db_path)
+        gateway = inspect_gateway_health(self._context.db_path)
         return StatusResponse(
             application_name="MyHermes",
             project_version=project_version,
             web_status="running",
             database=database,
             gateway=gateway,
-            # 兼容旧客户端；新客户端必须读取嵌套状态模型。
+            # 保留旧字段以兼容已有调用方；新代码应使用嵌套状态模型。
             gateway_status=gateway.status,
             database_status=(
                 "available" if database.status == "healthy" else database.status
@@ -75,30 +121,34 @@ class ReadService:
             current_time=datetime.now(UTC),
         )
 
-    def list_sessions(self, *, limit: int, offset: int) -> SessionListResponse:
-        """读取已有 CLI 会话摘要，不补查额外字段。"""
+
+class SessionReadService(_ReadServiceBase):
+    """读取 CLI 会话及消息，不访问 Gateway、Agent 或运行时状态。"""
+
+    def list_sessions(self, *, page: PageParams) -> SessionListResponse:
+        """用 SQL 分页读取 CLI 会话摘要，再在返回前脱敏。"""
         try:
-            with self._connection() as conn:
-                records = list_cli_sessions(conn, limit=limit, offset=offset)
-            items = [
-                SessionSummary(
-                    conversation_id=self._required_text(record, "session_id"),
-                    preview=self._optional_text(record.get("preview")),
-                    source="cli",
-                    created_at=None,
-                    updated_at=self._timestamp(record.get("timestamp")),
-                    message_count=None,
+            with self._context.connection() as conn:
+                records = list_cli_session_summaries(
+                    conn,
+                    limit=page.fetch_limit,
+                    offset=page.offset,
                 )
-                for record in records
-            ]
-            return SessionListResponse(items=items, limit=limit, offset=offset)
-        except (OSError, TypeError, ValueError, OverflowError, ValidationError) as exc:
-            raise ReadDataUnavailable("会话数据当前不可读取。") from exc
+            items = [self._session_summary(record) for record in records]
+            items, has_more = split_page(items, page)
+            return SessionListResponse(
+                items=items,
+                limit=page.limit,
+                offset=page.offset,
+                has_more=has_more,
+            )
+        except (TypeError, ValueError, OverflowError, OSError, ValidationError) as exc:
+            raise ReadDataUnavailable("data_invalid") from exc
 
     def get_session(self, conversation_id: str) -> SessionDetailResponse:
-        """读取已有 CLI 会话消息，不补查消息时间或内部状态。"""
+        """读取单个 CLI 会话的安全消息副本。"""
         try:
-            with self._connection() as conn:
+            with self._context.connection() as conn:
                 if not session_exists(conn, conversation_id, source="cli"):
                     raise ResourceNotFound()
                 records = get_session_messages(conn, conversation_id)
@@ -110,29 +160,115 @@ class ReadService:
                 updated_at=None,
                 messages=messages,
             )
-        except (OSError, TypeError, ValueError, ValidationError) as exc:
-            raise ReadDataUnavailable("会话数据当前不可读取。") from exc
+        except (TypeError, ValueError, OverflowError, OSError, ValidationError) as exc:
+            raise ReadDataUnavailable("data_invalid") from exc
 
-    def list_cron_jobs(self) -> CronJobListResponse:
-        """读取持久化的 Cron 定义，不启动调度器或修改调度状态。"""
+    def _session_summary(self, record: object) -> SessionSummary:
+        """将持久化的会话摘要转换为有限长度的公开摘要。"""
+        if not isinstance(record, dict):
+            raise ValueError("record is invalid")
+        preview = self._optional_text(record.get("preview"))
+        return SessionSummary(
+            conversation_id=self._required_text(record, "session_id"),
+            preview=(
+                self._redactor.preview_text(preview)
+                if preview is not None
+                else None
+            ),
+            source="cli",
+            created_at=None,
+            updated_at=self._timestamp(record.get("timestamp")),
+            message_count=None,
+        )
+
+    def _message_detail(self, record: object) -> MessageDetail:
+        """仅映射消息公开字段，并安全处理损坏的 tool_calls。"""
+        if not isinstance(record, dict):
+            raise ValueError("record is invalid")
+        tool_calls = record.get("tool_calls")
+        if tool_calls is not None and (
+            not isinstance(tool_calls, list)
+            or any(not isinstance(item, dict) for item in tool_calls)
+        ):
+            raise ValueError("tool_calls is invalid")
+        safe_tool_calls = self._redact_tool_calls(tool_calls)
+        content = record.get("content")
+        if not isinstance(content, str):
+            raise ValueError("content is invalid")
+        return MessageDetail(
+            role=self._required_text(record, "role"),
+            content=self._redactor.message_text(content),
+            tool_calls=safe_tool_calls,
+            tool_call_id=self._optional_text(record.get("tool_call_id")),
+            timestamp=None,
+        )
+
+    def _redact_tool_calls(
+        self,
+        tool_calls: list[dict] | None,
+    ) -> list[dict[str, object]] | None:
+        """保留既有 tool_calls 响应形状，同时限制每个调用的结构化输出。"""
+        if tool_calls is None:
+            return None
+        result: list[dict[str, object]] = []
+        item_limit = max(1, self._redactor.limits.max_list_items)
+        visible_calls = tool_calls[:item_limit]
+        if len(tool_calls) > item_limit:
+            visible_calls = tool_calls[:max(item_limit - 1, 0)]
+        for item in visible_calls:
+            redacted = self._redactor.redact_value(item)
+            if not isinstance(redacted, dict):
+                raise ValueError("tool_calls is invalid")
+            result.append(redacted)
+        if len(tool_calls) > item_limit:
+            result.append({TRUNCATED_VALUE: TRUNCATED_VALUE})
+        return result
+
+
+class CronReadService(_ReadServiceBase):
+    """读取 Cron 定义和运行历史，不承载任何控制或调度逻辑。"""
+
+    def list_cron_jobs(self, *, page: PageParams) -> CronJobListResponse:
+        """用 SQL 分页读取 Cron 定义，不启动调度器或修改调度状态。"""
         try:
-            with self._connection() as conn:
-                records = list_cron_jobs(conn)
+            with self._context.connection() as conn:
+                records = list_cron_jobs(
+                    conn,
+                    limit=page.fetch_limit,
+                    offset=page.offset,
+                )
+            items = [self._cron_job_summary(record) for record in records]
+            items, has_more = split_page(items, page)
             return CronJobListResponse(
-                items=[self._cron_job_summary(record) for record in records]
+                items=items,
+                limit=page.limit,
+                offset=page.offset,
+                has_more=has_more,
             )
-        except (OSError, TypeError, ValueError, OverflowError, ValidationError) as exc:
-            raise ReadDataUnavailable("Cron 数据当前不可读取。") from exc
+        except (TypeError, ValueError, OverflowError, OSError, ValidationError) as exc:
+            raise ReadDataUnavailable("data_invalid") from exc
 
-    def get_cron_job(self, job_id: str) -> CronJobDetailResponse:
-        """读取 Cron 任务定义及已有公开运行历史。"""
+    def get_cron_job(
+        self,
+        job_id: str,
+        *,
+        page: PageParams,
+    ) -> CronJobDetailResponse:
+        """读取 Cron 任务定义及其分页后的公开运行历史。"""
         try:
-            with self._connection() as conn:
+            with self._context.connection() as conn:
                 record = get_cron_job(conn, job_id)
                 if record is None:
                     raise ResourceNotFound()
-                run_records = list_cron_runs(conn, job_id)
+                run_records = list_cron_runs(
+                    conn,
+                    job_id,
+                    limit=page.fetch_limit,
+                    offset=page.offset,
+                )
             summary = self._cron_job_summary(record)
+            runs = [self._cron_run_summary(item) for item in run_records]
+            runs, has_more = split_page(runs, page)
             return CronJobDetailResponse(
                 job_id=summary.job_id,
                 name=summary.name,
@@ -142,133 +278,280 @@ class ReadService:
                 enabled=summary.enabled,
                 last_run_at=summary.last_run_at,
                 next_run_at=summary.next_run_at,
-                runs=[self._cron_run_summary(item) for item in run_records],
+                runs=runs,
+                limit=page.limit,
+                offset=page.offset,
+                has_more=has_more,
             )
-        except (OSError, TypeError, ValueError, OverflowError, ValidationError) as exc:
-            raise ReadDataUnavailable("Cron 数据当前不可读取。") from exc
+        except (TypeError, ValueError, OverflowError, OSError, ValidationError) as exc:
+            raise ReadDataUnavailable("data_invalid") from exc
 
-    def list_skills(self) -> SkillListResponse:
-        """复用现有 Skill 发现逻辑，只映射非敏感摘要。"""
-        try:
-            from hermes.tools.skill import discover_skills
-
-            discovered = discover_skills()
-        except (OSError, yaml.YAMLError) as exc:
-            raise ReadDataUnavailable("Skill 目录当前不可读取。") from exc
-
-        items = [
-            SkillSummary(
-                name=str(item.get("name", "")),
-                description=self._optional_text(item.get("description")),
-                version=self._optional_text(item.get("version")),
-                available="error" not in item,
-            )
-            for item in discovered
-            if item.get("name")
-        ]
-        return SkillListResponse(items=items)
-
-    def list_toolsets(self) -> ToolsetListResponse:
-        """保留 Toolset 响应契约，但拒绝通过注册行为读取元数据。"""
-        # 当前项目没有无需注册工具即可读取 Toolset 元数据的公开纯读取接口。
-        # 因此不能导入或装配 ToolRegistry，更不能读取其私有字段。
-        raise ReadDataUnavailable(
-            "当前缺少无副作用的 Toolset 元数据读取接口。"
-        )
-
-    @staticmethod
-    def _optional_text(value: object) -> str | None:
-        """避免把内部对象的表示直接带入 HTTP 响应。"""
-        return value if isinstance(value, str) and value else None
-
-    @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        """为单次查询提供连接，并把预期持久化错误转换为受控异常。"""
-        if not self._db_path:
-            raise ReadDataUnavailable("数据库只读连接当前不可用。")
-        try:
-            with readonly_connection(self._db_path) as conn:
-                yield conn
-        except (sqlite3.Error, DBError, OSError) as exc:
-            raise ReadDataUnavailable("数据库只读查询当前不可用。") from exc
-
-    @staticmethod
-    def _timestamp(value: object) -> datetime | None:
-        """将公开的 Unix 时间戳转换为带 UTC 时区的时间。"""
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("timestamp is invalid")
-        timestamp = float(value)
-        if not math.isfinite(timestamp):
-            raise ValueError("timestamp is invalid")
-        return datetime.fromtimestamp(timestamp, UTC)
-
-    @staticmethod
-    def _required_text(record: dict, field_name: str) -> str:
-        """确保领域记录中的标识字段不会以内部对象形式泄漏。"""
-        value = record.get(field_name)
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"{field_name} is invalid")
-        return value
-
-    def _message_detail(self, record: dict) -> MessageDetail:
-        """丢弃消息字典中不属于 Web schema 的内部字段。"""
-        tool_calls = record.get("tool_calls")
-        if tool_calls is not None and (
-            not isinstance(tool_calls, list)
-            or any(not isinstance(item, dict) for item in tool_calls)
-        ):
-            raise ValueError("tool_calls is invalid")
-        return MessageDetail(
-            role=self._required_text(record, "role"),
-            content=self._message_content(record),
-            tool_calls=tool_calls,
-            tool_call_id=self._optional_text(record.get("tool_call_id")),
-            timestamp=None,
-        )
-
-    @staticmethod
-    def _message_content(record: dict) -> str:
-        """保留正常的空消息内容，但拒绝非字符串内部对象。"""
-        content = record.get("content")
-        if not isinstance(content, str):
-            raise ValueError("content is invalid")
-        return content
-
-    def _cron_job_summary(self, record: dict) -> CronJobSummary:
-        """将公开 Cron 定义转换为不包含能力和投递信息的摘要。"""
+    def _cron_job_summary(self, record: object) -> CronJobSummary:
+        """将公开 Cron 定义转换为不包含能力和投递信息的安全摘要。"""
+        if not isinstance(record, dict):
+            raise ValueError("record is invalid")
         schedule_type = self._required_text(record, "schedule_type")
         schedule_expr = self._required_text(record, "schedule_expr")
         prompt = self._required_text(record, "prompt")
-        normalized_prompt = " ".join(prompt.split())
-        preview = (
-            f"{normalized_prompt[:117]}..."
-            if len(normalized_prompt) > 120
-            else normalized_prompt
-        )
+        name = self._required_text(record, "name")
+        timezone = self._optional_text(record.get("timezone"))
         paused = record.get("paused")
-        deleted_at = record.get("deleted_at")
         if not isinstance(paused, bool):
             raise ValueError("paused is invalid")
         return CronJobSummary(
             job_id=self._required_text(record, "job_id"),
-            name=self._required_text(record, "name"),
-            prompt_preview=preview,
-            schedule=f"{schedule_type}:{schedule_expr}",
-            timezone=self._optional_text(record.get("timezone")),
-            enabled=not paused and deleted_at is None,
+            name=self._redactor.preview_text(name),
+            prompt_preview=self._redactor.preview_text(prompt),
+            schedule=self._redactor.preview_text(
+                f"{schedule_type}:{schedule_expr}"
+            ),
+            timezone=(
+                self._redactor.preview_text(timezone)
+                if timezone is not None
+                else None
+            ),
+            enabled=not paused and record.get("deleted_at") is None,
             last_run_at=self._timestamp(record.get("last_run_at")),
             next_run_at=self._timestamp(record.get("next_run_at")),
         )
 
-    def _cron_run_summary(self, record: dict) -> CronRunSummary:
-        """只映射公开运行历史中适合管理页面展示的字段。"""
+    def _cron_run_summary(self, record: object) -> CronRunSummary:
+        """仅映射适合管理页面展示的 Cron 运行历史字段。"""
+        if not isinstance(record, dict):
+            raise ValueError("record is invalid")
+        result_summary = self._optional_text(record.get("result_summary"))
         return CronRunSummary(
             run_id=self._required_text(record, "run_id"),
             status=self._required_text(record, "status"),
             scheduled_for=self._timestamp(record.get("scheduled_for")),
             started_at=self._timestamp(record.get("started_at")),
             finished_at=self._timestamp(record.get("finished_at")),
-            result_summary=self._optional_text(record.get("result_summary")),
+            result_summary=(
+                self._redactor.error_text(result_summary)
+                if result_summary is not None
+                else None
+            ),
         )
+
+
+class CatalogReadService(_ReadServiceBase):
+    """读取无需注册工具的当前 Skill 目录元数据。"""
+
+    def __init__(
+        self,
+        context: DashboardReadContext | str | Path | None = None,
+        redactor: DashboardRedactor | None = None,
+        *,
+        skills_dir: Path | str | None = None,
+    ):
+        super().__init__(context, redactor)
+        self._skills_dir = (
+            Path(skills_dir) if skills_dir is not None else hermes_home() / "skills"
+        )
+
+    def list_skills(self, *, page: PageParams) -> SkillListResponse:
+        """有限读取 Skill frontmatter，不导入工具适配层或触发注册。"""
+        try:
+            if not self._skills_dir.exists():
+                return SkillListResponse(
+                    items=[],
+                    limit=page.limit,
+                    offset=page.offset,
+                    has_more=False,
+                )
+            if not self._skills_dir.is_dir():
+                raise ReadDataUnavailable("catalog_unavailable")
+            entries = sorted(
+                (
+                    entry
+                    for entry in self._skills_dir.iterdir()
+                    if not entry.is_symlink()
+                    and entry.is_dir()
+                    and _SKILL_NAME_RE.fullmatch(entry.name)
+                ),
+                key=lambda entry: (entry.name.lower(), entry.name),
+            )
+            page_items: list[SkillSummary] = []
+            skipped = 0
+            for entry in entries:
+                item = self._skill_summary(entry)
+                if item is None:
+                    continue
+                if skipped < page.offset:
+                    skipped += 1
+                    continue
+                page_items.append(item)
+                if len(page_items) >= page.fetch_limit:
+                    break
+            page_items, has_more = split_page(page_items, page)
+            return SkillListResponse(
+                items=page_items,
+                limit=page.limit,
+                offset=page.offset,
+                has_more=has_more,
+            )
+        except ReadDataUnavailable:
+            raise
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+            raise ReadDataUnavailable("catalog_unavailable") from exc
+
+    def list_toolsets(self, *, page: PageParams) -> ToolsetListResponse:
+        """拒绝通过 ToolRegistry 注册行为读取当前未公开的目录元数据。"""
+        del page
+        raise ReadDataUnavailable("catalog_unavailable")
+
+    def _skill_summary(self, skill_dir: Path) -> SkillSummary | None:
+        """只解析受限前置元数据；单个损坏 Skill 不泄漏失败细节。"""
+        skill_file = skill_dir / "SKILL.md"
+        try:
+            if not skill_file.is_file() or skill_file.is_symlink():
+                return None
+            metadata = _read_skill_frontmatter(skill_file)
+            if metadata is None:
+                return SkillSummary(name=skill_dir.name, available=False)
+            name = metadata.get("name", skill_dir.name)
+            description = metadata.get("description")
+            skill_version = metadata.get("version")
+            if not isinstance(name, str) or not name:
+                return SkillSummary(name=skill_dir.name, available=False)
+            if description is not None and not isinstance(description, str):
+                return SkillSummary(name=skill_dir.name, available=False)
+            if skill_version is not None and not isinstance(skill_version, str):
+                return SkillSummary(name=skill_dir.name, available=False)
+            return SkillSummary(
+                name=self._redactor.preview_text(name),
+                description=(
+                    self._redactor.preview_text(description)
+                    if description
+                    else None
+                ),
+                version=(
+                    self._redactor.preview_text(skill_version)
+                    if skill_version
+                    else None
+                ),
+                available=True,
+            )
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+            return SkillSummary(name=skill_dir.name, available=False)
+
+
+class ReadService:
+    """兼容旧调用方的门面；业务读取均委托给领域服务。"""
+
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        *,
+        context: DashboardReadContext | None = None,
+        redactor: DashboardRedactor | None = None,
+        health_read_service: HealthReadService | None = None,
+        session_read_service: SessionReadService | None = None,
+        cron_read_service: CronReadService | None = None,
+        catalog_read_service: CatalogReadService | None = None,
+    ):
+        shared_context = context or DashboardReadContext(db_path)
+        shared_redactor = redactor or DashboardRedactor()
+        self.health = health_read_service or HealthReadService(
+            shared_context,
+            shared_redactor,
+        )
+        self.sessions = session_read_service or SessionReadService(
+            shared_context,
+            shared_redactor,
+        )
+        self.cron = cron_read_service or CronReadService(
+            shared_context,
+            shared_redactor,
+        )
+        self.catalog = catalog_read_service or CatalogReadService(
+            shared_context,
+            shared_redactor,
+        )
+
+    def get_status(self) -> StatusResponse:
+        """兼容既有状态读取调用。"""
+        return self.health.get_status()
+
+    def list_sessions(
+        self,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> SessionListResponse:
+        """兼容既有会话列表读取调用。"""
+        return self.sessions.list_sessions(page=PageParams(limit=limit, offset=offset))
+
+    def get_session(self, conversation_id: str) -> SessionDetailResponse:
+        """兼容既有会话详情读取调用。"""
+        return self.sessions.get_session(conversation_id)
+
+    def list_cron_jobs(
+        self,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> CronJobListResponse:
+        """兼容既有 Cron 列表读取调用。"""
+        return self.cron.list_cron_jobs(page=PageParams(limit=limit, offset=offset))
+
+    def get_cron_job(
+        self,
+        job_id: str,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> CronJobDetailResponse:
+        """兼容既有 Cron 详情读取调用。"""
+        return self.cron.get_cron_job(
+            job_id,
+            page=PageParams(limit=limit, offset=offset),
+        )
+
+    def list_skills(
+        self,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> SkillListResponse:
+        """兼容既有 Skill 目录读取调用。"""
+        return self.catalog.list_skills(page=PageParams(limit=limit, offset=offset))
+
+    def list_toolsets(
+        self,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> ToolsetListResponse:
+        """兼容既有 Toolset 目录读取调用。"""
+        return self.catalog.list_toolsets(
+            page=PageParams(limit=limit, offset=offset),
+        )
+
+
+def _read_skill_frontmatter(skill_file: Path) -> dict[str, object] | None:
+    """读取固定大小的 Skill frontmatter，避免目录枚举变成完整正文读取。"""
+    with skill_file.open("r", encoding="utf-8") as handle:
+        text = handle.read(_MAX_SKILL_FRONTMATTER_CHARS)
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return {}
+    frontmatter: list[str] = []
+    for line in lines[1:]:
+        if line.strip() == "---":
+            value = yaml.safe_load("".join(frontmatter)) or {}
+            return value if isinstance(value, dict) else None
+        frontmatter.append(line)
+    return {}
+
+
+__all__ = [
+    "CatalogReadService",
+    "CronReadService",
+    "DashboardReadError",
+    "HealthReadService",
+    "ReadDataUnavailable",
+    "ReadService",
+    "ResourceNotFound",
+    "SessionReadService",
+]

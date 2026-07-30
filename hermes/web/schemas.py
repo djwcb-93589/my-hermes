@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from hermes.web.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+
 
 class ErrorResponse(BaseModel):
     """对外稳定的错误结构，不包含内部异常信息。"""
@@ -65,12 +67,22 @@ class SessionSummary(BaseModel):
     message_count: int | None = Field(default=None, ge=0)
 
 
-class SessionListResponse(BaseModel):
+class PaginationMetadata(BaseModel):
+    """所有 Dashboard 列表响应共享的分页元数据。"""
+
+    limit: int = Field(
+        default=DEFAULT_PAGE_LIMIT,
+        ge=1,
+        le=MAX_PAGE_LIMIT,
+    )
+    offset: int = Field(default=0, ge=0)
+    has_more: bool = False
+
+
+class SessionListResponse(PaginationMetadata):
     """分页会话列表。"""
 
     items: list[SessionSummary]
-    limit: int = Field(ge=1)
-    offset: int = Field(ge=0)
 
 
 class MessageDetail(BaseModel):
@@ -121,9 +133,16 @@ class CronJobDetailResponse(CronJobSummary):
     """Cron 任务定义及其公开运行历史。"""
 
     runs: list[CronRunSummary]
+    limit: int = Field(
+        default=DEFAULT_PAGE_LIMIT,
+        ge=1,
+        le=MAX_PAGE_LIMIT,
+    )
+    offset: int = Field(default=0, ge=0)
+    has_more: bool = False
 
 
-class CronJobListResponse(BaseModel):
+class CronJobListResponse(PaginationMetadata):
     """Cron 任务列表。"""
 
     items: list[CronJobSummary]
@@ -138,7 +157,7 @@ class SkillSummary(BaseModel):
     available: bool
 
 
-class SkillListResponse(BaseModel):
+class SkillListResponse(PaginationMetadata):
     """Skill 目录。"""
 
     items: list[SkillSummary]
@@ -152,7 +171,7 @@ class ToolsetSummary(BaseModel):
     environments: list[str]
 
 
-class ToolsetListResponse(BaseModel):
+class ToolsetListResponse(PaginationMetadata):
     """工具集目录。"""
 
     items: list[ToolsetSummary]

@@ -2,15 +2,15 @@
 
 from fastapi import APIRouter, Request
 
-from hermes.web.read_service import ReadService
+from hermes.web.read_service import HealthReadService
 from hermes.web.schemas import HealthzResponse, StatusResponse
 
 
 router = APIRouter(tags=["status"])
 
 
-def _service(request: Request) -> ReadService:
-    return request.app.state.read_service
+def _service(request: Request) -> HealthReadService:
+    return request.app.state.health_read_service
 
 
 @router.get("/healthz", response_model=HealthzResponse)
