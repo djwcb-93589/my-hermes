@@ -64,6 +64,10 @@ class ProcessStartError(ProcessError):
     """后台进程启动或注册失败。"""
 
 
+class ProcessTerminationError(ProcessError):
+    """无法确认后台进程已经停止。"""
+
+
 class ProcessWaitCancelled(ProcessError):
     """调用方取消了等待，但没有终止后台进程。"""
 
@@ -129,6 +133,10 @@ class ProcessRecord:
         default_factory=threading.Lock,
         repr=False,
     )
+    handle_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
     reader_thread: threading.Thread | None = field(default=None, repr=False)
     startup_event: threading.Event = field(
         default_factory=threading.Event,
@@ -140,7 +148,10 @@ class ProcessRecord:
     )
     termination_requested: bool = field(default=False, repr=False)
     termination_signal_sent: bool = field(default=False, repr=False)
+    termination_in_progress: bool = field(default=False, repr=False)
     close_called: bool = field(default=False, repr=False)
+    log_read_error_count: int = field(default=0, repr=False)
+    poll_error_count: int = field(default=0, repr=False)
 
 
 _TERMINAL_STATUSES: Final[frozenset[ProcessStatus]] = frozenset(
@@ -168,7 +179,10 @@ _ALLOWED_TRANSITIONS: Final[
     ),
 }
 _READER_POLL_INTERVAL_SECONDS: Final[float] = 0.05
-_CONSECUTIVE_HANDLE_ERROR_LIMIT: Final[int] = 3
+_TERMINATION_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+_CONSECUTIVE_POLL_ERROR_LIMIT: Final[int] = 3
+_FORCE_KILL_WAIT_SECONDS: Final[float] = 5.0
+_STARTUP_CLEANUP_WAIT_SECONDS: Final[float] = 5.0
 _MAX_LOG_READ_CHARS: Final[int] = 20_000
 _FINAL_DRAIN_READ_LIMIT: Final[int] = 64
 _UNSET: Final[object] = object()
@@ -208,6 +222,9 @@ class ProcessManager:
         self._running: dict[str, ProcessRecord] = {}
         self._finished: dict[str, ProcessRecord] = {}
         self._registry_lock = threading.Lock()
+        # 供未来会话资源层记录清理失败；本阶段不对外暴露。
+        self._cleanup_failures: list[ProcessSnapshot] = []
+        self._cleanup_failure_lock = threading.Lock()
 
     def spawn(
         self,
@@ -256,7 +273,7 @@ class ProcessManager:
             with record.record_lock:
                 record.handle = handle
 
-            pid = handle.pid
+            pid = self._handle_pid(record)
             if pid is not None and (
                 isinstance(pid, bool) or not isinstance(pid, int)
             ):
@@ -270,21 +287,31 @@ class ProcessManager:
             )
             with record.record_lock:
                 record.pid = pid
+                termination_requested = record.termination_requested
+                termination_source = record.termination_source or "kill"
                 self._transition_locked(record, ProcessStatus.RUNNING)
-                record.reader_thread = reader_thread
-            reader_thread.start()
-            record.startup_event.set()
+                if not termination_requested:
+                    record.reader_thread = reader_thread
+
+            if termination_requested:
+                # 清理已在 starter 运行期间登记；不再启动普通读取器。
+                record.startup_event.set()
+            else:
+                reader_thread.start()
+                record.startup_event.set()
         except Exception as exc:
             self._mark_start_failed(record)
             self._dispose_failed_start(record)
             raise ProcessStartError("Process start failed") from exc
 
-        with record.record_lock:
-            termination_requested = record.termination_requested
-            termination_source = record.termination_source or "kill"
+        # 与正在进入的 cleanup 串行，避免返回一个已被清理请求接管的 running 快照。
+        with record.termination_lock:
+            with record.record_lock:
+                termination_requested = record.termination_requested
+                termination_source = record.termination_source or "kill"
         if termination_requested:
-            # 启动期间收到清理请求时，句柄就绪后补做终止。
-            self._terminate_record(
+            # 启动期间收到清理请求时，句柄就绪后立即进入终止路径。
+            return self._terminate_record(
                 record,
                 grace_seconds=2.0,
                 source=termination_source,
@@ -329,24 +356,9 @@ class ProcessManager:
         return tuple(snapshots)
 
     def poll(self, session_key: str, process_id: str) -> ProcessSnapshot:
-        """非阻塞地刷新并返回一个后台进程的状态。"""
+        """只读且非阻塞地返回一个后台进程的当前快照。"""
 
         record = self._get_owned_record(session_key, process_id)
-        snapshot = self._snapshot(record)
-        if snapshot.status in _TERMINAL_STATUSES:
-            return snapshot
-
-        handle = self._get_handle(record)
-        if handle is None:
-            return snapshot
-
-        try:
-            exit_code = self._poll_handle(handle)
-        except Exception:
-            return self._snapshot(record)
-        if exit_code is not None:
-            self._complete_observed_exit(record, exit_code)
-            self._close_record(record)
         return self._snapshot(record)
 
     def log(
@@ -468,7 +480,8 @@ class ProcessManager:
                     source="session_cleanup",
                 )
             except Exception:
-                # 单个后端失效不能阻止其余会话内资源清理。
+                # 单个清理失败不能伪装为成功，也不能阻止其余资源清理。
+                self._record_cleanup_failure(record)
                 continue
 
     def cleanup_all(self) -> None:
@@ -485,7 +498,8 @@ class ProcessManager:
                     source="global_cleanup",
                 )
             except Exception:
-                # 单个后端失效不能阻止其他受管资源清理。
+                # 单个清理失败不能伪装为成功，也不能阻止其他资源清理。
+                self._record_cleanup_failure(record)
                 continue
 
     def prune(self) -> None:
@@ -572,69 +586,161 @@ class ProcessManager:
         with record.record_lock:
             return record.handle
 
-    def _reader_loop(self, record: ProcessRecord) -> None:
-        """持续收集输出并在进程完成时原子迁移记录。"""
+    def _handle_pid(self, record: ProcessRecord) -> int | None:
+        """在 Handle 操作锁下读取启动阶段的进程标识。"""
 
-        handle = self._get_handle(record)
-        if handle is None:
-            self._complete_lost(record)
-            self._close_record(record)
-            return
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            return handle.pid
 
-        consecutive_errors = 0
-        try:
-            while True:
-                if self._snapshot(record).status in _TERMINAL_STATUSES:
-                    return
+    def _handle_read_available(self, record: ProcessRecord) -> str:
+        """串行读取一次当前可用输出。"""
 
-                iteration_failed = False
-                try:
-                    self._append_output(record, self._read_available(handle))
-                except Exception:
-                    iteration_failed = True
-
-                try:
-                    exit_code = self._poll_handle(handle)
-                except Exception:
-                    iteration_failed = True
-                    exit_code = None
-
-                if exit_code is not None:
-                    self._drain_final_output(record, handle)
-                    self._complete_observed_exit(record, exit_code)
-                    return
-
-                if iteration_failed:
-                    consecutive_errors += 1
-                    if consecutive_errors >= _CONSECUTIVE_HANDLE_ERROR_LIMIT:
-                        self._complete_lost(record)
-                        return
-                else:
-                    consecutive_errors = 0
-
-                time.sleep(_READER_POLL_INTERVAL_SECONDS)
-        finally:
-            if self._snapshot(record).status not in _TERMINAL_STATUSES:
-                self._complete_lost(record)
-            self._close_record(record)
-
-    def _read_available(self, handle: BackgroundProcessHandle) -> str:
-        """读取并校验一次非阻塞输出。"""
-
-        output = handle.read_available()
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            output = handle.read_available()
         if not isinstance(output, str):
             raise TypeError("process handle output must be a string")
         return output
 
-    def _poll_handle(self, handle: BackgroundProcessHandle) -> int | None:
-        """查询并校验一次句柄退出码。"""
+    def _handle_poll(self, record: ProcessRecord) -> int | None:
+        """串行查询一次进程退出状态。"""
 
-        exit_code = handle.poll()
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            exit_code = handle.poll()
+        return self._validate_handle_exit_code(exit_code, "poll result")
+
+    def _handle_wait(
+        self,
+        record: ProcessRecord,
+        timeout: float,
+    ) -> int | None:
+        """串行等待一次有限时长的进程退出结果。"""
+
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            exit_code = handle.wait(timeout=timeout)
+        return self._validate_handle_exit_code(exit_code, "wait result")
+
+    def _handle_interrupt(self, record: ProcessRecord) -> None:
+        """串行请求进程协作式退出。"""
+
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            handle.interrupt()
+
+    def _handle_kill(self, record: ProcessRecord) -> None:
+        """串行请求强制终止进程。"""
+
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            handle.kill()
+
+    def _handle_close(self, record: ProcessRecord) -> None:
+        """串行关闭句柄，并保证 close 最多执行一次。"""
+
+        handle = self._get_handle(record)
+        if handle is None:
+            return
+        with record.handle_lock:
+            with record.record_lock:
+                if record.close_called or record.handle is not handle:
+                    return
+                record.close_called = True
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    def _require_handle(self, record: ProcessRecord) -> BackgroundProcessHandle:
+        """短暂读取句柄引用，随后由调用方取得 Handle 操作锁。"""
+
+        handle = self._get_handle(record)
+        if handle is None:
+            raise ProcessError("Process handle is unavailable")
+        return handle
+
+    @staticmethod
+    def _validate_handle_exit_code(
+        exit_code: object,
+        operation: str,
+    ) -> int | None:
+        """校验 Handle 返回的退出码类型。"""
+
         if exit_code is not None and (
             isinstance(exit_code, bool) or not isinstance(exit_code, int)
         ):
-            raise TypeError("process handle poll result must be an integer or None")
+            raise TypeError(
+                f"process handle {operation} must be an integer or None"
+            )
         return exit_code
+
+    @staticmethod
+    def _assert_handle_open_locked(
+        record: ProcessRecord,
+        handle: BackgroundProcessHandle,
+    ) -> None:
+        """在 Handle 锁下短暂确认句柄仍可使用。"""
+
+        with record.record_lock:
+            if record.close_called or record.handle is not handle:
+                raise ProcessError("Process handle is unavailable")
+
+    def _reader_loop(self, record: ProcessRecord) -> None:
+        """持续收集输出并在进程完成时原子迁移记录。"""
+
+        try:
+            if self._get_handle(record) is None:
+                self._complete_lost(record)
+                return
+
+            while True:
+                if self._snapshot(record).status in _TERMINAL_STATUSES:
+                    return
+
+                try:
+                    self._append_output(
+                        record,
+                        self._handle_read_available(record),
+                    )
+                except Exception:
+                    self._record_log_read_failure(record)
+                else:
+                    self._clear_log_read_failures(record)
+
+                try:
+                    exit_code = self._handle_poll(record)
+                except Exception:
+                    poll_error_count = self._record_poll_failure(record)
+                    if (
+                        poll_error_count >= _CONSECUTIVE_POLL_ERROR_LIMIT
+                        and not self._is_termination_in_progress(record)
+                    ):
+                        self._complete_lost(record)
+                        return
+                else:
+                    self._clear_poll_failures(record)
+                    if exit_code is not None:
+                        self._finish_confirmed_exit(record, exit_code)
+                        return
+
+                time.sleep(_READER_POLL_INTERVAL_SECONDS)
+        finally:
+            snapshot = self._snapshot(record)
+            if (
+                snapshot.status not in _TERMINAL_STATUSES
+                and not self._is_termination_in_progress(record)
+            ):
+                self._complete_lost(record)
+            if self._snapshot(record).status in _TERMINAL_STATUSES:
+                self._handle_close(record)
 
     def _append_output(self, record: ProcessRecord, output: str) -> None:
         """追加输出，并在需要时从缓冲区头部滚动裁剪。"""
@@ -652,13 +758,12 @@ class ProcessManager:
     def _drain_final_output(
         self,
         record: ProcessRecord,
-        handle: BackgroundProcessHandle,
     ) -> None:
         """在检测到退出后有限次数地排空剩余输出。"""
 
         for _ in range(_FINAL_DRAIN_READ_LIMIT):
             try:
-                output = self._read_available(handle)
+                output = self._handle_read_available(record)
             except Exception:
                 return
             if not output:
@@ -693,27 +798,45 @@ class ProcessManager:
         )
 
     def _complete_lost(self, record: ProcessRecord) -> None:
-        """在句柄持续失效时结束记录，已请求终止时保持 killed 语义。"""
+        """在持续状态查询失败时标记 lost，而不伪造 killed。"""
 
         with record.record_lock:
-            termination_requested = record.termination_requested
             termination_source = record.termination_source
-        if termination_requested:
-            self._finalize_record(
-                record,
-                ProcessStatus.KILLED,
-                exit_code=None,
-                completion_reason="killed",
-                termination_source=termination_source or "kill",
-            )
-            return
         self._finalize_record(
             record,
             ProcessStatus.LOST,
             exit_code=None,
             completion_reason="backend_lost",
-            termination_source=None,
+            termination_source=termination_source,
         )
+
+    def _finish_confirmed_exit(
+        self,
+        record: ProcessRecord,
+        exit_code: int | None,
+    ) -> ProcessSnapshot:
+        """确认退出后先排空尾部日志，再完成记录并关闭句柄。"""
+
+        snapshot = self._snapshot(record)
+        if snapshot.status in _TERMINAL_STATUSES:
+            return snapshot
+        if exit_code is None:
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+
+        self._drain_final_output(record)
+        self._complete_observed_exit(record, exit_code)
+        snapshot = self._snapshot(record)
+        if snapshot.status not in (
+            ProcessStatus.EXITED,
+            ProcessStatus.KILLED,
+        ):
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+        self._handle_close(record)
+        return self._snapshot(record)
 
     def _finalize_record(
         self,
@@ -798,13 +921,11 @@ class ProcessManager:
         """尽力终止并释放启动失败时已取得的句柄。"""
 
         with record.termination_lock:
-            handle = self._get_handle(record)
-            if handle is not None:
-                try:
-                    handle.kill()
-                except Exception:
-                    pass
-        self._close_record(record)
+            try:
+                self._handle_kill(record)
+            except Exception:
+                pass
+        self._handle_close(record)
 
     def _terminate_record(
         self,
@@ -816,84 +937,82 @@ class ProcessManager:
         """在不持有全局注册表锁时执行幂等终止流程。"""
 
         with record.termination_lock:
-            snapshot = self._snapshot(record)
-            if snapshot.status in _TERMINAL_STATUSES:
-                return snapshot
-
-            if snapshot.status is ProcessStatus.STARTING:
-                self._request_termination(record, source)
-                record.startup_event.wait(grace_seconds)
+            self._set_termination_in_progress(record, True)
+            try:
                 snapshot = self._snapshot(record)
                 if snapshot.status in _TERMINAL_STATUSES:
                     return snapshot
+
                 if snapshot.status is ProcessStatus.STARTING:
-                    # starter 尚未返回；spawn 会在句柄就绪后补做终止。
-                    return snapshot
+                    self._request_termination(record, source)
+                    # 启动还在外部 starter 中，不能在持锁状态下无限等待。
+                    record.startup_event.wait(_STARTUP_CLEANUP_WAIT_SECONDS)
+                    snapshot = self._snapshot(record)
+                    if snapshot.status in _TERMINAL_STATUSES:
+                        return snapshot
+                    if snapshot.status is ProcessStatus.STARTING:
+                        raise ProcessTerminationError(
+                            "Could not confirm process termination"
+                        )
 
-            handle = self._get_handle(record)
-            if handle is None:
+                if self._get_handle(record) is None:
+                    self._request_termination(record, source)
+                    raise ProcessTerminationError(
+                        "Could not confirm process termination"
+                    )
+
+                confirmed, exit_code = self._try_confirm_exit(record)
+                if confirmed:
+                    return self._finish_confirmed_exit(record, exit_code)
+
                 self._request_termination(record, source)
-                self._finalize_record(
+
+                # 发出中断前再次查询，避免将已经自然退出的进程误标为 killed。
+                confirmed, exit_code = self._try_confirm_exit(record)
+                if confirmed:
+                    return self._finish_confirmed_exit(record, exit_code)
+                terminal_snapshot = self._terminal_result_or_raise(record)
+                if terminal_snapshot is not None:
+                    return terminal_snapshot
+
+                try:
+                    self._handle_interrupt(record)
+                except Exception:
+                    pass
+                else:
+                    self._mark_termination_signal_sent(record)
+
+                confirmed, exit_code = self._wait_for_exit_confirmation(
                     record,
-                    ProcessStatus.KILLED,
-                    exit_code=None,
-                    completion_reason="killed",
-                    termination_source=source,
+                    grace_seconds,
                 )
-                return self._snapshot(record)
+                if confirmed:
+                    return self._finish_confirmed_exit(record, exit_code)
+                terminal_snapshot = self._terminal_result_or_raise(record)
+                if terminal_snapshot is not None:
+                    return terminal_snapshot
 
-            poll_succeeded, exit_code = self._try_poll_handle(handle)
-            if poll_succeeded and exit_code is not None:
-                self._complete_observed_exit(record, exit_code)
-                self._close_record(record)
-                return self._snapshot(record)
+                try:
+                    self._handle_kill(record)
+                except Exception:
+                    pass
+                else:
+                    self._mark_termination_signal_sent(record)
 
-            self._request_termination(record, source)
-
-            # 发出中断前再次查询，避免将已经自然退出的进程误标为 killed。
-            poll_succeeded, exit_code = self._try_poll_handle(handle)
-            if poll_succeeded and exit_code is not None:
-                self._complete_observed_exit(record, exit_code)
-                self._close_record(record)
-                return self._snapshot(record)
-
-            if self._snapshot(record).status in _TERMINAL_STATUSES:
-                return self._snapshot(record)
-
-            self._mark_termination_signal_sent(record)
-            try:
-                handle.interrupt()
-            except Exception:
-                pass
-
-            if grace_seconds > 0:
-                record.completion_event.wait(grace_seconds)
-            snapshot = self._snapshot(record)
-            if snapshot.status in _TERMINAL_STATUSES:
-                return snapshot
-
-            poll_succeeded, exit_code = self._try_poll_handle(handle)
-            if poll_succeeded and exit_code is not None:
-                self._complete_observed_exit(record, exit_code)
-                self._close_record(record)
-                return self._snapshot(record)
-
-            self._mark_termination_signal_sent(record)
-            try:
-                handle.kill()
-            except Exception:
-                pass
-
-            _, exit_code = self._try_poll_handle(handle)
-            self._finalize_record(
-                record,
-                ProcessStatus.KILLED,
-                exit_code=exit_code,
-                completion_reason="killed",
-                termination_source=source,
-            )
-            self._close_record(record)
-            return self._snapshot(record)
+                confirmed, exit_code = self._wait_for_exit_confirmation(
+                    record,
+                    _FORCE_KILL_WAIT_SECONDS,
+                )
+                if confirmed:
+                    return self._finish_confirmed_exit(record, exit_code)
+                terminal_snapshot = self._terminal_result_or_raise(record)
+                if terminal_snapshot is not None:
+                    return terminal_snapshot
+                raise ProcessTerminationError(
+                    "Could not confirm process termination"
+                )
+            finally:
+                self._set_termination_in_progress(record, False)
 
     def _request_termination(self, record: ProcessRecord, source: str) -> None:
         """记录终止意图，但尚不改变运行状态。"""
@@ -912,29 +1031,119 @@ class ProcessManager:
             if record.status not in _TERMINAL_STATUSES:
                 record.termination_signal_sent = True
 
-    def _try_poll_handle(
+    def _try_confirm_exit(
         self,
-        handle: BackgroundProcessHandle,
+        record: ProcessRecord,
     ) -> tuple[bool, int | None]:
-        """执行一次轮询，并把后端异常留给调用方按需降级。"""
+        """尝试通过状态查询确认退出，失败时保留运行记录。"""
 
         try:
-            return True, self._poll_handle(handle)
+            exit_code = self._handle_poll(record)
         except Exception:
             return False, None
+        return exit_code is not None, exit_code
 
-    def _close_record(self, record: ProcessRecord) -> None:
-        """确保每条记录的句柄至多关闭一次。"""
+    def _wait_for_exit_confirmation(
+        self,
+        record: ProcessRecord,
+        timeout: float,
+    ) -> tuple[bool, int | None]:
+        """优先使用 Handle.wait，并以有限轮询作为状态确认兜底。"""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            snapshot = self._snapshot(record)
+            if snapshot.status in (ProcessStatus.EXITED, ProcessStatus.KILLED):
+                return True, snapshot.exit_code
+            if snapshot.status in _TERMINAL_STATUSES:
+                return False, None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, None
+            wait_seconds = min(_TERMINATION_POLL_INTERVAL_SECONDS, remaining)
+
+            try:
+                exit_code = self._handle_wait(record, wait_seconds)
+            except Exception:
+                exit_code = None
+            if exit_code is not None:
+                return True, exit_code
+
+            confirmed, exit_code = self._try_confirm_exit(record)
+            if confirmed:
+                return True, exit_code
+
+            record.completion_event.wait(wait_seconds)
+
+    def _terminal_result_or_raise(
+        self,
+        record: ProcessRecord,
+    ) -> ProcessSnapshot | None:
+        """返回已确认终态；lost 不得被当作终止成功。"""
+
+        snapshot = self._snapshot(record)
+        if snapshot.status in (
+            ProcessStatus.EXITED,
+            ProcessStatus.KILLED,
+            ProcessStatus.FAILED_START,
+        ):
+            return snapshot
+        if snapshot.status is ProcessStatus.LOST:
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+        return None
+
+    def _set_termination_in_progress(
+        self,
+        record: ProcessRecord,
+        in_progress: bool,
+    ) -> None:
+        """标记终止流程占用，避免读取器在流程中抢先关闭句柄。"""
 
         with record.record_lock:
-            if record.close_called or record.handle is None:
-                return
-            record.close_called = True
-            handle = record.handle
-        try:
-            handle.close()
-        except Exception:
-            pass
+            record.termination_in_progress = in_progress
+
+    def _is_termination_in_progress(self, record: ProcessRecord) -> bool:
+        """读取当前是否由终止流程负责状态确认。"""
+
+        with record.record_lock:
+            return record.termination_in_progress
+
+    def _record_log_read_failure(self, record: ProcessRecord) -> None:
+        """累计日志读取错误，但不据此判定后台进程丢失。"""
+
+        with record.record_lock:
+            record.log_read_error_count += 1
+
+    def _clear_log_read_failures(self, record: ProcessRecord) -> None:
+        """在日志读取恢复后清空连续错误计数。"""
+
+        with record.record_lock:
+            record.log_read_error_count = 0
+
+    def _record_poll_failure(self, record: ProcessRecord) -> int:
+        """累计状态查询错误，并返回当前连续次数。"""
+
+        with record.record_lock:
+            record.poll_error_count += 1
+            return record.poll_error_count
+
+    def _clear_poll_failures(self, record: ProcessRecord) -> None:
+        """状态查询成功后清空连续错误计数。"""
+
+        with record.record_lock:
+            record.poll_error_count = 0
+
+    def _record_cleanup_failure(self, record: ProcessRecord) -> None:
+        """保留有限的清理失败快照，供后续会话资源层诊断。"""
+
+        snapshot = self._snapshot(record)
+        with self._cleanup_failure_lock:
+            self._cleanup_failures.append(snapshot)
+            if len(self._cleanup_failures) > 64:
+                del self._cleanup_failures[:-64]
 
     @staticmethod
     def _wait_cancelled(cancel_checker: Callable[[], bool] | None) -> bool:
@@ -1011,6 +1220,7 @@ __all__ = [
     "ProcessSnapshot",
     "ProcessStartError",
     "ProcessStatus",
+    "ProcessTerminationError",
     "ProcessWaitCancelled",
     "process_manager",
 ]
