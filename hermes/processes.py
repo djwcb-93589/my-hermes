@@ -34,6 +34,12 @@ class BackgroundProcessHandle(Protocol):
     def read_available(self) -> BackgroundProcessOutput:
         """返回新输出、此前丢弃的字符数以及输出读取错误。"""
 
+    def read_final_output(self) -> BackgroundProcessOutput:
+        """仅在成功 close 后读取并消费最后一批输出状态。
+
+        该调用不得再次 poll；重复调用必须返回不含文本、丢弃字符或读取错误的空批次。
+        """
+
     def wait(self, timeout: float | None = None) -> int | None:
         """等待结束；超时时返回 None，结束后返回退出码。"""
 
@@ -715,6 +721,7 @@ class ProcessManager:
         for operation in (
             "poll",
             "read_available",
+            "read_final_output",
             "wait",
             "interrupt",
             "kill",
@@ -810,18 +817,28 @@ class ProcessManager:
                 result = self._validate_handle_output(
                     handle.read_available()
                 )
-                self._append_output(
-                    record,
-                    result.text,
-                    discarded_chars=result.discarded_chars,
-                )
-                if result.read_error is None:
-                    self._clear_log_read_failures(record)
-                else:
-                    self._record_log_read_failure(record)
+                consumed = self._commit_handle_output(record, result)
             except Exception:
                 self._record_log_read_failure(record)
                 raise
+        return consumed
+
+    def _commit_handle_output(
+        self,
+        record: ProcessRecord,
+        result: BackgroundProcessOutput,
+    ) -> tuple[bool, bool]:
+        """提交已校验输出批次，并统一维护 cursor 与日志读取错误状态。"""
+
+        self._append_output(
+            record,
+            result.text,
+            discarded_chars=result.discarded_chars,
+        )
+        if result.read_error is None:
+            self._clear_log_read_failures(record)
+        else:
+            self._record_log_read_failure(record)
         return (
             bool(result.text or result.discarded_chars),
             result.read_error is not None,
@@ -908,7 +925,7 @@ class ProcessManager:
             return signal_sent
 
     def _handle_close(self, record: ProcessRecord) -> None:
-        """串行关闭句柄；仅在成功后禁止重复调用。"""
+        """串行关闭句柄并消费最终输出；全部成功后才提交关闭状态。"""
 
         handle = self._get_handle(record)
         if handle is None:
@@ -919,6 +936,24 @@ class ProcessManager:
                     return
             try:
                 handle.close()
+            except Exception as error:
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                ) from error
+            try:
+                final_output = handle.read_final_output()
+            except Exception as error:
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                ) from error
+            try:
+                result = self._validate_handle_output(final_output)
+            except Exception as error:
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                ) from error
+            try:
+                self._commit_handle_output(record, result)
             except Exception as error:
                 raise ProcessTerminationError(
                     "Could not close process handle"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import codecs
 from collections import deque
+from dataclasses import dataclass, field
 import os
 import shlex
 import signal
@@ -533,6 +534,17 @@ class _BackgroundProcessLaunchOwnershipError(RuntimeError):
         )
 
 
+@dataclass(slots=True)
+class _DeferredResourceClose:
+    """跟踪一个可能阻塞的资源 close worker。"""
+
+    resource: object
+    completed: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    started: bool = False
+    error: BaseException | None = None
+
+
 _BACKGROUND_DISPOSE_WAIT_SECONDS = 5.0
 _BACKGROUND_DISPOSE_RETRY_WAIT_SECONDS = 5.0
 _PROCESS_TREE_WAIT_POLL_SECONDS = 0.05
@@ -545,6 +557,8 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
     _MAX_PENDING_OUTPUT_CHARS = 256_000
     _FINAL_OUTPUT_WAIT_SECONDS = 0.5
     _CLOSE_OUTPUT_WAIT_SECONDS = 0.5
+    _PIPE_CLOSE_WAIT_SECONDS = 0.5
+    _CLOSE_TOTAL_WAIT_SECONDS = 1.0
 
     def __init__(
         self,
@@ -562,7 +576,7 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         self._snapshot_path = snapshot_path
         self._startup_gate_path = startup_gate_path
         self._operation_lock = threading.Lock()
-        self._close_lock = threading.Lock()
+        self._close_lock = threading.RLock()
         self._output_lock = threading.Lock()
         self._pending_output: deque[str] = deque()
         self._pending_chars = 0
@@ -572,6 +586,8 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         self._output_error: Exception | None = None
         self._closed = False
         self._stdin_closed = True
+        self._stdin_close_state: _DeferredResourceClose | None = None
+        self._stdout_close_state: _DeferredResourceClose | None = None
         self._output_thread: threading.Thread | None = None
 
     def attach_process(self, proc: subprocess.Popen) -> None:
@@ -690,19 +706,46 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
             and self.poll() is not None
         ):
             self._wait_output_eof(self._FINAL_OUTPUT_WAIT_SECONDS)
+        return self._take_pending_output_batch()
+
+    def read_final_output(self) -> BackgroundProcessOutput:
+        """仅在成功 close 后原子消费不会再增长的最终输出批次。"""
+
+        with self._operation_lock:
+            if not self._closed:
+                raise RuntimeError("Background process handle is not closed")
+            if self._output_thread is not None:
+                raise RuntimeError(
+                    "Background output reader is still running"
+                )
+            if (
+                self._stdin_close_state is not None
+                or self._stdout_close_state is not None
+            ):
+                raise RuntimeError(
+                    "Background pipe close is still running"
+                )
+            if not self._output_eof_event.is_set():
+                raise RuntimeError("Background output EOF is unavailable")
+        return self._take_pending_output_batch()
+
+    def _take_pending_output_batch(self) -> BackgroundProcessOutput:
+        """统一消费 pending 文本、丢弃计数和读取错误。"""
+
         with self._output_lock:
             output = "".join(self._pending_output)
-            self._pending_output.clear()
-            self._pending_chars = 0
             discarded_chars = self._discarded_chars
-            self._discarded_chars = 0
             read_error = self._output_error
-            self._output_error = None
-            return BackgroundProcessOutput(
+            result = BackgroundProcessOutput(
                 text=output,
                 discarded_chars=discarded_chars,
                 read_error=read_error,
             )
+            self._pending_output.clear()
+            self._pending_chars = 0
+            self._discarded_chars = 0
+            self._output_error = None
+            return result
 
     def wait(self, timeout: float | None = None) -> int | None:
         """有限等待本地进程；超时不向上泄漏 TimeoutExpired。"""
@@ -807,6 +850,28 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
     def close(self) -> None:
         """有限等待输出回收，并保留失败资源供后续 close 重试。"""
 
+        close_deadline = (
+            time.monotonic() + self._CLOSE_TOTAL_WAIT_SECONDS
+        )
+        acquired = self._close_lock.acquire(
+            timeout=self._remaining_close_time(close_deadline)
+        )
+        if not acquired:
+            close_error = RuntimeError(
+                "Background process handle close failed"
+            )
+            close_error._resource_errors = (
+                RuntimeError("Background close serialization timed out"),
+            )
+            raise close_error
+        try:
+            self._close_serialized(close_deadline)
+        finally:
+            self._close_lock.release()
+
+    def _close_serialized(self, close_deadline: float) -> None:
+        """在已取得 close 锁后推进一次有界资源释放。"""
+
         with self._close_lock:
             errors: list[BaseException] = []
 
@@ -845,11 +910,18 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 )
             else:
                 try:
+                    output_deadline = min(
+                        close_deadline,
+                        (
+                            time.monotonic()
+                            + self._CLOSE_OUTPUT_WAIT_SECONDS
+                        ),
+                    )
                     self._wait_output_eof(
-                        self._CLOSE_OUTPUT_WAIT_SECONDS
+                        self._remaining_close_time(output_deadline)
                     )
                     output_thread.join(
-                        timeout=self._CLOSE_OUTPUT_WAIT_SECONDS
+                        timeout=self._remaining_close_time(output_deadline)
                     )
                 except BaseException as error:
                     errors.append(error)
@@ -873,31 +945,10 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 close_error._resource_errors = tuple(errors)
                 raise close_error
 
-            with self._operation_lock:
-                close_stdin = not self._stdin_closed
-                proc = self._proc
-            if close_stdin:
-                try:
-                    stdin = None if proc is None else proc.stdin
-                    if stdin is not None:
-                        stdin.close()
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    with self._operation_lock:
-                        self._stdin_closed = True
-
-            with self._operation_lock:
-                stdout = self._stdout
-            if stdout is not None:
-                try:
-                    stdout.close()
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    with self._operation_lock:
-                        if self._stdout is stdout:
-                            self._stdout = None
+            self._close_pipes_with_workers(
+                close_deadline=close_deadline,
+                errors=errors,
+            )
 
             with self._operation_lock:
                 snapshot_path = self._snapshot_path
@@ -930,6 +981,8 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                     and self._output_thread is None
                     and self._stdout is None
                     and self._stdin_closed
+                    and self._stdin_close_state is None
+                    and self._stdout_close_state is None
                     and self._snapshot_path is None
                     and self._startup_gate_path is None
                 )
@@ -948,6 +1001,203 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 )
                 close_error._resource_errors = tuple(errors)
                 raise close_error
+
+    @staticmethod
+    def _remaining_close_time(deadline: float) -> float:
+        """按 monotonic 绝对截止时间计算本次仍可等待的秒数。"""
+
+        return max(0.0, deadline - time.monotonic())
+
+    @staticmethod
+    def _run_deferred_resource_close(
+        state: _DeferredResourceClose,
+    ) -> None:
+        """在独立 daemon worker 中执行真实资源 close。"""
+
+        try:
+            close = getattr(state.resource, "close")
+            close()
+        except BaseException as error:
+            state.error = error
+        finally:
+            state.completed.set()
+
+    def _new_deferred_resource_close(
+        self,
+        resource: object,
+        *,
+        name: str,
+    ) -> _DeferredResourceClose:
+        """创建但不启动一个资源 close worker。"""
+
+        state = _DeferredResourceClose(resource=resource)
+        state.thread = threading.Thread(
+            target=self._run_deferred_resource_close,
+            args=(state,),
+            name=name,
+            daemon=True,
+        )
+        return state
+
+    @staticmethod
+    def _start_deferred_resource_close(
+        state: _DeferredResourceClose,
+    ) -> None:
+        """启动 worker；启动失败也通过同一完成状态向 close 汇报。"""
+
+        thread = state.thread
+        if thread is None:
+            state.error = RuntimeError(
+                "Background pipe close worker is unavailable"
+            )
+            state.completed.set()
+            return
+        try:
+            thread.start()
+        except BaseException as error:
+            state.thread = None
+            state.error = error
+            state.completed.set()
+        else:
+            state.started = True
+
+    def _close_pipes_with_workers(
+        self,
+        *,
+        close_deadline: float,
+        errors: list[BaseException],
+    ) -> None:
+        """并行启动至多一个 stdin/stdout worker，并在短截止时间内收敛。"""
+
+        states_to_start: list[_DeferredResourceClose] = []
+        states_to_wait: list[_DeferredResourceClose] = []
+        with self._operation_lock:
+            proc = self._proc
+            stdin = None
+            if not self._stdin_closed:
+                try:
+                    stdin = None if proc is None else proc.stdin
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    if stdin is None:
+                        self._stdin_closed = True
+                    elif self._stdin_close_state is None:
+                        self._stdin_close_state = (
+                            self._new_deferred_resource_close(
+                                stdin,
+                                name="hermes-local-stdin-close",
+                            )
+                        )
+                        states_to_start.append(
+                            self._stdin_close_state
+                        )
+                    if self._stdin_close_state is not None:
+                        states_to_wait.append(
+                            self._stdin_close_state
+                        )
+
+            stdout = self._stdout
+            if stdout is not None:
+                if self._stdout_close_state is None:
+                    if (
+                        self._stdin_close_state is not None
+                        and self._stdin_close_state.resource is stdout
+                    ):
+                        self._stdout_close_state = (
+                            self._stdin_close_state
+                        )
+                    else:
+                        self._stdout_close_state = (
+                            self._new_deferred_resource_close(
+                                stdout,
+                                name="hermes-local-stdout-close",
+                            )
+                        )
+                        states_to_start.append(
+                            self._stdout_close_state
+                        )
+                if self._stdout_close_state is not None:
+                    states_to_wait.append(
+                        self._stdout_close_state
+                    )
+
+        unique_states_to_start = tuple(
+            {
+                id(state): state
+                for state in states_to_start
+                if state is not None
+            }.values()
+        )
+        for state in unique_states_to_start:
+            self._start_deferred_resource_close(state)
+
+        pipe_deadline = min(
+            close_deadline,
+            time.monotonic() + self._PIPE_CLOSE_WAIT_SECONDS,
+        )
+        unique_states_to_wait = tuple(
+            {
+                id(state): state
+                for state in states_to_wait
+                if state is not None
+            }.values()
+        )
+        for state in unique_states_to_wait:
+            if not state.completed.is_set():
+                state.completed.wait(
+                    timeout=self._remaining_close_time(pipe_deadline)
+                )
+            thread = state.thread
+            if (
+                state.completed.is_set()
+                and state.started
+                and thread is not None
+            ):
+                thread.join(
+                    timeout=self._remaining_close_time(pipe_deadline)
+                )
+
+        with self._operation_lock:
+            for state in unique_states_to_wait:
+                if not state.completed.is_set():
+                    errors.append(
+                        RuntimeError(
+                            "Background pipe close timed out"
+                        )
+                    )
+                    continue
+                thread = state.thread
+                if (
+                    state.started
+                    and thread is not None
+                    and thread.is_alive()
+                ):
+                    errors.append(
+                        RuntimeError(
+                            "Background pipe close worker did not stop"
+                        )
+                    )
+                    continue
+                if state.error is not None:
+                    errors.append(state.error)
+                    if self._stdin_close_state is state:
+                        self._stdin_close_state = None
+                    if self._stdout_close_state is state:
+                        self._stdout_close_state = None
+                    continue
+
+                if self._stdin_close_state is state:
+                    current_stdin = (
+                        None if self._proc is None else self._proc.stdin
+                    )
+                    if current_stdin is state.resource:
+                        self._stdin_closed = True
+                    self._stdin_close_state = None
+                if self._stdout_close_state is state:
+                    if self._stdout is state.resource:
+                        self._stdout = None
+                    self._stdout_close_state = None
 
     def _poll_process_tree_locked(self) -> int | None:
         """仅在受管 Windows Job 或 POSIX 进程组结束后报告退出。"""
