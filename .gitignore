@@ -49,3 +49,5 @@ scripts/
 !/hermes/skills/bundled/**
 computer_use_tests/
 tests_docx/
+tests_process/
+tests_dashboard

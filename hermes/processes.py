@@ -197,6 +197,7 @@ class ProcessRecord:
     termination_signal_sent: bool = field(default=False, repr=False)
     termination_in_progress: bool = field(default=False, repr=False)
     close_called: bool = field(default=False, repr=False)
+    resource_cleanup_pending: bool = field(default=False, repr=False)
     log_read_error_count: int = field(default=0, repr=False)
     poll_error_count: int = field(default=0, repr=False)
 
@@ -892,6 +893,20 @@ class ProcessManager:
             )
             return False, exit_code
 
+    def _handle_cleanup_kill(self, record: ProcessRecord) -> bool:
+        """为资源清理强杀 Handle，不再依赖已经失效的 poll 路径。"""
+
+        handle = self._require_handle(record)
+        with record.handle_lock:
+            self._assert_handle_open_locked(record, handle)
+            signal_sent = self._validate_handle_termination_result(
+                handle.kill(),
+                "kill result",
+            )
+            if signal_sent:
+                self._mark_termination_signal_sent(record)
+            return signal_sent
+
     def _handle_close(self, record: ProcessRecord) -> None:
         """串行关闭句柄；仅在成功后禁止重复调用。"""
 
@@ -913,7 +928,7 @@ class ProcessManager:
                     record.close_called = True
 
     def _handle_close_best_effort(self, record: ProcessRecord) -> None:
-        """普通终态沿用尽力释放语义，failed-start 使用严格关闭入口。"""
+        """普通退出终态沿用尽力释放，failed-start 与 lost 使用严格入口。"""
 
         try:
             self._handle_close(record)
@@ -972,8 +987,8 @@ class ProcessManager:
 
         try:
             if self._get_handle(record) is None:
-                self._complete_lost(record)
-                return
+                if self._complete_lost(record):
+                    return
 
             while True:
                 if self._snapshot(record).status in _TERMINAL_STATUSES:
@@ -993,8 +1008,8 @@ class ProcessManager:
                         and not self._is_termination_in_progress(record)
                         and not self._is_failed_start_cleanup_pending(record)
                     ):
-                        self._complete_lost(record)
-                        return
+                        if self._complete_lost(record):
+                            return
                 else:
                     self._clear_poll_failures(record)
                     if exit_code is not None:
@@ -1025,7 +1040,10 @@ class ProcessManager:
                 and not self._is_failed_start_cleanup_pending(record)
             ):
                 self._complete_lost(record)
-            if self._snapshot(record).status in _TERMINAL_STATUSES:
+            if (
+                self._snapshot(record).status in _TERMINAL_STATUSES
+                and not self._is_lost_cleanup_pending(record)
+            ):
                 self._handle_close_best_effort(record)
 
     def _append_output(
@@ -1093,20 +1111,33 @@ class ProcessManager:
             termination_source=None,
         )
 
-    def _complete_lost(self, record: ProcessRecord) -> None:
-        """在持续状态查询失败时标记 lost，而不伪造 killed。"""
+    def _complete_lost(self, record: ProcessRecord) -> bool:
+        """标记逻辑 lost，并为仍持有的 Handle 保留显式清理责任。"""
 
         with record.record_lock:
             termination_source = record.termination_source
-        if termination_source == "failed_start_cleanup":
-            return
-        self._finalize_record(
-            record,
-            ProcessStatus.LOST,
-            exit_code=None,
-            completion_reason="backend_lost",
-            termination_source=termination_source,
-        )
+            if (
+                termination_source == "failed_start_cleanup"
+                or record.termination_in_progress
+            ):
+                return False
+            transitioned = self._transition_locked(
+                record,
+                ProcessStatus.LOST,
+                exit_code=None,
+                completion_reason="backend_lost",
+                termination_source=termination_source,
+            )
+            if not transitioned:
+                return False
+            resource_cleanup_pending = (
+                record.handle is not None and not record.close_called
+            )
+            record.resource_cleanup_pending = resource_cleanup_pending
+            record.completion_event.set()
+        if not resource_cleanup_pending:
+            self._move_to_finished(record)
+        return True
 
     def _finish_confirmed_exit(
         self,
@@ -1222,7 +1253,10 @@ class ProcessManager:
         """幂等地将一个终态记录从运行表移动到结束表。"""
 
         with record.record_lock:
-            if record.status not in _TERMINAL_STATUSES:
+            if (
+                record.status not in _TERMINAL_STATUSES
+                or record.resource_cleanup_pending
+            ):
                 return
         with self._registry_lock:
             if self._running.get(record.process_id) is record:
@@ -1449,6 +1483,11 @@ class ProcessManager:
                         record,
                         source=source,
                     )
+                if self._is_lost_cleanup_pending(record):
+                    return self._terminate_lost_record(
+                        record,
+                        source=source,
+                    )
 
                 snapshot = self._snapshot(record)
                 if snapshot.status in _TERMINAL_STATUSES:
@@ -1459,6 +1498,11 @@ class ProcessManager:
                     # 注册尚未结束时等待统一启动事件，避免抢先写入普通终态。
                     record.startup_event.wait(_STARTUP_CLEANUP_WAIT_SECONDS)
                     snapshot = self._snapshot(record)
+                    if self._is_lost_cleanup_pending(record):
+                        return self._terminate_lost_record(
+                            record,
+                            source=source,
+                        )
                     if snapshot.status in _TERMINAL_STATUSES:
                         return snapshot
                     if self._is_failed_start_cleanup_pending(record):
@@ -1559,6 +1603,52 @@ class ProcessManager:
         self._confirm_failed_start_handle_stopped(record)
         return self._complete_failed_start_record(record)
 
+    def _terminate_lost_record(
+        self,
+        record: ProcessRecord,
+        *,
+        source: str,
+    ) -> ProcessSnapshot:
+        """显式终止并严格释放仍由 lost 记录持有的后台资源。"""
+
+        with record.record_lock:
+            cleanup_pending = (
+                record.status is ProcessStatus.LOST
+                and record.resource_cleanup_pending
+            )
+            if cleanup_pending:
+                record.termination_requested = True
+                record.termination_source = source
+        if not cleanup_pending:
+            return self._snapshot(record)
+
+        if self._get_handle(record) is None:
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            )
+
+        try:
+            self._handle_cleanup_kill(record)
+        except Exception as error:
+            raise ProcessTerminationError(
+                "Could not confirm process termination"
+            ) from error
+
+        self._drain_final_output(record)
+        self._handle_close(record)
+
+        with record.record_lock:
+            if (
+                record.status is not ProcessStatus.LOST
+                or not record.close_called
+            ):
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                )
+            record.resource_cleanup_pending = False
+        self._move_to_finished(record)
+        return self._snapshot(record)
+
     def _request_termination(self, record: ProcessRecord, source: str) -> None:
         """记录终止意图，但尚不改变运行状态。"""
 
@@ -1573,7 +1663,13 @@ class ProcessManager:
         """标记已经向句柄发送终止信号，供读取器稳定归类退出。"""
 
         with record.record_lock:
-            if record.status not in _TERMINAL_STATUSES:
+            if (
+                record.status not in _TERMINAL_STATUSES
+                or (
+                    record.status is ProcessStatus.LOST
+                    and record.resource_cleanup_pending
+                )
+            ):
                 record.termination_signal_sent = True
 
     def _try_confirm_exit(
@@ -1663,6 +1759,15 @@ class ProcessManager:
             return (
                 record.status is ProcessStatus.RUNNING
                 and record.termination_source == "failed_start_cleanup"
+            )
+
+    def _is_lost_cleanup_pending(self, record: ProcessRecord) -> bool:
+        """确认 lost 记录仍持有必须由显式清理释放的 Handle。"""
+
+        with record.record_lock:
+            return (
+                record.status is ProcessStatus.LOST
+                and record.resource_cleanup_pending
             )
 
     def _record_log_read_failure(self, record: ProcessRecord) -> None:
