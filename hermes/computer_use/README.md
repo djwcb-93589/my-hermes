@@ -38,8 +38,8 @@ NoopBackend 和 FakeBackend、P3 cua-driver 进程生命周期和 MCP stdio
 元素和坐标到坐标；滚动支持窗口、元素和坐标目标。不支持的精确参数会返回明确
 失败或降级结果，不会被静默忽略。
 
-`focus_app` 不会抢占真实桌面焦点，也不会自动启动应用。当前仍未接入审批、
-安全策略、CLI 和 Agent。
+`focus_app` 不会抢占真实桌面焦点，也不会自动启动应用。当前仍未接入审批执行链、
+CLI 和 Agent。
 
 ## 依赖方向
 
@@ -119,6 +119,12 @@ P6.5 会在启动 cua-driver 前清理其子进程环境中继承的模型 API K
 可通过 `check_cua_driver_readiness()` 独立检查 cua-driver 的安装和健康状态。该检查不会自动安装驱动、修改 `PATH` 或请求系统权限。解释器退出时，transport 会尽力关闭仍登记为活动状态的 cua-driver 子进程。
 
 P6.5.1 的 readiness 优先使用临时 cua-driver MCP 会话中的 `health_report`。旧版本或 `health_report` 被拒绝时，会回退到 `check_permissions`、`list_apps` 和 `--version`。它不会启动正式 Computer Use Backend；临时诊断进程无论成功或失败都会在结束后清理，也不会自动安装驱动、请求权限或修改 `PATH`。
+
+## P7 低打扰审批策略
+
+Computer Use 使用低打扰审批策略：普通点击、滚动、拖动、聚焦、文本输入和常用快捷键默认直接允许；只有关闭应用和明确危险的终端文本需要一次审批。系统锁定、注销和安全注意序列等组合键会被直接阻止。
+
+P7 只实现风险策略与审批 Binding，尚未注册 `computer_use` 工具，也尚未接入 Agent、CLI 或 Gateway。后续执行器必须在实际动作前使用最新目标上下文重新评估，不能复用目标窗口已经变化的授权。
 
 ## 图片边界
 

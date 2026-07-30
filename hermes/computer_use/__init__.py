@@ -2,6 +2,12 @@
 
 from .backend import ComputerUseBackend
 from .backends import CuaDriverBackend, FakeBackend, FakeCall, NoopBackend
+from .approval import (
+    ComputerUseApprovalHandler,
+    assess_computer_use_operation,
+    register_computer_use_approval_handler,
+    summarize_computer_use_operation,
+)
 from .contracts import (
     ActionEffect,
     ActionResult,
@@ -69,4 +75,8 @@ __all__ = [
     "FakeCall",
     "build_cua_driver_env",
     "check_cua_driver_readiness",
+    "assess_computer_use_operation",
+    "summarize_computer_use_operation",
+    "register_computer_use_approval_handler",
+    "ComputerUseApprovalHandler",
 ]
