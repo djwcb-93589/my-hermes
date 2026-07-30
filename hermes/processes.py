@@ -634,6 +634,7 @@ class ProcessManager:
         with record.handle_lock:
             self._assert_handle_open_locked(record, handle)
             handle.interrupt()
+            self._mark_termination_signal_sent(record)
 
     def _handle_kill(self, record: ProcessRecord) -> None:
         """串行请求强制终止进程。"""
@@ -642,6 +643,7 @@ class ProcessManager:
         with record.handle_lock:
             self._assert_handle_open_locked(record, handle)
             handle.kill()
+            self._mark_termination_signal_sent(record)
 
     def _handle_close(self, record: ProcessRecord) -> None:
         """串行关闭句柄，并保证 close 最多执行一次。"""
@@ -979,8 +981,6 @@ class ProcessManager:
                     self._handle_interrupt(record)
                 except Exception:
                     pass
-                else:
-                    self._mark_termination_signal_sent(record)
 
                 confirmed, exit_code = self._wait_for_exit_confirmation(
                     record,
@@ -996,8 +996,6 @@ class ProcessManager:
                     self._handle_kill(record)
                 except Exception:
                     pass
-                else:
-                    self._mark_termination_signal_sent(record)
 
                 confirmed, exit_code = self._wait_for_exit_confirmation(
                     record,

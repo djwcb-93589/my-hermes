@@ -42,6 +42,7 @@ from hermes.config import (
     _config,
 )
 from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessPolicy
+from hermes.processes import BackgroundProcessHandle
 from hermes.redaction import is_explicit_credential_env_name
 
 
@@ -175,6 +176,14 @@ def filter_local_subprocess_environment(
 
 class UnsupportedBackendError(Exception):
     """后端未实现该文件操作（如 Docker/SSH 默认不暴露文件 IO）。"""
+
+
+class BackgroundProcessUnsupportedError(RuntimeError):
+    """当前 Backend 暂不支持后台进程。"""
+
+
+class BackgroundProcessCancelledError(RuntimeError):
+    """后台进程在成功返回 Handle 前被取消。"""
 
 
 class BaseExecutionEnvironment(ABC):
@@ -354,6 +363,18 @@ class BaseExecutionEnvironment(ABC):
                 timeout=timeout,
                 cancel_checker=cancel_checker,
             )
+
+    def spawn_background(
+        self,
+        command: str,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> BackgroundProcessHandle:
+        """启动后台进程；默认 Backend 显式声明尚不支持。"""
+
+        raise BackgroundProcessUnsupportedError(
+            "Current backend does not support background processes"
+        )
 
     def _execute(
         self,
