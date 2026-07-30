@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hermes.observability.monitoring_aggregation import (
+    MAX_MONITORING_TIME_BUCKETS,
+    MAX_MONITORING_TOOL_STATS,
+    MAX_MONITORING_WINDOW_SECONDS,
+    FinishReasonCategory,
+    MonitoringGranularity,
+    ToolErrorCategory,
+)
+from hermes.tool_policy import ExecutionEnvironment
 from hermes.web.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 
 
@@ -205,6 +214,17 @@ class _MonitoringResponseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+_NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+_NonNegativeFiniteFloat = Annotated[
+    float,
+    Field(strict=True, ge=0, allow_inf_nan=False),
+]
+_Rate = Annotated[
+    float,
+    Field(strict=True, ge=0, le=1, allow_inf_nan=False),
+]
+
+
 class MonitoringPaginationResponse(PaginationMetadata):
     """监控列表复用现有分页字段，并拒绝额外响应字段。"""
 
@@ -304,6 +324,160 @@ class RunTimelineResponse(MonitoringPaginationResponse):
 
     run_id: str
     items: list[ObservationResponse]
+
+
+class MonitoringWindowResponse(_MonitoringResponseModel):
+    """聚合查询实际使用的有界 Unix 时间窗口和受控过滤。"""
+
+    started_at: _NonNegativeFiniteFloat
+    ended_at: _NonNegativeFiniteFloat
+    environment: ExecutionEnvironment | None = None
+    tool_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_window(self) -> Self:
+        """拒绝响应构造阶段出现的反向时间窗口。"""
+        if self.started_at > self.ended_at:
+            raise ValueError("started_at must not be after ended_at")
+        if self.ended_at - self.started_at > MAX_MONITORING_WINDOW_SECONDS:
+            raise ValueError("monitoring window exceeds the fixed limit")
+        return self
+
+
+class FinishReasonCountResponse(_MonitoringResponseModel):
+    """单个受控模型完成原因的调用数。"""
+
+    finish_reason: FinishReasonCategory
+    count: _NonNegativeInt
+
+
+class ToolErrorCountResponse(_MonitoringResponseModel):
+    """单个受控工具错误类别的失败调用数。"""
+
+    error_type: ToolErrorCategory
+    count: _NonNegativeInt
+
+
+class RunMetricsResponse(_MonitoringResponseModel):
+    """基于 run_end Observation 的终态运行指标。"""
+
+    run_count: _NonNegativeInt
+    completed_count: _NonNegativeInt
+    failed_count: _NonNegativeInt
+    cancelled_count: _NonNegativeInt
+    other_terminal_count: _NonNegativeInt
+    success_rate: _Rate | None = None
+    average_iterations: _NonNegativeFiniteFloat | None = None
+    average_tool_call_count: _NonNegativeFiniteFloat | None = None
+    runs_with_final_reply: _NonNegativeInt
+    runs_without_final_reply: _NonNegativeInt
+
+
+class ModelCallMetricsResponse(_MonitoringResponseModel):
+    """不包含 Prompt 或回复正文的模型调用指标。"""
+
+    model_call_count: _NonNegativeInt
+    calls_with_text: _NonNegativeInt
+    calls_without_text: _NonNegativeInt
+    total_tool_call_count: _NonNegativeInt
+    average_tool_call_count: _NonNegativeFiniteFloat | None = None
+    total_prompt_tokens: _NonNegativeInt | None = None
+    total_completion_tokens: _NonNegativeInt | None = None
+    total_tokens: _NonNegativeInt | None = None
+    token_coverage_count: _NonNegativeInt
+    average_duration_ms: _NonNegativeFiniteFloat | None = None
+    finish_reason_counts: list[FinishReasonCountResponse] = Field(
+        default_factory=list,
+        max_length=len(FinishReasonCategory),
+    )
+
+
+class ToolCallMetricsResponse(_MonitoringResponseModel):
+    """不包含工具参数或结果正文的工具调用指标。"""
+
+    tool_call_count: _NonNegativeInt
+    successful_tool_call_count: _NonNegativeInt
+    failed_tool_call_count: _NonNegativeInt
+    success_rate: _Rate | None = None
+    average_duration_ms: _NonNegativeFiniteFloat | None = None
+    error_type_counts: list[ToolErrorCountResponse] = Field(
+        default_factory=list,
+        max_length=len(ToolErrorCategory),
+    )
+
+
+class ToolExecutionMetricsResponse(_MonitoringResponseModel):
+    """现有 Tool Execution Journal 的当前状态分布。"""
+
+    execution_count: _NonNegativeInt
+    prepared_count: _NonNegativeInt
+    awaiting_approval_count: _NonNegativeInt
+    running_count: _NonNegativeInt
+    succeeded_count: _NonNegativeInt
+    failed_count: _NonNegativeInt
+    unknown_count: _NonNegativeInt
+    with_result_count: _NonNegativeInt
+    with_external_operation_count: _NonNegativeInt
+    average_attempt_count: _NonNegativeFiniteFloat | None = None
+
+
+class MonitoringOverviewResponse(_MonitoringResponseModel):
+    """一次有界查询中的四类聚合指标。"""
+
+    window: MonitoringWindowResponse
+    runs: RunMetricsResponse
+    model_calls: ModelCallMetricsResponse
+    tool_calls: ToolCallMetricsResponse
+    tool_executions: ToolExecutionMetricsResponse
+
+
+class ToolStatsItemResponse(_MonitoringResponseModel):
+    """按稳定工具名称聚合的有限调用统计。"""
+
+    tool_name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+    )
+    call_count: _NonNegativeInt
+    success_count: _NonNegativeInt
+    failure_count: _NonNegativeInt
+    success_rate: _Rate | None = None
+    average_duration_ms: _NonNegativeFiniteFloat | None = None
+
+
+class ToolStatsResponse(_MonitoringResponseModel):
+    """固定排序且最多一百项的工具调用聚合。"""
+
+    window: MonitoringWindowResponse
+    items: list[ToolStatsItemResponse] = Field(
+        max_length=MAX_MONITORING_TOOL_STATS,
+    )
+
+
+class MonitoringTimeBucketResponse(_MonitoringResponseModel):
+    """一个 UTC Unix 边界的固定趋势时间桶。"""
+
+    bucket_started_at: _NonNegativeInt
+    run_count: _NonNegativeInt
+    model_call_count: _NonNegativeInt
+    tool_call_count: _NonNegativeInt
+    failed_tool_call_count: _NonNegativeInt
+
+
+class MonitoringTimeSeriesResponse(_MonitoringResponseModel):
+    """补齐空桶后的有界监控趋势。"""
+
+    window: MonitoringWindowResponse
+    granularity: MonitoringGranularity
+    buckets: list[MonitoringTimeBucketResponse] = Field(
+        max_length=MAX_MONITORING_TIME_BUCKETS,
+    )
 
 
 class CronControlResponse(BaseModel):
