@@ -621,14 +621,23 @@ def register_all(
     from hermes.tools.browser import register as _browser
     from hermes.cron.tool import register as _cron
 
-    _terminal(
-        staging_registry,
-        process_manager=active_process_manager,
-    )
-    _process(
-        staging_registry,
-        process_manager=active_process_manager,
-    )
+    if process_manager is None:
+        _terminal(staging_registry)
+    else:
+        _terminal(
+            staging_registry,
+            process_manager=active_process_manager,
+        )
+    # Process 是 Terminal 的伴随能力；替代来源未注册正式 Terminal 时，
+    # 不越过该来源装配真实 Process。
+    if staging_registry.get_entry("terminal") is not None:
+        if process_manager is None:
+            _process(staging_registry)
+        else:
+            _process(
+                staging_registry,
+                process_manager=active_process_manager,
+            )
     _file(staging_registry)
     _memory(staging_registry)
     try:
@@ -642,10 +651,13 @@ def register_all(
             "Skill tools unavailable; Skill capability was skipped: %s",
             type(exc).__name__,
         )
-    _delegate(
-        staging_registry,
-        process_manager=active_process_manager,
-    )
+    if process_manager is None:
+        _delegate(staging_registry)
+    else:
+        _delegate(
+            staging_registry,
+            process_manager=active_process_manager,
+        )
     _gateway_send_file(staging_registry)
     _media(staging_registry)
     _browser(staging_registry)

@@ -681,27 +681,22 @@ def handle_delegate_cancel(args, **kwargs) -> str:
 def register(registry, *, process_manager=None):
     """注册 Delegate 的真实 handler。"""
 
-    active_process_manager = process_manager
-    if active_process_manager is None:
-        from hermes.processes import (
-            process_manager as default_process_manager,
-        )
+    delegate_task_handler = handle_delegate
+    if process_manager is not None:
+        if not callable(
+            getattr(process_manager, "cleanup_session", None)
+        ):
+            raise TypeError("process_manager must provide cleanup_session()")
 
-        active_process_manager = default_process_manager
-    if not callable(
-        getattr(active_process_manager, "cleanup_session", None)
-    ):
-        raise TypeError("process_manager must provide cleanup_session()")
+        def delegate_task_handler(args, **kwargs):
+            """绑定应用级共享 ProcessManager，拒绝运行时上下文覆盖。"""
 
-    def delegate_task_handler(args, **kwargs):
-        """绑定应用级共享 ProcessManager，拒绝运行时上下文覆盖。"""
-
-        kwargs.pop("process_manager", None)
-        return handle_delegate(
-            args,
-            process_manager=active_process_manager,
-            **kwargs,
-        )
+            kwargs.pop("process_manager", None)
+            return handle_delegate(
+                args,
+                process_manager=process_manager,
+                **kwargs,
+            )
 
     register_declared_handlers(
         registry,

@@ -404,8 +404,18 @@ def run_terminal(args, *, process_manager=None, **kwargs):
 
 
 def register(registry, *, process_manager=None):
-    """注册 Terminal 的运行时 handler 和审批处理器。"""
+    """注册 Terminal Toolset 的运行时 handler 和审批处理器。"""
 
+    terminal_declarations = tuple(
+        declaration
+        for declaration in TOOL_DECLARATIONS
+        if declaration.name == "terminal"
+    )
+    if len(terminal_declarations) != 1:
+        raise ValueError(
+            "terminal toolset must declare exactly one terminal tool"
+        )
+    terminal_declaration = terminal_declarations[0]
     active_process_manager = process_manager
     if active_process_manager is None:
         from hermes.processes import (
@@ -427,4 +437,4 @@ def register(registry, *, process_manager=None):
         )
 
     register_terminal_approval_handler()
-    registry.register_declaration(TOOL_DECLARATIONS[0], handler)
+    registry.register_declaration(terminal_declaration, handler)

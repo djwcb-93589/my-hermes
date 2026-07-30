@@ -44,6 +44,11 @@ _SOURCES = (
         toolsets=("terminal",),
     ),
     ToolsetDeclarationSource(
+        name="process",
+        module_name="hermes.tool_declarations.process",
+        toolsets=("terminal",),
+    ),
+    ToolsetDeclarationSource(
         name="file",
         module_name="hermes.tool_declarations.file",
         toolsets=("file",),
@@ -117,7 +122,11 @@ def build_toolset_catalog_snapshot() -> ToolsetCatalogSnapshot:
             )
 
     capability_snapshot = tuple(sorted(
-        capabilities,
+        (
+            descriptor
+            for descriptor in capabilities
+            if descriptor.toolset not in unavailable_toolsets
+        ),
         key=lambda descriptor: (descriptor.toolset, descriptor.name),
     ))
     available_toolsets = {

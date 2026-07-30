@@ -403,10 +403,27 @@ def _status_check(record: object, process_manager) -> dict:
     }
 
 
-def register(registry, *, process_manager) -> None:
+def register(registry, *, process_manager=None) -> None:
     """绑定共享 ProcessManager 并注册 Process Tool。"""
 
-    if not callable(getattr(process_manager, "poll", None)):
+    process_declarations = tuple(
+        declaration
+        for declaration in TOOL_DECLARATIONS
+        if declaration.name == "process"
+    )
+    if len(process_declarations) != 1:
+        raise ValueError(
+            "process toolset must declare exactly one process tool"
+        )
+    process_declaration = process_declarations[0]
+    active_process_manager = process_manager
+    if active_process_manager is None:
+        from hermes.processes import (
+            process_manager as default_process_manager,
+        )
+
+        active_process_manager = default_process_manager
+    if not callable(getattr(active_process_manager, "poll", None)):
         raise TypeError("process_manager must provide process operations")
 
     def handler(args, **kwargs):
@@ -415,17 +432,17 @@ def register(registry, *, process_manager) -> None:
         kwargs.pop("process_manager", None)
         return run_process(
             args,
-            process_manager=process_manager,
+            process_manager=active_process_manager,
             **kwargs,
         )
 
     def status_check(record, _external_operation_id):
         """崩溃恢复只读检查状态，绝不重放 kill。"""
 
-        return _status_check(record, process_manager)
+        return _status_check(record, active_process_manager)
 
     registry.register_declaration(
-        TOOL_DECLARATIONS[0],
+        process_declaration,
         handler,
         status_check=status_check,
     )
