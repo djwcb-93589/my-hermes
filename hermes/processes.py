@@ -27,11 +27,17 @@ class BackgroundProcessHandle(Protocol):
     def wait(self, timeout: float | None = None) -> int | None:
         """等待结束；超时时返回 None，结束后返回退出码。"""
 
-    def interrupt(self) -> None:
-        """请求进程协作式退出。"""
+    def interrupt(self) -> bool:
+        """发送协作式终止请求时返回 True；调用前已自然结束时返回 False。
 
-    def kill(self) -> None:
-        """强制终止进程及其受管理的后代。"""
+        真实发送失败必须抛出异常。
+        """
+
+    def kill(self) -> bool:
+        """执行强制终止时返回 True；调用前已自然结束时返回 False。
+
+        所有终止方式失败且目标仍运行时必须抛出异常。
+        """
 
     def close(self) -> None:
         """释放管道、句柄或远端临时资源。"""
@@ -627,23 +633,49 @@ class ProcessManager:
             exit_code = handle.wait(timeout=timeout)
         return self._validate_handle_exit_code(exit_code, "wait result")
 
-    def _handle_interrupt(self, record: ProcessRecord) -> None:
-        """串行请求进程协作式退出。"""
+    def _handle_interrupt(
+        self,
+        record: ProcessRecord,
+    ) -> tuple[bool, int | None]:
+        """串行请求协作式退出，并保留自然退出与已发送信号的区别。"""
 
         handle = self._require_handle(record)
         with record.handle_lock:
             self._assert_handle_open_locked(record, handle)
-            handle.interrupt()
-            self._mark_termination_signal_sent(record)
+            signal_sent = self._validate_handle_termination_result(
+                handle.interrupt(),
+                "interrupt result",
+            )
+            if signal_sent:
+                self._mark_termination_signal_sent(record)
+                return True, None
+            exit_code = self._validate_handle_exit_code(
+                handle.poll(),
+                "poll result",
+            )
+            return False, exit_code
 
-    def _handle_kill(self, record: ProcessRecord) -> None:
-        """串行请求强制终止进程。"""
+    def _handle_kill(
+        self,
+        record: ProcessRecord,
+    ) -> tuple[bool, int | None]:
+        """串行请求强制终止，并保留自然退出与已发送信号的区别。"""
 
         handle = self._require_handle(record)
         with record.handle_lock:
             self._assert_handle_open_locked(record, handle)
-            handle.kill()
-            self._mark_termination_signal_sent(record)
+            signal_sent = self._validate_handle_termination_result(
+                handle.kill(),
+                "kill result",
+            )
+            if signal_sent:
+                self._mark_termination_signal_sent(record)
+                return True, None
+            exit_code = self._validate_handle_exit_code(
+                handle.poll(),
+                "poll result",
+            )
+            return False, exit_code
 
     def _handle_close(self, record: ProcessRecord) -> None:
         """串行关闭句柄，并保证 close 最多执行一次。"""
@@ -683,6 +715,19 @@ class ProcessManager:
                 f"process handle {operation} must be an integer or None"
             )
         return exit_code
+
+    @staticmethod
+    def _validate_handle_termination_result(
+        signal_sent: object,
+        operation: str,
+    ) -> bool:
+        """校验 Handle 对终止请求是否真实发送的明确结果。"""
+
+        if not isinstance(signal_sent, bool):
+            raise TypeError(
+                f"process handle {operation} must be a boolean"
+            )
+        return signal_sent
 
     @staticmethod
     def _assert_handle_open_locked(
@@ -978,9 +1023,12 @@ class ProcessManager:
                     return terminal_snapshot
 
                 try:
-                    self._handle_interrupt(record)
+                    signal_sent, exit_code = self._handle_interrupt(record)
                 except Exception:
                     pass
+                else:
+                    if not signal_sent and exit_code is not None:
+                        return self._finish_confirmed_exit(record, exit_code)
 
                 confirmed, exit_code = self._wait_for_exit_confirmation(
                     record,
@@ -993,9 +1041,12 @@ class ProcessManager:
                     return terminal_snapshot
 
                 try:
-                    self._handle_kill(record)
+                    signal_sent, exit_code = self._handle_kill(record)
                 except Exception:
                     pass
+                else:
+                    if not signal_sent and exit_code is not None:
+                        return self._finish_confirmed_exit(record, exit_code)
 
                 confirmed, exit_code = self._wait_for_exit_confirmation(
                     record,

@@ -105,19 +105,24 @@ def _attach_windows_job(proc: subprocess.Popen) -> None:
     proc._hermes_job_handle = job_handle
 
 
-def _interrupt_local_process(proc: subprocess.Popen) -> None:
-    """向本地进程组发送协作式中断；已退出时保持幂等。"""
+def _interrupt_local_process(proc: subprocess.Popen) -> bool:
+    """发送协作式中断；调用前已退出时明确返回 False。"""
 
     if proc.poll() is not None:
-        return
+        return False
     try:
         if sys.platform == "win32":
             proc.send_signal(signal.CTRL_BREAK_EVENT)
-            return
+            return True
         os.killpg(proc.pid, signal.SIGINT)
-    except (OSError, ValueError):
-        if proc.poll() is not None:
-            return
+        return True
+    except (OSError, ValueError) as interrupt_error:
+        try:
+            process_exited = proc.poll() is not None
+        except Exception:
+            raise interrupt_error
+        if process_exited:
+            return False
         raise
 
 
@@ -126,11 +131,11 @@ def _kill_local_process_tree(
     job_handle: object | None = None,
     *,
     job_assigned: bool = False,
-) -> None:
-    """强制终止本地进程树；真实失败必须反馈给调用方。"""
+) -> bool:
+    """强制终止本地进程树，并返回是否确实执行过终止操作。"""
 
     if proc.poll() is not None:
-        return
+        return False
 
     if sys.platform == "win32":
         job_terminated = False
@@ -183,26 +188,35 @@ def _kill_local_process_tree(
             else:
                 root_killed = True
 
-        if proc.poll() is not None or any(
-            (job_terminated, taskkill_succeeded, root_killed)
-        ):
-            return
+        if any((job_terminated, taskkill_succeeded, root_killed)):
+            return True
+        if proc.poll() is not None:
+            return False
         if failures:
             raise failures[-1]
         raise RuntimeError("Could not terminate local Windows process tree")
 
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-        return
+        return True
     except (OSError, ValueError) as group_error:
-        if proc.poll() is not None:
-            return
+        try:
+            process_exited = proc.poll() is not None
+        except Exception:
+            raise group_error
+        if process_exited:
+            return False
         try:
             proc.kill()
         except (OSError, ValueError) as process_error:
-            if proc.poll() is not None:
-                return
+            try:
+                process_exited = proc.poll() is not None
+            except Exception:
+                raise process_error
+            if process_exited:
+                return False
             raise process_error from group_error
+        return True
 
 
 def _remove_local_path(path: Path | None) -> None:
@@ -214,6 +228,14 @@ def _remove_local_path(path: Path | None) -> None:
         path.unlink()
     except OSError:
         pass
+
+
+class BackgroundProcessCleanupError(RuntimeError):
+    """后台启动失败后，无法确认已创建进程完成清理。"""
+
+
+_BACKGROUND_DISPOSE_WAIT_SECONDS = 5.0
+_BACKGROUND_DISPOSE_RETRY_WAIT_SECONDS = 5.0
 
 
 class LocalBackgroundProcessHandle(BackgroundProcessHandle):
@@ -313,17 +335,17 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         except subprocess.TimeoutExpired:
             return None
 
-    def interrupt(self) -> None:
-        """请求整个本地进程组协作式退出。"""
+    def interrupt(self) -> bool:
+        """请求整个本地进程组协作式退出，并返回是否真正发送了信号。"""
 
         with self._operation_lock:
-            _interrupt_local_process(self._proc)
+            return _interrupt_local_process(self._proc)
 
-    def kill(self) -> None:
-        """强制终止整个本地进程树。"""
+    def kill(self) -> bool:
+        """强制终止整个本地进程树，并返回是否真正执行了终止操作。"""
 
         with self._operation_lock:
-            _kill_local_process_tree(
+            return _kill_local_process_tree(
                 self._proc,
                 self._job_handle,
                 job_assigned=self._job_assigned,
@@ -346,6 +368,10 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
             self._startup_gate_path = None
             output_thread = self._output_thread
             try:
+                stdin = self._proc.stdin
+            except BaseException:
+                stdin = None
+            try:
                 process_exited = self._proc.poll() is not None
             except Exception:
                 process_exited = False
@@ -358,6 +384,11 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
             except BaseException:
                 pass
         try:
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except BaseException:
+                    pass
             if stdout is not None:
                 try:
                     stdout.close()
@@ -646,7 +677,11 @@ class LocalBackend(BaseExecutionEnvironment):
                 raise BackgroundProcessCancelledError(
                     "Background process start cancelled"
                 )
-            proc = self._run_background_bash(wrapped, env=launch_env)
+            proc = self._run_background_bash(
+                wrapped,
+                env=launch_env,
+                wait_for_start_gate=startup_gate_path is not None,
+            )
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
                     "Background process start cancelled"
@@ -654,6 +689,10 @@ class LocalBackend(BaseExecutionEnvironment):
             if sys.platform == "win32":
                 _assign_windows_job(proc, job_handle)
                 job_assigned = True
+            if self._cancel_requested(cancel_checker):
+                raise BackgroundProcessCancelledError(
+                    "Background process start cancelled"
+                )
             handle = LocalBackgroundProcessHandle(
                 proc,
                 job_handle=job_handle,
@@ -662,31 +701,31 @@ class LocalBackend(BaseExecutionEnvironment):
                 startup_gate_path=startup_gate_path,
             )
             handle.start_output_reader()
+            if self._cancel_requested(cancel_checker):
+                raise BackgroundProcessCancelledError(
+                    "Background process start cancelled"
+                )
             if startup_gate_path is not None:
                 self._release_background_start_gate(startup_gate_path)
+                self._close_background_gate_wait_pipe(proc)
 
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
                     "Background process start cancelled"
                 )
             return handle
-        except BaseException:
-            if handle is not None:
-                self._dispose_background_handle(handle)
-            elif proc is not None:
-                self._dispose_unmanaged_background_process(
-                    proc,
-                    job_handle,
+        except BaseException as start_error:
+            try:
+                self._force_dispose_background_before_return(
+                    proc=proc,
+                    handle=handle,
+                    job_handle=job_handle,
                     job_assigned=job_assigned,
+                    snapshot_path=snapshot_copy,
+                    startup_gate_path=startup_gate_path,
                 )
-            elif job_handle is not None:
-                try:
-                    _close_windows_job(job_handle)
-                except BaseException:
-                    pass
-            if snapshot_copy is not None:
-                self._remove_background_snapshot(snapshot_copy)
-            _remove_local_path(startup_gate_path)
+            except BackgroundProcessCleanupError as cleanup_error:
+                raise cleanup_error from start_error
             raise
 
     def _copy_background_snapshot_locked(self) -> Path:
@@ -717,13 +756,14 @@ class LocalBackend(BaseExecutionEnvironment):
         if startup_gate_shell is not None:
             quoted_gate = shlex.quote(startup_gate_shell)
             # Popen 不稳定暴露主线程句柄时，使用纯 Bash 内建的启动闸门。
-            # 根 Bash 在加入 Job 前只会自旋，不会启动用户命令或外部子进程。
+            # 根 Bash 在加入 Job 前不会启动用户命令或外部子进程，并通过私有管道限速轮询。
             parts.extend(
                 [
                     (
                         f"while :; do IFS= read -r _hermes_gate < "
                         f"{quoted_gate} || _hermes_gate=; "
-                        "[[ $_hermes_gate == ready ]] && break; done"
+                        "[[ $_hermes_gate == ready ]] && break; "
+                        "IFS= read -r -t 0.05 _hermes_gate_wait || :; done"
                     ),
                     f"rm -f {quoted_gate}",
                 ]
@@ -743,6 +783,7 @@ class LocalBackend(BaseExecutionEnvironment):
         cmd_string: str,
         *,
         env: dict[str, str],
+        wait_for_start_gate: bool = False,
     ) -> subprocess.Popen:
         """独立启动 Bash 和进程组，不复用前台 execute 流程。"""
 
@@ -752,12 +793,19 @@ class LocalBackend(BaseExecutionEnvironment):
             if sys.platform == "win32"
             else {"start_new_session": True}
         )
+        gate_wait_options = (
+            {"stdin": subprocess.PIPE}
+            if wait_for_start_gate
+            else {}
+        )
         return subprocess.Popen(
             [bash, "-c", cmd_string],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=False,
             env=env,
+            # 此管道只用于 Windows 启动闸门的 Bash 内建等待，不向用户暴露 stdin。
+            **gate_wait_options,
             **process_group_options,
         )
 
@@ -784,32 +832,59 @@ class LocalBackend(BaseExecutionEnvironment):
         startup_gate_path.write_text("ready\n", encoding="ascii")
 
     @staticmethod
-    def _remove_background_snapshot(snapshot_copy: Path) -> None:
-        """尽力清理未被新 Bash 自行删除的一次性快照文件。"""
+    def _close_background_gate_wait_pipe(proc: subprocess.Popen) -> None:
+        """关闭仅供启动闸门限速等待的私有 stdin 管道。"""
 
-        _remove_local_path(snapshot_copy)
+        try:
+            stdin = proc.stdin
+        except BaseException:
+            return
+        if stdin is None:
+            return
+        try:
+            stdin.close()
+        except BaseException:
+            pass
 
     @staticmethod
-    def _dispose_unmanaged_background_process(
+    def _background_process_has_exited(proc: subprocess.Popen) -> bool:
+        """仅以 poll 的明确结果确认根进程已经结束。"""
+
+        try:
+            return proc.poll() is not None
+        except BaseException:
+            return False
+
+    @classmethod
+    def _wait_for_background_process_exit(
+        cls,
+        proc: subprocess.Popen,
+        timeout: float,
+        *,
+        handle: LocalBackgroundProcessHandle | None = None,
+    ) -> bool:
+        """有限等待后再次以 poll 确认后台根进程退出。"""
+
+        try:
+            if handle is not None:
+                handle.wait(timeout=timeout)
+            else:
+                proc.wait(timeout=timeout)
+        except BaseException:
+            pass
+        return cls._background_process_has_exited(proc)
+
+    @staticmethod
+    def _release_unmanaged_background_resources(
         proc: subprocess.Popen,
         job_handle: object | None,
         *,
-        job_assigned: bool,
+        snapshot_path: Path | None,
+        startup_gate_path: Path | None,
     ) -> None:
-        """Handle 构造前失败时终止并释放已启动的本地进程。"""
+        """仅在确认根进程退出后释放尚未交给 Handle 的资源。"""
 
-        try:
-            _kill_local_process_tree(
-                proc,
-                job_handle,
-                job_assigned=job_assigned,
-            )
-        except BaseException:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except BaseException:
-            pass
+        LocalBackend._close_background_gate_wait_pipe(proc)
         try:
             stdout = proc.stdout
         except BaseException:
@@ -823,25 +898,84 @@ class LocalBackend(BaseExecutionEnvironment):
             _close_windows_job(job_handle)
         except BaseException:
             pass
+        _remove_local_path(snapshot_path)
+        _remove_local_path(startup_gate_path)
 
-    @staticmethod
-    def _dispose_background_handle(
-        handle: LocalBackgroundProcessHandle,
+    def _force_dispose_background_before_return(
+        self,
+        *,
+        proc: subprocess.Popen | None,
+        handle: LocalBackgroundProcessHandle | None,
+        job_handle: object | None,
+        job_assigned: bool,
+        snapshot_path: Path | None,
+        startup_gate_path: Path | None,
     ) -> None:
-        """Handle 已创建但尚未返回时，避免留下孤儿进程和资源。"""
+        """在后台启动失败后确认根进程退出，随后才释放关联资源。"""
 
-        try:
-            handle.kill()
-        except BaseException:
-            pass
-        try:
-            handle.wait(timeout=5)
-        except BaseException:
-            pass
-        try:
-            handle.close()
-        except BaseException:
-            pass
+        if proc is None:
+            try:
+                _close_windows_job(job_handle)
+            except BaseException:
+                pass
+            _remove_local_path(snapshot_path)
+            _remove_local_path(startup_gate_path)
+            return
+
+        if not self._background_process_has_exited(proc):
+            try:
+                if handle is not None:
+                    handle.kill()
+                else:
+                    _kill_local_process_tree(
+                        proc,
+                        job_handle,
+                        job_assigned=job_assigned,
+                    )
+            except BaseException:
+                pass
+            self._wait_for_background_process_exit(
+                proc,
+                _BACKGROUND_DISPOSE_WAIT_SECONDS,
+                handle=handle,
+            )
+
+        if not self._background_process_has_exited(proc):
+            try:
+                if handle is not None:
+                    handle.kill()
+                else:
+                    _kill_local_process_tree(
+                        proc,
+                        job_handle,
+                        job_assigned=job_assigned,
+                    )
+            except BaseException:
+                pass
+            self._wait_for_background_process_exit(
+                proc,
+                _BACKGROUND_DISPOSE_RETRY_WAIT_SECONDS,
+                handle=handle,
+            )
+
+        if not self._background_process_has_exited(proc):
+            raise BackgroundProcessCleanupError(
+                "Could not confirm background process cleanup"
+            )
+
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException:
+                pass
+            return
+
+        self._release_unmanaged_background_resources(
+            proc,
+            job_handle,
+            snapshot_path=snapshot_path,
+            startup_gate_path=startup_gate_path,
+        )
 
     def _interrupt_process(self, proc: subprocess.Popen) -> None:
         """向整组进程发送与终端 Ctrl+C 等价的软中断。"""
