@@ -26,7 +26,6 @@ from pathlib import Path
 
 from hermes.backends import (
     BackgroundProcessCancelledError,
-    BackgroundProcessStartCleanupError,
     BaseExecutionEnvironment,
     filter_local_subprocess_environment,
 )
@@ -35,7 +34,11 @@ from hermes.path_utils import (
     git_bash_to_windows_path as _bash_to_win_path,
     windows_to_git_bash_path as _win_to_bash_path,
 )
-from hermes.processes import BackgroundProcessHandle, BackgroundProcessOutput
+from hermes.processes import (
+    BackgroundProcessHandle,
+    BackgroundProcessOutput,
+    BackgroundProcessStartCleanupError,
+)
 
 
 if sys.platform == "win32":

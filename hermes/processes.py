@@ -59,6 +59,30 @@ class BackgroundProcessHandle(Protocol):
         """释放管道、句柄或远端临时资源。"""
 
 
+class BackgroundProcessStartCleanupError(RuntimeError):
+    """启动失败且清理未确认时，把 Handle 控制权移交给 ProcessManager。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        handle: BackgroundProcessHandle,
+        start_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.handle = handle
+        # 原始异常只供内部诊断；公共错误仍由 ProcessManager 稳定脱敏。
+        self._start_error = start_error
+        self._cleanup_error = cleanup_error
+        self.start_error_type = (
+            None if start_error is None else type(start_error).__name__
+        )
+        self.cleanup_error_type = (
+            None if cleanup_error is None else type(cleanup_error).__name__
+        )
+
+
 class ProcessStatus(str, Enum):
     """后台进程的生命周期状态。"""
 
@@ -341,18 +365,6 @@ class ProcessManager:
             if handle is None:
                 raise TypeError("starter returned no process handle")
         except Exception as start_error:
-            # 延迟导入 Backend 公共异常，避免模块加载阶段形成循环依赖。
-            try:
-                from hermes.backends import BackgroundProcessStartCleanupError
-            except Exception as import_error:
-                self._mark_start_failed(record)
-                raise ProcessStartError(
-                    "Process start failed"
-                ) from _ProcessStartFailureContext(
-                    start_error=start_error,
-                    cleanup_error=import_error,
-                )
-
             if not isinstance(
                 start_error,
                 BackgroundProcessStartCleanupError,
@@ -2052,6 +2064,7 @@ process_manager = ProcessManager()
 __all__ = [
     "BackgroundProcessHandle",
     "BackgroundProcessOutput",
+    "BackgroundProcessStartCleanupError",
     "ProcessError",
     "ProcessCleanupReport",
     "ProcessLimitError",
