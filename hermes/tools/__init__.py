@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
@@ -472,8 +473,16 @@ def register_declared_handlers(
         declaration.name
         for declaration in declaration_items
     )
-    if len(declaration_names) != len(set(declaration_names)):
-        raise ValueError("tool declarations contain duplicate names")
+    duplicate_names = tuple(sorted(
+        name
+        for name, count in Counter(declaration_names).items()
+        if count > 1
+    ))
+    if duplicate_names:
+        raise ValueError(
+            "tool declarations contain duplicate names: "
+            + ", ".join(duplicate_names)
+        )
     if not isinstance(handlers_by_name, Mapping):
         raise TypeError("handlers_by_name must be a mapping")
     if any(
@@ -484,15 +493,28 @@ def register_declared_handlers(
 
     expected_names = set(declaration_names)
     handler_names = set(handlers_by_name)
-    if expected_names - handler_names:
-        raise ValueError("tool declarations have missing handlers")
-    if handler_names - expected_names:
-        raise ValueError("tool declarations have extra handlers")
-    if any(
-        not callable(handlers_by_name[name])
-        for name in declaration_names
-    ):
-        raise TypeError("tool declaration handlers must be callable")
+    missing_names = tuple(sorted(expected_names - handler_names))
+    if missing_names:
+        raise ValueError(
+            "tool declarations have missing handlers: "
+            + ", ".join(missing_names)
+        )
+    extra_names = tuple(sorted(handler_names - expected_names))
+    if extra_names:
+        raise ValueError(
+            "tool declarations have extra handlers: "
+            + ", ".join(extra_names)
+        )
+    uncallable_names = tuple(sorted({
+        name
+        for name in handler_names
+        if not callable(handlers_by_name[name])
+    }))
+    if uncallable_names:
+        raise TypeError(
+            "tool declaration handlers must be callable: "
+            + ", ".join(uncallable_names)
+        )
 
     staging_registry = ToolRegistry()
     for declaration in declaration_items:
