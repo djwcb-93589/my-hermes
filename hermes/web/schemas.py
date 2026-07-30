@@ -163,12 +163,33 @@ class SkillListResponse(PaginationMetadata):
     items: list[SkillSummary]
 
 
+class ToolCapabilitySummary(BaseModel):
+    """工具集目录中的单个声明能力，不包含 handler 或完整 schema。"""
+
+    name: str
+    description: str | None = None
+    parameter_names: list[str]
+    required_parameters: list[str]
+    environments: list[str]
+    default_environments: list[str]
+    unattended_allowed: bool
+    approval_mode: str
+    risk_level: str
+    retry_safe: bool
+    unknown_on_crash: bool
+    supports_cancellation: bool
+    has_status_check: bool
+
+
 class ToolsetSummary(BaseModel):
     """ToolRegistry 声明的一个工具集。"""
 
     name: str
     available: bool
     environments: list[str]
+    tool_count: int = Field(default=0, ge=0)
+    default_environments: list[str] = Field(default_factory=list)
+    tools: list[ToolCapabilitySummary] = Field(default_factory=list)
 
 
 class ToolsetListResponse(PaginationMetadata):

@@ -7,24 +7,31 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from browser.runtime import (
-    BrowserRuntimeError,
-    configure_default_browser_manager,
-    default_browser_manager,
-)
-from hermes.approval import build_assessment_response, is_remote_approval
-from hermes.config import BROWSER_CONFIG
-from hermes.tools.browser_approval import (
-    approved_browser_media_snapshots_candidate,
-    approved_browser_operation_context_candidate,
-    assess_browser_operation,
-    assess_external_media_analysis,
-    browser_media_snapshot_matches,
-    browser_operation_risk_level,
-    browser_operation_state_matches,
-    register_browser_approval_handlers,
-)
-from hermes.backends import get_backend
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from browser.runtime import (
+        BrowserRuntimeError,
+        configure_default_browser_manager,
+        default_browser_manager,
+    )
+    from hermes.approval import build_assessment_response, is_remote_approval
+    from hermes.config import BROWSER_CONFIG
+    from hermes.tools.browser_approval import (
+        approved_browser_media_snapshots_candidate,
+        approved_browser_operation_context_candidate,
+        assess_browser_operation,
+        assess_external_media_analysis,
+        browser_media_snapshot_matches,
+        browser_operation_risk_level,
+        browser_operation_state_matches,
+        register_browser_approval_handlers,
+    )
+    from hermes.backends import get_backend
 
 
 _INTERNAL_RESULT_FIELDS = {
@@ -578,14 +585,15 @@ _TIMEOUT = {"type": "integer", "minimum": 1}
 
 def register(registry) -> None:
     """注册默认关闭、显式启用 browser toolset 后才可见的浏览器工具。"""
-    configure_default_browser_manager(
-        idle_timeout_seconds=BROWSER_CONFIG["idle_timeout_seconds"],
-        headless=BROWSER_CONFIG["headless"],
-        channel=BROWSER_CONFIG["channel"],
-        startup_timeout_seconds=BROWSER_CONFIG["startup_timeout_seconds"],
-        operation_timeout_seconds=BROWSER_CONFIG["operation_timeout_seconds"],
-    )
-    register_browser_approval_handlers()
+    if not getattr(registry, "metadata_only", False):
+        configure_default_browser_manager(
+            idle_timeout_seconds=BROWSER_CONFIG["idle_timeout_seconds"],
+            headless=BROWSER_CONFIG["headless"],
+            channel=BROWSER_CONFIG["channel"],
+            startup_timeout_seconds=BROWSER_CONFIG["startup_timeout_seconds"],
+            operation_timeout_seconds=BROWSER_CONFIG["operation_timeout_seconds"],
+        )
+        register_browser_approval_handlers()
     operations: list[tuple[str, str, str, dict[str, Any], list[str], Callable, bool, bool]] = [
         ("browser_navigate", "navigate", "Open a URL and return a new snapshot_id.", {"url": _STRING}, ["url"], _handle_simple("navigate", {"url"}, {"url"}), False, True),
         ("browser_snapshot", "snapshot", "Read the current page and create a new snapshot. Optionally pass the latest snapshot_id to verify it is still current before refreshing.", {"snapshot_id": _SNAPSHOT}, [], _handle_simple("snapshot", {"snapshot_id"}, set()), False, False),

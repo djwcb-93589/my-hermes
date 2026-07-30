@@ -20,22 +20,32 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
-from hermes.agent_loop import AgentLoop, ParsedToolCall
-from hermes.backends import cleanup_backend
-from hermes.config import (
-    MAX_CHILD_ITERATIONS,
-    MODEL,
-    MODEL_MAX_OUTPUT_TOKENS,
-    client as _default_client,
-)
-from hermes.delegate_jobs import get_delegate_job_manager
-from hermes.hooks import SyncControlBridge, SyncHookRegistry
-from hermes.tools import (
-    ExecutionEnvironment,
-    ToolPolicy,
-    ToolResolution,
-    registry,
-)
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from hermes.agent_loop import AgentLoop, ParsedToolCall
+    from hermes.backends import cleanup_backend
+    from hermes.config import (
+        MAX_CHILD_ITERATIONS,
+        MODEL,
+        MODEL_MAX_OUTPUT_TOKENS,
+        client as _default_client,
+    )
+    from hermes.delegate_jobs import get_delegate_job_manager
+    from hermes.hooks import SyncControlBridge, SyncHookRegistry
+    from hermes.tools import (
+        ExecutionEnvironment,
+        ToolPolicy,
+        ToolResolution,
+        registry,
+    )
+else:
+    # 仅声明能力时不导入 AgentLoop，类基底仅用于让处理函数定义保持可加载。
+    AgentLoop = object
 
 
 _DEFAULT_TOOLSETS = ["terminal", "file"]

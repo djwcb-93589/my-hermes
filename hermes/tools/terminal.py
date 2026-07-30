@@ -4,26 +4,33 @@ from __future__ import annotations
 
 import json
 
-from hermes.approval import (
-    build_assessment_response,
-    is_remote_approval,
-)
-from hermes.tools.terminal_approval import (
-    assess_terminal_operation,
-    assess_terminal_path_policy_denial,
-    normalize_terminal_command,
-    register_terminal_approval_handler,
-)
-from hermes.backends import (
-    INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
-    get_backend,
-)
-from hermes.path_policy import (
-    ALLOW_ALL_PATH_POLICY,
-    PathAccessDeniedError,
-)
-from hermes.redaction import redact_terminal_output
-from hermes.terminal_path_preflight import preflight_terminal_command
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from hermes.approval import (
+        build_assessment_response,
+        is_remote_approval,
+    )
+    from hermes.tools.terminal_approval import (
+        assess_terminal_operation,
+        assess_terminal_path_policy_denial,
+        normalize_terminal_command,
+        register_terminal_approval_handler,
+    )
+    from hermes.backends import (
+        INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
+        get_backend,
+    )
+    from hermes.path_policy import (
+        ALLOW_ALL_PATH_POLICY,
+        PathAccessDeniedError,
+    )
+    from hermes.redaction import redact_terminal_output
+    from hermes.terminal_path_preflight import preflight_terminal_command
 
 
 def run_terminal(args, **kwargs):
@@ -154,7 +161,8 @@ def run_terminal(args, **kwargs):
 
 
 def register(registry):
-    register_terminal_approval_handler()
+    if not getattr(registry, "metadata_only", False):
+        register_terminal_approval_handler()
     registry.register(
         name="terminal",
         toolset="terminal",

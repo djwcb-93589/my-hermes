@@ -16,30 +16,37 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from hermes.approval import (
-    build_assessment_response,
-    is_remote_approval,
-)
-from hermes.tools.file_approval import (
-    DENY,
-    FileStateSnapshotError,
-    approved_file_path_candidate,
-    approved_file_snapshot_candidate,
-    approved_file_state_matches,
-    assess_file_path_policy_denial,
-    assess_file_operation,
-    capture_file_approval_snapshot,
-    is_sensitive_file_path,
-    register_file_approval_handler,
-    requires_file_state_snapshot,
-)
-from hermes.backends import get_backend, UnsupportedBackendError
-from hermes.config import SENSITIVE_FILE_PATTERNS
-from hermes.path_policy import (
-    ALLOW_ALL_PATH_POLICY,
-    PathAccessDeniedError,
-)
-from hermes.redaction import redact_file_content
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from hermes.approval import (
+        build_assessment_response,
+        is_remote_approval,
+    )
+    from hermes.tools.file_approval import (
+        DENY,
+        FileStateSnapshotError,
+        approved_file_path_candidate,
+        approved_file_snapshot_candidate,
+        approved_file_state_matches,
+        assess_file_path_policy_denial,
+        assess_file_operation,
+        capture_file_approval_snapshot,
+        is_sensitive_file_path,
+        register_file_approval_handler,
+        requires_file_state_snapshot,
+    )
+    from hermes.backends import get_backend, UnsupportedBackendError
+    from hermes.config import SENSITIVE_FILE_PATTERNS
+    from hermes.path_policy import (
+        ALLOW_ALL_PATH_POLICY,
+        PathAccessDeniedError,
+    )
+    from hermes.redaction import redact_file_content
 
 
 # 单次读取的字节上限。超过则 truncated=true，调用方再用 offset 续读。
@@ -495,7 +502,8 @@ def _do_stat(backend, abs_path, rel_path):
 
 
 def register(registry):
-    register_file_approval_handler()
+    if not getattr(registry, "metadata_only", False):
+        register_file_approval_handler()
     registry.register(
         name="file",
         toolset="file",

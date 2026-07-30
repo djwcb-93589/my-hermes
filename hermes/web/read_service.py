@@ -13,6 +13,10 @@ from pydantic import ValidationError
 import yaml
 
 from hermes.config_values import hermes_home
+from hermes.observability.contracts import (
+    CapabilityDescriptor,
+    ToolsetDescriptor,
+)
 from hermes.persistence.core import (
     list_cli_session_summaries,
     list_session_message_records_for_dashboard,
@@ -44,7 +48,9 @@ from hermes.web.schemas import (
     SkillListResponse,
     SkillSummary,
     StatusResponse,
+    ToolCapabilitySummary,
     ToolsetListResponse,
+    ToolsetSummary,
 )
 
 
@@ -396,11 +402,15 @@ class CatalogReadService(_ReadServiceBase):
         redactor: DashboardRedactor | None = None,
         *,
         skills_dir: Path | str | None = None,
+        capabilities: tuple[CapabilityDescriptor, ...] | None = None,
+        toolsets: tuple[ToolsetDescriptor, ...] | None = None,
     ):
         super().__init__(context, redactor)
         self._skills_dir = (
             Path(skills_dir) if skills_dir is not None else hermes_home() / "skills"
         )
+        self._capabilities = self._capability_snapshot(capabilities)
+        self._toolsets = self._toolset_snapshot(toolsets)
 
     def list_skills(self, *, page: PageParams) -> SkillListResponse:
         """有限读取 Skill frontmatter，不导入工具适配层或触发注册。"""
@@ -449,9 +459,148 @@ class CatalogReadService(_ReadServiceBase):
             raise ReadDataUnavailable("catalog_unavailable") from exc
 
     def list_toolsets(self, *, page: PageParams) -> ToolsetListResponse:
-        """拒绝通过 ToolRegistry 注册行为读取当前未公开的目录元数据。"""
-        del page
-        raise ReadDataUnavailable("catalog_unavailable")
+        """读取应用装配期注入的不可变能力快照，不重复导入或注册工具。"""
+        if self._capabilities is None or self._toolsets is None:
+            raise ReadDataUnavailable("catalog_unavailable")
+        try:
+            tools_by_toolset: dict[str, list[CapabilityDescriptor]] = {}
+            for capability in self._capabilities:
+                tools_by_toolset.setdefault(capability.toolset, []).append(
+                    capability
+                )
+            all_items = [
+                self._toolset_summary(
+                    descriptor,
+                    tools_by_toolset.get(descriptor.name, ()),
+                )
+                for descriptor in self._toolsets
+            ]
+            all_items.sort(key=lambda item: item.name)
+            visible_items = all_items[
+                page.offset:page.offset + page.fetch_limit
+            ]
+            items, has_more = split_page(visible_items, page)
+            return ToolsetListResponse(
+                items=items,
+                limit=page.limit,
+                offset=page.offset,
+                has_more=has_more,
+                tool_details_available=True,
+            )
+        except (TypeError, ValueError, OverflowError, ValidationError) as exc:
+            raise ReadDataUnavailable("catalog_unavailable") from exc
+
+    @staticmethod
+    def _capability_snapshot(
+        capabilities: tuple[CapabilityDescriptor, ...] | None,
+    ) -> tuple[CapabilityDescriptor, ...] | None:
+        """只接受已冻结的能力元数据，避免服务持有可执行注册表。"""
+        if capabilities is None:
+            return None
+        if not isinstance(capabilities, tuple) or not all(
+            isinstance(item, CapabilityDescriptor)
+            for item in capabilities
+        ):
+            raise TypeError("capabilities must be a tuple of CapabilityDescriptor")
+        return capabilities
+
+    @staticmethod
+    def _toolset_snapshot(
+        toolsets: tuple[ToolsetDescriptor, ...] | None,
+    ) -> tuple[ToolsetDescriptor, ...] | None:
+        """只接受已冻结的工具集聚合，保持启动期快照语义。"""
+        if toolsets is None:
+            return None
+        if not isinstance(toolsets, tuple) or not all(
+            isinstance(item, ToolsetDescriptor)
+            for item in toolsets
+        ):
+            raise TypeError("toolsets must be a tuple of ToolsetDescriptor")
+        return toolsets
+
+    def _toolset_summary(
+        self,
+        descriptor: ToolsetDescriptor,
+        capabilities: (
+            list[CapabilityDescriptor]
+            | tuple[CapabilityDescriptor, ...]
+        ),
+    ) -> ToolsetSummary:
+        """将通用能力契约按现有 Dashboard 输出策略投影为 API 模型。"""
+        tools = [
+            self._tool_capability_summary(capability)
+            for capability in sorted(capabilities, key=lambda item: item.name)
+        ]
+        return ToolsetSummary(
+            name=self._redactor.structure_text(
+                descriptor.name,
+                limit=self._redactor.limits.preview_text_limit,
+            ),
+            available=True,
+            environments=[
+                self._redactor.structure_text(
+                    value,
+                    limit=self._redactor.limits.preview_text_limit,
+                )
+                for value in descriptor.execution_environments
+            ],
+            tool_count=len(tools),
+            default_environments=[
+                self._redactor.structure_text(
+                    value,
+                    limit=self._redactor.limits.preview_text_limit,
+                )
+                for value in descriptor.default_enabled_environments
+            ],
+            tools=tools,
+        )
+
+    def _tool_capability_summary(
+        self,
+        capability: CapabilityDescriptor,
+    ) -> ToolCapabilitySummary:
+        """只输出能力目录需要的参数名称与声明属性，不回传完整 schema。"""
+        structure_limit = self._redactor.limits.preview_text_limit
+        return ToolCapabilitySummary(
+            name=self._redactor.structure_text(
+                capability.name,
+                limit=structure_limit,
+            ),
+            description=(
+                self._redactor.preview_text(capability.description)
+                if capability.description
+                else None
+            ),
+            parameter_names=[
+                self._redactor.structure_text(name, limit=structure_limit)
+                for name in capability.parameter_names
+            ],
+            required_parameters=[
+                self._redactor.structure_text(name, limit=structure_limit)
+                for name in capability.required_parameters
+            ],
+            environments=[
+                self._redactor.structure_text(value, limit=structure_limit)
+                for value in capability.execution_environments
+            ],
+            default_environments=[
+                self._redactor.structure_text(value, limit=structure_limit)
+                for value in capability.default_enabled_environments
+            ],
+            unattended_allowed=capability.unattended_allowed,
+            approval_mode=self._redactor.structure_text(
+                capability.approval_mode,
+                limit=structure_limit,
+            ),
+            risk_level=self._redactor.structure_text(
+                capability.risk_level,
+                limit=structure_limit,
+            ),
+            retry_safe=capability.retry_safe,
+            unknown_on_crash=capability.unknown_on_crash,
+            supports_cancellation=capability.supports_cancellation,
+            has_status_check=capability.has_status_check,
+        )
 
     def _skill_summary(self, skill_dir: Path) -> SkillSummary | None:
         """只解析受限前置元数据；单个损坏 Skill 不泄漏失败细节。"""

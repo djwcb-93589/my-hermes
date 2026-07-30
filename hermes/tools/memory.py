@@ -12,17 +12,25 @@ import json
 import re
 from pathlib import Path
 
-from hermes._io_utils import LockTimeout, atomic_write_text, file_lock
-from hermes.config import (
-    HERMES_HOME,
-    MEMORY_CHAR_LIMIT,
-    USER_CHAR_LIMIT,
-)
+from hermes.tools import _metadata_registration_import_active
 
 
-MEMORY_DIR = HERMES_HOME / "memories"
-MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
-USER_FILE = MEMORY_DIR / "USER.md"
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from hermes._io_utils import LockTimeout, atomic_write_text, file_lock
+    from hermes.config import (
+        HERMES_HOME,
+        MEMORY_CHAR_LIMIT,
+        USER_CHAR_LIMIT,
+    )
+
+
+if not __hermes_metadata_only__:
+    MEMORY_DIR = HERMES_HOME / "memories"
+    MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
+    USER_FILE = MEMORY_DIR / "USER.md"
 ENTRY_SEP = "\n\n§\n\n"
 
 # 文件锁等待超时时间（秒）。memory 的写入路径较短,5 秒足够。

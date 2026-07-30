@@ -10,43 +10,50 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from hermes.approval import is_remote_approval
-from hermes.cron.approval import (
-    approval_scope_for_job,
-    approved_candidate_job_id,
-    cron_approval_response,
-    cron_grant_matches,
-    register_cron_approval_handler,
-)
-from hermes.config import DB_PATH
-from hermes.cron.capability import (
-    _normalise_path,
-    build_capability_scope,
-    build_cron_capability_grant,
-    capability_change_requires_reauthorization,
-)
-from hermes.cron.job import CronJob
-from hermes.cron.parser import parse_schedule, validate_timezone
-from hermes.cron.store import JobStore
-from hermes.db import (
-    DBError,
-    create_cron_capability_grant,
-    create_manual_cron_run,
-    get_cron_job,
-    init_db,
-    list_cron_runs,
-    resume_cron_job,
-    soft_delete_cron_job,
-    update_cron_job_schedule_state,
-)
-from hermes.tools import (
-    ExecutionEnvironment,
-    ToolPolicy,
-    ToolRiskLevel,
-    register_all,
-    registry,
-)
-from hermes.redaction import redact_explicit_secrets
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from hermes.approval import is_remote_approval
+    from hermes.cron.approval import (
+        approval_scope_for_job,
+        approved_candidate_job_id,
+        cron_approval_response,
+        cron_grant_matches,
+        register_cron_approval_handler,
+    )
+    from hermes.config import DB_PATH
+    from hermes.cron.capability import (
+        _normalise_path,
+        build_capability_scope,
+        build_cron_capability_grant,
+        capability_change_requires_reauthorization,
+    )
+    from hermes.cron.job import CronJob
+    from hermes.cron.parser import parse_schedule, validate_timezone
+    from hermes.cron.store import JobStore
+    from hermes.db import (
+        DBError,
+        create_cron_capability_grant,
+        create_manual_cron_run,
+        get_cron_job,
+        init_db,
+        list_cron_runs,
+        resume_cron_job,
+        soft_delete_cron_job,
+        update_cron_job_schedule_state,
+    )
+    from hermes.tools import (
+        ExecutionEnvironment,
+        ToolPolicy,
+        ToolRiskLevel,
+        register_all,
+        registry,
+    )
+    from hermes.redaction import redact_explicit_secrets
 
 
 _INTERNAL_FIELD_NAMES = frozenset({
@@ -645,7 +652,8 @@ def handle_cron_tool(args, **kwargs):
 
 
 def register(registry):
-    register_cron_approval_handler()
+    if not getattr(registry, "metadata_only", False):
+        register_cron_approval_handler()
     registry.register(
         name="cron", toolset="cron",
         schema={

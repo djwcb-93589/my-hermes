@@ -7,6 +7,10 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from hermes.observability.contracts import (
+    CapabilityDescriptor,
+    ToolsetDescriptor,
+)
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
 from hermes.web.read_context import DashboardReadContext
@@ -50,10 +54,16 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
     )
     read_context = DashboardReadContext(config.db_path)
     redactor = DashboardRedactor()
+    capabilities, toolsets = _build_toolset_catalog_snapshot()
     health_read_service = HealthReadService(read_context, redactor)
     session_read_service = SessionReadService(read_context, redactor)
     cron_read_service = CronReadService(read_context, redactor)
-    catalog_read_service = CatalogReadService(read_context, redactor)
+    catalog_read_service = CatalogReadService(
+        read_context,
+        redactor,
+        capabilities=capabilities,
+        toolsets=toolsets,
+    )
     read_service = ReadService(
         context=read_context,
         redactor=redactor,
@@ -72,6 +82,25 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         control_authenticator=authenticator,
         access_policy=access_policy,
     )
+
+
+def _build_toolset_catalog_snapshot() -> tuple[
+    tuple[CapabilityDescriptor, ...] | None,
+    tuple[ToolsetDescriptor, ...] | None,
+]:
+    """在应用装配期构建一次仅声明能力快照，目录失败不影响其他 Dashboard 服务。"""
+    try:
+        from hermes.tools import ToolRegistry, register_all
+
+        catalog_registry = ToolRegistry(metadata_only=True)
+        register_all(catalog_registry)
+        return (
+            catalog_registry.describe_capabilities(),
+            catalog_registry.describe_toolsets(),
+        )
+    except Exception:
+        # 不泄露导入或注册失败的内部细节；CatalogReadService 会稳定返回 503。
+        return None, None
 
 
 def create_app(

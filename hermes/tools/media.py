@@ -8,21 +8,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
-from hermes.approval import build_assessment_response, is_remote_approval
-from hermes.tools.media_approval import (
-    approved_media_snapshots_candidate,
-    approved_media_state_matches,
-    assess_media_path_policy_denial,
-    assess_media_analysis,
-    has_symlink_component,
-    is_sensitive_media_path,
-    register_media_approval_handler,
-)
-from hermes.backends import get_backend
-from hermes.backends.local import LocalBackend
-from hermes.file_state import FileStateSnapshotError, capture_file_state_snapshot
-from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessDeniedError
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
+    from hermes.approval import build_assessment_response, is_remote_approval
+    from hermes.tools.media_approval import (
+        approved_media_snapshots_candidate,
+        approved_media_state_matches,
+        assess_media_path_policy_denial,
+        assess_media_analysis,
+        has_symlink_component,
+        is_sensitive_media_path,
+        register_media_approval_handler,
+    )
+    from hermes.backends import get_backend
+    from hermes.backends.local import LocalBackend
+    from hermes.file_state import FileStateSnapshotError, capture_file_state_snapshot
+    from hermes.path_policy import ALLOW_ALL_PATH_POLICY, PathAccessDeniedError
 
 
 _ALLOWED_FIELDS = frozenset({"paths", "prompt", "media_type", "timeout_ms"})
@@ -308,7 +315,8 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
 
 def register(registry) -> None:
     """注册仅供交互式 CLI 会话调用的高成本媒体分析能力。"""
-    register_media_approval_handler()
+    if not getattr(registry, "metadata_only", False):
+        register_media_approval_handler()
     registry.register(
         name="media_analyze",
         toolset="media",

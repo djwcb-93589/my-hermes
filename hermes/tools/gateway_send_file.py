@@ -6,17 +6,24 @@ import hashlib
 import json
 from collections.abc import Mapping
 
-from hermes.approval import build_assessment_response, is_remote_approval
-from hermes.tools.gateway_send_file_approval import (
-    assess_gateway_send_file,
-    gateway_send_file_grant_matches_runtime,
-    register_gateway_send_file_approval_handler,
-)
-from hermes.db import DBError
-from hermes.gateway.outbound_delivery import OutboundDeliveryService
-from hermes.outbound_file import (
-    OutboundFileValidationError,
-)
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
+
+
+if not __hermes_metadata_only__:
+    from hermes.approval import build_assessment_response, is_remote_approval
+    from hermes.tools.gateway_send_file_approval import (
+        assess_gateway_send_file,
+        gateway_send_file_grant_matches_runtime,
+        register_gateway_send_file_approval_handler,
+    )
+    from hermes.db import DBError
+    from hermes.gateway.outbound_delivery import OutboundDeliveryService
+    from hermes.outbound_file import (
+        OutboundFileValidationError,
+    )
 
 
 _INTERNAL_ARGUMENT_FIELDS = frozenset({
@@ -206,7 +213,8 @@ def handle_gateway_send_file(args: dict, **kwargs) -> str:
 
 
 def register(registry) -> None:
-    register_gateway_send_file_approval_handler()
+    if not getattr(registry, "metadata_only", False):
+        register_gateway_send_file_approval_handler()
     registry.register(
         name="gateway_send_file",
         toolset="messaging",

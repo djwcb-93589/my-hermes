@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 
-from hermes.config import HERMES_HOME
+from hermes.tools import _metadata_registration_import_active
+
+
+__hermes_metadata_only__ = _metadata_registration_import_active()
 
 
 # 保留此变量以兼容既有调用方和临时目录 monkeypatch。
-SKILLS_DIR = HERMES_HOME / "skills"
+if not __hermes_metadata_only__:
+    from hermes.config import HERMES_HOME
+
+    SKILLS_DIR = HERMES_HOME / "skills"
 _default_service: SkillService | None = None
 
 
