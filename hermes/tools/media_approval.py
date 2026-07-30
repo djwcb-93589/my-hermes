@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -36,6 +37,32 @@ from hermes.path_policy import PATH_POLICY_DENIED_ERROR_TYPE
 
 _MEDIA_TOOL_NAME = "media_analyze"
 _MEDIA_PROVIDER = "doubao_ark"
+
+
+def is_media_path_within_cwd(abs_path: str, *, cwd: str) -> bool:
+    """按真实路径确认媒体文件仍位于指定 cwd 内。"""
+    try:
+        if (
+            not isinstance(cwd, str)
+            or not cwd.strip()
+            or not isinstance(abs_path, str)
+            or not abs_path
+            or not os.path.isabs(abs_path)
+        ):
+            return False
+        normalized_cwd = os.path.normcase(
+            os.path.realpath(os.path.abspath(cwd))
+        )
+        normalized_path = os.path.normcase(
+            os.path.realpath(os.path.abspath(abs_path))
+        )
+        return (
+            os.path.commonpath((normalized_cwd, normalized_path))
+            == normalized_cwd
+        )
+    except (OSError, TypeError, ValueError):
+        # Windows 不同盘符及任何规范化失败都视为 cwd 越界。
+        return False
 
 
 def has_symlink_component(path: Path) -> bool:
@@ -229,11 +256,13 @@ def approved_media_state_matches(
         return False
     path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
     try:
+        cwd = getattr(backend, "cwd")
         for item, snapshot in zip(sources, snapshots, strict=True):
             abs_path = str(getattr(item, "abs_path"))
             path = Path(abs_path)
             if (
                 snapshot.get("abs_path") != abs_path
+                or not is_media_path_within_cwd(abs_path, cwd=cwd)
                 or has_symlink_component(path)
                 or path.is_symlink()
                 or not path.is_file()
@@ -246,7 +275,13 @@ def approved_media_state_matches(
                 )
             ):
                 return False
-    except (FileStateSnapshotError, OSError, TypeError, ValueError):
+    except (
+        AttributeError,
+        FileStateSnapshotError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
         return False
     return True
 

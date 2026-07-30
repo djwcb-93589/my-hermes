@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from browser.multimodal import MediaSource, MultimodalAnalyzer, MultimodalError
@@ -21,6 +21,7 @@ from hermes.tools.media_approval import (
     assess_media_analysis,
     assess_media_path_policy_denial,
     has_symlink_component,
+    is_media_path_within_cwd,
     is_sensitive_media_path,
     register_media_approval_handler,
 )
@@ -97,11 +98,30 @@ def _validate_args(args: Any) -> tuple[list[str], str, str, int | None] | str:
 
 
 def _is_relative_input_path(raw_path: str) -> bool:
-    """拒绝绝对路径和 home 展开写法；路径始终以当前 session cwd 为起点。"""
+    """在 resolve 前拒绝越级、绝对路径、盘符和 home 展开写法。"""
+    windows_path = PureWindowsPath(raw_path)
+    segments = raw_path.replace("\\", "/").split("/")
     return not (
         os.path.isabs(raw_path)
         or Path(raw_path).is_absolute()
+        or PurePosixPath(raw_path).is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+        or bool(windows_path.root)
         or raw_path.startswith("~")
+        or ".." in segments
+    )
+
+
+def _media_sources_within_current_cwd(
+    backend: LocalBackend,
+    sources: list[_ResolvedMedia],
+) -> bool:
+    """确认一组已解析媒体仍全部位于 backend 当前 cwd 内。"""
+    cwd = getattr(backend, "cwd", None)
+    return isinstance(cwd, str) and all(
+        is_media_path_within_cwd(item.abs_path, cwd=cwd)
+        for item in sources
     )
 
 
@@ -113,16 +133,47 @@ def _resolve_media_sources(
 ) -> list[_ResolvedMedia] | str:
     """通过 LocalBackend 与共享路径策略将相对路径变成可读取的普通文件。"""
     path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
+    resolution_cwd = getattr(backend, "cwd", None)
+    if not isinstance(resolution_cwd, str) or not resolution_cwd.strip():
+        return _error(
+            "invalid_media_path",
+            "media path cannot be resolved safely",
+        )
     sources: list[_ResolvedMedia] = []
     for raw_path in paths:
+        if not _is_relative_input_path(raw_path):
+            return _error(
+                "invalid_media_path",
+                "media paths must be relative to the current session cwd",
+            )
         try:
             resolved_text = backend.resolve_path(raw_path)
-            if not _is_relative_input_path(raw_path):
-                return _error("invalid_media_path", "media paths must be relative to the current session cwd")
+            if (
+                backend.cwd != resolution_cwd
+                or not is_media_path_within_cwd(
+                    resolved_text,
+                    cwd=resolution_cwd,
+                )
+            ):
+                return _error(
+                    "invalid_media_path",
+                    "media path must remain within the current session cwd",
+                )
             requested_path = Path(resolved_text)
             if has_symlink_component(requested_path):
                 return _error("invalid_media_path", "symbolic links are not supported for media files")
             allowed_text = path_policy.require_allowed(resolved_text, cwd=backend.cwd)
+            if (
+                backend.cwd != resolution_cwd
+                or not is_media_path_within_cwd(
+                    allowed_text,
+                    cwd=resolution_cwd,
+                )
+            ):
+                return _error(
+                    "invalid_media_path",
+                    "media path must remain within the current session cwd",
+                )
             allowed_path = Path(allowed_text)
             if not allowed_path.exists():
                 return _error("media_not_found", "media file does not exist")
@@ -220,6 +271,12 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
             fatal=True,
         )
 
+    if not _media_sources_within_current_cwd(backend, sources):
+        return _error(
+            "invalid_media_path",
+            "media path must remain within the current session cwd",
+        )
+
     approval_grant = kwargs.get("approval_grant")
     approved_snapshots = approved_media_snapshots_candidate(
         approval_grant,
@@ -233,6 +290,11 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
             sources,
             media_snapshots,
         ):
+            if not _media_sources_within_current_cwd(backend, sources):
+                return _error(
+                    "invalid_media_path",
+                    "media path must remain within the current session cwd",
+                )
             return _error(
                 "approval_stale",
                 "approved media file state changed; request approval again",
@@ -242,6 +304,12 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
         if isinstance(captured_snapshots, str):
             return captured_snapshots
         media_snapshots = captured_snapshots
+
+    if not _media_sources_within_current_cwd(backend, sources):
+        return _error(
+            "invalid_media_path",
+            "media path must remain within the current session cwd",
+        )
 
     try:
         assessment = assess_media_analysis(
@@ -269,12 +337,22 @@ def handle_media_analyze(args: Any, **kwargs: Any) -> str:
     if policy_response is not None:
         return policy_response
 
-    # 审批通过后再次复核，确保调用外部服务前文件没有被替换或变成敏感路径。
+    # 审批通过后再次复核 cwd 和文件状态，确保外发前安全边界没有变化。
+    if not _media_sources_within_current_cwd(backend, sources):
+        return _error(
+            "invalid_media_path",
+            "media path must remain within the current session cwd",
+        )
     if not approved_media_state_matches(
         backend,
         sources,
         media_snapshots,
     ):
+        if not _media_sources_within_current_cwd(backend, sources):
+            return _error(
+                "invalid_media_path",
+                "media path must remain within the current session cwd",
+            )
         return _error(
             "approval_stale",
             "approved media file state changed; request approval again",

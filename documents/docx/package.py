@@ -274,7 +274,8 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     entry_names: set[str] = set()
     total_uncompressed_size = 0
     for info in entries:
-        normalized_name = _normalize_entry_name(info.filename)
+        # 必须检查原始名称，避免 zipfile 的 NUL 截断或分隔符转换隐藏非法路径。
+        normalized_name = _normalize_entry_name(info.orig_filename)
         if normalized_name in entry_names:
             raise DocxError("invalid_docx_package", "DOCX ZIP 包含重复的 entry 路径。")
         entry_names.add(normalized_name)
