@@ -46,7 +46,7 @@ class ToolPolicy:
     enabled_toolsets: frozenset[str] | None = None
     unattended: bool = False
     trusted_context: frozenset[str] = field(default_factory=frozenset)
-    allowed_approval_modes: frozenset[str] | None = None
+    allowed_approval_modes: frozenset[ApprovalMode | str] | None = None
     max_risk_level: ToolRiskLevel | str | None = None
 
     def __post_init__(self) -> None:
@@ -69,7 +69,8 @@ class ToolPolicy:
                 self,
                 "allowed_approval_modes",
                 frozenset(
-                    str(item).strip() for item in self.allowed_approval_modes
+                    normalize_approval_mode(item)
+                    for item in self.allowed_approval_modes
                 ),
             )
         if self.max_risk_level is not None:
@@ -119,6 +120,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, ToolEntry] = {}
+        self._default_tools_registered = False
 
     def register(
         self,
@@ -139,6 +141,10 @@ class ToolRegistry:
         supports_cancellation: bool = False,
     ) -> None:
         """注册一次工具及其跨入口运行策略。"""
+        if type(name) is not str or not name.strip():
+            raise ValueError("tool name must be a non-empty string")
+        if name in self._tools:
+            raise ValueError(f"tool is already registered: {name}")
         _validate_tool_schema(schema)
         if not isinstance(supports_cancellation, bool):
             raise ValueError("supports_cancellation must be a boolean")
@@ -222,7 +228,7 @@ class ToolRegistry:
         if not isinstance(other_registry, ToolRegistry):
             raise TypeError("other_registry must be a ToolRegistry")
         if other_registry is self:
-            return
+            raise ValueError("cannot merge a tool registry into itself")
 
         validated_registry = ToolRegistry()
         for name, entry in other_registry._tools.items():
@@ -325,7 +331,7 @@ class ToolRegistry:
                 continue
             if (
                 policy.allowed_approval_modes is not None
-                and entry.approval_mode.value not in policy.allowed_approval_modes
+                and entry.approval_mode not in policy.allowed_approval_modes
             ):
                 continue
             if (
@@ -453,13 +459,8 @@ def register_declared_handlers(
     handlers_by_name: Mapping[str, Callable],
 ) -> None:
     """完整校验名称绑定后注册一组共享声明。"""
-    register_declaration = getattr(
-        target_registry,
-        "register_declaration",
-        None,
-    )
-    if not callable(register_declaration):
-        raise TypeError("target_registry must support register_declaration")
+    if not isinstance(target_registry, ToolRegistry):
+        raise TypeError("target_registry must be a ToolRegistry")
 
     declaration_items = tuple(declarations)
     if not declaration_items or not all(
@@ -493,11 +494,13 @@ def register_declared_handlers(
     ):
         raise TypeError("tool declaration handlers must be callable")
 
+    staging_registry = ToolRegistry()
     for declaration in declaration_items:
-        register_declaration(
+        staging_registry.register_declaration(
             declaration,
             handlers_by_name[declaration.name],
         )
+    target_registry.merge_from(staging_registry)
 
 
 registry = ToolRegistry()
@@ -562,6 +565,11 @@ def _declaration_from_entry(entry: ToolEntry) -> ToolDeclaration:
 def register_all(target_registry: ToolRegistry | None = None) -> None:
     """导入并注册所有工具；重复调用不会改变最终注册表。"""
     target = registry if target_registry is None else target_registry
+    if not isinstance(target, ToolRegistry):
+        raise TypeError("target_registry must be a ToolRegistry")
+    if target._default_tools_registered:
+        return
+    staging_registry = ToolRegistry()
     from hermes.tools.terminal import register as _terminal
     from hermes.tools.file import register as _file
     from hermes.tools.memory import register as _memory
@@ -571,30 +579,23 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
     from hermes.tools.browser import register as _browser
     from hermes.cron.tool import register as _cron
 
-    _terminal(target)
-    _file(target)
-    _memory(target)
+    _terminal(staging_registry)
+    _file(staging_registry)
+    _memory(staging_registry)
     try:
-        skill_registry = ToolRegistry()
         from hermes.tools.skill import register as _skill
-
-        _skill(skill_registry)
-        if all(
-            target.get_entry(name) == entry
-            for name, entry in skill_registry._tools.items()
-        ):
-            # 重复初始化时保留完全一致的 Skill 工具，避免误报名称冲突。
-            pass
-        else:
-            target.merge_from(skill_registry)
     except Exception as exc:
         logger.warning(
             "Skill tools unavailable; Skill capability was skipped: %s",
             type(exc).__name__,
             exc_info=True,
         )
-    _delegate(target)
-    _gateway_send_file(target)
-    _media(target)
-    _browser(target)
-    _cron(target)
+    else:
+        _skill(staging_registry)
+    _delegate(staging_registry)
+    _gateway_send_file(staging_registry)
+    _media(staging_registry)
+    _browser(staging_registry)
+    _cron(staging_registry)
+    target.merge_from(staging_registry)
+    target._default_tools_registered = True

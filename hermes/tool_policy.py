@@ -51,7 +51,9 @@ def normalize_approval_mode(value: ApprovalMode | str) -> ApprovalMode:
     """把审批模式规范化为共享枚举。"""
     if isinstance(value, ApprovalMode):
         return value
-    return ApprovalMode(str(value))
+    if type(value) is not str:
+        raise TypeError("approval mode must be an ApprovalMode or string")
+    return ApprovalMode(value.strip().lower())
 
 
 def normalize_tool_risk_level(
