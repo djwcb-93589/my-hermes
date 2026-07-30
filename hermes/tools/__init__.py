@@ -584,13 +584,24 @@ def _declaration_from_entry(entry: ToolEntry) -> ToolDeclaration:
     )
 
 
-def register_all(target_registry: ToolRegistry | None = None) -> None:
+def register_all(
+    target_registry: ToolRegistry | None = None,
+    *,
+    process_manager=None,
+) -> None:
     """导入并注册所有工具；重复调用不会改变最终注册表。"""
     target = registry if target_registry is None else target_registry
     if not isinstance(target, ToolRegistry):
         raise TypeError("target_registry must be a ToolRegistry")
     if target._default_tools_registered:
         return
+    active_process_manager = process_manager
+    if active_process_manager is None:
+        from hermes.processes import (
+            process_manager as default_process_manager,
+        )
+
+        active_process_manager = default_process_manager
     staging_registry = ToolRegistry()
     from hermes.tools.terminal import register as _terminal
     from hermes.tools.file import register as _file
@@ -601,7 +612,10 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
     from hermes.tools.browser import register as _browser
     from hermes.cron.tool import register as _cron
 
-    _terminal(staging_registry)
+    _terminal(
+        staging_registry,
+        process_manager=active_process_manager,
+    )
     _file(staging_registry)
     _memory(staging_registry)
     try:

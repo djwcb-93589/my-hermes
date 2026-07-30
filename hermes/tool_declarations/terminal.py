@@ -44,8 +44,14 @@ TOOL_DECLARATIONS = (
                 "NOT PowerShell, CMD, or WSL. Always emit Bash/POSIX-compatible "
                 "commands. Use forward-slash MSYS paths for absolute Windows "
                 "locations (e.g. /d/my-project, not D:\\\\my-project). "
-                "On Linux/macOS the local backend uses /bin/bash. The result "
-                "is JSON with output, exit_code, cwd, and session-state flags. "
+                "On Linux/macOS the local backend uses /bin/bash. A foreground "
+                "result is JSON with output, exit_code, cwd, and session-state "
+                "flags. "
+                "Set background=true for long-running commands that should be "
+                "registered and return immediately without waiting for command "
+                "completion. A successful background start returns a "
+                "process_id intended for a later process-management tool; this "
+                "stage does not expose process control operations. "
                 "Local terminal path enforcement is best-effort and is not a "
                 "sandbox. Commands that clearly reference a path blocked by "
                 "the shared filesystem policy are rejected before approval, "
@@ -56,7 +62,19 @@ TOOL_DECLARATIONS = (
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Start a long-running command in the background "
+                            "and return immediately after registration. The "
+                            "response includes a process_id for a later "
+                            "process-management tool."
+                        ),
+                    },
+                },
                 "required": ["command"],
             },
         },
