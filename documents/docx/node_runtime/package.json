@@ -5,6 +5,9 @@
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "bundle": "node scripts/build-bundle.mjs"
+  },
   "dependencies": {
     "docx": "9.7.1"
   }

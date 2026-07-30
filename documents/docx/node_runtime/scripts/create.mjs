@@ -13,7 +13,7 @@ import {
   TableRow,
   TextRun,
   UnderlineType,
-} from "docx";
+} from "../vendor/docx.mjs";
 
 
 const ALIGNMENTS = Object.freeze({

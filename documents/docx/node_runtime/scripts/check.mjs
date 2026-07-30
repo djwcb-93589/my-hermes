@@ -1,5 +1,11 @@
 try {
-  await import("docx");
+  const docx = await import("../vendor/docx.mjs");
+  if (
+    typeof docx.Document !== "function"
+    || typeof docx.Packer?.toBuffer !== "function"
+  ) {
+    throw new Error("DOCX bundle 导出不完整。");
+  }
   process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
 } catch {
   process.stderr.write(

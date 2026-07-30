@@ -39,7 +39,15 @@ browser/screenshot/
 自进化机制设计.txt
 scripts/
 !/documents/docx/node_runtime/scripts/
+!/documents/docx/node_runtime/scripts/build-bundle.mjs
 !/documents/docx/node_runtime/scripts/check.mjs
 !/documents/docx/node_runtime/scripts/create.mjs
+!/documents/docx/node_runtime/vendor/
+!/documents/docx/node_runtime/vendor/docx.mjs
+!/documents/docx/node_runtime/vendor/LICENSE.docx.txt
+!/skills/docx/
+!/skills/docx/SKILL.md
+!/skills/docx/references/
+!/skills/docx/references/*.md
 computer_use_tests/
 tests_docx/

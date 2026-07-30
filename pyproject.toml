@@ -24,8 +24,12 @@ include = ["hermes", "hermes.*", "browser", "browser.*", "documents", "documents
 
 [tool.setuptools.package-data]
 "documents.docx" = [
+    "node_runtime/bundle-manifest.json",
     "node_runtime/package.json",
     "node_runtime/package-lock.json",
+    "node_runtime/vendor/docx.mjs",
+    "node_runtime/vendor/LICENSE.docx.txt",
+    "node_runtime/scripts/build-bundle.mjs",
     "node_runtime/scripts/check.mjs",
     "node_runtime/scripts/create.mjs",
 ]

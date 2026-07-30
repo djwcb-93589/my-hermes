@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "bundle_version": 1,
+  "minimum_node_major": 20,
+  "dependency": {
+    "name": "docx",
+    "version": "9.7.1"
+  },
+  "package_lock_sha256": "2f1e377d5a6923929f0e2a130fc0b48549fcec5479a8e231c2aa31358883d2a3",
+  "files": {
+    "scripts/check.mjs": "4a59f48bfcfb4fa1862cb7d1b1cf62be651f186da8a03a02c0dfa5d27f299a5c",
+    "scripts/create.mjs": "4346df8b913485fbb65511012e10881e158e54377d684ad633000388c6a88cbe",
+    "vendor/docx.mjs": "0563fb6f6d8e4ef134592207b727a351712cd3d5245572c84280ed46205523bd"
+  }
+}

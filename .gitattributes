@@ -1,0 +1,4 @@
+documents/docx/node_runtime/**/*.json text eol=lf
+documents/docx/node_runtime/**/*.mjs text eol=lf
+documents/docx/node_runtime/**/*.txt text eol=lf
+documents/docx/node_runtime/vendor/docx.mjs text eol=lf -diff whitespace=-trailing-space

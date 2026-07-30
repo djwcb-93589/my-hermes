@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import sys
+import sysconfig
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +22,20 @@ from .errors import DocxError
 _MINIMUM_NODE_MAJOR = 20
 _DEPENDENCY_CHECK_TIMEOUT_SECONDS = 10.0
 _VERSION_PATTERN = re.compile(r"^v?(?P<major>\d+)(?:\.\d+){0,2}")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_BUNDLE_CACHE_ENV = "MYHERMES_DOCX_RUNTIME_CACHE"
+_BUNDLE_MANIFEST_NAME = "bundle-manifest.json"
+_BUNDLE_SCHEMA_VERSION = 1
+_BUNDLE_VERSION = 1
+_RUNTIME_BUNDLE_FILES = frozenset(
+    {
+        "scripts/check.mjs",
+        "scripts/create.mjs",
+        "vendor/docx.mjs",
+    }
+)
+_MAX_BUNDLE_MANIFEST_SIZE = 64 * 1024
+_MAX_BUNDLE_FILE_SIZE = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -38,16 +56,32 @@ class DocxRuntimeStatus:
     components: list[RuntimeComponentStatus]
 
 
+@dataclass(frozen=True)
+class _PreparedBundle:
+    """经过完整性校验并写入内容寻址缓存的 Node bundle。"""
+
+    runtime_dir: Path
+    create_script: Path
+    check_script: Path
+    docx_version: str
+    fingerprint: str
+
+
 class NodeRuntime:
     """只允许执行模块内部固定创建脚本的 Node 运行时。"""
 
     def __init__(self, node_executable: str | Path | None = None) -> None:
         self._configured_executable = node_executable
-        self._runtime_dir = Path(__file__).resolve().parent / "node_runtime"
+        self._package_runtime_dir = (
+            Path(__file__).resolve().parent / "node_runtime"
+        )
+        self._runtime_dir = self._package_runtime_dir
         self._script_path = self._runtime_dir / "scripts" / "create.mjs"
         self._dependency_check_path = self._runtime_dir / "scripts" / "check.mjs"
         self._resolved_executable: Path | None = None
         self._node_version: str | None = None
+        self._docx_version: str | None = None
+        self._bundle_fingerprint: str | None = None
         self._checked = False
 
     @property
@@ -56,48 +90,57 @@ class NodeRuntime:
 
         return self._node_version
 
-    def check(self) -> None:
-        """检查 Node 版本、固定脚本和本地 npm 依赖。"""
+    @property
+    def docx_version(self) -> str | None:
+        """返回最近一次成功检查得到的 bundle 内 docx 版本。"""
 
-        self._checked = False
-        self._resolved_executable = None
-        self._node_version = None
+        return self._docx_version
+
+    @property
+    def bundle_fingerprint(self) -> str | None:
+        """返回最近一次成功检查得到的内容寻址 bundle 摘要。"""
+
+        return self._bundle_fingerprint
+
+    def check(self) -> None:
+        """检查 Node 版本、随包 bundle、用户缓存和固定依赖脚本。"""
+
         version = self.check_node()
         executable = self._resolved_executable
         if executable is None:
             raise DocxError("node_runtime_unavailable", "Node 运行时不可用。")
-        required_files = (
-            self._runtime_dir / "package.json",
-            self._runtime_dir / "package-lock.json",
-            self._script_path,
-            self._dependency_check_path,
-        )
-        dependency_directory = self._runtime_dir / "node_modules" / "docx"
-        if (
-            not all(path.is_file() for path in required_files)
-            or not dependency_directory.is_dir()
-        ):
-            raise DocxError(
-                "node_dependencies_missing",
-                "DOCX Node 依赖尚未准备，请先在安装阶段运行 npm ci。",
-            )
-
+        bundle = self._prepare_bundle()
+        self._runtime_dir = bundle.runtime_dir
+        self._script_path = bundle.create_script
+        self._dependency_check_path = bundle.check_script
         self._check_dependencies(executable)
         self._resolved_executable = executable
         self._node_version = version
+        self._docx_version = bundle.docx_version
+        self._bundle_fingerprint = bundle.fingerprint
         self._checked = True
 
     def check_node(self) -> str:
         """只检查 Node 可执行文件和主版本，不加载 docx 依赖。"""
 
-        self._checked = False
-        self._resolved_executable = None
-        self._node_version = None
+        self._reset_check_state()
         executable = self._resolve_executable()
         version = self._check_version(executable)
         self._resolved_executable = executable
         self._node_version = version
         return version
+
+    def _reset_check_state(self) -> None:
+        self._checked = False
+        self._resolved_executable = None
+        self._node_version = None
+        self._docx_version = None
+        self._bundle_fingerprint = None
+        self._runtime_dir = self._package_runtime_dir
+        self._script_path = self._runtime_dir / "scripts" / "create.mjs"
+        self._dependency_check_path = (
+            self._runtime_dir / "scripts" / "check.mjs"
+        )
 
     def run_create(
         self,
@@ -183,6 +226,137 @@ class NodeRuntime:
         ):
             raise DocxError("node_result_invalid", "Node runtime 返回了无效结果。")
         return result
+
+    def _prepare_bundle(self) -> _PreparedBundle:
+        manifest, manifest_payload = self._load_bundle_manifest()
+        source_payloads = self._read_verified_bundle_files(manifest)
+        fingerprint = hashlib.sha256(manifest_payload).hexdigest()
+        cache_root = _resolve_bundle_cache_root(self._package_runtime_dir)
+        bundle_root = cache_root / fingerprint
+        try:
+            bundle_root.mkdir(parents=True, exist_ok=True)
+            if bundle_root.is_symlink():
+                raise OSError("bundle cache directory is a symbolic link")
+            resolved_bundle_root = bundle_root.resolve(strict=True)
+            if not _path_is_within(resolved_bundle_root, cache_root):
+                raise OSError("bundle cache directory escaped cache root")
+            for relative_path, payload in source_payloads.items():
+                target = bundle_root / Path(*relative_path.split("/"))
+                _cache_verified_file(
+                    target,
+                    payload,
+                    expected_sha256=manifest["files"][relative_path],
+                    bundle_root=resolved_bundle_root,
+                )
+        except DocxError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise DocxError(
+                "node_dependencies_missing",
+                "无法准备 DOCX Node bundle 用户缓存。",
+            ) from exc
+
+        create_script = bundle_root / "scripts" / "create.mjs"
+        check_script = bundle_root / "scripts" / "check.mjs"
+        return _PreparedBundle(
+            runtime_dir=bundle_root,
+            create_script=create_script,
+            check_script=check_script,
+            docx_version=manifest["dependency"]["version"],
+            fingerprint=fingerprint,
+        )
+
+    def _load_bundle_manifest(self) -> tuple[dict[str, Any], bytes]:
+        manifest_path = self._package_runtime_dir / _BUNDLE_MANIFEST_NAME
+        try:
+            if (
+                not manifest_path.is_file()
+                or manifest_path.stat().st_size > _MAX_BUNDLE_MANIFEST_SIZE
+            ):
+                raise ValueError("bundle manifest unavailable")
+            payload = manifest_path.read_bytes()
+            manifest = json.loads(payload)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node bundle 清单缺失或无效。",
+            ) from exc
+        if not _valid_bundle_manifest(manifest):
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node bundle 清单缺失或无效。",
+            )
+
+        package_path = self._package_runtime_dir / "package.json"
+        lock_path = self._package_runtime_dir / "package-lock.json"
+        try:
+            package_payload = json.loads(package_path.read_text(encoding="utf-8"))
+            lock_payload = lock_path.read_bytes()
+            package_lock = json.loads(lock_payload)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node 版本锁定文件缺失或无效。",
+            ) from exc
+
+        dependency_version = manifest["dependency"]["version"]
+        if (
+            package_payload.get("dependencies", {}).get("docx")
+            != dependency_version
+            or package_payload.get("engines", {}).get("node")
+            != f">={_MINIMUM_NODE_MAJOR}"
+            or package_lock.get("packages", {})
+            .get("", {})
+            .get("dependencies", {})
+            .get("docx")
+            != dependency_version
+            or package_lock.get("packages", {})
+            .get("", {})
+            .get("engines", {})
+            .get("node")
+            != f">={_MINIMUM_NODE_MAJOR}"
+            or package_lock.get("packages", {})
+            .get("node_modules/docx", {})
+            .get("version")
+            != dependency_version
+            or _sha256_bytes(lock_payload)
+            != manifest["package_lock_sha256"]
+        ):
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node bundle 与版本锁定文件不一致。",
+            )
+        return manifest, payload
+
+    def _read_verified_bundle_files(
+        self,
+        manifest: dict[str, Any],
+    ) -> dict[str, bytes]:
+        payloads: dict[str, bytes] = {}
+        for relative_path in sorted(_RUNTIME_BUNDLE_FILES):
+            source_path = (
+                self._package_runtime_dir
+                / Path(*relative_path.split("/"))
+            )
+            try:
+                if (
+                    not source_path.is_file()
+                    or source_path.stat().st_size > _MAX_BUNDLE_FILE_SIZE
+                ):
+                    raise ValueError("bundle file unavailable")
+                payload = source_path.read_bytes()
+            except (OSError, ValueError) as exc:
+                raise DocxError(
+                    "node_dependencies_missing",
+                    "DOCX Node bundle 文件缺失或无效。",
+                ) from exc
+            if _sha256_bytes(payload) != manifest["files"][relative_path]:
+                raise DocxError(
+                    "node_dependencies_missing",
+                    "DOCX Node bundle 完整性检查失败。",
+                )
+            payloads[relative_path] = payload
+        return payloads
 
     def _resolve_executable(self) -> Path:
         configured = self._configured_executable
@@ -276,7 +450,7 @@ class NodeRuntime:
         if completed.returncode != 0 or len(lines) != 1:
             raise DocxError(
                 "node_dependencies_missing",
-                "DOCX Node 依赖无法加载，请在安装阶段重新运行 npm ci。",
+                "随包 DOCX Node bundle 无法加载。",
             )
         try:
             result = json.loads(lines[0])
@@ -304,6 +478,168 @@ class NodeRuntime:
             if isinstance(payload, dict) and isinstance(payload.get("error_type"), str):
                 return payload["error_type"]
         return None
+
+
+def _valid_bundle_manifest(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "bundle_version",
+        "minimum_node_major",
+        "dependency",
+        "package_lock_sha256",
+        "files",
+    }:
+        return False
+    dependency = value.get("dependency")
+    files = value.get("files")
+    return (
+        value.get("schema_version") == _BUNDLE_SCHEMA_VERSION
+        and value.get("bundle_version") == _BUNDLE_VERSION
+        and value.get("minimum_node_major") == _MINIMUM_NODE_MAJOR
+        and isinstance(dependency, dict)
+        and set(dependency) == {"name", "version"}
+        and dependency.get("name") == "docx"
+        and isinstance(dependency.get("version"), str)
+        and bool(dependency["version"])
+        and _valid_sha256(value.get("package_lock_sha256"))
+        and isinstance(files, dict)
+        and set(files) == _RUNTIME_BUNDLE_FILES
+        and all(_valid_sha256(digest) for digest in files.values())
+    )
+
+
+def _valid_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _resolve_bundle_cache_root(package_runtime_dir: Path) -> Path:
+    configured = os.environ.get(_BUNDLE_CACHE_ENV)
+    try:
+        if configured is not None:
+            raw_value = configured.strip()
+            if not raw_value:
+                raise ValueError("empty cache path")
+            candidate = Path(raw_value).expanduser()
+            if not candidate.is_absolute():
+                raise ValueError("relative cache path")
+        elif os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            candidate = (
+                Path(local_app_data)
+                if local_app_data and Path(local_app_data).is_absolute()
+                else Path.home() / "AppData" / "Local"
+            )
+            candidate = candidate / "MyHermes" / "Cache" / "docx-node"
+        elif sys.platform == "darwin":
+            candidate = (
+                Path.home()
+                / "Library"
+                / "Caches"
+                / "MyHermes"
+                / "docx-node"
+            )
+        else:
+            xdg_cache = os.environ.get("XDG_CACHE_HOME")
+            base = (
+                Path(xdg_cache)
+                if xdg_cache and Path(xdg_cache).is_absolute()
+                else Path.home() / ".cache"
+            )
+            candidate = base / "myhermes" / "docx-node"
+        cache_root = candidate.resolve(strict=False)
+        package_root = package_runtime_dir.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DocxError(
+            "node_dependencies_missing",
+            "DOCX Node bundle 缓存路径无效。",
+        ) from exc
+
+    if _path_is_within(cache_root, package_root):
+        raise DocxError(
+            "node_dependencies_missing",
+            "DOCX Node bundle 缓存不得位于安装包目录。",
+        )
+    for install_path in {
+        sysconfig.get_path("purelib"),
+        sysconfig.get_path("platlib"),
+    }:
+        if not install_path:
+            continue
+        try:
+            site_packages = Path(install_path).resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if _path_is_within(cache_root, site_packages):
+            raise DocxError(
+                "node_dependencies_missing",
+                "DOCX Node bundle 缓存不得位于 site-packages。",
+            )
+    return cache_root
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _cache_verified_file(
+    target: Path,
+    payload: bytes,
+    *,
+    expected_sha256: str,
+    bundle_root: Path,
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = target.parent.resolve(strict=True)
+    if not _path_is_within(resolved_parent, bundle_root):
+        raise DocxError(
+            "node_dependencies_missing",
+            "DOCX Node bundle 缓存路径越界。",
+        )
+    if (
+        target.is_file()
+        and not target.is_symlink()
+        and _sha256_file(target) == expected_sha256
+    ):
+        return
+
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+        if target.is_symlink() or _sha256_file(target) != expected_sha256:
+            raise OSError("cached bundle verification failed")
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def check_docx_runtime(
@@ -356,19 +692,22 @@ def check_docx_runtime(
 
     dependency_available = False
     dependency_detail: str | None = (
-        None if node_available else "node_runtime_unavailable"
+        None if node_available else node_detail
     )
+    dependency_version: str | None = None
     if node_available:
         try:
             runtime.check()
             dependency_available = True
+            dependency_version = runtime.docx_version
+            dependency_detail = "bundled_cache"
         except DocxError as exc:
             dependency_detail = exc.error_type
     components.append(
         RuntimeComponentStatus(
             name="node_docx_dependency",
             available=dependency_available,
-            version=None,
+            version=dependency_version,
             detail=dependency_detail,
         )
     )
