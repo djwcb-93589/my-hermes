@@ -585,9 +585,29 @@ def _call_tool_if_available(
 def _parse_health_report(
     raw_result: Mapping[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """验证 health_report 正式结构并转换为 readiness 字段。"""
+    """优先解析有效结构化报告，再兼容 JSON 文本报告。"""
 
-    payload = _extract_tool_payload(raw_result)
+    if raw_result is None or raw_result.get("isError") is True:
+        return None
+
+    report = _parse_health_report_payload(
+        raw_result.get("structuredContent"),
+    )
+    if report is not None:
+        return report
+
+    for payload in _json_content_payloads(raw_result):
+        report = _parse_health_report_payload(payload)
+        if report is not None:
+            return report
+    return None
+
+
+def _parse_health_report_payload(
+    payload: Any,
+) -> dict[str, Any] | None:
+    """验证单个候选载荷是否为 health_report 的正式结构。"""
+
     if not isinstance(payload, Mapping):
         return None
     if payload.get("schema_version") != "1":
@@ -622,7 +642,7 @@ def _run_fallback_probes(
     checks.extend(permission_checks)
 
     list_apps_result = _call_tool_if_available(session, "list_apps")
-    list_apps_succeeded = _is_valid_app_list(list_apps_result)
+    list_apps_succeeded = _list_apps_call_succeeded(list_apps_result)
     checks.append(
         {
             "label": "list_apps",
@@ -656,6 +676,21 @@ def _extract_tool_payload(
     content = raw_result.get("content")
     if not isinstance(content, list):
         return None
+    for payload in _json_content_payloads(raw_result):
+        return payload
+    return None
+
+
+def _json_content_payloads(
+    raw_result: Mapping[str, Any],
+) -> list[Any]:
+    """解析 content 中所有有效的 JSON 文本候选。"""
+
+    content = raw_result.get("content")
+    if not isinstance(content, list):
+        return []
+
+    payloads: list[Any] = []
     for item in content:
         if not isinstance(item, Mapping) or item.get("type") != "text":
             continue
@@ -663,10 +698,10 @@ def _extract_tool_payload(
         if not isinstance(text, str):
             continue
         try:
-            return json.loads(text)
+            payloads.append(json.loads(text))
         except json.JSONDecodeError:
             continue
-    return None
+    return payloads
 
 
 def _normalize_checks(checks: list[Any]) -> list[dict[str, str]]:
@@ -743,16 +778,12 @@ def _collect_boolean_fields(
             _collect_boolean_fields(item, prefix=label, values=values)
 
 
-def _is_valid_app_list(raw_result: Mapping[str, Any] | None) -> bool:
-    """确认 list_apps 返回的正式或直接数据包含应用列表。"""
+def _list_apps_call_succeeded(
+    raw_result: Mapping[str, Any] | None,
+) -> bool:
+    """仅依据 list_apps 调用是否成功判断驱动调用链状态。"""
 
-    payload = _extract_tool_payload(raw_result)
-    if isinstance(payload, list):
-        return True
-    return isinstance(payload, Mapping) and isinstance(
-        payload.get("apps"),
-        list,
-    )
+    return raw_result is not None and raw_result.get("isError") is not True
 
 
 def _fallback_ready(
