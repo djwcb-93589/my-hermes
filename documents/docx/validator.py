@@ -106,6 +106,7 @@ _WP_EXTENT = f"{{{_WP_NS}}}extent"
 _WP_DOC_PROPERTIES = f"{{{_WP_NS}}}docPr"
 _A_BLIP = f"{{{_A_NS}}}blip"
 _R_EMBED = f"{{{_OFFICE_REL_NS}}}embed"
+_R_LINK = f"{{{_OFFICE_REL_NS}}}link"
 
 _CONTENT_TYPES_PART = "[Content_Types].xml"
 _DOCUMENT_PART = "word/document.xml"
@@ -509,17 +510,6 @@ def _validate_relationships(
             external = target_mode == "External"
             target_part: str | None = None
             if external:
-                if relationship_type in {
-                    IMAGE_RELATIONSHIP_TYPE,
-                    HEADER_RELATIONSHIP_TYPE,
-                    FOOTER_RELATIONSHIP_TYPE,
-                    NUMBERING_RELATIONSHIP_TYPE,
-                }:
-                    context.add_issue(
-                        "internal_relationship_marked_external",
-                        "内部 OOXML relationship 被错误标记为 External。",
-                        part_name=part_name,
-                    )
                 if relationship_type == HYPERLINK_RELATIONSHIP_TYPE:
                     try:
                         validate_hyperlink_url(target)
@@ -529,6 +519,13 @@ def _validate_relationships(
                             "外部 hyperlink 使用不受支持的 URL。",
                             part_name=part_name,
                         )
+                else:
+                    context.add_issue(
+                        "unsupported_external_relationship",
+                        "DOCX 包含当前模块不允许安全处理的外部 relationship。",
+                        part_name=part_name,
+                        severity="warning",
+                    )
             else:
                 if relationship_type == HYPERLINK_RELATIONSHIP_TYPE:
                     context.add_issue(
@@ -1113,26 +1110,69 @@ def _validate_document_drawings(
             "wp:docPr/@id 必须是唯一正整数。",
             part_name=_DOCUMENT_PART,
         )
-    embedded_relationship_ids: set[str] = set()
+    used_image_relationship_ids: set[str] = set()
     for blip in root.iter(_A_BLIP):
-        relationship_id = blip.attrib.get(_R_EMBED)
-        if relationship_id:
-            embedded_relationship_ids.add(relationship_id)
-        record = (
-            context.relationships.get((_DOCUMENT_PART, relationship_id))
-            if relationship_id
-            else None
-        )
-        if (
-            record is None
-            or record.relationship_type != IMAGE_RELATIONSHIP_TYPE
-            or record.external
-            or record.target_part is None
-            or not context.package.has_part(record.target_part)
-        ):
+        embed_id = blip.attrib.get(_R_EMBED)
+        link_id = blip.attrib.get(_R_LINK)
+        if embed_id:
+            used_image_relationship_ids.add(embed_id)
+        if link_id is not None:
+            if link_id:
+                used_image_relationship_ids.add(link_id)
+            context.add_issue(
+                "unsupported_external_image",
+                "DrawingML 图片使用了当前模块不允许渲染的外部 r:link。",
+                part_name=_DOCUMENT_PART,
+                severity="warning",
+            )
+
+        if embed_id is not None:
+            embed_record = context.relationships.get(
+                (_DOCUMENT_PART, embed_id)
+            )
+            if (
+                not embed_id
+                or embed_record is None
+                or embed_record.relationship_type
+                != IMAGE_RELATIONSHIP_TYPE
+                or embed_record.external
+                or embed_record.target_part is None
+                or not context.package.has_part(
+                    embed_record.target_part
+                )
+            ):
+                context.add_issue(
+                    "invalid_image_embed",
+                    "DrawingML r:embed 未指向有效内部图片 relationship。",
+                    part_name=_DOCUMENT_PART,
+                )
+        elif link_id is None:
             context.add_issue(
                 "invalid_image_embed",
-                "DrawingML r:embed 未指向有效内部图片 relationship。",
+                "DrawingML 图片缺少 r:embed 或 r:link relationship。",
+                part_name=_DOCUMENT_PART,
+            )
+
+        if link_id is not None:
+            link_record = context.relationships.get(
+                (_DOCUMENT_PART, link_id)
+            )
+            if (
+                not link_id
+                or link_record is None
+                or link_record.relationship_type
+                != IMAGE_RELATIONSHIP_TYPE
+                or not link_record.external
+            ):
+                context.add_issue(
+                    "invalid_external_image_reference",
+                    "DrawingML r:link 未指向有效外部图片 relationship。",
+                    part_name=_DOCUMENT_PART,
+                )
+        if embed_id is not None and link_id is not None:
+            context.add_issue(
+                "invalid_external_image_reference",
+                "DrawingML 图片不能同时使用 r:embed 和 r:link。",
                 part_name=_DOCUMENT_PART,
             )
         if not extent_by_blip.get(id(blip), False):
@@ -1147,7 +1187,7 @@ def _validate_document_drawings(
                 record.source_part == _DOCUMENT_PART
                 and record.relationship_type == IMAGE_RELATIONSHIP_TYPE
                 and record.relationship_id
-                not in embedded_relationship_ids
+                not in used_image_relationship_ids
             ):
                 context.add_issue(
                     "unused_document_image_relationship",

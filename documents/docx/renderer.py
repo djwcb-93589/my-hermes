@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -14,7 +15,10 @@ from pathlib import Path
 from types import ModuleType
 
 from .errors import DocxError
-from .validation_models import ValidateDocumentRequest
+from .validation_models import (
+    ValidateDocumentRequest,
+    ValidateDocumentResult,
+)
 from .validator import DocxValidator
 
 
@@ -26,6 +30,15 @@ _MAX_RENDERED_PAGES = 200
 _MAX_PAGE_PIXELS = 40_000_000
 _MAX_PAGE_IMAGE_TOTAL_SIZE = 512 * 1024 * 1024
 _PAGE_RENDER_SCALE = 1.5
+_UNSAFE_RENDER_ISSUE_CODES = frozenset(
+    {
+        "unsupported_external_relationship",
+        "unsupported_external_image",
+    }
+)
+_RENDERED_PAGE_NAME_PATTERN = re.compile(
+    r"^page-[0-9]+\.png\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -80,11 +93,7 @@ class DocxRenderer:
                 strict=True,
             )
         )
-        if not validation_result.valid:
-            raise DocxError(
-                "validation_failed",
-                "源 DOCX 未通过核心验证，未启动 Renderer。",
-            )
+        _ensure_safe_for_render(validation_result)
         source_path = validation_result.source_path
         output_dir, created_output_dir = _prepare_output_directory(
             validated_request.output_dir,
@@ -130,10 +139,24 @@ class DocxRenderer:
                     )
                     for page_path in page_paths
                 )
+                stale_page_paths = (
+                    _find_stale_page_outputs(
+                        output_dir,
+                        retained_names={
+                            page_path.name for page_path in page_paths
+                        },
+                    )
+                    if (
+                        validated_request.overwrite
+                        and validated_request.export_page_images
+                    )
+                    else []
+                )
                 _commit_render_outputs(
                     outputs,
                     overwrite=validated_request.overwrite,
                     staging_path=staging_path,
+                    stale_targets=stale_page_paths,
                 )
         except DocxError:
             _cleanup_created_output_directory(
@@ -172,6 +195,23 @@ def render_document(
     """使用一次性 Renderer 转换本地 DOCX。"""
 
     return DocxRenderer().render(request)
+
+
+def _ensure_safe_for_render(
+    result: ValidateDocumentResult,
+) -> None:
+    """拒绝损坏文档及所有当前不允许交给 LibreOffice 的外部资源。"""
+
+    unsafe_codes = {
+        issue.code
+        for issue in result.issues
+        if issue.code in _UNSAFE_RENDER_ISSUE_CODES
+    }
+    if not result.valid or unsafe_codes:
+        raise DocxError(
+            "validation_failed",
+            "源 DOCX 未通过安全渲染验证，未启动 Renderer。",
+        )
 
 
 def find_libreoffice_executable(
@@ -617,6 +657,7 @@ def _commit_render_outputs(
     *,
     overwrite: bool,
     staging_path: Path,
+    stale_targets: list[Path],
 ) -> None:
     if len({target for _, target in outputs}) != len(outputs):
         raise DocxError(
@@ -644,6 +685,39 @@ def _commit_render_outputs(
         if target.exists() and not overwrite:
             raise DocxError("output_exists", "Renderer 目标文件已存在。")
 
+    if stale_targets and not overwrite:
+        raise DocxError(
+            "render_output_invalid",
+            "no-clobber 渲染不能包含旧页面清理计划。",
+        )
+    output_parents = {target.parent for _, target in outputs}
+    if len(output_parents) != 1:
+        raise DocxError(
+            "render_output_invalid",
+            "Renderer 输出目标目录不一致。",
+        )
+    output_directory = next(iter(output_parents))
+    if len(set(stale_targets)) != len(stale_targets):
+        raise DocxError(
+            "render_output_invalid",
+            "Renderer 旧页面清理计划包含重复路径。",
+        )
+    output_targets = {target for _, target in outputs}
+    for stale_target in stale_targets:
+        if (
+            stale_target.parent != output_directory
+            or stale_target in output_targets
+            or not _RENDERED_PAGE_NAME_PATTERN.fullmatch(
+                stale_target.name
+            )
+            or stale_target.is_symlink()
+            or not stale_target.is_file()
+        ):
+            raise DocxError(
+                "render_failed",
+                "旧页面图片清理目标不再是安全的普通文件。",
+            )
+
     if not overwrite:
         committed: list[Path] = []
         try:
@@ -669,7 +743,11 @@ def _commit_render_outputs(
     backups: list[tuple[Path, Path]] = []
     committed: list[Path] = []
     try:
-        for index, (_, target) in enumerate(outputs):
+        backup_targets = list(stale_targets)
+        backup_targets.extend(
+            target for _, target in outputs if target.exists()
+        )
+        for index, target in enumerate(backup_targets):
             if target.exists():
                 backup = backup_directory / f"backup-{index:04d}"
                 os.replace(target, backup)
@@ -687,6 +765,40 @@ def _commit_render_outputs(
         raise DocxError(
             "render_failed",
             "无法原子提交 Renderer 输出。",
+        ) from exc
+
+
+def _find_stale_page_outputs(
+    output_directory: Path,
+    *,
+    retained_names: set[str],
+) -> list[Path]:
+    """只定位严格命名且不属于本次新页面集合的旧页面普通文件。"""
+
+    try:
+        stale_paths: list[Path] = []
+        for candidate in output_directory.iterdir():
+            if (
+                _RENDERED_PAGE_NAME_PATTERN.fullmatch(
+                    candidate.name
+                )
+                is None
+                or candidate.name in retained_names
+            ):
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                raise DocxError(
+                    "render_failed",
+                    "旧页面图片清理目标不是安全的普通文件。",
+                )
+            stale_paths.append(candidate)
+        return sorted(stale_paths, key=lambda path: path.name)
+    except DocxError:
+        raise
+    except OSError as exc:
+        raise DocxError(
+            "render_failed",
+            "无法安全枚举覆盖渲染的旧页面图片。",
         ) from exc
 
 
