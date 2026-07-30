@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes.web.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 
@@ -197,6 +197,113 @@ class ToolsetListResponse(PaginationMetadata):
 
     items: list[ToolsetSummary]
     tool_details_available: bool
+
+
+class _MonitoringResponseModel(BaseModel):
+    """监控 API 的严格响应基类，不透传未知投影字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MonitoringPaginationResponse(PaginationMetadata):
+    """监控列表复用现有分页字段，并拒绝额外响应字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ToolExecutionListItem(_MonitoringResponseModel):
+    """不含参数、结果正文和执行所有权信息的工具执行摘要。"""
+
+    execution_id: str
+    environment: str
+    session_id: str | None = None
+    source_message_id: str | None = None
+    cron_run_id: str | None = None
+    tool_call_id: str
+    tool_name: str
+    recovery_policy: str
+    status: str
+    attempt_count: int = Field(ge=0)
+    has_result: bool
+    has_external_operation: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ToolExecutionDetailResponse(ToolExecutionListItem):
+    """单条 Tool Execution 的类型化安全详情。"""
+
+
+class ToolExecutionListResponse(MonitoringPaginationResponse):
+    """分页 Tool Execution 安全摘要。"""
+
+    items: list[ToolExecutionListItem]
+
+
+class _ObservationResponseBase(_MonitoringResponseModel):
+    """三类 Observation 响应共享的安全关联字段。"""
+
+    observation_id: str
+    run_id: str
+    parent_run_id: str | None = None
+    created_at: datetime
+
+
+class ToolObservationResponse(_ObservationResponseBase):
+    """不包含工具参数和工具结果的调用事件。"""
+
+    event_type: Literal["tool_call"] = "tool_call"
+    tool_call_id: str
+    tool_name: str
+    status: str
+    success: bool
+    error_type: str | None = None
+    duration_ms: int = Field(ge=0)
+
+
+class ModelObservationResponse(_ObservationResponseBase):
+    """不包含 Prompt 和模型回复正文的调用事件。"""
+
+    event_type: Literal["model_call"] = "model_call"
+    finish_reason: str | None = None
+    has_text: bool
+    tool_call_count: int = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    duration_ms: int = Field(ge=0)
+
+
+class RunObservationResponse(_ObservationResponseBase):
+    """不包含最终回答正文的运行结束事件。"""
+
+    event_type: Literal["run_end"] = "run_end"
+    status: str
+    stop_reason: str
+    iterations: int = Field(ge=0)
+    tool_call_count: int = Field(ge=0)
+    has_final_reply: bool
+
+
+ObservationResponse = Annotated[
+    ToolObservationResponse
+    | ModelObservationResponse
+    | RunObservationResponse,
+    Field(discriminator="event_type"),
+]
+
+
+class ObservationListResponse(MonitoringPaginationResponse):
+    """分页 Observation 安全投影。"""
+
+    items: list[ObservationResponse]
+
+
+class RunTimelineResponse(MonitoringPaginationResponse):
+    """单个 run 的有界 Observation 时间线。"""
+
+    run_id: str
+    items: list[ObservationResponse]
 
 
 class CronControlResponse(BaseModel):

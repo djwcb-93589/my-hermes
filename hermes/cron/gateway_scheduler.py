@@ -27,6 +27,7 @@ from hermes.db import (
     transition_cron_run,
 )
 from hermes.gateway.persistence import GatewayPersistence
+from hermes.hooks import SyncHookRegistry
 
 
 @dataclass
@@ -49,6 +50,7 @@ class GatewayCronScheduler:
         llm_semaphore: asyncio.Semaphore,
         lease_fence_provider: Callable[[], dict | None],
         lease_is_valid: Callable[[], bool],
+        hook_registry: SyncHookRegistry | None = None,
         poll_seconds: float = 5.0,
         max_concurrent: int = 1,
         misfire_grace_seconds: float = 60.0,
@@ -60,11 +62,17 @@ class GatewayCronScheduler:
             raise ValueError("Gateway Cron max_concurrent must be positive")
         if misfire_grace_seconds < 0:
             raise ValueError("Gateway Cron misfire_grace_seconds must be non-negative")
+        if hook_registry is not None and not isinstance(
+            hook_registry,
+            SyncHookRegistry,
+        ):
+            raise TypeError("hook_registry must be a SyncHookRegistry or None")
         self._persistence = persistence
         self._db_path = db_path
         self._llm_semaphore = llm_semaphore
         self._lease_fence_provider = lease_fence_provider
         self._lease_is_valid = lease_is_valid
+        self._hook_registry = hook_registry
         self._poll_seconds = float(poll_seconds)
         self._misfire_grace_seconds = float(misfire_grace_seconds)
         self._max_concurrent = int(max_concurrent)
@@ -289,6 +297,7 @@ class GatewayCronScheduler:
                         CronExecutor(
                             self._db_path,
                             cancel_checker=cancel_event.is_set,
+                            hook_registry=self._hook_registry,
                             **fence,
                         ).execute,
                         job,

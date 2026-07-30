@@ -45,6 +45,7 @@ from hermes.durable_tool_dispatcher import (
     DurableToolDispatcher,
     DurableToolExecutionContext,
 )
+from hermes.hooks import SyncHookRegistry
 from hermes.tool_execution_recovery import ToolExecutionRecoveryService
 from hermes.tools.skill import load_skill_body
 from hermes.tools import (
@@ -224,12 +225,19 @@ class CronExecutor:
         db_path: str | None = None,
         *,
         cancel_checker: Callable[[], bool] | None = None,
+        hook_registry: SyncHookRegistry | None = None,
         lease_name: str | None = None,
         instance_id: str | None = None,
         lease_epoch: int | None = None,
     ):
+        if hook_registry is not None and not isinstance(
+            hook_registry,
+            SyncHookRegistry,
+        ):
+            raise TypeError("hook_registry must be a SyncHookRegistry or None")
         self._db_path = db_path or DB_PATH
         self._external_cancel_checker = cancel_checker
+        self._hook_registry = hook_registry
         fence_values = (lease_name, instance_id, lease_epoch)
         if any(value is not None for value in fence_values):
             if any(value is None for value in fence_values):
@@ -533,6 +541,7 @@ class CronExecutor:
                         "connection": conn,
                     },
                 },
+                hook_registry=self._hook_registry,
             )
             run_prompt = (
                 f"{job.prompt}\n\n"

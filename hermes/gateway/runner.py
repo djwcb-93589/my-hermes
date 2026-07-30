@@ -32,7 +32,7 @@ from hermes.config import (
     PATH_ACCESS_POLICY,
     load_gateway_busy_input_mode,
 )
-from hermes.hooks import AsyncHookRegistry
+from hermes.hooks import AsyncHookRegistry, SyncHookRegistry
 from hermes.db import (
     add_final_message_with_gateway_outbox,
     add_messages,
@@ -873,6 +873,18 @@ class GatewayRunner:
         idle_timeout = gateway_cfg.get("session_idle_timeout", 86400)
         max_pending = gateway_cfg.get("max_pending_messages", 20)
         max_concurrent = gateway_cfg.get("max_concurrent_llm_requests", 4)
+        self._cron_hook_registry: SyncHookRegistry | None = None
+        if hook_registry is not None:
+            from hermes.persistence.observation import (
+                configure_sqlite_observation_sink,
+            )
+
+            configure_sqlite_observation_sink(hook_registry, db_path)
+            self._cron_hook_registry = SyncHookRegistry()
+            configure_sqlite_observation_sink(
+                self._cron_hook_registry,
+                db_path,
+            )
         self.persistence = GatewayPersistence(db_path)
         self._runtime_lease = GatewayRuntimeLease(
             self.persistence,
@@ -936,6 +948,7 @@ class GatewayRunner:
             llm_semaphore=self._llm_semaphore,
             lease_fence_provider=self._cron_runtime_fence,
             lease_is_valid=lambda: self._runtime_lease_valid,
+            hook_registry=self._cron_hook_registry,
             poll_seconds=self.cron_poll_seconds,
             max_concurrent=self.cron_max_concurrent,
             misfire_grace_seconds=self.cron_misfire_grace_seconds,
@@ -2750,6 +2763,7 @@ class GatewayRunner:
                 await asyncio.to_thread(
                     CronExecutor(
                         self.db_path,
+                        hook_registry=self._cron_hook_registry,
                         **self._cron_runtime_fence(),
                     ).execute,
                     CronJob.from_record(item["job"]),

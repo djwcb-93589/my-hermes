@@ -11,10 +11,15 @@ from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
 )
+from hermes.persistence.monitoring import (
+    SQLiteObservationReadRepository,
+    SQLiteToolExecutionReadRepository,
+)
 from hermes.tool_declarations.catalog import build_toolset_catalog_snapshot
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
-from hermes.web.read_context import DashboardReadContext
+from hermes.web.monitoring_service import MonitoringReadService
+from hermes.web.read_context import DashboardReadContext, ReadInvalidRequest
 from hermes.web.read_service import (
     CatalogReadService,
     CronReadService,
@@ -25,7 +30,7 @@ from hermes.web.read_service import (
     SessionReadService,
 )
 from hermes.web.redaction import DashboardRedactor
-from hermes.web.routes import catalog, cron, sessions, status
+from hermes.web.routes import catalog, cron, monitoring, sessions, status
 from hermes.web.schemas import ErrorResponse
 from hermes.web.security import (
     TOKEN_HEADER,
@@ -65,6 +70,14 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         capabilities=capabilities,
         toolsets=toolsets,
     )
+    monitoring_read_service = (
+        MonitoringReadService(
+            SQLiteObservationReadRepository(config.db_path),
+            SQLiteToolExecutionReadRepository(config.db_path),
+        )
+        if config.db_path is not None
+        else None
+    )
     read_service = ReadService(
         context=read_context,
         redactor=redactor,
@@ -79,6 +92,7 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         session_read_service=session_read_service,
         cron_read_service=cron_read_service,
         catalog_read_service=catalog_read_service,
+        monitoring_read_service=monitoring_read_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
         access_policy=access_policy,
@@ -104,6 +118,7 @@ def create_app(
     session_read_service: SessionReadService | None = None,
     cron_read_service: CronReadService | None = None,
     catalog_read_service: CatalogReadService | None = None,
+    monitoring_read_service: MonitoringReadService | None = None,
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
@@ -136,6 +151,7 @@ def create_app(
     application.state.session_read_service = resolved_session_service
     application.state.cron_read_service = resolved_cron_service
     application.state.catalog_read_service = resolved_catalog_service
+    application.state.monitoring_read_service = monitoring_read_service
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
     application.state.dashboard_access_policy = policy
@@ -204,6 +220,18 @@ def create_app(
         )
         return JSONResponse(status_code=404, content=jsonable_encoder(body))
 
+    @application.exception_handler(ReadInvalidRequest)
+    async def handle_invalid_read_request(
+        request: Request,
+        exc: ReadInvalidRequest,
+    ) -> JSONResponse:
+        del request, exc
+        body = ErrorResponse(
+            code="invalid_request",
+            message="读取请求参数无效。",
+        )
+        return JSONResponse(status_code=400, content=jsonable_encoder(body))
+
     @application.exception_handler(ControlUnavailable)
     async def handle_control_unavailable(
         request: Request,
@@ -265,6 +293,7 @@ def create_app(
     application.include_router(sessions.router)
     application.include_router(cron.router)
     application.include_router(catalog.router)
+    application.include_router(monitoring.router)
     return application
 
 

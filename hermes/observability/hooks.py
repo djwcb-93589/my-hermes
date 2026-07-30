@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Callable, Mapping
 
 from hermes.hooks import (
     AsyncHookRegistry,
@@ -17,6 +18,37 @@ from hermes.observability.contracts import (
     RunObservation,
     ToolCallObservation,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _deliver_observation(
+    *,
+    event_type: str,
+    build: Callable[[], object],
+    record: Callable[[object], None],
+) -> None:
+    """隔离 Observation 投影和写入失败，且日志不携带事件或异常正文。"""
+    try:
+        observation = build()
+    except Exception as exc:
+        logger.warning(
+            "Observation delivery failed: event_type=%s stage=projection "
+            "exception_type=%s",
+            event_type,
+            type(exc).__name__,
+        )
+        return
+    try:
+        record(observation)
+    except Exception as exc:
+        logger.warning(
+            "Observation delivery failed: event_type=%s stage=record "
+            "exception_type=%s",
+            event_type,
+            type(exc).__name__,
+        )
 
 
 def register_observation_sink(
@@ -40,13 +72,25 @@ def register_observation_sink(
     prefix = hook_id_prefix.strip()
 
     def on_tool_call(context: HookContext) -> None:
-        sink.record_tool_call(_tool_call_observation(context))
+        _deliver_observation(
+            event_type="tool_call",
+            build=lambda: _tool_call_observation(context),
+            record=sink.record_tool_call,
+        )
 
     def on_model_call(context: HookContext) -> None:
-        sink.record_model_call(_model_call_observation(context))
+        _deliver_observation(
+            event_type="model_call",
+            build=lambda: _model_call_observation(context),
+            record=sink.record_model_call,
+        )
 
     def on_run_end(context: HookContext) -> None:
-        sink.record_run_end(_run_observation(context))
+        _deliver_observation(
+            event_type="run_end",
+            build=lambda: _run_observation(context),
+            record=sink.record_run_end,
+        )
 
     return (
         hook_registry.register(

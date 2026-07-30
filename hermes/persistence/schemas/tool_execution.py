@@ -62,5 +62,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 status, updated_at, execution_id
             )
             WHERE gateway_lease_name IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_tool_executions_monitoring_order
+            ON tool_executions(updated_at DESC, execution_id DESC);
         """
     )

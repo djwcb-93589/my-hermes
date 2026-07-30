@@ -1,4 +1,4 @@
-"""将异步控制 Hook 安全桥接给同步 Delegate。"""
+"""将异步 Hook 安全桥接给同步 Delegate。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from hermes.hooks.async_registry import (
     _AsyncControlSnapshot,
 )
 from hermes.hooks.contracts import (
+    HookDispatchResult,
     HookEvent,
     HookInvocationResult,
     HookName,
@@ -33,13 +34,18 @@ _CONTROL_EVENTS = (
     HookEventName.PRE_LLM_CALL.value,
     HookEventName.PRE_TOOL_CALL.value,
 )
+_OBSERVATION_EVENTS = frozenset({
+    HookEventName.POST_LLM_CALL.value,
+    HookEventName.POST_TOOL_CALL.value,
+    HookEventName.RUN_END.value,
+})
 _BRIDGE_DEFAULT_TIMEOUT_SECONDS = 5.0
 _BRIDGE_OVERHEAD_SECONDS = 1.0
 DEFAULT_BRIDGE_TOTAL_TIMEOUT_SECONDS = 15.0
 
 
 class SyncControlBridge(SyncHookRegistry):
-    """把同步子 Agent 的控制事件提交回创建它的异步事件循环。"""
+    """把同步子 Agent 的控制与观察事件提交回原异步事件循环。"""
 
     def __init__(
         self,
@@ -167,6 +173,63 @@ class SyncControlBridge(SyncHookRegistry):
             logger.exception("Control Hook bridge dispatch failed")
             return self._failure_result(event)
 
+    def emit(self, event: HookEvent) -> HookDispatchResult:
+        """把同步 Delegate 的只读观察事件转发给原 Async Registry。"""
+        if not isinstance(event, HookEvent):
+            raise TypeError("event must be a HookEvent")
+        if event.name not in _OBSERVATION_EVENTS:
+            return HookDispatchResult(event=event, results=())
+        try:
+            if asyncio.get_running_loop() is self._event_loop:
+                return self._observation_failure_result(event)
+        except RuntimeError:
+            pass
+
+        with self._state_lock:
+            registry = self._registry
+            event_loop = self._event_loop
+            closed = self._closed
+        if (
+            closed
+            or registry is None
+            or event_loop is None
+            or event_loop.is_closed()
+            or not event_loop.is_running()
+        ):
+            return self._observation_failure_result(event)
+
+        coroutine = registry.emit(event)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
+        except Exception as exc:
+            coroutine.close()
+            logger.warning(
+                "Observation Hook bridge submission failed: "
+                "event=%s exception=%s",
+                event.name,
+                type(exc).__name__,
+            )
+            return self._observation_failure_result(event)
+        try:
+            return future.result(timeout=self._bridge_total_timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._consume_observation_future(future)
+            logger.warning(
+                "Observation Hook bridge timed out: event=%s",
+                event.name,
+            )
+            return self._observation_failure_result(event)
+        except Exception as exc:
+            self._consume_observation_future(future)
+            logger.warning(
+                "Observation Hook bridge dispatch failed: "
+                "event=%s exception=%s",
+                event.name,
+                type(exc).__name__,
+            )
+            return self._observation_failure_result(event)
+
     async def _dispatch_snapshot(
         self,
         registry: AsyncHookRegistry,
@@ -198,6 +261,21 @@ class SyncControlBridge(SyncHookRegistry):
         future.add_done_callback(consume)
 
     @staticmethod
+    def _consume_observation_future(
+        future: concurrent.futures.Future[HookDispatchResult],
+    ) -> None:
+        """消费已脱离等待的观察分发结果，不记录异常正文。"""
+        def consume(
+            completed: concurrent.futures.Future[HookDispatchResult],
+        ) -> None:
+            try:
+                completed.result()
+            except Exception:
+                return
+
+        future.add_done_callback(consume)
+
+    @staticmethod
     def _failure_result(event: HookEvent) -> HookControlDispatchResult:
         """构造不泄露桥接和 Plugin 内部细节的失败默认阻止结果。"""
         return build_control_dispatch_result(
@@ -211,6 +289,21 @@ class SyncControlBridge(SyncHookRegistry):
                 )
             ],
             block_reason=control_failure_reason(),
+        )
+
+    @staticmethod
+    def _observation_failure_result(event: HookEvent) -> HookDispatchResult:
+        """构造不会改变子 Agent 业务结果的观察桥接失败摘要。"""
+        return HookDispatchResult(
+            event=event,
+            results=(
+                HookInvocationResult(
+                    hook_id="observation_bridge",
+                    success=False,
+                    error_type="HookObservationBridgeError",
+                    error_message="hook observation bridge failed",
+                ),
+            ),
         )
 
     def close(self) -> None:

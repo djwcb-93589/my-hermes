@@ -32,13 +32,14 @@ from .migrations.delivery import _migrate_v15_to_v16, _migrate_v16_to_v17, _migr
 from .migrations.feishu import _migrate_v9_to_v10, _migrate_v10_to_v11, _migrate_v17_to_v18
 from .migrations.gateway import _migrate_v2_to_v3, _migrate_v3_to_v4, _migrate_v4_to_v5, _migrate_v5_to_v6, _migrate_v6_to_v7, _migrate_v7_to_v8, _migrate_v8_to_v9, _migrate_v11_to_v12, _migrate_v12_to_v13, _migrate_v14_to_v15
 from .migrations.mixed import _migrate_v22_to_v23, _migrate_v23_to_v24
+from .migrations.observation import _migrate_v35_to_v36
 from .migrations.tool_execution import _migrate_v25_to_v26, _migrate_v27_to_v28, _migrate_v31_to_v32
-from .schemas import approval, background_review, core, cron, delivery, feishu, gateway, tool_execution
+from .schemas import approval, background_review, core, cron, delivery, feishu, gateway, observation, tool_execution
 
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 35
+LATEST_SCHEMA_VERSION = 36
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -89,6 +90,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     feishu.create_schema(conn)
     cron.create_schema(conn)
     tool_execution.create_schema(conn)
+    observation.create_schema(conn)
 
 
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
@@ -535,6 +537,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 35
+
+    if current < 36:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v35_to_v36(conn)
+            _set_schema_version(conn, 36)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 36
 
     return current
 

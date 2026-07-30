@@ -45,6 +45,13 @@ class ResourceNotFound(DashboardReadError):
         super().__init__("resource_not_found")
 
 
+class ReadInvalidRequest(DashboardReadError):
+    """管理读取请求中的领域参数组合无效。"""
+
+    def __init__(self):
+        super().__init__("invalid_request")
+
+
 class DashboardReadContext:
     """保存规范化数据库路径，并统一使用现有只读连接协议。"""
 

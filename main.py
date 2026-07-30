@@ -57,8 +57,9 @@ def _cli_tool_policy() -> ToolPolicy:
 def cli_loop() -> None:
     from hermes.cli_state_machine import CLIController, CLIEventQueue, CLIWorker
     from hermes.cli_ui import CLIInput, CLIUI, patched_cli_stdout
-    from hermes.config import BASE_URL, HERMES_HOME, MODEL, _config
+    from hermes.config import BASE_URL, DB_PATH, HERMES_HOME, MODEL, _config
     from hermes.hooks import SyncHookRegistry
+    from hermes.persistence.observation import configure_sqlite_observation_sink
     from hermes.plugins import SyncPluginRuntime
     from hermes.prompt import build_system_prompt
     from hermes.session_resources import cleanup_all_session_resources
@@ -67,6 +68,7 @@ def cli_loop() -> None:
     """启动默认 CLI 的事件驱动输入、路由和单 worker 执行流程。"""
     register_all()
     hook_registry = SyncHookRegistry()
+    configure_sqlite_observation_sink(hook_registry, DB_PATH)
     plugin_runtime = SyncPluginRuntime(
         hook_registry,
         plugins_config=_config["plugins"],

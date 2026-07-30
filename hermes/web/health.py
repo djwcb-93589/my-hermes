@@ -23,6 +23,7 @@ _REQUIRED_TABLES = frozenset({
     "gateway_runtime_lease",
     "tool_executions",
     "model_call_events",
+    "observations",
 })
 
 
