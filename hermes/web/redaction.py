@@ -108,17 +108,31 @@ class DashboardRedactor:
         """脱敏后生成受限长度的错误或结果摘要。"""
         return self.redact_text(value, limit=self.limits.error_text_limit)
 
+    def structure_text(self, value: object, *, limit: int | None = None) -> str:
+        """处理结构字段，保留普通路径形式但继续隐藏凭证和 URL 查询值。"""
+        redacted = self._redact_common_text(value)
+        redacted = self._redact_urls(redacted)
+        return _truncate_text(
+            redacted,
+            self.limits.structured_value_limit if limit is None else limit,
+        )
+
     def redact_text(self, value: object, *, limit: int | None = None) -> str:
         """先脱敏字符串，再按字符边界安全截断。"""
-        text = _coerce_text(value)
-        redacted = redact_explicit_secrets(text).replace("<secret>", REDACTED_VALUE)
-        redacted = _HEADER_RE.sub(_redact_header, redacted)
-        redacted = _ENV_ASSIGNMENT_RE.sub(_redact_environment_assignment, redacted)
+        redacted = self._redact_common_text(value)
         redacted = self._redact_urls_and_paths(redacted)
         return _truncate_text(
             redacted,
             self.limits.structured_value_limit if limit is None else limit,
         )
+
+    @staticmethod
+    def _redact_common_text(value: object) -> str:
+        """复用与字段语义无关的秘密、Header 和环境变量脱敏规则。"""
+        text = _coerce_text(value)
+        redacted = redact_explicit_secrets(text).replace("<secret>", REDACTED_VALUE)
+        redacted = _HEADER_RE.sub(_redact_header, redacted)
+        return _ENV_ASSIGNMENT_RE.sub(_redact_environment_assignment, redacted)
 
     def redact_value(
         self,
@@ -202,13 +216,22 @@ class DashboardRedactor:
 
     def _redact_urls_and_paths(self, text: str) -> str:
         """避免路径规则改写 URL path，同时处理普通文本中的绝对路径。"""
+        return self._redact_url_segments(text, self._redact_paths)
+
+    def _redact_urls(self, text: str) -> str:
+        """仅处理 URL 中的凭证和查询值，不识别普通绝对路径。"""
+        return self._redact_url_segments(text, _identity_text)
+
+    @staticmethod
+    def _redact_url_segments(text: str, text_transformer) -> str:
+        """在不改写 URL path 的前提下处理 URL 外部的文本片段。"""
         parts: list[str] = []
         cursor = 0
         for match in _URL_RE.finditer(text):
-            parts.append(self._redact_paths(text[cursor:match.start()]))
+            parts.append(text_transformer(text[cursor:match.start()]))
             parts.append(_redact_url(match.group(0)))
             cursor = match.end()
-        parts.append(self._redact_paths(text[cursor:]))
+        parts.append(text_transformer(text[cursor:]))
         return "".join(parts)
 
     def _redact_paths(self, text: str) -> str:
@@ -254,6 +277,11 @@ class _StructuredBudget:
         result = _truncate_text(value, self.remaining)
         self.remaining = 0
         return result
+
+
+def _identity_text(value: str) -> str:
+    """保留结构文本中不属于 URL 的普通字符。"""
+    return value
 
 
 def _coerce_text(value: object) -> str:

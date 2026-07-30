@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import UTC, datetime
@@ -13,8 +14,8 @@ import yaml
 
 from hermes.config_values import hermes_home
 from hermes.persistence.core import (
-    get_session_messages,
     list_cli_session_summaries,
+    list_session_message_records_for_dashboard,
     session_exists,
 )
 from hermes.persistence.cron import get_cron_job, list_cron_jobs, list_cron_runs
@@ -26,7 +27,11 @@ from hermes.web.read_context import (
     ReadDataUnavailable,
     ResourceNotFound,
 )
-from hermes.web.redaction import DashboardRedactor, TRUNCATED_VALUE
+from hermes.web.redaction import (
+    REDACTED_VALUE,
+    TRUNCATED_VALUE,
+    DashboardRedactor,
+)
 from hermes.web.schemas import (
     CronJobDetailResponse,
     CronJobListResponse,
@@ -45,6 +50,15 @@ from hermes.web.schemas import (
 
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_SKILL_FRONTMATTER_CHARS = 16_384
+_MISSING = object()
+
+# 单条历史记录损坏时的稳定 Dashboard 降级表示，不包含原始数据或异常详情。
+INVALID_TOOL_CALLS_PLACEHOLDER = [
+    {
+        "status": "invalid",
+        "detail": REDACTED_VALUE,
+    }
+]
 
 
 class _ReadServiceBase:
@@ -151,7 +165,10 @@ class SessionReadService(_ReadServiceBase):
             with self._context.connection() as conn:
                 if not session_exists(conn, conversation_id, source="cli"):
                     raise ResourceNotFound()
-                records = get_session_messages(conn, conversation_id)
+                records = list_session_message_records_for_dashboard(
+                    conn,
+                    conversation_id,
+                )
             messages = [self._message_detail(record) for record in records]
             return SessionDetailResponse(
                 conversation_id=conversation_id,
@@ -185,44 +202,84 @@ class SessionReadService(_ReadServiceBase):
         """仅映射消息公开字段，并安全处理损坏的 tool_calls。"""
         if not isinstance(record, dict):
             raise ValueError("record is invalid")
-        tool_calls = record.get("tool_calls")
-        if tool_calls is not None and (
-            not isinstance(tool_calls, list)
-            or any(not isinstance(item, dict) for item in tool_calls)
-        ):
-            raise ValueError("tool_calls is invalid")
-        safe_tool_calls = self._redact_tool_calls(tool_calls)
+        tool_calls_raw = record.get("tool_calls_raw", _MISSING)
+        if tool_calls_raw is _MISSING:
+            safe_tool_calls = self._redact_tool_calls(record.get("tool_calls"))
+        else:
+            safe_tool_calls = self._parse_tool_calls_raw(tool_calls_raw)
         content = record.get("content")
         if not isinstance(content, str):
             raise ValueError("content is invalid")
         return MessageDetail(
-            role=self._required_text(record, "role"),
+            role=self._redactor.structure_text(
+                self._required_text(record, "role")
+            ),
             content=self._redactor.message_text(content),
             tool_calls=safe_tool_calls,
             tool_call_id=self._optional_text(record.get("tool_call_id")),
             timestamp=None,
         )
 
+    def _parse_tool_calls_raw(
+        self,
+        tool_calls_raw: object,
+    ) -> list[dict[str, object]] | None:
+        """安全解析 Dashboard 专用原始字段，解析失败只降级当前消息。"""
+        if tool_calls_raw is None:
+            return None
+        if not isinstance(tool_calls_raw, str):
+            return self._invalid_tool_calls_placeholder()
+        try:
+            tool_calls = json.loads(tool_calls_raw)
+        except (TypeError, ValueError, RecursionError):
+            return self._invalid_tool_calls_placeholder()
+        if not isinstance(tool_calls, list):
+            return self._invalid_tool_calls_placeholder()
+        return self._redact_tool_calls(tool_calls)
+
     def _redact_tool_calls(
         self,
-        tool_calls: list[dict] | None,
+        tool_calls: object,
     ) -> list[dict[str, object]] | None:
-        """保留既有 tool_calls 响应形状，同时限制每个调用的结构化输出。"""
+        """逐项脱敏工具调用；损坏项只使用固定占位对象替换。"""
         if tool_calls is None:
             return None
+        if not isinstance(tool_calls, list):
+            return self._invalid_tool_calls_placeholder()
         result: list[dict[str, object]] = []
-        item_limit = max(1, self._redactor.limits.max_list_items)
-        visible_calls = tool_calls[:item_limit]
-        if len(tool_calls) > item_limit:
-            visible_calls = tool_calls[:max(item_limit - 1, 0)]
-        for item in visible_calls:
-            redacted = self._redactor.redact_value(item)
-            if not isinstance(redacted, dict):
-                raise ValueError("tool_calls is invalid")
-            result.append(redacted)
-        if len(tool_calls) > item_limit:
-            result.append({TRUNCATED_VALUE: TRUNCATED_VALUE})
+        try:
+            item_limit = max(1, self._redactor.limits.max_list_items)
+            visible_calls = tool_calls[:item_limit]
+            if len(tool_calls) > item_limit:
+                visible_calls = tool_calls[:max(item_limit - 1, 0)]
+            for item in visible_calls:
+                if not isinstance(item, dict):
+                    result.append(self._invalid_tool_call_item())
+                    continue
+                try:
+                    redacted = self._redactor.redact_value(item)
+                except (TypeError, ValueError, OverflowError, RecursionError):
+                    result.append(self._invalid_tool_call_item())
+                    continue
+                if not isinstance(redacted, dict):
+                    result.append(self._invalid_tool_call_item())
+                    continue
+                result.append(redacted)
+            if len(tool_calls) > item_limit:
+                result.append({TRUNCATED_VALUE: TRUNCATED_VALUE})
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return self._invalid_tool_calls_placeholder()
         return result
+
+    @staticmethod
+    def _invalid_tool_call_item() -> dict[str, str]:
+        """返回新的占位对象，避免调用方修改模块级稳定定义。"""
+        return dict(INVALID_TOOL_CALLS_PLACEHOLDER[0])
+
+    @classmethod
+    def _invalid_tool_calls_placeholder(cls) -> list[dict[str, str]]:
+        """返回新的占位列表，保证每个响应互不共享可变对象。"""
+        return [cls._invalid_tool_call_item()]
 
 
 class CronReadService(_ReadServiceBase):
@@ -302,11 +359,15 @@ class CronReadService(_ReadServiceBase):
             job_id=self._required_text(record, "job_id"),
             name=self._redactor.preview_text(name),
             prompt_preview=self._redactor.preview_text(prompt),
-            schedule=self._redactor.preview_text(
-                f"{schedule_type}:{schedule_expr}"
+            schedule=self._redactor.structure_text(
+                f"{schedule_type}:{schedule_expr}",
+                limit=self._redactor.limits.preview_text_limit,
             ),
             timezone=(
-                self._redactor.preview_text(timezone)
+                self._redactor.structure_text(
+                    timezone,
+                    limit=self._redactor.limits.preview_text_limit,
+                )
                 if timezone is not None
                 else None
             ),
@@ -322,7 +383,10 @@ class CronReadService(_ReadServiceBase):
         result_summary = self._optional_text(record.get("result_summary"))
         return CronRunSummary(
             run_id=self._required_text(record, "run_id"),
-            status=self._required_text(record, "status"),
+            status=self._redactor.structure_text(
+                self._required_text(record, "status"),
+                limit=self._redactor.limits.preview_text_limit,
+            ),
             scheduled_for=self._timestamp(record.get("scheduled_for")),
             started_at=self._timestamp(record.get("started_at")),
             finished_at=self._timestamp(record.get("finished_at")),
@@ -419,14 +483,20 @@ class CatalogReadService(_ReadServiceBase):
             if skill_version is not None and not isinstance(skill_version, str):
                 return SkillSummary(name=skill_dir.name, available=False)
             return SkillSummary(
-                name=self._redactor.preview_text(name),
+                name=self._redactor.structure_text(
+                    name,
+                    limit=self._redactor.limits.preview_text_limit,
+                ),
                 description=(
                     self._redactor.preview_text(description)
                     if description
                     else None
                 ),
                 version=(
-                    self._redactor.preview_text(skill_version)
+                    self._redactor.structure_text(
+                        skill_version,
+                        limit=self._redactor.limits.preview_text_limit,
+                    )
                     if skill_version
                     else None
                 ),
@@ -550,6 +620,7 @@ __all__ = [
     "CronReadService",
     "DashboardReadError",
     "HealthReadService",
+    "INVALID_TOOL_CALLS_PLACEHOLDER",
     "ReadDataUnavailable",
     "ReadService",
     "ResourceNotFound",

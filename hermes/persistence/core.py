@@ -279,6 +279,36 @@ def get_session_messages(
     return _deserialize_message_rows(rows)
 
 
+def list_session_message_records_for_dashboard(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> list[dict]:
+    """按插入顺序读取 Dashboard 所需的消息原始公开字段。
+
+    该接口保留 ``tool_calls`` 的原始持久化值，让 Dashboard 可对单条损坏
+    记录局部降级；通用消息读取仍继续使用既有反序列化语义。
+    """
+    rows = conn.execute(
+        """
+        SELECT role, content, tool_calls, tool_call_id, timestamp
+        FROM messages
+        WHERE session_id = ?
+        ORDER BY id
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "role": role,
+            "content": content,
+            "tool_calls_raw": tool_calls,
+            "tool_call_id": tool_call_id,
+            "timestamp": timestamp,
+        }
+        for role, content, tool_calls, tool_call_id, timestamp in rows
+    ]
+
+
 def get_session_messages_in_id_range(
     conn: sqlite3.Connection,
     session_id: str,
