@@ -19,6 +19,7 @@ from typing import Callable
 
 
 MAX_BACKGROUND_DELEGATE_JOBS = 3
+_SHUTDOWN_WAIT_SECONDS = 10.0
 
 
 @dataclass
@@ -65,6 +66,7 @@ class DelegateJobManager:
         self._jobs: dict[str, DelegateJob] = {}
         self._lock = threading.Lock()
         self.max_jobs = max_jobs
+        self._accepting = True
 
     # ---------- 查询:两种视图 ----------
 
@@ -158,6 +160,12 @@ class DelegateJobManager:
         cancel_checker(查 ``job.cancel_requested``),最后启动 worker。
         """
         with self._lock:
+            if not self._accepting:
+                return {
+                    "ok": False,
+                    "status": "rejected",
+                    "error": "delegate job manager is shutting down",
+                }
             active = sum(
                 1 for j in self._jobs.values()
                 if j.status in ("queued", "running")
@@ -203,9 +211,6 @@ class DelegateJobManager:
                 name=f"delegate-worker-{job_id}",
                 daemon=True,
             )
-            with self._lock:
-                job._thread = thread
-            thread.start()
         except Exception:
             self._rollback_submission(job)
             return {
@@ -213,6 +218,26 @@ class DelegateJobManager:
                 "status": "submit_failed",
                 "error": "background delegate worker failed to start",
             }
+        with self._lock:
+            # 线程发布与 start 位于同一锁内：shutdown 要么先关闭接收，
+            # 要么一定能观察到已经成功启动的 worker。
+            if not self._accepting:
+                self._rollback_submission_locked(job)
+                return {
+                    "ok": False,
+                    "status": "rejected",
+                    "error": "delegate job manager is shutting down",
+                }
+            job._thread = thread
+            try:
+                thread.start()
+            except Exception:
+                self._rollback_submission_locked(job)
+                return {
+                    "ok": False,
+                    "status": "submit_failed",
+                    "error": "background delegate worker failed to start",
+                }
 
         return {
             "ok": True,
@@ -223,16 +248,22 @@ class DelegateJobManager:
 
     def _rollback_submission(self, job: DelegateJob) -> None:
         """撤销尚未交给 worker 的 Job，确保不会占用后台并发额度。"""
+
         with self._lock:
-            job.status = "failed"
-            job.child_status = "submit_failed"
-            job.error = "background delegate submission failed"
-            job.finished_at = time.time()
-            job._hook_registry = None
-            job._parent_run_id = None
-            job._thread = None
-            if self._jobs.get(job.job_id) is job:
-                del self._jobs[job.job_id]
+            self._rollback_submission_locked(job)
+
+    def _rollback_submission_locked(self, job: DelegateJob) -> None:
+        """在 Manager 锁内撤销尚未启动的提交。"""
+
+        job.status = "failed"
+        job.child_status = "submit_failed"
+        job.error = "background delegate submission failed"
+        job.finished_at = time.time()
+        job._hook_registry = None
+        job._parent_run_id = None
+        job._thread = None
+        if self._jobs.get(job.job_id) is job:
+            del self._jobs[job.job_id]
 
     def cancel(self, job_id: str) -> dict:
         """协作式取消:标记 cancel_requested,worker 在下一轮检查时退出。
@@ -261,6 +292,42 @@ class DelegateJobManager:
                 "ok": True, "status": "cancel_requested", "job_id": job_id,
                 "message": "cancel flag set; worker will exit at next checkpoint",
             }
+
+    def shutdown(
+        self,
+        timeout_seconds: float = _SHUTDOWN_WAIT_SECONDS,
+    ) -> tuple[str, ...]:
+        """停止接收任务、请求取消并有限等待已有 worker 收口。"""
+
+        timeout = max(0.0, float(timeout_seconds))
+        current_thread = threading.current_thread()
+        with self._lock:
+            self._accepting = False
+            jobs = tuple(self._jobs.values())
+            for job in jobs:
+                if job.status not in TERMINAL_STATUSES:
+                    job.cancel_requested = True
+            threads = tuple(
+                (job.job_id, job._thread)
+                for job in jobs
+                if (
+                    job._thread is not None
+                    and job._thread is not current_thread
+                )
+            )
+
+        deadline = time.monotonic() + timeout
+        for _job_id, thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+
+        return tuple(
+            job_id
+            for job_id, thread in threads
+            if thread.is_alive()
+        )
 
     # ---------- worker ----------
 
@@ -316,3 +383,15 @@ def get_delegate_job_manager() -> DelegateJobManager:
         if _manager is None:
             _manager = DelegateJobManager()
         return _manager
+
+
+def shutdown_delegate_jobs(
+    timeout_seconds: float = _SHUTDOWN_WAIT_SECONDS,
+) -> tuple[str, ...]:
+    """应用退出时有限等待已存在的后台 Delegate，不隐式创建 Manager。"""
+
+    with _manager_lock:
+        manager = _manager
+    if manager is None:
+        return ()
+    return manager.shutdown(timeout_seconds)

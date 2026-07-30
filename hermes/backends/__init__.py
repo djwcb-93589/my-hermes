@@ -178,6 +178,14 @@ class UnsupportedBackendError(Exception):
     """后端未实现该文件操作（如 Docker/SSH 默认不暴露文件 IO）。"""
 
 
+class BackendCleanupError(RuntimeError):
+    """一个或多个 Backend 未能完成资源清理。"""
+
+    def __init__(self, failed_count: int = 1) -> None:
+        self.failed_count = max(1, int(failed_count))
+        super().__init__("Backend cleanup failed")
+
+
 class BackgroundProcessUnsupportedError(RuntimeError):
     """当前 Backend 暂不支持后台进程。"""
 
@@ -632,7 +640,8 @@ def get_backend(session_key: str = "default") -> BaseExecutionEnvironment:
 
 
 def cleanup_backend(session_key: str) -> bool:
-    """清理指定 session 的 backend。存在则返回 True。"""
+    """清理指定 session 的 backend；失败时保留实例供后续重试。"""
+
     with _backends_lock:
         b = _backends.pop(session_key, None)
     _clear_session_approval_state(session_key)
@@ -640,22 +649,37 @@ def cleanup_backend(session_key: str) -> bool:
         return False
     try:
         b.cleanup()
-    except Exception:
-        pass
+    except Exception as error:
+        with _backends_lock:
+            _backends.setdefault(session_key, b)
+        raise BackendCleanupError() from error
     return True
 
 
 def cleanup_all_backends() -> None:
-    """清理所有缓存的 backend。程序退出时调用。"""
+    """清理所有缓存 Backend，并保留失败实例供后续重试。"""
+
     with _backends_lock:
         items = list(_backends.items())
         _backends.clear()
+
+    failures: list[
+        tuple[str, BaseExecutionEnvironment, Exception]
+    ] = []
     for session_key, b in items:
         _clear_session_approval_state(session_key)
         try:
             b.cleanup()
-        except Exception:
-            pass
+        except Exception as error:
+            failures.append((session_key, b, error))
+
+    if not failures:
+        return
+
+    with _backends_lock:
+        for session_key, backend, _error in failures:
+            _backends.setdefault(session_key, backend)
+    raise BackendCleanupError(len(failures)) from failures[-1][2]
 
 
 __all__ = [
@@ -665,6 +689,7 @@ __all__ = [
     "BackgroundProcessCancelledError",
     "BackgroundProcessStartCleanupError",
     "BackgroundProcessUnsupportedError",
+    "BackendCleanupError",
     "BaseExecutionEnvironment",
     "UnsupportedBackendError",
     "cleanup_all_backends",

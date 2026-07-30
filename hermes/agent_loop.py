@@ -3013,7 +3013,8 @@ class AsyncAgentLoop(AgentLoop):
         tool_call,
         parsed_call: ParsedToolCall | None = None,
     ) -> tuple[str, str | None, str | None]:
-        """在线程池运行现有同步工具,避免阻塞 Gateway 事件循环。"""
+        """在线程池运行同步工具，并在取消时等待真实调用完成收口。"""
+
         tool_context = dict(self.tool_context)
         allowed_tool_names = getattr(self, "allowed_tool_names", None)
         if allowed_tool_names is not None:
@@ -3026,15 +3027,34 @@ class AsyncAgentLoop(AgentLoop):
                 tool_context["hook_registry"] = delegate_registry
             if self.run_id is not None:
                 tool_context["parent_run_id"] = self.run_id
-        return await asyncio.to_thread(
-            dispatch_tool_call,
-            tool_call,
-            self.registry,
-            session_key=self.session_key,
-            blocked_tools=self.blocked_tools,
-            tool_context=tool_context,
-            parsed_call=parsed_call,
+
+        dispatch_task = asyncio.create_task(
+            asyncio.to_thread(
+                dispatch_tool_call,
+                tool_call,
+                self.registry,
+                session_key=self.session_key,
+                blocked_tools=self.blocked_tools,
+                tool_context=tool_context,
+                parsed_call=parsed_call,
+            ),
+            name="hermes-tool-dispatch",
         )
+        cancelled = False
+        while not dispatch_task.done():
+            try:
+                await asyncio.shield(dispatch_task)
+            except asyncio.CancelledError:
+                # to_thread 已运行后不能被 asyncio 取消；等待它观察同一个
+                # cancel_checker 并完成，避免 session cleanup 漏过迟到 spawn。
+                cancelled = True
+        if cancelled:
+            try:
+                dispatch_task.result()
+            except BaseException:
+                pass
+            raise asyncio.CancelledError
+        return dispatch_task.result()
 
     async def on_tool_message(
         self,

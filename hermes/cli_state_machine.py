@@ -510,12 +510,14 @@ class CLIController:
         ui: CLIControllerUI,
         cached_prompt: str,
         tool_policy: object,
+        process_manager: object | None = None,
     ) -> None:
         self._events = events
         self._worker = worker
         self._ui = ui
         self._cached_prompt = cached_prompt
         self._tool_policy = tool_policy
+        self._process_manager = process_manager
         self._session_id: str | None = None
         self._pending_approval: dict | None = None
         self._session_choices: dict[str, str] = {}
@@ -524,6 +526,12 @@ class CLIController:
         self._shutting_down = False
         self._current_cancel_event: threading.Event | None = None
         self._active_steer_mailbox: SteerMailbox | None = None
+
+    @property
+    def current_session_id(self) -> str | None:
+        """返回 controller 当前持有的只读会话标识。"""
+
+        return self._session_id
 
     def run(self) -> None:
         """等待输入或 worker 通知；不使用轮询或定时唤醒。"""
@@ -612,6 +620,10 @@ class CLIController:
             self._ui.show_message("no approval is pending")
             return
 
+        if command == "/new":
+            self._reset_current_session()
+            return
+
         if command == "/resume":
             selection = command_argument.strip()
             task = (
@@ -627,10 +639,6 @@ class CLIController:
             )
             self._submit_task(task)
             return
-        if command == "/new":
-            self._session_id = None
-            self._ui.show_message("new session will start with your next message")
-            return
         if command == "/sessions":
             self._submit_task(
                 CLIWorkerTask(
@@ -644,6 +652,40 @@ class CLIController:
             return
 
         self._submit_or_queue_message(user_input)
+
+    def _reset_current_session(self) -> None:
+        """仅在统一资源清理完整成功后放弃当前会话。"""
+
+        session_id = self._session_id
+        if session_id is None:
+            self._pending_approval = None
+            self._ui.show_message(
+                "new session will start with your next message"
+            )
+            return
+
+        try:
+            from hermes.session_resources import cleanup_session_resources
+
+            report = cleanup_session_resources(
+                session_id,
+                process_manager=self._process_manager,
+            )
+            cleanup_complete = report.complete
+        except Exception:
+            cleanup_complete = False
+
+        if not cleanup_complete:
+            self._ui.show_message(
+                "session cleanup did not complete; current session was kept"
+            )
+            return
+
+        self._session_id = None
+        self._pending_approval = None
+        self._ui.show_message(
+            "new session will start with your next message"
+        )
 
     def _handle_pending_approval(self, command: str, argument: str) -> None:
         if self._running:

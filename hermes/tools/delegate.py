@@ -3,7 +3,7 @@ delegate 工具:同步、可隔离的 leaf subagent。
 
 每个实际启动的 delegate 调用生成唯一 ``child_session_key``,通过 AgentLoop
 跑子 agent 循环,所有工具调用透传 child_session_key 实现 cwd / 文件状态隔离。
-无论成功 / 异常 / max_iter,都通过 finally 清理对应 backend。
+无论成功 / 异常 / max_iter,都通过 finally 清理对应 child 会话资源。
 
 子 agent 是 leaf agent:
   - toolsets 严格校验,只接受全局 registry 声明支持 Delegate 的项；未知
@@ -21,7 +21,6 @@ from datetime import datetime
 from typing import Callable
 
 from hermes.agent_loop import AgentLoop, ParsedToolCall
-from hermes.backends import cleanup_backend
 from hermes.config import (
     MAX_CHILD_ITERATIONS,
     MODEL,
@@ -30,6 +29,7 @@ from hermes.config import (
 )
 from hermes.delegate_jobs import get_delegate_job_manager
 from hermes.hooks import SyncControlBridge, SyncHookRegistry
+from hermes.session_resources import cleanup_session_resources
 from hermes.tool_declarations.delegate import TOOL_DECLARATIONS
 from hermes.tools import (
     ExecutionEnvironment,
@@ -270,12 +270,13 @@ def run_delegate_child(
     tool_context: dict | None = None,
     hook_registry: SyncHookRegistry | None = None,
     parent_run_id: str | None = None,
+    process_manager=None,
 ) -> dict:
     """跑一个子 agent 任务,返回 dict(不是 JSON)。
 
     同步 ``handle_delegate(background=False)`` 和后台 worker 都用这个
-    helper,避免两套 subagent 执行逻辑。``cleanup_backend`` 在 finally
-    里保证执行,无论成功 / 异常 / 取消 / max_iter。
+    helper,避免两套 subagent 执行逻辑。会话资源清理在 finally 里保证
+    执行,无论成功 / 异常 / 取消 / max_iter。
     """
     try:
         if callable(cancel_checker) and bool(cancel_checker()):
@@ -340,8 +341,11 @@ def run_delegate_child(
             "error": repr(exc),
         }
     finally:
-        # 无论成功 / 失败 / max_iter / 取消,都释放 child 的 terminal backend
-        cleanup_backend(child_session_key)
+        # 子循环结束后只释放 child 资源；不触碰 parent 会话。
+        cleanup_session_resources(
+            child_session_key,
+            process_manager=process_manager,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +366,7 @@ def handle_delegate(args, **kwargs) -> str:
     goal, context, toolsets, err = _validate_args(args)
     if err is not None:
         return err
+    process_manager = kwargs.get("process_manager")
 
     # 子 agent 的 backend 生命周期在 delegate 返回时结束，无法把待审批操作
     # 安全恢复到原 cwd。远程会话必须让主 agent 直接调用 File/Terminal，确保
@@ -470,6 +475,7 @@ def handle_delegate(args, **kwargs) -> str:
                 tool_context=child_tool_context,
                 hook_registry=hook_registry,
                 parent_run_id=parent_run_id,
+                process_manager=process_manager,
             )
         finally:
             if isinstance(hook_registry, SyncControlBridge):
@@ -509,6 +515,7 @@ def handle_delegate(args, **kwargs) -> str:
 
         def runner() -> dict:
             runtime_registry = None
+            child_loop_started = False
             try:
                 startup_gate.wait()
                 if not worker_accepted["value"]:
@@ -524,6 +531,7 @@ def handle_delegate(args, **kwargs) -> str:
                     }
                 runtime_registry = captured_runtime_refs["hook_registry"]
                 runtime_parent_run_id = captured_runtime_refs["parent_run_id"]
+                child_loop_started = True
                 return run_delegate_child(
                     goal, context, toolsets, child_session_key,
                     cancel_checker=lambda: manager.is_cancel_requested(job_id),
@@ -538,6 +546,7 @@ def handle_delegate(args, **kwargs) -> str:
                         if isinstance(runtime_parent_run_id, str)
                         else None
                     ),
+                    process_manager=process_manager,
                 )
             finally:
                 # Job 终态以外，runner 闭包自身也不再保留运行时 Hook 引用。
@@ -545,6 +554,11 @@ def handle_delegate(args, **kwargs) -> str:
                     runtime_registry.close()
                 captured_runtime_refs["hook_registry"] = None
                 captured_runtime_refs["parent_run_id"] = None
+                if not child_loop_started:
+                    cleanup_session_resources(
+                        child_session_key,
+                        process_manager=process_manager,
+                    )
         return runner
 
     try:
@@ -560,7 +574,10 @@ def handle_delegate(args, **kwargs) -> str:
         worker_accepted["value"] = False
         startup_gate.set()
         release_submission_refs()
-        cleanup_backend(child_session_key)
+        cleanup_session_resources(
+            child_session_key,
+            process_manager=process_manager,
+        )
         return _json_dumps(
             {
                 "ok": False,
@@ -576,7 +593,10 @@ def handle_delegate(args, **kwargs) -> str:
         # 并发上限拒绝:job 还没创建,但 child_session_key 已分配过,
         # 这里 cleanup 防止潜在泄漏(run_delegate_child 没被调用过,
         # backend 也没真正创建,但保险一道)。
-        cleanup_backend(child_session_key)
+        cleanup_session_resources(
+            child_session_key,
+            process_manager=process_manager,
+        )
         return _json_dumps(submit_result)
 
     try:
@@ -588,7 +608,10 @@ def handle_delegate(args, **kwargs) -> str:
         worker_accepted["value"] = False
         release_submission_refs()
         startup_gate.set()
-        cleanup_backend(child_session_key)
+        cleanup_session_resources(
+            child_session_key,
+            process_manager=process_manager,
+        )
         return _json_dumps(
             {
                 "ok": False,
@@ -655,13 +678,36 @@ def handle_delegate_cancel(args, **kwargs) -> str:
     return _json_dumps(res)
 
 
-def register(registry):
+def register(registry, *, process_manager=None):
     """注册 Delegate 的真实 handler。"""
+
+    active_process_manager = process_manager
+    if active_process_manager is None:
+        from hermes.processes import (
+            process_manager as default_process_manager,
+        )
+
+        active_process_manager = default_process_manager
+    if not callable(
+        getattr(active_process_manager, "cleanup_session", None)
+    ):
+        raise TypeError("process_manager must provide cleanup_session()")
+
+    def delegate_task_handler(args, **kwargs):
+        """绑定应用级共享 ProcessManager，拒绝运行时上下文覆盖。"""
+
+        kwargs.pop("process_manager", None)
+        return handle_delegate(
+            args,
+            process_manager=active_process_manager,
+            **kwargs,
+        )
+
     register_declared_handlers(
         registry,
         TOOL_DECLARATIONS,
         {
-            "delegate_task": handle_delegate,
+            "delegate_task": delegate_task_handler,
             "delegate_status": handle_delegate_status,
             "delegate_result": handle_delegate_result,
             "delegate_cancel": handle_delegate_cancel,

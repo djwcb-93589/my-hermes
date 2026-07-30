@@ -58,15 +58,20 @@ def cli_loop() -> None:
     from hermes.cli_state_machine import CLIController, CLIEventQueue, CLIWorker
     from hermes.cli_ui import CLIInput, CLIUI, patched_cli_stdout
     from hermes.config import BASE_URL, DB_PATH, HERMES_HOME, MODEL, _config
+    from hermes.delegate_jobs import shutdown_delegate_jobs
     from hermes.hooks import SyncHookRegistry
     from hermes.persistence.observation import configure_sqlite_observation_sink
     from hermes.plugins import SyncPluginRuntime
+    from hermes.processes import process_manager
     from hermes.prompt import build_system_prompt
-    from hermes.session_resources import cleanup_all_session_resources
+    from hermes.session_resources import (
+        cleanup_all_session_resources,
+        cleanup_session_resources,
+    )
     from hermes.tools import register_all, registry
 
     """启动默认 CLI 的事件驱动输入、路由和单 worker 执行流程。"""
-    register_all()
+    register_all(process_manager=process_manager)
     hook_registry = SyncHookRegistry()
     configure_sqlite_observation_sink(hook_registry, DB_PATH)
     plugin_runtime = SyncPluginRuntime(
@@ -76,6 +81,7 @@ def cli_loop() -> None:
     plugin_runtime.load()
     cli_ui = None
     worker = None
+    controller = None
     worker_started = False
 
     try:
@@ -103,6 +109,7 @@ def cli_loop() -> None:
             ui=cli_ui,
             cached_prompt=cached_prompt,
             tool_policy=tool_policy,
+            process_manager=process_manager,
         )
         with patched_cli_stdout():
             cli_ui.show_startup(
@@ -132,9 +139,43 @@ def cli_loop() -> None:
                     worker.shutdown()
             finally:
                 try:
-                    plugin_runtime.close()
+                    delegate_lifecycle_complete = False
+                    try:
+                        unfinished_delegate_jobs = shutdown_delegate_jobs()
+                    except Exception as error:
+                        print(
+                            "Delegate shutdown incomplete: "
+                            f"exception={type(error).__name__}"
+                        )
+                    else:
+                        delegate_lifecycle_complete = (
+                            not unfinished_delegate_jobs
+                        )
+                        if unfinished_delegate_jobs:
+                            print(
+                                "Delegate shutdown incomplete: "
+                                f"active_jobs={len(unfinished_delegate_jobs)}"
+                            )
+                    current_session_id = (
+                        None
+                        if controller is None
+                        else controller.current_session_id
+                    )
+                    if current_session_id is not None:
+                        cleanup_session_resources(
+                            current_session_id,
+                            process_manager=process_manager,
+                        )
                 finally:
-                    cleanup_all_session_resources()
+                    try:
+                        cleanup_all_session_resources(
+                            process_manager=process_manager,
+                            lifecycle_barrier_complete=(
+                                delegate_lifecycle_complete
+                            ),
+                        )
+                    finally:
+                        plugin_runtime.close()
 
 
 def main() -> None:

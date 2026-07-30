@@ -849,35 +849,104 @@ class SessionStore:
         """清理真正空闲且没有持久投递负担的会话。"""
         return len(self.cleanup_idle_conversations(protected_route_keys))
 
+    @staticmethod
+    def _conversation_is_idle(
+        route_key: str,
+        ctx: SessionContext,
+        *,
+        protected_route_keys: set[str],
+        now: float,
+        idle_timeout: float,
+    ) -> bool:
+        """按现有运行状态判断会话是否已满足最终清理条件。"""
+
+        return (
+            route_key not in protected_route_keys
+            and not ctx.busy
+            and not ctx.pending
+            and (
+                ctx.worker_task is None
+                or ctx.worker_task.done()
+            )
+            and (
+                ctx.active_task is None
+                or ctx.active_task.done()
+            )
+            and (now - ctx.last_activity) > idle_timeout
+        )
+
+    def idle_conversation_candidates(
+        self,
+        protected_route_keys: set[str] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        """只读返回可清理 route 与 conversation，供异步资源编排使用。"""
+
+        now = time.time()
+        protected = protected_route_keys or set()
+        return tuple(
+            (route_key, ctx.conversation_id)
+            for route_key, ctx in self._contexts.items()
+            if self._conversation_is_idle(
+                route_key,
+                ctx,
+                protected_route_keys=protected,
+                now=now,
+                idle_timeout=self.idle_timeout,
+            )
+        )
+
+    def idle_conversation_is_current(
+        self,
+        route_key: str,
+        conversation_id: str,
+        protected_route_keys: set[str] | None = None,
+    ) -> bool:
+        """重新确认候选仍是同一空闲会话，避免清理新近活动的 route。"""
+
+        ctx = self._contexts.get(route_key)
+        if ctx is None or ctx.conversation_id != conversation_id:
+            return False
+        return self._conversation_is_idle(
+            route_key,
+            ctx,
+            protected_route_keys=protected_route_keys or set(),
+            now=time.time(),
+            idle_timeout=self.idle_timeout,
+        )
+
+    def remove_idle_conversation(
+        self,
+        route_key: str,
+        conversation_id: str,
+        protected_route_keys: set[str] | None = None,
+    ) -> bool:
+        """仅在资源清理成功后移除仍保持空闲的同一会话。"""
+
+        if not self.idle_conversation_is_current(
+            route_key,
+            conversation_id,
+            protected_route_keys,
+        ):
+            return False
+        ctx = self._contexts[route_key]
+        self._close_active_steer_mailbox(ctx)
+        del self._contexts[route_key]
+        self._context_locks.pop(route_key, None)
+        return True
+
     def cleanup_idle_conversations(
         self,
         protected_route_keys: set[str] | None = None,
     ) -> list[str]:
         """清理空闲 route，并返回需要释放授权的 conversation IDs。"""
-        now = time.time()
-        protected = protected_route_keys or set()
-        expired = [
-            k for k, ctx in self._contexts.items()
-            if (
-                k not in protected
-                and not ctx.busy
-                and not ctx.pending
-                and (
-                    ctx.worker_task is None
-                    or ctx.worker_task.done()
-                )
-                and (
-                    ctx.active_task is None
-                    or ctx.active_task.done()
-                )
-                and (now - ctx.last_activity) > self.idle_timeout
-            )
-        ]
-        conversation_ids = [
-            self._contexts[k].conversation_id for k in expired
-        ]
-        for k in expired:
-            self._close_active_steer_mailbox(self._contexts[k])
-            del self._contexts[k]
-            self._context_locks.pop(k, None)
+        conversation_ids: list[str] = []
+        for route_key, conversation_id in self.idle_conversation_candidates(
+            protected_route_keys,
+        ):
+            if self.remove_idle_conversation(
+                route_key,
+                conversation_id,
+                protected_route_keys,
+            ):
+                conversation_ids.append(conversation_id)
         return conversation_ids

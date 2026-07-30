@@ -122,6 +122,7 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, ToolEntry] = {}
         self._default_tools_registered = False
+        self._process_manager_binding = None
 
     def register(
         self,
@@ -594,6 +595,13 @@ def register_all(
     if not isinstance(target, ToolRegistry):
         raise TypeError("target_registry must be a ToolRegistry")
     if target._default_tools_registered:
+        if (
+            process_manager is not None
+            and target._process_manager_binding is not process_manager
+        ):
+            raise RuntimeError(
+                "Tool registry is already bound to a different process manager"
+            )
         return
     active_process_manager = process_manager
     if active_process_manager is None:
@@ -634,10 +642,14 @@ def register_all(
             "Skill tools unavailable; Skill capability was skipped: %s",
             type(exc).__name__,
         )
-    _delegate(staging_registry)
+    _delegate(
+        staging_registry,
+        process_manager=active_process_manager,
+    )
     _gateway_send_file(staging_registry)
     _media(staging_registry)
     _browser(staging_registry)
     _cron(staging_registry)
     target.merge_from(staging_registry)
+    target._process_manager_binding = active_process_manager
     target._default_tools_registered = True

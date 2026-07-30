@@ -158,6 +158,21 @@ class ProcessLogResult:
     exit_code: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessCleanupReport:
+    """一次批量进程清理的安全、不可变结果。"""
+
+    attempted_process_ids: tuple[str, ...]
+    completed_process_ids: tuple[str, ...]
+    unresolved_process_ids: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        """返回本次捕获的所有记录是否都已完成资源释放。"""
+
+        return not self.unresolved_process_ids
+
+
 @dataclass(slots=True)
 class ProcessRecord:
     """仅供 ProcessManager 使用的可变进程记录。"""
@@ -588,7 +603,7 @@ class ProcessManager:
             source="kill",
         )
 
-    def cleanup_session(self, session_key: str) -> None:
+    def cleanup_session(self, session_key: str) -> ProcessCleanupReport:
         """终止当前会话的运行中进程，并保留已结束记录至 TTL 到期。"""
 
         session_key = self._validate_session_key(session_key)
@@ -599,35 +614,78 @@ class ProcessManager:
                 if record.session_key == session_key
             )
 
-        for record in records:
-            try:
-                self._terminate_record(
-                    record,
-                    grace_seconds=0.0,
-                    source="session_cleanup",
-                )
-            except Exception:
-                # 单个清理失败不能伪装为成功，也不能阻止其余资源清理。
-                self._record_cleanup_failure(record)
-                continue
+        return self._cleanup_records(
+            records,
+            source="session_cleanup",
+        )
 
-    def cleanup_all(self) -> None:
+    def cleanup_all(self) -> ProcessCleanupReport:
         """终止全部运行中进程，并保留已结束记录至 TTL 到期。"""
 
         with self._registry_lock:
             records = tuple(self._running.values())
 
+        return self._cleanup_records(
+            records,
+            source="global_cleanup",
+        )
+
+    def _cleanup_records(
+        self,
+        records: tuple[ProcessRecord, ...],
+        *,
+        source: str,
+    ) -> ProcessCleanupReport:
+        """逐条清理捕获记录，并按注册表与资源释放事实生成稳定报告。"""
+
+        attempted_process_ids = tuple(
+            record.process_id for record in records
+        )
+        completed_process_ids: list[str] = []
+        unresolved_process_ids: list[str] = []
+
         for record in records:
+            termination_failed = False
             try:
                 self._terminate_record(
                     record,
                     grace_seconds=0.0,
-                    source="global_cleanup",
+                    source=source,
                 )
             except Exception:
+                termination_failed = True
+
+            if (
+                not termination_failed
+                and self._cleanup_record_completed(record)
+            ):
+                completed_process_ids.append(record.process_id)
+                continue
+
+            unresolved_process_ids.append(record.process_id)
+            try:
                 # 单个清理失败不能伪装为成功，也不能阻止其他资源清理。
                 self._record_cleanup_failure(record)
-                continue
+            except Exception:
+                pass
+
+        return ProcessCleanupReport(
+            attempted_process_ids=attempted_process_ids,
+            completed_process_ids=tuple(completed_process_ids),
+            unresolved_process_ids=tuple(unresolved_process_ids),
+        )
+
+    def _cleanup_record_completed(self, record: ProcessRecord) -> bool:
+        """仅在记录离开运行表且 Handle 已释放后确认清理完成。"""
+
+        with record.record_lock:
+            resources_released = (
+                record.handle is None or record.close_called
+            )
+        if not resources_released:
+            return False
+        with self._registry_lock:
+            return self._running.get(record.process_id) is not record
 
     def prune(self) -> None:
         """删除超过保留期限的终态记录，不影响运行中进程。"""
@@ -1098,7 +1156,7 @@ class ProcessManager:
                 self._snapshot(record).status in _TERMINAL_STATUSES
                 and not self._is_lost_cleanup_pending(record)
             ):
-                self._handle_close_best_effort(record)
+                self._release_confirmed_exit_resources_best_effort(record)
 
     def _append_output(
         self,
@@ -1148,6 +1206,11 @@ class ProcessManager:
         with record.record_lock:
             termination_signal_sent = record.termination_signal_sent
             termination_source = record.termination_source
+            # 终态可以先对查询可见，但 Handle 成功关闭前仍保留在运行表，
+            # 使后续 session/global cleanup 能够再次严格收尾。
+            record.resource_cleanup_pending = (
+                record.handle is not None and not record.close_called
+            )
         if termination_signal_sent:
             self._finalize_record(
                 record,
@@ -1223,8 +1286,38 @@ class ProcessManager:
             raise ProcessTerminationError(
                 "Could not confirm process termination"
             )
-        self._handle_close_best_effort(record)
+        self._release_confirmed_exit_resources_best_effort(record)
         return self._snapshot(record)
+
+    def _release_confirmed_exit_resources(self, record: ProcessRecord) -> None:
+        """严格关闭已确认退出的 Handle，成功后才允许迁移至结束表。"""
+
+        self._handle_close(record)
+        with record.record_lock:
+            if record.status not in (
+                ProcessStatus.EXITED,
+                ProcessStatus.KILLED,
+            ):
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                )
+            if record.handle is not None and not record.close_called:
+                raise ProcessTerminationError(
+                    "Could not close process handle"
+                )
+            record.resource_cleanup_pending = False
+        self._move_to_finished(record)
+
+    def _release_confirmed_exit_resources_best_effort(
+        self,
+        record: ProcessRecord,
+    ) -> None:
+        """自然观察路径尽力收尾；失败记录保留在运行表供 cleanup 重试。"""
+
+        try:
+            self._release_confirmed_exit_resources(record)
+        except Exception:
+            pass
 
     def _finalize_record(
         self,
@@ -1542,6 +1635,11 @@ class ProcessManager:
                         record,
                         source=source,
                     )
+                if self._is_confirmed_exit_cleanup_pending(record):
+                    return self._terminate_confirmed_exit_record(
+                        record,
+                        strict=source != "kill",
+                    )
 
                 snapshot = self._snapshot(record)
                 if snapshot.status in _TERMINAL_STATUSES:
@@ -1656,6 +1754,21 @@ class ProcessManager:
         self._request_failed_start_cleanup(record)
         self._confirm_failed_start_handle_stopped(record)
         return self._complete_failed_start_record(record)
+
+    def _terminate_confirmed_exit_record(
+        self,
+        record: ProcessRecord,
+        *,
+        strict: bool,
+    ) -> ProcessSnapshot:
+        """重试已确认退出但 Handle 尚未成功释放的普通终态记录。"""
+
+        try:
+            self._release_confirmed_exit_resources(record)
+        except Exception:
+            if strict:
+                raise
+        return self._snapshot(record)
 
     def _terminate_lost_record(
         self,
@@ -1824,6 +1937,19 @@ class ProcessManager:
                 and record.resource_cleanup_pending
             )
 
+    def _is_confirmed_exit_cleanup_pending(
+        self,
+        record: ProcessRecord,
+    ) -> bool:
+        """确认普通终态记录仍需重试 Handle 资源释放。"""
+
+        with record.record_lock:
+            return (
+                record.status
+                in (ProcessStatus.EXITED, ProcessStatus.KILLED)
+                and record.resource_cleanup_pending
+            )
+
     def _record_log_read_failure(self, record: ProcessRecord) -> None:
         """累计日志读取错误，但不据此判定后台进程丢失。"""
 
@@ -1927,6 +2053,7 @@ __all__ = [
     "BackgroundProcessHandle",
     "BackgroundProcessOutput",
     "ProcessError",
+    "ProcessCleanupReport",
     "ProcessLimitError",
     "ProcessLogResult",
     "ProcessManager",

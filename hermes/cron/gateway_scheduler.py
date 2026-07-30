@@ -51,6 +51,7 @@ class GatewayCronScheduler:
         lease_fence_provider: Callable[[], dict | None],
         lease_is_valid: Callable[[], bool],
         hook_registry: SyncHookRegistry | None = None,
+        process_manager=None,
         poll_seconds: float = 5.0,
         max_concurrent: int = 1,
         misfire_grace_seconds: float = 60.0,
@@ -73,6 +74,7 @@ class GatewayCronScheduler:
         self._lease_fence_provider = lease_fence_provider
         self._lease_is_valid = lease_is_valid
         self._hook_registry = hook_registry
+        self._process_manager = process_manager
         self._poll_seconds = float(poll_seconds)
         self._misfire_grace_seconds = float(misfire_grace_seconds)
         self._max_concurrent = int(max_concurrent)
@@ -312,16 +314,36 @@ class GatewayCronScheduler:
         try:
             async with self._cron_semaphore:
                 async with self._llm_semaphore:
-                    result = await asyncio.to_thread(
-                        CronExecutor(
-                            self._db_path,
-                            cancel_checker=cancel_event.is_set,
-                            hook_registry=self._hook_registry,
-                            **fence,
-                        ).execute,
-                        job,
-                        run,
+                    execution_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            CronExecutor(
+                                self._db_path,
+                                cancel_checker=cancel_event.is_set,
+                                hook_registry=self._hook_registry,
+                                process_manager=self._process_manager,
+                                **fence,
+                            ).execute,
+                            job,
+                            run,
+                        ),
+                        name=f"gateway-cron-worker-{run.run_id}",
                     )
+                    cancelled = False
+                    while not execution_task.done():
+                        try:
+                            await asyncio.shield(execution_task)
+                        except asyncio.CancelledError:
+                            # 同步 Cron 线程无法被 asyncio 强停；先传播协作
+                            # 取消，再等它完成 finally 中的 session 清理。
+                            cancel_event.set()
+                            cancelled = True
+                    if cancelled:
+                        try:
+                            execution_task.result()
+                        except BaseException:
+                            pass
+                        raise asyncio.CancelledError
+                    result = execution_task.result()
                 if (
                     self._execution_finished is not None
                     and self._lease_is_valid()

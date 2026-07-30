@@ -793,9 +793,17 @@ class GatewayRunner:
         db_path: str,
         *,
         hook_registry: AsyncHookRegistry | None = None,
+        process_manager=None,
     ):
         # Gateway 的配置校验依赖全局元数据，先完成幂等注册。
-        register_all()
+        if process_manager is None:
+            from hermes.processes import (
+                process_manager as default_process_manager,
+            )
+
+            process_manager = default_process_manager
+        self._process_manager = process_manager
+        register_all(process_manager=self._process_manager)
         if hook_registry is not None and not isinstance(
             hook_registry,
             AsyncHookRegistry,
@@ -947,6 +955,7 @@ class GatewayRunner:
             llm_semaphore=self._llm_semaphore,
             lease_fence_provider=self._cron_runtime_fence,
             lease_is_valid=lambda: self._runtime_lease_valid,
+            process_manager=self._process_manager,
             poll_seconds=self.cron_poll_seconds,
             max_concurrent=self.cron_max_concurrent,
             misfire_grace_seconds=self.cron_misfire_grace_seconds,
@@ -982,6 +991,7 @@ class GatewayRunner:
         self._readiness_probe_cached_result = False
         self._route_admission_locks: dict[str, asyncio.Lock] = {}
         self._route_admission_users: dict[str, int] = {}
+        self._route_admission_closed = False
         self._stop_lock = asyncio.Lock()
         # 异步模型客户端按需创建,Gateway 停止时统一关闭。
         self._async_client = None
@@ -1630,6 +1640,7 @@ class GatewayRunner:
     def _on_runtime_lease_lost(self, error_type: str | None) -> None:
         """先撤销运行资格，再调度不会自等待的统一安全停止。"""
         self._accepting_external_messages = False
+        self._route_admission_closed = True
         self._lifecycle_phase = "lease_lost"
         if error_type:
             print(
@@ -1658,6 +1669,78 @@ class GatewayRunner:
                 name="gateway-lease-loss-shutdown",
             )
 
+    async def _await_operation_completion(
+        self,
+        operation,
+        *,
+        task_name: str,
+    ):
+        """取消调用协程时仍等待已启动的真实操作完成。"""
+
+        operation_task = asyncio.create_task(
+            operation,
+            name=task_name,
+        )
+        cancelled = False
+        while not operation_task.done():
+            try:
+                await asyncio.shield(operation_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            try:
+                operation_task.result()
+            except BaseException:
+                pass
+            raise asyncio.CancelledError
+        return operation_task.result()
+
+    async def _await_blocking_operation(
+        self,
+        operation,
+        *args,
+        **kwargs,
+    ):
+        """在线程中完成同步操作，取消时也等待真实 worker 收口。"""
+
+        return await self._await_operation_completion(
+            asyncio.to_thread(
+                operation,
+                *args,
+                **kwargs,
+            ),
+            task_name="gateway-blocking-operation",
+        )
+
+    async def _cleanup_session_resources(
+        self,
+        session_key: str,
+    ):
+        """使用 Runner 注册工具时绑定的同一 Manager 清理单会话资源。"""
+
+        from hermes.session_resources import cleanup_session_resources
+
+        return await self._await_blocking_operation(
+            cleanup_session_resources,
+            session_key,
+            process_manager=self._process_manager,
+        )
+
+    async def _cleanup_all_session_resources(
+        self,
+        *,
+        lifecycle_barrier_complete: bool = True,
+    ):
+        """使用 Runner 绑定的同一 Manager 清理全部运行期资源。"""
+
+        from hermes.session_resources import cleanup_all_session_resources
+
+        return await self._await_blocking_operation(
+            cleanup_all_session_resources,
+            process_manager=self._process_manager,
+            lifecycle_barrier_complete=lifecycle_barrier_complete,
+        )
+
     async def _session_cleanup_loop(self) -> None:
         """周期清理没有运行、排队或持久投递负担的空闲会话。"""
         try:
@@ -1669,23 +1752,45 @@ class GatewayRunner:
                     protected = await self.persistence.call(
                         get_gateway_routes_with_pending_outbox,
                     )
-                    removed_conversations = (
-                        self.sessions.cleanup_idle_conversations(protected)
+                    candidates = (
+                        self.sessions.idle_conversation_candidates(protected)
                     )
-                    if removed_conversations:
-                        from hermes.session_resources import cleanup_session_resources
-                        for conversation_id in removed_conversations:
-                            await asyncio.to_thread(
-                                cleanup_session_resources,
+                    removed = 0
+                    incomplete = 0
+                    for route_key, conversation_id in candidates:
+                        async with self._route_admission(route_key):
+                            current_protected = await self.persistence.call(
+                                get_gateway_routes_with_pending_outbox,
+                            )
+                            if not self.sessions.idle_conversation_is_current(
+                                route_key,
+                                conversation_id,
+                                current_protected,
+                            ):
+                                continue
+                            report = await self._cleanup_session_resources(
                                 conversation_id,
                             )
-                    removed = len(removed_conversations)
+                            if not report.complete:
+                                incomplete += 1
+                                continue
+                            if self.sessions.remove_idle_conversation(
+                                route_key,
+                                conversation_id,
+                                current_protected,
+                            ):
+                                removed += 1
                 except Exception as exc:
                     print(
                         "  [gateway] session cleanup failed: "
                         f"{type(exc).__name__}"
                     )
                     continue
+                if incomplete:
+                    print(
+                        "  [gateway] idle session resource cleanup "
+                        f"incomplete: count={incomplete}"
+                    )
                 if removed:
                     print(
                         "  [gateway] idle sessions cleaned: "
@@ -2294,6 +2399,8 @@ class GatewayRunner:
         self,
         delivery: dict,
         event: MessageEvent | None,
+        *,
+        admission_locked: bool = False,
     ) -> None:
         """持久 Outbox 已提交后唤醒原 route；停机时交给下次启动恢复。"""
         if self._lifecycle_phase != "running":
@@ -2304,12 +2411,30 @@ class GatewayRunner:
                 str(delivery["route_key"]),
             )
             return
+        route_key = str(delivery["route_key"])
+        if admission_locked:
+            await self._wake_file_delivery_route_locked(
+                route_key,
+                event,
+            )
+            return
+        async with self._route_admission(route_key):
+            await self._wake_file_delivery_route_locked(route_key, event)
+
+    async def _wake_file_delivery_route_locked(
+        self,
+        route_key: str,
+        event: MessageEvent,
+    ) -> None:
+        """在 route admission 内取得当前 Context 并唤醒持久投递。"""
+
+        if self._lifecycle_phase != "running":
+            return
         ctx = await self.sessions.get_or_create_async(
-            delivery["route_key"],
+            route_key,
             self._build_gateway_prompt(event.source),
         )
-        async with self._route_admission(delivery["route_key"]):
-            await self._dispatch_next_locked(ctx)
+        await self._dispatch_next_locked(ctx)
 
     async def _fail_file_delivery_with_notification(
         self,
@@ -2327,20 +2452,59 @@ class GatewayRunner:
             )
             return bool(failed)
         failure_outbox, event = self._build_file_failure_outbox(delivery)
-        failed = await self.persistence.call(
-            fail_gateway_file_delivery,
-            delivery["id"],
-            error_code,
-            failure_outbox,
-            **self._runtime_fence_kwargs(),
-        )
-        if failed:
-            await self._wake_file_delivery_route(delivery, event)
-        return bool(failed)
+        if self._route_admission_closed:
+            return False
+        async with self._route_admission(str(delivery["route_key"])):
+            if self._lifecycle_phase != "running":
+                return False
+            failed = await self.persistence.call(
+                fail_gateway_file_delivery,
+                delivery["id"],
+                error_code,
+                failure_outbox,
+                **self._runtime_fence_kwargs(),
+            )
+            if failed:
+                await self._wake_file_delivery_route(
+                    delivery,
+                    event,
+                    admission_locked=True,
+                )
+            return bool(failed)
 
     async def _schedule_file_outbox(self, delivery: dict) -> None:
         """在 file_key 边界之后原子创建 Outbox，并唤醒既有 route 调度器。"""
         outbox, event = self._build_file_delivery_outbox(delivery)
+        if event is not None:
+            if self._route_admission_closed:
+                return
+            async with self._route_admission(str(delivery["route_key"])):
+                if self._lifecycle_phase != "running":
+                    return
+                await self._persist_file_outbox_and_wake(
+                    delivery,
+                    outbox,
+                    event,
+                    admission_locked=True,
+                )
+            return
+        await self._persist_file_outbox_and_wake(
+            delivery,
+            outbox,
+            event,
+            admission_locked=False,
+        )
+
+    async def _persist_file_outbox_and_wake(
+        self,
+        delivery: dict,
+        outbox: dict,
+        event: MessageEvent | None,
+        *,
+        admission_locked: bool,
+    ) -> None:
+        """持久化文件 Outbox，并在同一 route 屏障内唤醒对应会话。"""
+
         try:
             outbox_id = await self._durable_file_transition(
                 create_gateway_file_delivery_outbox,
@@ -2373,7 +2537,11 @@ class GatewayRunner:
             )
             return
 
-        await self._wake_file_delivery_route(delivery, event)
+        await self._wake_file_delivery_route(
+            delivery,
+            event,
+            admission_locked=admission_locked,
+        )
 
     async def _run_claimed_file_upload(
         self,
@@ -2667,6 +2835,7 @@ class GatewayRunner:
     async def _abort_startup_after_lease(self) -> None:
         """启动恢复失败时停止已创建资源并尽早交还租约。"""
         self._accepting_external_messages = False
+        self._route_admission_closed = True
         self._runtime_lease.revoke()
         await self._cancel_background_tasks()
         active_tasks = self.sessions.cancel_all(reason="shutdown")
@@ -2725,6 +2894,7 @@ class GatewayRunner:
         self._bind_cron_observation_bridge()
         self._startup_in_progress = True
         self._accepting_external_messages = False
+        self._route_admission_closed = False
         self._inbox_restored_adapters.clear()
         self._receiving_adapters.clear()
         self._startup_message_states.clear()
@@ -2762,9 +2932,12 @@ class GatewayRunner:
                 **fence,
             )
             if records:
-                await self.persistence.call(
-                    self._recover_gateway_tool_executions,
-                    records,
+                await self._await_operation_completion(
+                    self.persistence.call(
+                        self._recover_gateway_tool_executions,
+                        records,
+                    ),
+                    task_name="gateway-tool-execution-recovery",
                 )
             await self._require_startup_runtime_lease()
         except Exception:
@@ -2782,10 +2955,11 @@ class GatewayRunner:
             )
             for item in interrupted:
                 await self._require_startup_runtime_lease()
-                await asyncio.to_thread(
+                await self._await_blocking_operation(
                     CronExecutor(
                         self.db_path,
                         hook_registry=self._cron_observation_bridge,
+                        process_manager=self._process_manager,
                         **self._cron_runtime_fence(),
                     ).execute,
                     CronJob.from_record(item["job"]),
@@ -2917,6 +3091,7 @@ class GatewayRunner:
                 return
             self._lifecycle_phase = "stopping"
             self._accepting_external_messages = False
+            self._route_admission_closed = True
             self._runtime_lease.revoke()
             self._cron_scheduler.revoke()
 
@@ -2933,7 +3108,11 @@ class GatewayRunner:
                     self._receiving_adapters.discard(name)
             self._receiving_adapters.clear()
 
-            # 入站关闭后再停止 heartbeat / housekeeping 和 route worker。
+            # 入站关闭后先等待已经进入 admission 的请求完成 worker 登记，
+            # 再统一取消，避免 global cleanup 漏过迟到的工具调用。
+            await self._drain_route_admissions()
+
+            # admission 收口后再停止 heartbeat / housekeeping 和 route worker。
             await self._cron_scheduler.stop()
             await self._cancel_background_tasks()
             try:
@@ -2950,6 +3129,48 @@ class GatewayRunner:
             active_tasks = self.sessions.cancel_all(reason="shutdown")
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
+
+            from hermes.delegate_jobs import shutdown_delegate_jobs
+
+            delegate_lifecycle_complete = False
+            try:
+                unfinished_delegate_jobs = (
+                    await self._await_blocking_operation(
+                        shutdown_delegate_jobs,
+                    )
+                )
+            except Exception as error:
+                print(
+                    "  [gateway] delegate shutdown incomplete: "
+                    f"exception={type(error).__name__}"
+                )
+            else:
+                delegate_lifecycle_complete = (
+                    not unfinished_delegate_jobs
+                )
+                if unfinished_delegate_jobs:
+                    print(
+                        "  [gateway] delegate shutdown incomplete: "
+                        f"active_jobs={len(unfinished_delegate_jobs)}"
+                    )
+
+            resource_cleanup = await self._cleanup_all_session_resources(
+                lifecycle_barrier_complete=delegate_lifecycle_complete,
+            )
+            if not resource_cleanup.complete:
+                process_cleanup = resource_cleanup.process_cleanup
+                unresolved_count = (
+                    0
+                    if process_cleanup is None
+                    else len(
+                        process_cleanup.unresolved_process_ids
+                    )
+                )
+                print(
+                    "  [gateway] global resource cleanup incomplete: "
+                    f"unresolved_processes={unresolved_count}"
+                )
+
             for adapter in self.adapters.values():
                 try:
                     await adapter.disconnect()
@@ -2979,8 +3200,6 @@ class GatewayRunner:
                     )
                 finally:
                     self._async_client = None
-            from hermes.session_resources import cleanup_all_session_resources
-            cleanup_all_session_resources()
             self._receiving_adapters.clear()
             self._inbox_restored_adapters.clear()
             self._startup_in_progress = False
@@ -4578,6 +4797,12 @@ class GatewayRunner:
     @asynccontextmanager
     async def _route_admission(self, route_key: str):
         """登记并持有 route 的短临界区，退出后回收空闲锁。"""
+
+        if self._route_admission_closed:
+            raise RuntimeError(
+                f"gateway route admission is closed during "
+                f"{self._lifecycle_phase}"
+            )
         lock = self._route_admission_locks.setdefault(
             route_key,
             asyncio.Lock(),
@@ -4596,6 +4821,17 @@ class GatewayRunner:
                     self._route_admission_locks.pop(route_key, None)
             else:
                 self._route_admission_users[route_key] = users
+
+    async def _drain_route_admissions(self) -> None:
+        """关闭新 admission，并等待已登记临界区全部退出。"""
+
+        self._route_admission_closed = True
+        locks = tuple(self._route_admission_locks.values())
+        for lock in locks:
+            async with lock:
+                pass
+        # 让刚退出临界区的 finally 完成 users/lock 回收。
+        await asyncio.sleep(0)
 
     async def _pending_approval_for_context(self, route_key: str, ctx):
         """读取当前 route/conversation 的未决请求。"""
@@ -5139,30 +5375,54 @@ class GatewayRunner:
                             )
                         else:
                             try:
-                                result = await self.persistence.call(
-                                    delete_gateway_conversation_for_route,
-                                    route_key,
-                                    conversation_id,
+                                cleanup_report = (
+                                    await self._cleanup_session_resources(
+                                        conversation_id,
+                                    )
                                 )
                             except Exception:
-                                content = "删除失败：暂时无法删除该会话，请稍后重试。"
+                                cleanup_report = None
+                            if (
+                                cleanup_report is None
+                                or not cleanup_report.complete
+                            ):
+                                content = (
+                                    "删除失败：该会话资源未能完成清理，"
+                                    "请稍后重试。"
+                                )
                             else:
-                                outcome = result.get("outcome")
-                                if outcome == "deleted":
-                                    self.sessions.clear_conversation_list_mapping(ctx)
-                                    content = "\n".join([
-                                        "会话 "
-                                        f"{self._short_conversation_id(conversation_id)} "
-                                        "已删除。",
-                                        "请重新使用 /sessions <页码> 刷新会话列表。",
-                                    ])
-                                elif outcome == "current":
+                                try:
+                                    result = await self.persistence.call(
+                                        delete_gateway_conversation_for_route,
+                                        route_key,
+                                        conversation_id,
+                                    )
+                                except Exception:
                                     content = (
-                                        "不能删除当前正在使用的会话，请先使用 /new 或 "
-                                        "/resume <序号> 切换到其他会话。"
+                                        "删除失败：暂时无法删除该会话，"
+                                        "请稍后重试。"
                                     )
                                 else:
-                                    content = "删除失败：该会话不存在或无权访问。"
+                                    outcome = result.get("outcome")
+                                    if outcome == "deleted":
+                                        self.sessions.clear_conversation_list_mapping(
+                                            ctx
+                                        )
+                                        content = "\n".join([
+                                            "会话 "
+                                            f"{self._short_conversation_id(conversation_id)} "
+                                            "已删除。",
+                                            "请重新使用 /sessions <页码> 刷新会话列表。",
+                                        ])
+                                    elif outcome == "current":
+                                        content = (
+                                            "不能删除当前正在使用的会话，请先使用 /new 或 "
+                                            "/resume <序号> 切换到其他会话。"
+                                        )
+                                    else:
+                                        content = (
+                                            "删除失败：该会话不存在或无权访问。"
+                                        )
 
             if event.source.platform not in self.adapters:
                 await self._reply(event, content)
@@ -5259,13 +5519,39 @@ class GatewayRunner:
                 and not await self._persist_event_async(route_key, event)
             ):
                 return
+
+            try:
+                cleanup_report = await self._cleanup_session_resources(
+                    previous_conversation_id,
+                )
+            except Exception:
+                cleanup_report = None
+            if cleanup_report is None or not cleanup_report.complete:
+                cleanup_error = (
+                    "无法创建新会话：旧会话资源未能完成清理，请稍后重试。"
+                )
+                if event.source.platform not in self.adapters:
+                    result = await self._reply(event, cleanup_error)
+                    if result is None or result.success:
+                        await self._complete_event_async(route_key, event)
+                    else:
+                        await self._mark_delivery_failed_without_outbox_async(
+                            route_key,
+                            event,
+                        )
+                    await self._dispatch_next(ctx, admission_locked=True)
+                    return
+                await self._start_durable_reply_async(
+                    route_key,
+                    event,
+                    cleanup_error,
+                    "new_conversation_cleanup_failed",
+                    ctx,
+                )
+                return
+
             ctx = await self.sessions.new_conversation_async(
                 route_key, self._build_gateway_prompt(event.source),
-            )
-            from hermes.session_resources import cleanup_session_resources
-            await asyncio.to_thread(
-                cleanup_session_resources,
-                previous_conversation_id,
             )
             if event.source.platform not in self.adapters:
                 # 保留无 Adapter 的测试 / 嵌入式调用兼容路径。真实平台事件
@@ -6028,37 +6314,30 @@ class GatewayRunner:
             return
 
         route_key = ctx.route_key
+        if self._route_admission_closed:
+            return
         # 当前 admission 调用可能在同一个事件循环回调中紧接着
         # 提交多条消息。后台收尾者等到已注册的 admission
         # 全部退出，并再让出一次调度；这样同一回调紧接着
         # 发起的下一条消息可以先注册，不会被接力者插队。
         await self._wait_for_route_admissions(route_key)
-        lock = self._route_admission_locks.setdefault(
-            route_key,
-            asyncio.Lock(),
-        )
-        self._route_admission_users[route_key] = (
-            self._route_admission_users.get(route_key, 0) + 1
-        )
-        try:
-            async with lock:
-                await self._dispatch_next_locked(ctx)
-        finally:
-            users = self._route_admission_users.get(route_key, 1) - 1
-            if users <= 0:
-                self._route_admission_users.pop(route_key, None)
-                if self._route_admission_locks.get(route_key) is lock:
-                    self._route_admission_locks.pop(route_key, None)
-            else:
-                self._route_admission_users[route_key] = users
+        if self._route_admission_closed:
+            return
+        async with self._route_admission(route_key):
+            await self._dispatch_next_locked(ctx)
 
     async def _wait_for_route_admissions(self, route_key: str) -> None:
         """等待当前入站批次稳定退出 route 临界区。"""
         while True:
             while self._route_admission_users.get(route_key, 0) > 0:
+                if self._route_admission_closed:
+                    return
                 await asyncio.sleep(0)
             await asyncio.sleep(0)
-            if self._route_admission_users.get(route_key, 0) == 0:
+            if (
+                self._route_admission_closed
+                or self._route_admission_users.get(route_key, 0) == 0
+            ):
                 return
 
     async def _dispatch_next_locked(self, ctx) -> None:
@@ -6170,7 +6449,7 @@ class GatewayRunner:
             )
             # 审批恢复会执行同步工具；放到工作线程中等待，不能占住 Gateway
             # 事件循环，否则 runtime lease 的心跳无法按时续约。
-            output = await asyncio.to_thread(
+            output = await self._await_blocking_operation(
                 dispatcher.dispatch,
                 approval_grant.tool_name,
                 approval_grant.arguments,

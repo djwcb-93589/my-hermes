@@ -15,6 +15,7 @@ from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
 from hermes.hooks import AsyncHookRegistry
 from hermes.plugins import AsyncPluginRuntime
+from hermes.processes import process_manager
 from hermes.tools import register_all
 
 
@@ -23,7 +24,7 @@ async def run_gateway():
     print(f"=== Hermes Gateway ===")
     print(f"Model: {MODEL}")
 
-    register_all()
+    register_all(process_manager=process_manager)
     hook_registry = AsyncHookRegistry()
     plugin_runtime = AsyncPluginRuntime(
         hook_registry,
@@ -39,7 +40,11 @@ async def run_gateway():
     )
     runtime_state = {"runner": None}
     try:
-        await _run_gateway_impl(hook_registry, runtime_state)
+        await _run_gateway_impl(
+            hook_registry,
+            runtime_state,
+            process_manager,
+        )
     finally:
         try:
             runner = runtime_state["runner"]
@@ -50,7 +55,11 @@ async def run_gateway():
             print("  [gateway] stopped")
 
 
-async def _run_gateway_impl(hook_registry, runtime_state) -> None:
+async def _run_gateway_impl(
+    hook_registry,
+    runtime_state,
+    active_process_manager=None,
+) -> None:
     """构造 Adapter 并运行 Gateway；资源释放统一由外层负责。"""
     # Runner 会按平台配置把同一工具集同时用于 prompt、API schema 和
     # dispatch 白名单；全局 registry 本身不作为安全边界。
@@ -60,6 +69,7 @@ async def _run_gateway_impl(hook_registry, runtime_state) -> None:
         config=_config,
         db_path=DB_PATH,
         hook_registry=hook_registry,
+        process_manager=active_process_manager,
     )
     runtime_state["runner"] = runner
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from hermes.backends import cleanup_backend, get_backend
+from hermes.backends import get_backend
 from hermes.config import (
     COMPRESSION_THRESHOLD,
     DB_PATH,
@@ -41,6 +41,7 @@ from hermes.db import (
 )
 from hermes.path_utils import git_bash_to_windows_path
 from hermes.prompt import build_system_prompt
+from hermes.session_resources import cleanup_session_resources
 from hermes.durable_tool_dispatcher import (
     DurableToolDispatcher,
     DurableToolExecutionContext,
@@ -226,6 +227,7 @@ class CronExecutor:
         *,
         cancel_checker: Callable[[], bool] | None = None,
         hook_registry: SyncHookRegistry | None = None,
+        process_manager=None,
         lease_name: str | None = None,
         instance_id: str | None = None,
         lease_epoch: int | None = None,
@@ -238,6 +240,14 @@ class CronExecutor:
         self._db_path = db_path or DB_PATH
         self._external_cancel_checker = cancel_checker
         self._hook_registry = hook_registry
+        active_process_manager = process_manager
+        if active_process_manager is None:
+            from hermes.processes import (
+                process_manager as default_process_manager,
+            )
+
+            active_process_manager = default_process_manager
+        self._process_manager = active_process_manager
         fence_values = (lease_name, instance_id, lease_epoch)
         if any(value is not None for value in fence_values):
             if any(value is None for value in fence_values):
@@ -382,7 +392,7 @@ class CronExecutor:
                     0, (), (), "invalid_execution_context", summary,
                 )
 
-            register_all()
+            register_all(process_manager=self._process_manager)
             policy = ToolPolicy(
                 ExecutionEnvironment.CRON,
                 enabled_toolsets=(
@@ -590,6 +600,11 @@ class CronExecutor:
                 retryable=bool(loop_result.retryable and status == "failed"),
             )
         finally:
-            if backend_created:
-                cleanup_backend(session_id)
-            conn.close()
+            try:
+                if backend_created:
+                    cleanup_session_resources(
+                        session_id,
+                        process_manager=self._process_manager,
+                    )
+            finally:
+                conn.close()
