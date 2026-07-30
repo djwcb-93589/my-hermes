@@ -584,14 +584,15 @@ def register_all(target_registry: ToolRegistry | None = None) -> None:
     _memory(staging_registry)
     try:
         from hermes.tools.skill import register as _skill
+
+        skill_registry = ToolRegistry()
+        _skill(skill_registry)
+        staging_registry.merge_from(skill_registry)
     except Exception as exc:
         logger.warning(
             "Skill tools unavailable; Skill capability was skipped: %s",
             type(exc).__name__,
-            exc_info=True,
         )
-    else:
-        _skill(staging_registry)
     _delegate(staging_registry)
     _gateway_send_file(staging_registry)
     _media(staging_registry)
