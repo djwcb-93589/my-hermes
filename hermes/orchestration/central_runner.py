@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -38,6 +39,8 @@ from hermes.orchestration.workflow_execution import (
     WorkflowTaskExecutionPoolFactory,
 )
 
+
+logger = logging.getLogger(__name__)
 
 _MAX_RUNNER_ID_LENGTH = 256
 _MAX_WORKFLOW_ID_LENGTH = 128
@@ -312,24 +315,32 @@ class CentralWorkflowRunner:
             )
         except Exception as exc:
             raise WorkflowRunnerError(
-                "workflow task execution pool could not be created"
+                "workflow task execution pool could not be created",
+                error_type="workflow_pool_creation_failed",
+                persistence_unknown=False,
             ) from exc
-        if (
-            not callable(getattr(pool, "submit", None))
-            or not callable(getattr(pool, "close", None))
-        ):
-            close = getattr(pool, "close", None)
-            if callable(close):
-                try:
-                    close(wait=True)
-                except Exception:
-                    pass
+        try:
+            pool_is_valid = callable(
+                getattr(pool, "submit", None)
+            ) and callable(getattr(pool, "close", None))
+        except Exception as exc:
             raise WorkflowRunnerError(
-                "pool_factory returned an invalid execution pool"
+                "pool_factory returned an invalid execution pool",
+                error_type="workflow_pool_invalid",
+                persistence_unknown=False,
+            ) from exc
+        if not pool_is_valid:
+            raise WorkflowRunnerError(
+                "pool_factory returned an invalid execution pool",
+                error_type="workflow_pool_invalid",
+                persistence_unknown=False,
             )
 
+        stable_result: WorkflowExecutionResult | None = None
+        primary_error: BaseException | None = None
+        close_error: BaseException | None = None
         try:
-            return self._run_with_pool(
+            stable_result = self._run_with_pool(
                 workflow_id=normalized_workflow_id,
                 pool=pool,
                 cancel_checker=cancel_checker,
@@ -337,13 +348,40 @@ class CentralWorkflowRunner:
                 parent_run_id=parent_run_id,
                 tool_context=tool_context,
             )
+        except BaseException as exc:
+            primary_error = exc
         finally:
             try:
                 pool.close(wait=True)
-            except Exception as exc:
-                raise WorkflowRunnerError(
-                    "workflow task execution pool could not be closed"
-                ) from exc
+            except BaseException as exc:
+                close_error = exc
+
+        if close_error is not None:
+            # Pool 生命周期故障只作为附加诊断，不覆盖主结果或主异常。
+            try:
+                logger.error(
+                    "workflow execution pool close failed: "
+                    "workflow_id=%s exception_type=%s",
+                    normalized_workflow_id,
+                    type(close_error).__name__,
+                )
+            except BaseException:
+                pass
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_error.__traceback__)
+        if stable_result is not None:
+            return stable_result
+        if close_error is not None:
+            raise WorkflowRunnerError(
+                "workflow task execution pool could not be closed",
+                error_type="workflow_pool_close_failed",
+                persistence_unknown=True,
+            ) from close_error
+        raise WorkflowRunnerError(
+            "workflow runner finished without an execution result",
+            error_type="workflow_runner_invariant_failed",
+            persistence_unknown=True,
+        )
 
     def _run_with_pool(
         self,

@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 
+from hermes.hooks import SyncControlBridge
 from hermes.orchestration.application import (
     OrchestrationApplication,
     OrchestrationRunReport,
@@ -18,6 +19,7 @@ from hermes.orchestration.composition import (
 from hermes.orchestration.errors import (
     OrchestrationError,
     OrchestrationPersistenceError,
+    OrchestrationRunCreatedError,
     OrchestrationValidationError,
     WorkflowRunnerError,
 )
@@ -350,14 +352,18 @@ def _error_payload(
     status: str,
     error_type: str,
     error: str,
+    workflow_id: str | None = None,
+    workflow_status: str | None = None,
+    snapshot_fresh: bool = False,
+    result_task_key: str | None = None,
 ) -> dict[str, object]:
     return {
         "ok": False,
         "status": status,
-        "workflow_id": None,
-        "workflow_status": None,
-        "snapshot_fresh": False,
-        "result_task_key": None,
+        "workflow_id": workflow_id,
+        "workflow_status": workflow_status,
+        "snapshot_fresh": snapshot_fresh,
+        "result_task_key": result_task_key,
         "result_summary": None,
         "result_metadata": None,
         "scheduled_task_ids": [],
@@ -365,6 +371,29 @@ def _error_payload(
         "error_type": error_type,
         "error": error,
     }
+
+
+def _close_owned_bridge(
+    bridge: SyncControlBridge | None,
+    *,
+    workflow_id: str | None,
+) -> None:
+    """只关闭同步工具调用明确拥有的控制桥，且不改变业务结果。"""
+
+    if bridge is None:
+        return
+    try:
+        bridge.close()
+    except BaseException as exc:
+        try:
+            logger.error(
+                "orchestration_run control bridge close failed: "
+                "workflow_id=%s exception_type=%s",
+                workflow_id,
+                type(exc).__name__,
+            )
+        except BaseException:
+            pass
 
 
 def _json_dumps(payload: dict[str, object]) -> str:
@@ -402,6 +431,14 @@ def handle_orchestration_run(
 ) -> str:
     """解析公开参数并同步调用应用，不直接接触 Store、Runner 或 Claim。"""
 
+    runtime_hook_registry = runtime_kwargs.get("hook_registry")
+    bridge_to_close = (
+        runtime_hook_registry
+        if isinstance(runtime_hook_registry, SyncControlBridge)
+        else None
+    )
+    workflow_id_for_lifecycle: str | None = None
+    result_task_key_for_lifecycle: str | None = None
     try:
         request = _parse_request(
             args,
@@ -419,7 +456,23 @@ def handle_orchestration_run(
             raise WorkflowRunnerError(
                 "orchestration application returned an invalid report"
             )
+        workflow_id_for_lifecycle = report.workflow_id
+        result_task_key_for_lifecycle = report.result_task_key
         return _json_dumps(_report_payload(report))
+    except OrchestrationRunCreatedError as exc:
+        workflow_id_for_lifecycle = exc.workflow_id
+        result_task_key_for_lifecycle = exc.result_task_key
+        return _json_dumps(_error_payload(
+            status=(
+                "persistence_unknown"
+                if exc.persistence_unknown
+                else "internal_error"
+            ),
+            workflow_id=exc.workflow_id,
+            result_task_key=exc.result_task_key,
+            error_type=exc.error_type,
+            error=exc.safe_message,
+        ))
     except OrchestrationValidationError as exc:
         return _json_dumps(_error_payload(
             status="invalid_args",
@@ -449,11 +502,27 @@ def handle_orchestration_run(
             "orchestration_run failed: exception_type=%s",
             type(exc).__name__,
         )
+        if workflow_id_for_lifecycle is not None:
+            return _json_dumps(_error_payload(
+                status="internal_error",
+                workflow_id=workflow_id_for_lifecycle,
+                result_task_key=result_task_key_for_lifecycle,
+                error_type="orchestration_report_failed",
+                error=(
+                    "workflow was created but its report could not be "
+                    "serialized"
+                ),
+            ))
         return _json_dumps(_error_payload(
             status="internal_error",
             error_type="internal_error",
             error="orchestration execution failed",
         ))
+    finally:
+        _close_owned_bridge(
+            bridge_to_close,
+            workflow_id=workflow_id_for_lifecycle,
+        )
 
 
 def register(

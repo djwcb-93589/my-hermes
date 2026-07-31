@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from hermes.orchestration.errors import (
+    OrchestrationPersistenceError,
+    OrchestrationRunCreatedError,
     OrchestrationValidationError,
     WorkflowRunnerError,
 )
@@ -289,33 +291,116 @@ class OrchestrationApplication:
 
         result_task_key = self._resolve_result_task_key(request)
         workflow = self._service.create_workflow(request.workflow)
-        runner = self._runner_factory.create(
-            max_concurrency=request.max_concurrency
-        )
-        if not callable(getattr(runner, "run", None)):
-            raise WorkflowRunnerError(
-                "runner_factory returned an invalid workflow runner"
+        workflow_id = workflow.workflow_id
+        try:
+            runner = self._runner_factory.create(
+                max_concurrency=request.max_concurrency
             )
-        result = runner.run(
-            workflow.workflow_id,
-            cancel_checker=cancel_checker,
-            hook_registry=hook_registry,
-            parent_run_id=parent_run_id,
-            tool_context=(
-                None if tool_context is None else dict(tool_context)
-            ),
-        )
+            if not callable(getattr(runner, "run", None)):
+                raise WorkflowRunnerError(
+                    "runner_factory returned an invalid workflow runner",
+                    persistence_unknown=False,
+                )
+        except Exception as exc:
+            raise OrchestrationRunCreatedError(
+                workflow_id=workflow_id,
+                result_task_key=result_task_key,
+                error_type="orchestration_runner_creation_failed",
+                safe_message=(
+                    "workflow was created but its runner could not be created"
+                ),
+                persistence_unknown=False,
+            ) from exc
+
+        try:
+            result = runner.run(
+                workflow_id,
+                cancel_checker=cancel_checker,
+                hook_registry=hook_registry,
+                parent_run_id=parent_run_id,
+                tool_context=(
+                    None if tool_context is None else dict(tool_context)
+                ),
+            )
+        except OrchestrationPersistenceError as exc:
+            raise OrchestrationRunCreatedError(
+                workflow_id=workflow_id,
+                result_task_key=result_task_key,
+                error_type="orchestration_persistence_unknown",
+                safe_message=(
+                    "workflow was created but its persistence outcome is "
+                    "unknown"
+                ),
+                persistence_unknown=True,
+            ) from exc
+        except WorkflowRunnerError as exc:
+            if exc.error_type == "workflow_pool_close_failed":
+                error_type = "orchestration_pool_close_failed"
+                safe_message = (
+                    "workflow was created but its execution pool lifecycle "
+                    "could not be confirmed"
+                )
+            else:
+                error_type = "orchestration_runner_failed"
+                safe_message = (
+                    "workflow was created but its runner did not produce a "
+                    "stable result"
+                )
+            raise OrchestrationRunCreatedError(
+                workflow_id=workflow_id,
+                result_task_key=result_task_key,
+                error_type=error_type,
+                safe_message=safe_message,
+                persistence_unknown=exc.persistence_unknown,
+            ) from exc
+        except Exception as exc:
+            raise OrchestrationRunCreatedError(
+                workflow_id=workflow_id,
+                result_task_key=result_task_key,
+                error_type="orchestration_runner_failed",
+                safe_message=(
+                    "workflow was created but its runner did not produce a "
+                    "stable result"
+                ),
+                persistence_unknown=True,
+            ) from exc
+
         if (
             not isinstance(result, WorkflowExecutionResult)
-            or result.workflow_id != workflow.workflow_id
+            or result.workflow_id != workflow_id
         ):
-            raise WorkflowRunnerError(
+            cause = WorkflowRunnerError(
                 "workflow runner returned an invalid execution result"
             )
-        return self._build_report(
-            result,
-            result_task_key=result_task_key,
-        )
+            raise OrchestrationRunCreatedError(
+                workflow_id=workflow_id,
+                result_task_key=result_task_key,
+                error_type="orchestration_runner_result_invalid",
+                safe_message=(
+                    "workflow was created but its runner returned an invalid "
+                    "result"
+                ),
+                persistence_unknown=True,
+            ) from cause
+        try:
+            return self._build_report(
+                result,
+                result_task_key=result_task_key,
+            )
+        except Exception as exc:
+            raise OrchestrationRunCreatedError(
+                workflow_id=workflow_id,
+                result_task_key=result_task_key,
+                error_type="orchestration_report_failed",
+                safe_message=(
+                    "workflow was created but its report could not be "
+                    "constructed"
+                ),
+                persistence_unknown=(
+                    result.kind
+                    is WorkflowExecutionKind.PERSISTENCE_UNKNOWN
+                ),
+            ) from exc
 
     @staticmethod
     def _resolve_result_task_key(
