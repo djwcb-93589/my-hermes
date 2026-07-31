@@ -652,7 +652,7 @@ def register_all(
             type(exc).__name__,
         )
     if process_manager is None:
-        _delegate(staging_registry)
+        _delegate(staging_registry, process_manager=active_process_manager)
     else:
         _delegate(
             staging_registry,
