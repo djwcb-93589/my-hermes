@@ -333,6 +333,19 @@ class OrchestrationService:
             offset=offset,
         )
 
+    def list_task_dependencies(
+        self,
+        *,
+        task_id: str,
+    ) -> tuple[TaskRecord, ...]:
+        return self._store.list_task_dependencies(
+            task_id=_require_string(
+                task_id,
+                "task_id",
+                max_length=_MAX_KEY_LENGTH,
+            )
+        )
+
     def claim_ready_tasks(
         self,
         *,
@@ -497,6 +510,31 @@ class OrchestrationService:
                 blocked_reason,
                 "blocked_reason",
                 max_length=_MAX_BLOCKED_REASON_LENGTH,
+            ),
+        )
+
+    def release_task_claim(
+        self,
+        *,
+        task_id: str,
+        claim_token: str,
+        reason: str,
+    ) -> TaskRecord:
+        return self._store.release_task_claim(
+            task_id=_require_string(
+                task_id,
+                "task_id",
+                max_length=_MAX_KEY_LENGTH,
+            ),
+            claim_token=_require_string(
+                claim_token,
+                "claim_token",
+                max_length=256,
+            ),
+            reason=_require_string(
+                reason,
+                "reason",
+                max_length=_MAX_ERROR_MESSAGE_LENGTH,
             ),
         )
 

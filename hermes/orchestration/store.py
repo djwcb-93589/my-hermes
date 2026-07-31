@@ -44,6 +44,13 @@ class OrchestrationStore(Protocol):
     ) -> tuple[TaskRunRecord, ...]:
         """按最新 attempt 优先稳定列出 Run。"""
 
+    def list_task_dependencies(
+        self,
+        *,
+        task_id: str,
+    ) -> tuple[TaskRecord, ...]:
+        """按 task_key、task_id 稳定列出当前 Task 的直接依赖。"""
+
     def claim_ready_tasks(
         self,
         *,
@@ -100,6 +107,15 @@ class OrchestrationStore(Protocol):
         blocked_reason: str,
     ) -> TaskRecord:
         """原子结束当前 Run，并把 Task 置为 blocked。"""
+
+    def release_task_claim(
+        self,
+        *,
+        task_id: str,
+        claim_token: str,
+        reason: str,
+    ) -> TaskRecord:
+        """主动释放有效 Claim，使 Task 不消耗预算地回到 ready。"""
 
     def unblock_task(self, *, task_id: str) -> TaskRecord:
         """根据当前依赖状态把 blocked Task 恢复为 ready 或 todo。"""

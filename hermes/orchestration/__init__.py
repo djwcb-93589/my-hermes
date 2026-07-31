@@ -8,7 +8,20 @@ from hermes.orchestration.errors import (
     OrchestrationPersistenceError,
     OrchestrationValidationError,
     TaskClaimLostError,
+    TaskContextError,
+    TaskExecutionError,
+    TaskSessionPreparationError,
+    TaskToolResolutionError,
+    UnknownAgentRoleError,
     WorkflowCycleError,
+)
+from hermes.orchestration.execution import (
+    ClaimedTaskExecutor,
+    ResolvedAgentTools,
+    TaskExecutionOutcome,
+    TaskExecutionOutcomeKind,
+    TaskSessionPreparer,
+    TaskToolResolver,
 )
 from hermes.orchestration.models import (
     TaskClaim,
@@ -22,10 +35,17 @@ from hermes.orchestration.models import (
     WorkflowStatus,
 )
 from hermes.orchestration.service import OrchestrationService
+from hermes.orchestration.roles import (
+    AgentRoleSpec,
+    RoleResolver,
+    StaticRoleRegistry,
+)
 from hermes.orchestration.store import OrchestrationStore
 
 
 __all__ = [
+    "AgentRoleSpec",
+    "ClaimedTaskExecutor",
     "InvalidTaskTransitionError",
     "OrchestrationConflictError",
     "OrchestrationError",
@@ -34,13 +54,25 @@ __all__ = [
     "OrchestrationService",
     "OrchestrationStore",
     "OrchestrationValidationError",
+    "ResolvedAgentTools",
+    "RoleResolver",
+    "StaticRoleRegistry",
     "TaskClaim",
     "TaskClaimLostError",
+    "TaskContextError",
     "TaskCreateSpec",
+    "TaskExecutionError",
+    "TaskExecutionOutcome",
+    "TaskExecutionOutcomeKind",
     "TaskRecord",
     "TaskRunRecord",
     "TaskRunStatus",
+    "TaskSessionPreparer",
+    "TaskSessionPreparationError",
     "TaskStatus",
+    "TaskToolResolutionError",
+    "TaskToolResolver",
+    "UnknownAgentRoleError",
     "WorkflowCreateSpec",
     "WorkflowCycleError",
     "WorkflowRecord",

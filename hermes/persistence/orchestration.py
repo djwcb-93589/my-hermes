@@ -50,6 +50,10 @@ _TASK_COLUMNS = (
     "result_metadata_json, error_type, error_message, blocked_reason, "
     "created_at, ready_at, started_at, finished_at, updated_at"
 )
+_DEPENDENCY_TASK_COLUMNS = ", ".join(
+    f"parent.{column.strip()}"
+    for column in _TASK_COLUMNS.split(",")
+)
 _RUN_COLUMNS = (
     "run_id, workflow_id, task_id, attempt_number, worker_id, claim_token, "
     "status, session_key, claimed_at, started_at, heartbeat_at, finished_at, "
@@ -1082,6 +1086,46 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                 ).fetchall()
                 return tuple(_run_from_row(row) for row in rows)
 
+    def list_task_dependencies(
+        self,
+        *,
+        task_id: str,
+    ) -> tuple[TaskRecord, ...]:
+        normalized = _argument_text(task_id, "task_id", max_length=128)
+        with _database_operation("task dependency listing"):
+            with readonly_connection(self._db_path) as conn:
+                task = _require_task(conn, normalized)
+                rows = conn.execute(
+                    "SELECT dependency.workflow_id, "
+                    f"{_DEPENDENCY_TASK_COLUMNS} "
+                    "FROM orchestration_task_dependencies AS dependency "
+                    "LEFT JOIN orchestration_tasks AS parent "
+                    "ON parent.task_id=dependency.depends_on_task_id "
+                    "WHERE dependency.task_id=? "
+                    "ORDER BY parent.task_key, parent.task_id",
+                    (normalized,),
+                ).fetchall()
+                dependencies: list[TaskRecord] = []
+                for row in rows:
+                    if not isinstance(row, tuple) or len(row) != 26:
+                        raise OrchestrationPersistenceError(
+                            "stored task dependency row is invalid"
+                        )
+                    dependency_workflow_id = _stored_text(
+                        row[0],
+                        "dependency workflow_id",
+                    )
+                    dependency = _task_from_row(tuple(row[1:]))
+                    if (
+                        dependency_workflow_id != task.workflow_id
+                        or dependency.workflow_id != task.workflow_id
+                    ):
+                        raise OrchestrationPersistenceError(
+                            "stored task dependency crosses workflows"
+                        )
+                    dependencies.append(dependency)
+                return tuple(dependencies)
+
     def claim_ready_tasks(
         self,
         *,
@@ -1748,6 +1792,115 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                     if run_cursor.rowcount != 1 or task_cursor.rowcount != 1:
                         raise TaskClaimLostError(
                             "task claim was lost while blocking"
+                        )
+                    result = _require_task(conn, normalized_task_id)
+        return result
+
+    def release_task_claim(
+        self,
+        *,
+        task_id: str,
+        claim_token: str,
+        reason: str,
+    ) -> TaskRecord:
+        normalized_task_id = _argument_text(
+            task_id,
+            "task_id",
+            max_length=128,
+        )
+        token = _argument_text(
+            claim_token,
+            "claim_token",
+            max_length=256,
+        )
+        normalized_reason = _argument_text(
+            reason,
+            "reason",
+            max_length=4_000,
+        )
+        with _database_operation("task claim release"):
+            with existing_write_connection(self._db_path) as conn:
+                with _immediate_transaction(conn):
+                    now = self._now()
+                    _task, run, workflow = _require_live_claim(
+                        conn,
+                        normalized_task_id,
+                        token,
+                        now,
+                    )
+                    if workflow.status is not WorkflowStatus.ACTIVE:
+                        raise TaskClaimLostError(
+                            "task claim workflow no longer allows release"
+                        )
+                    run_cursor = conn.execute(
+                        """
+                        UPDATE orchestration_task_runs
+                        SET status=?, finished_at=?, error_type=?,
+                            error_message=?
+                        WHERE run_id=? AND claim_token=?
+                          AND status IN (?, ?)
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_tasks AS current_task
+                              JOIN orchestration_workflows AS current_workflow
+                                ON current_workflow.workflow_id=
+                                   current_task.workflow_id
+                              WHERE current_task.task_id=?
+                                AND current_task.status=?
+                                AND current_task.claim_token=?
+                                AND current_task.claim_expires_at>?
+                                AND current_task.attempt_count
+                                    < current_task.max_attempts
+                                AND current_workflow.status=?
+                          )
+                        """,
+                        (
+                            TaskRunStatus.CANCELLED.value,
+                            now,
+                            "claim_released",
+                            normalized_reason,
+                            run.run_id,
+                            token,
+                            *_ACTIVE_RUN_STATUSES,
+                            normalized_task_id,
+                            TaskStatus.RUNNING.value,
+                            token,
+                            now,
+                            WorkflowStatus.ACTIVE.value,
+                        ),
+                    )
+                    task_cursor = conn.execute(
+                        """
+                        UPDATE orchestration_tasks
+                        SET status=?, ready_at=?, claim_owner=NULL,
+                            claim_token=NULL, claim_expires_at=NULL,
+                            blocked_reason=NULL, error_type=NULL,
+                            error_message=NULL, finished_at=NULL, updated_at=?
+                        WHERE task_id=? AND status=? AND claim_token=?
+                          AND claim_expires_at>?
+                          AND attempt_count < max_attempts
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_workflows AS current_workflow
+                              WHERE current_workflow.workflow_id=
+                                    orchestration_tasks.workflow_id
+                                AND current_workflow.status=?
+                          )
+                        """,
+                        (
+                            TaskStatus.READY.value,
+                            now,
+                            now,
+                            normalized_task_id,
+                            TaskStatus.RUNNING.value,
+                            token,
+                            now,
+                            WorkflowStatus.ACTIVE.value,
+                        ),
+                    )
+                    if run_cursor.rowcount != 1 or task_cursor.rowcount != 1:
+                        raise TaskClaimLostError(
+                            "task claim was lost while being released"
                         )
                     result = _require_task(conn, normalized_task_id)
         return result
