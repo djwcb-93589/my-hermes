@@ -6,13 +6,11 @@ from hermes.subagents.contracts import (
 )
 from hermes.subagents.runtime import (
     IsolatedAgentExecutor,
-    IsolatedAgentLoop,
 )
 
 
 __all__ = [
     "IsolatedAgentExecutor",
-    "IsolatedAgentLoop",
     "IsolatedAgentRunResult",
     "IsolatedAgentRunSpec",
 ]

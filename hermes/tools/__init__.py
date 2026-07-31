@@ -651,13 +651,12 @@ def register_all(
             "Skill tools unavailable; Skill capability was skipped: %s",
             type(exc).__name__,
         )
-    if process_manager is None:
-        _delegate(staging_registry, process_manager=active_process_manager)
-    else:
-        _delegate(
-            staging_registry,
-            process_manager=active_process_manager,
-        )
+    # Handler 仍原子注册到 staging；Executor 只绑定最终应用 Registry。
+    _delegate(
+        staging_registry,
+        process_manager=active_process_manager,
+        execution_registry=target,
+    )
     _gateway_send_file(staging_registry)
     _media(staging_registry)
     _browser(staging_registry)

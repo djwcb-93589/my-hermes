@@ -31,10 +31,10 @@ from hermes.hooks import SyncControlBridge, SyncHookRegistry
 from hermes.session_resources import cleanup_session_resources
 from hermes.subagents import (
     IsolatedAgentExecutor,
-    IsolatedAgentLoop,
     IsolatedAgentRunResult,
     IsolatedAgentRunSpec,
 )
+from hermes.subagents.runtime import IsolatedAgentLoop
 from hermes.tool_declarations.delegate import TOOL_DECLARATIONS
 from hermes.tools import (
     ExecutionEnvironment,
@@ -756,9 +756,20 @@ def handle_delegate_cancel(args, **kwargs) -> str:
     return _json_dumps(res)
 
 
-def register(registry, *, process_manager=None):
-    """注册 Delegate 的真实 handler。"""
+def register(
+    registry,
+    *,
+    process_manager=None,
+    execution_registry=None,
+):
+    """向 registration Registry 注册，并绑定正式 execution Registry。"""
 
+    registration_registry = registry
+    active_execution_registry = (
+        registration_registry
+        if execution_registry is None
+        else execution_registry
+    )
     active_process_manager = process_manager
     if active_process_manager is None:
         from hermes.processes import (
@@ -772,7 +783,7 @@ def register(registry, *, process_manager=None):
         raise TypeError("process_manager must provide cleanup_session()")
 
     isolated_agent_executor = IsolatedAgentExecutor(
-        registry=registry,
+        registry=active_execution_registry,
         client=_default_client,
         process_manager=active_process_manager,
     )
@@ -783,6 +794,8 @@ def register(registry, *, process_manager=None):
         kwargs.pop("process_manager", None)
         kwargs.pop("executor", None)
         kwargs.pop("isolated_agent_executor", None)
+        kwargs.pop("execution_registry", None)
+        kwargs.pop("registry", None)
         return handle_delegate(
             args,
             isolated_agent_executor=isolated_agent_executor,
@@ -790,7 +803,7 @@ def register(registry, *, process_manager=None):
         )
 
     register_declared_handlers(
-        registry,
+        registration_registry,
         TOOL_DECLARATIONS,
         {
             "delegate_task": delegate_task_handler,

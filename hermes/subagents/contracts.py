@@ -25,6 +25,65 @@ def _freeze_value(value: object) -> object:
     return deepcopy(value)
 
 
+def _plain_value_sort_key(value: object) -> tuple[object, ...]:
+    """为普通数据生成稳定结构键；未知对象明确拒绝隐式字符串化。"""
+
+    if value is None:
+        return ("builtins.NoneType", "")
+    if type(value) in (bool, int, float, str, bytes):
+        value_type = type(value)
+        return (
+            f"{value_type.__module__}.{value_type.__qualname__}",
+            value,
+        )
+    if isinstance(value, Mapping):
+        entries = tuple(sorted(
+            (
+                _plain_value_sort_key(key),
+                _plain_value_sort_key(item),
+            )
+            for key, item in value.items()
+        ))
+        return ("mapping", entries)
+    if isinstance(value, (tuple, list)):
+        return (
+            "sequence",
+            tuple(_plain_value_sort_key(item) for item in value),
+        )
+    if isinstance(value, (frozenset, set)):
+        return (
+            "set",
+            tuple(sorted(
+                _plain_value_sort_key(item)
+                for item in value
+            )),
+        )
+    raise TypeError("set item does not have a stable plain-data order")
+
+
+def _to_plain_value(value: object) -> object:
+    """递归导出独立普通容器，不保留内部不可变容器引用。"""
+
+    if isinstance(value, Mapping):
+        plain_mapping: dict[object, object] = {}
+        for key, item in value.items():
+            plain_key = _to_plain_value(key)
+            plain_item = _to_plain_value(item)
+            try:
+                plain_mapping[plain_key] = plain_item
+            except TypeError as exc:
+                raise TypeError(
+                    "mapping key cannot be exported as a plain dict key"
+                ) from exc
+        return plain_mapping
+    if isinstance(value, (tuple, list)):
+        return [_to_plain_value(item) for item in value]
+    if isinstance(value, (frozenset, set)):
+        items = [_to_plain_value(item) for item in value]
+        return sorted(items, key=_plain_value_sort_key)
+    return deepcopy(value)
+
+
 def _freeze_mapping(
     value: Mapping[str, object],
     *,
@@ -81,6 +140,25 @@ class IsolatedAgentRunSpec:
             ),
         )
 
+    def to_dict(self) -> dict[str, object]:
+        """导出适合序列化或传输的全新普通 Python 数据。"""
+
+        plain = _to_plain_value(
+            {
+                "session_key": self.session_key,
+                "goal": self.goal,
+                "system_prompt": self.system_prompt,
+                "model": self.model,
+                "max_iterations": self.max_iterations,
+                "tool_definitions": self.tool_definitions,
+                "allowed_tool_names": self.allowed_tool_names,
+                "model_kwargs": self.model_kwargs,
+            }
+        )
+        if not isinstance(plain, dict):
+            raise TypeError("spec export must produce a dict")
+        return plain
+
 
 @dataclass(frozen=True, slots=True)
 class IsolatedAgentRunResult:
@@ -125,6 +203,30 @@ class IsolatedAgentRunResult:
                     field_name="approval_request",
                 ),
             )
+
+    def to_dict(self) -> dict[str, object]:
+        """导出不共享内部容器引用的完整普通结果。"""
+
+        plain = _to_plain_value(
+            {
+                "ok": self.ok,
+                "status": self.status,
+                "summary": self.summary,
+                "messages": self.messages,
+                "iterations": self.iterations,
+                "tools_used": self.tools_used,
+                "error": self.error,
+                "error_type": self.error_type,
+                "fatal": self.fatal,
+                "retryable": self.retryable,
+                "approval_request": self.approval_request,
+                "tool_batches": self.tool_batches,
+                "tool_call_count": self.tool_call_count,
+            }
+        )
+        if not isinstance(plain, dict):
+            raise TypeError("result export must produce a dict")
+        return plain
 
 
 __all__ = [

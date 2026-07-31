@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Mapping
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from hermes.agent_loop import AgentLoop, AgentLoopResult, ParsedToolCall
@@ -23,21 +22,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _mutable_copy(value: object) -> object:
-    """把契约中的冻结容器还原为本次运行独享的可变副本。"""
-
-    if isinstance(value, Mapping):
-        return {
-            deepcopy(key): _mutable_copy(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return [_mutable_copy(item) for item in value]
-    if isinstance(value, frozenset):
-        return {_mutable_copy(item) for item in value}
-    return deepcopy(value)
 
 
 def _definition_tool_name(
@@ -175,25 +159,45 @@ class IsolatedAgentExecutor:
         hook_registry: SyncHookRegistry | None = None,
         parent_run_id: str | None = None,
     ) -> IsolatedAgentRunResult:
-        """执行完整计划；方法一旦进入便独占 child session 的最终清理。"""
+        """校验完整计划，并在接受有效 session 后独占最终清理。"""
 
         result: IsolatedAgentRunResult | None = None
-        cleanup_error: Exception | None = None
+        cleanup_session_key: str | None = None
         try:
-            if callable(cancel_checker) and bool(cancel_checker()):
-                result = self._cancelled_result()
+            if not isinstance(spec, IsolatedAgentRunSpec):
+                result = self._invalid_spec_result(
+                    "spec must be an IsolatedAgentRunSpec"
+                )
+            elif (
+                not isinstance(spec.session_key, str)
+                or not spec.session_key.strip()
+            ):
+                result = self._invalid_spec_result(
+                    "session_key must be a non-empty string"
+                )
             else:
-                validation_error = self._validate_spec(spec)
+                # 仅在可信 session_key 建立后接管资源，之前的错误不触发清理。
+                cleanup_session_key = spec.session_key
+                validation_error = self._validate_spec_fields(spec)
                 if validation_error is not None:
                     result = self._invalid_spec_result(validation_error)
+                elif callable(cancel_checker) and bool(cancel_checker()):
+                    result = self._cancelled_result()
                 else:
-                    tools = [
-                        _mutable_copy(definition)
-                        for definition in spec.tool_definitions
-                    ]
-                    model_kwargs = _mutable_copy(spec.model_kwargs)
+                    plain_spec = spec.to_dict()
+                    tools = plain_spec["tool_definitions"]
+                    model_kwargs = plain_spec["model_kwargs"]
+                    if not isinstance(tools, list) or any(
+                        not isinstance(definition, dict)
+                        for definition in tools
+                    ):
+                        raise TypeError(
+                            "tool_definitions must resolve to a list of dicts"
+                        )
                     if not isinstance(model_kwargs, dict):
-                        raise TypeError("model_kwargs must resolve to a dict")
+                        raise TypeError(
+                            "model_kwargs must resolve to a dict"
+                        )
                     loop = IsolatedAgentLoop(
                         model=spec.model,
                         max_iterations=spec.max_iterations,
@@ -219,19 +223,24 @@ class IsolatedAgentExecutor:
         except Exception as exc:
             result = self._internal_error_result(exc)
         finally:
-            try:
-                cleanup_session_resources(
-                    spec.session_key,
-                    process_manager=self._process_manager,
-                )
-            except Exception as exc:
-                cleanup_error = exc
-                logger.exception(
-                    "Isolated Agent session cleanup failed"
-                )
+            if cleanup_session_key is not None:
+                try:
+                    cleanup_session_resources(
+                        cleanup_session_key,
+                        process_manager=self._process_manager,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        (
+                            "Isolated Agent session cleanup failed: "
+                            "exception_type=%s"
+                        ),
+                        type(exc).__name__,
+                    )
+                    # 已形成的业务或校验结果不可被清理异常覆盖。
+                    if result is None:
+                        result = self._internal_error_result(exc)
 
-        if cleanup_error is not None:
-            return self._internal_error_result(cleanup_error)
         if result is None:
             return self._internal_error_result(
                 RuntimeError("isolated execution produced no result")
@@ -239,13 +248,9 @@ class IsolatedAgentExecutor:
         return result
 
     @staticmethod
-    def _validate_spec(spec: IsolatedAgentRunSpec) -> str | None:
-        """验证 Runtime 启动所需的最小完整执行边界。"""
+    def _validate_spec_fields(spec: IsolatedAgentRunSpec) -> str | None:
+        """在 session 所有权建立后校验其余完整执行边界。"""
 
-        if not isinstance(spec, IsolatedAgentRunSpec):
-            return "spec must be an IsolatedAgentRunSpec"
-        if not isinstance(spec.session_key, str) or not spec.session_key.strip():
-            return "session_key must be a non-empty string"
         if not isinstance(spec.goal, str) or not spec.goal.strip():
             return "goal must be a non-empty string"
         if not isinstance(spec.system_prompt, str):
@@ -284,6 +289,8 @@ class IsolatedAgentExecutor:
                 "tool_definitions and allowed_tool_names must describe "
                 "the same boundary"
             )
+        if not isinstance(spec.model_kwargs, Mapping):
+            return "model_kwargs must be a mapping"
         return None
 
     @staticmethod
@@ -373,5 +380,4 @@ class IsolatedAgentExecutor:
 
 __all__ = [
     "IsolatedAgentExecutor",
-    "IsolatedAgentLoop",
 ]
