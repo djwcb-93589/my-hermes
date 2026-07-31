@@ -51,7 +51,13 @@ TOOL_DECLARATIONS = (
                 "registered and return immediately without waiting for command "
                 "completion. A successful background start returns a "
                 "process_id that the process tool uses for status, logs, "
-                "waiting, and termination. "
+                "waiting, termination, and input. background mode uses a "
+                "regular stdin/stdout pipe by default. Set pty=true together "
+                "with background=true to use a LocalBackend pseudo-terminal "
+                "for line-oriented interactive CLI programs, then use the "
+                "process tool write/submit actions for input. PTY processes "
+                "do not support closing stdin, terminal resize, reliable "
+                "full-screen UI reconstruction, or Docker/SSH transport. "
                 "Local terminal path enforcement is best-effort and is not a "
                 "sandbox. Commands that clearly reference a path blocked by "
                 "the shared filesystem policy are rejected before approval, "
@@ -72,6 +78,17 @@ TOOL_DECLARATIONS = (
                             "and return immediately after registration. The "
                             "response includes a process_id for the process "
                             "management tool."
+                        ),
+                    },
+                    "pty": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Use a pseudo-terminal for a LocalBackend "
+                            "background process. Requires background=true. "
+                            "Intended for line-oriented interactive CLI "
+                            "programs; full-screen terminal emulation is not "
+                            "provided."
                         ),
                     },
                 },

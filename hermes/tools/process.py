@@ -11,6 +11,7 @@ from hermes.processes import (
     ProcessError,
     ProcessInputBusyError,
     ProcessInputCloseError,
+    ProcessInputCloseUnsupportedError,
     ProcessInputClosedError,
     ProcessInputDeliveryError,
     ProcessInputNotRunningError,
@@ -137,11 +138,13 @@ def _validate_process_args(args: object) -> dict:
         data = args.get("data", "")
         if not isinstance(data, str) or (action == "write" and not data):
             raise _InvalidProcessArguments
-        payload = data if action == "write" else data + "\n"
         try:
-            payload_size = len(payload.encode("utf-8"))
+            payload_size = len(data.encode("utf-8"))
         except UnicodeEncodeError as error:
             raise _InvalidProcessArguments from error
+        if action == "submit":
+            # 只计入 Enter 的单字节上限，不在 Tool 层决定 CR/LF 内容。
+            payload_size += 1
         if payload_size > MAX_PROCESS_STDIN_BYTES:
             raise _InvalidProcessArguments
         validated["data"] = data
@@ -177,6 +180,7 @@ def _validate_process_args(args: object) -> dict:
 def _snapshot_payload(snapshot) -> dict:
     """序列化 ProcessSnapshot 的安全字段，刻意排除 command。"""
 
+    terminal_mode = _terminal_mode_value(snapshot)
     return {
         "process_id": snapshot.process_id,
         "pid": snapshot.pid,
@@ -190,7 +194,22 @@ def _snapshot_payload(snapshot) -> dict:
         "termination_source": snapshot.termination_source,
         "output_base_cursor": snapshot.output_base_cursor,
         "output_end_cursor": snapshot.output_end_cursor,
+        "terminal_mode": terminal_mode,
     }
+
+
+def _terminal_mode_value(snapshot) -> str:
+    """读取安全终端模式；兼容尚未携带该元数据的旧快照。"""
+
+    terminal_mode_metadata = getattr(snapshot, "terminal_mode", "pipe")
+    terminal_mode = getattr(
+        terminal_mode_metadata,
+        "value",
+        terminal_mode_metadata,
+    )
+    if terminal_mode not in {"pipe", "pty"}:
+        terminal_mode = "pipe"
+    return terminal_mode
 
 
 def _safe_log_output(snapshot, log_result) -> str:
@@ -258,12 +277,18 @@ def _run_process_action(
     process_id = validated["process_id"]
     if action in {"write", "submit"}:
         data = validated["data"]
-        payload = data if action == "write" else data + "\n"
-        bytes_written = process_manager.write_stdin(
-            session_key,
-            process_id,
-            payload,
-        )
+        if action == "write":
+            bytes_written = process_manager.write_stdin(
+                session_key,
+                process_id,
+                data,
+            )
+        else:
+            bytes_written = process_manager.submit_stdin(
+                session_key,
+                process_id,
+                data,
+            )
         response = {
             "ok": True,
             "action": action,
@@ -277,7 +302,7 @@ def _run_process_action(
             ),
         }
         if action == "submit":
-            response["newline_appended"] = True
+            response["enter_submitted"] = True
         return _json(response)
 
     if action == "close":
@@ -326,6 +351,7 @@ def _run_process_action(
             "action": "log",
             "process_id": log_result.process_id,
             "status": log_result.status.value,
+            "terminal_mode": _terminal_mode_value(snapshot),
             **_log_page_payload(snapshot, log_result),
             "exit_code": log_result.exit_code,
         })
@@ -449,6 +475,14 @@ def run_process(args, *, process_manager=None, **kwargs) -> str:
             "process_input_failed",
             "Process input could not be delivered",
             retryable=False,
+        )
+    except ProcessInputCloseUnsupportedError:
+        return _error(
+            "stdin_close_unsupported",
+            "Closing stdin is not supported for PTY processes",
+            retryable=False,
+            stdin_closed=False,
+            process_terminated=False,
         )
     except ProcessInputCloseError:
         return _error(

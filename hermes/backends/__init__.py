@@ -198,6 +198,18 @@ class BackgroundProcessCancelledError(RuntimeError):
     """后台进程在成功返回 Handle 前被取消。"""
 
 
+class BackgroundPtyUnsupportedError(RuntimeError):
+    """当前 Backend 不支持后台 PTY。"""
+
+
+class BackgroundPtyDependencyUnavailableError(RuntimeError):
+    """当前平台的后台 PTY 依赖不可用。"""
+
+
+class BackgroundPtyStartError(RuntimeError):
+    """后台 PTY 未能完成脱敏启动。"""
+
+
 class BaseExecutionEnvironment(ABC):
     """
     所有 terminal 后端必须满足的契约。
@@ -381,6 +393,7 @@ class BaseExecutionEnvironment(ABC):
         command: str,
         *,
         cancel_checker: Callable[[], bool] | None = None,
+        pty: bool = False,
     ) -> BackgroundProcessHandle:
         """启动后台进程；默认 Backend 显式声明尚不支持。"""
 
@@ -667,6 +680,9 @@ __all__ = [
     "BackgroundProcessHandle",
     "BackgroundProcessOutput",
     "BackgroundProcessCancelledError",
+    "BackgroundPtyDependencyUnavailableError",
+    "BackgroundPtyStartError",
+    "BackgroundPtyUnsupportedError",
     "BackgroundProcessStartCleanupError",
     "BackgroundProcessUnsupportedError",
     "BackendCleanupError",

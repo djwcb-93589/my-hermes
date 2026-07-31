@@ -55,6 +55,8 @@ if sys.platform == "win32":
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
 
     class _LargeInteger(ctypes.Structure):
         _fields_ = [("QuadPart", ctypes.c_longlong)]
@@ -112,6 +114,17 @@ if sys.platform == "win32":
         wintypes.HANDLE,
     )
     _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.TerminateProcess.argtypes = (
+        wintypes.HANDLE,
+        wintypes.UINT,
+    )
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
     _kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
     _kernel32.TerminateJobObject.restype = wintypes.BOOL
     _kernel32.SetInformationJobObject.argtypes = (
@@ -176,6 +189,92 @@ def _assign_windows_job(
     if not assigned:
         error = ctypes.get_last_error()
         raise OSError(error, "AssignProcessToJobObject failed")
+
+
+def _assign_windows_pid_to_job(
+    pid: int,
+    job_handle: object | None,
+) -> None:
+    """通过 PID 临时打开进程句柄并加入既有 Windows Job。"""
+
+    if sys.platform != "win32":
+        return
+    if not job_handle:
+        raise RuntimeError("Windows Job handle is unavailable")
+    process_handle = _kernel32.OpenProcess(
+        _PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
+        False,
+        pid,
+    )
+    if not process_handle:
+        raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+
+    operation_error: BaseException | None = None
+    try:
+        if not _kernel32.AssignProcessToJobObject(
+            job_handle,
+            process_handle,
+        ):
+            operation_error = OSError(
+                ctypes.get_last_error(),
+                "AssignProcessToJobObject failed",
+            )
+    finally:
+        if not _kernel32.CloseHandle(process_handle):
+            close_error = OSError(
+                ctypes.get_last_error(),
+                "CloseHandle failed",
+            )
+            if operation_error is None:
+                operation_error = close_error
+    if operation_error is not None:
+        raise operation_error
+
+
+def _terminate_windows_job(
+    job_handle: object | None,
+    *,
+    exit_code: int = 130,
+) -> bool:
+    """严格终止一个 Windows Job；成功调用时返回 True。"""
+
+    if sys.platform != "win32" or not job_handle:
+        raise RuntimeError("Windows Job handle is unavailable")
+    if not _kernel32.TerminateJobObject(job_handle, exit_code):
+        raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
+    return True
+
+
+def _terminate_windows_pid(pid: int, *, exit_code: int = 130) -> bool:
+    """在 Job 尚未确认分配时严格终止 bootstrap 根进程。"""
+
+    if sys.platform != "win32":
+        raise RuntimeError("Windows process termination is unavailable")
+    process_handle = _kernel32.OpenProcess(
+        _PROCESS_TERMINATE,
+        False,
+        pid,
+    )
+    if not process_handle:
+        raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+    operation_error: BaseException | None = None
+    try:
+        if not _kernel32.TerminateProcess(process_handle, exit_code):
+            operation_error = OSError(
+                ctypes.get_last_error(),
+                "TerminateProcess failed",
+            )
+    finally:
+        if not _kernel32.CloseHandle(process_handle):
+            close_error = OSError(
+                ctypes.get_last_error(),
+                "CloseHandle failed",
+            )
+            if operation_error is None:
+                operation_error = close_error
+    if operation_error is not None:
+        raise operation_error
+    return True
 
 
 def _query_windows_job_active_processes(job_handle: object | None) -> int:
@@ -729,6 +828,12 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         return self._started_cwd
 
     @property
+    def terminal_mode(self) -> str:
+        """普通后台句柄始终使用 pipe 传输。"""
+
+        return "pipe"
+
+    @property
     def pid(self) -> int | None:
         """返回受管宿主进程的 PID，供诊断使用。"""
 
@@ -892,6 +997,13 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 delivery_unknown=True,
             )
         return operation.bytes_written
+
+    def submit_stdin(self, data: str) -> int:
+        """pipe 模式把 Enter 定义为单个 LF。"""
+
+        if not isinstance(data, str):
+            raise ProcessInputError("Process input must be text")
+        return self.write_stdin(data + "\n")
 
     def close_stdin(self) -> bool:
         """有界关闭真实 stdin pipe；重复关闭返回 False。"""
@@ -1752,6 +1864,101 @@ class LocalBackend(BaseExecutionEnvironment):
         return proc
 
     def spawn_background(
+        self,
+        command: str,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+        pty: bool = False,
+    ) -> BackgroundProcessHandle:
+        """按显式传输模式分流，保持既有 pipe 启动路径不变。"""
+
+        if not isinstance(pty, bool):
+            raise ValueError("pty must be a boolean")
+        if pty:
+            return self._spawn_background_pty(
+                command,
+                cancel_checker=cancel_checker,
+            )
+        return self._spawn_background_pipe(
+            command,
+            cancel_checker=cancel_checker,
+        )
+
+    def _spawn_background_pty(
+        self,
+        command: str,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> BackgroundProcessHandle:
+        """冻结 Local 会话启动状态，再把 PTY 资源交给独立适配层。"""
+
+        from hermes.backends.local_pty import (
+            load_local_pty_binding,
+            spawn_local_pty_background,
+        )
+
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        if self._cancel_requested(cancel_checker):
+            raise BackgroundProcessCancelledError(
+                "Background process start cancelled"
+            )
+
+        # 依赖检查发生在复制快照之前，缺失时不创建任何后台资源。
+        pty_process_class, pty_platform_backend = load_local_pty_binding()
+        snapshot_copy: Path | None = None
+        ownership_transferred = False
+        try:
+            with self._execute_lock:
+                if not self._snapshot_ready:
+                    self.init_session()
+                started_cwd = self.cwd
+                snapshot_copy = self._copy_background_snapshot_locked()
+                cwd_shell = self._cwd_to_shell(started_cwd)
+                env = filter_local_subprocess_environment(
+                    os.environ,
+                    env_passthrough=self._env_passthrough,
+                    infrastructure_secret_values=(
+                        self._infrastructure_secret_values
+                    ),
+                )
+
+            if self._cancel_requested(cancel_checker):
+                raise BackgroundProcessCancelledError(
+                    "Background process start cancelled"
+                )
+
+            snapshot_shell = self._cwd_to_shell(str(snapshot_copy))
+            wrapped = self._wrap_background_command(
+                command,
+                cwd_shell=cwd_shell,
+                snapshot_shell=snapshot_shell,
+                startup_gate_shell=None,
+            )
+            if sys.platform == "win32":
+                env = dict(env)
+                env.pop("BASH_ENV", None)
+            shell_path = (
+                _find_git_bash() if sys.platform == "win32" else "bash"
+            )
+            ownership_transferred = True
+            return spawn_local_pty_background(
+                shell_path=shell_path,
+                command=wrapped,
+                env=env,
+                started_cwd=started_cwd,
+                snapshot_path=snapshot_copy,
+                pty_process_class=pty_process_class,
+                pty_platform_backend=pty_platform_backend,
+                cancel_checker=(
+                    lambda: self._cancel_requested(cancel_checker)
+                ),
+            )
+        finally:
+            if not ownership_transferred:
+                _remove_local_path(snapshot_copy)
+
+    def _spawn_background_pipe(
         self,
         command: str,
         *,

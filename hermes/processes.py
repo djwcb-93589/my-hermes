@@ -33,6 +33,10 @@ class BackgroundProcessHandle(Protocol):
     def pid(self) -> int | None:
         """返回宿主进程标识；后端没有可用标识时返回 None。"""
 
+    @property
+    def terminal_mode(self) -> str:
+        """返回稳定的终端传输模式；未知旧句柄由 Manager 回退为 pipe。"""
+
     def poll(self) -> int | None:
         """仍在运行时返回 None，结束后返回退出码。"""
 
@@ -50,6 +54,9 @@ class BackgroundProcessHandle(Protocol):
 
     def write_stdin(self, data: str) -> int:
         """完整写入 Unicode 文本，并返回实际提交的 UTF-8 字节数。"""
+
+    def submit_stdin(self, data: str) -> int:
+        """提交文本及当前传输定义的 Enter，并返回 UTF-8 字节数。"""
 
     def close_stdin(self) -> bool:
         """关闭 stdin；本次真实关闭返回 True，之前已关闭返回 False。"""
@@ -105,6 +112,13 @@ class ProcessStatus(str, Enum):
     FAILED_START = "failed_start"
 
 
+class ProcessTerminalMode(str, Enum):
+    """后台进程使用的稳定终端传输模式。"""
+
+    PIPE = "pipe"
+    PTY = "pty"
+
+
 class ProcessError(Exception):
     """后台进程领域的基础异常。"""
 
@@ -139,6 +153,10 @@ class ProcessInputDeliveryError(ProcessInputError):
 
 class ProcessInputCloseError(ProcessInputError):
     """stdin 关闭结果未能确认。"""
+
+
+class ProcessInputCloseUnsupportedError(ProcessInputError):
+    """当前传输不支持把 stdin close 映射为真实 EOF。"""
 
 
 class ProcessNotFoundError(ProcessError):
@@ -209,6 +227,7 @@ class ProcessSnapshot:
     termination_source: str | None
     output_base_cursor: int
     output_end_cursor: int
+    terminal_mode: ProcessTerminalMode = ProcessTerminalMode.PIPE
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +268,7 @@ class ProcessRecord:
     command: str
     backend_type: str
     cwd: str
+    terminal_mode: ProcessTerminalMode = ProcessTerminalMode.PIPE
     pid: int | None = None
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
@@ -450,6 +470,9 @@ class ProcessManager:
         if started_cwd is not None:
             with record.record_lock:
                 record.cwd = started_cwd
+        terminal_mode = self._read_optional_terminal_mode(handle)
+        with record.record_lock:
+            record.terminal_mode = terminal_mode
 
         try:
             pid = self._handle_pid(record)
@@ -699,6 +722,45 @@ class ProcessManager:
                     )
                 return bytes_written
 
+    def submit_stdin(
+        self,
+        session_key: str,
+        process_id: str,
+        data: str,
+    ) -> int:
+        """由 Handle 按传输语义提交文本和一次 Enter。"""
+
+        record = self._get_owned_record(session_key, process_id)
+        payload_size = self._validate_submit_data(data)
+        with record.termination_lock:
+            handle = self._input_handle_for_operation(record)
+            with record.handle_lock:
+                self._assert_input_allowed_locked(record, handle)
+                operation = self._get_input_operation(
+                    handle,
+                    "submit_stdin",
+                )
+                try:
+                    bytes_written = operation(data)
+                except ProcessInputError:
+                    raise
+                except Exception as error:
+                    raise ProcessInputDeliveryError(
+                        "Process input delivery could not be confirmed",
+                        delivery_unknown=True,
+                    ) from error
+
+                if (
+                    isinstance(bytes_written, bool)
+                    or not isinstance(bytes_written, int)
+                    or bytes_written != payload_size
+                ):
+                    raise ProcessInputDeliveryError(
+                        "Process input delivery could not be confirmed",
+                        delivery_unknown=True,
+                    )
+                return bytes_written
+
     def close_stdin(
         self,
         session_key: str,
@@ -913,6 +975,7 @@ class ProcessManager:
                 termination_source=record.termination_source,
                 output_base_cursor=record.output_base_cursor,
                 output_end_cursor=record.output_end_cursor,
+                terminal_mode=record.terminal_mode,
             )
 
     def _get_handle(
@@ -939,6 +1002,21 @@ class ProcessManager:
         return started_cwd
 
     @staticmethod
+    def _read_optional_terminal_mode(
+        handle: BackgroundProcessHandle,
+    ) -> ProcessTerminalMode:
+        """读取可选模式元数据；旧句柄、异常或非法值均安全回退。"""
+
+        try:
+            terminal_mode = getattr(handle, "terminal_mode")
+        except BaseException:
+            return ProcessTerminalMode.PIPE
+        try:
+            return ProcessTerminalMode(terminal_mode)
+        except BaseException:
+            return ProcessTerminalMode.PIPE
+
+    @staticmethod
     def _validate_stdin_data(data: str) -> int:
         """校验输入文本及统一 UTF-8 字节上限，不保留输入副本。"""
 
@@ -951,6 +1029,22 @@ class ProcessManager:
                 "Process input must be valid UTF-8 text"
             ) from error
         payload_size = len(encoded)
+        if payload_size > MAX_PROCESS_STDIN_BYTES:
+            raise ProcessInputError("Process input exceeds the size limit")
+        return payload_size
+
+    @staticmethod
+    def _validate_submit_data(data: str) -> int:
+        """校验 submit 文本，并把单字节 transport Enter 计入上限。"""
+
+        if not isinstance(data, str):
+            raise ProcessInputError("Process input must be text")
+        try:
+            payload_size = len(data.encode("utf-8")) + 1
+        except UnicodeEncodeError as error:
+            raise ProcessInputError(
+                "Process input must be valid UTF-8 text"
+            ) from error
         if payload_size > MAX_PROCESS_STDIN_BYTES:
             raise ProcessInputError("Process input exceeds the size limit")
         return payload_size
@@ -1060,8 +1154,10 @@ class ProcessManager:
                 "recoverable process handle does not satisfy protocol"
             ) from error
 
+        terminal_mode = self._read_optional_terminal_mode(handle)
         with record.record_lock:
             record.handle = handle
+            record.terminal_mode = terminal_mode
 
         try:
             pid = self._handle_pid(record)
@@ -2296,6 +2392,7 @@ __all__ = [
     "ProcessCleanupReport",
     "ProcessInputBusyError",
     "ProcessInputCloseError",
+    "ProcessInputCloseUnsupportedError",
     "ProcessInputClosedError",
     "ProcessInputDeliveryError",
     "ProcessInputError",
@@ -2308,6 +2405,7 @@ __all__ = [
     "ProcessSnapshot",
     "ProcessStartError",
     "ProcessStatus",
+    "ProcessTerminalMode",
     "ProcessTerminationError",
     "ProcessWaitCancelled",
     "process_manager",

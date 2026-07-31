@@ -9,6 +9,8 @@ from hermes.backends import (
     INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
     BackgroundProcessCancelledError,
     BackgroundProcessUnsupportedError,
+    BackgroundPtyDependencyUnavailableError,
+    BackgroundPtyStartError,
     BaseExecutionEnvironment,
     get_backend,
 )
@@ -79,6 +81,7 @@ def _run_terminal_background(
     session_key: str,
     process_manager,
     cancel_checker,
+    pty: bool = False,
 ) -> str:
     """只通过 ProcessManager 登记后台进程，并返回脱敏启动结果。"""
 
@@ -109,16 +112,34 @@ def _run_terminal_background(
         nonlocal starter_failure
         try:
             if callable(cancel_checker):
+                if not pty:
+                    return backend.spawn_background(
+                        command,
+                        cancel_checker=cancel_checker,
+                    )
                 return backend.spawn_background(
                     command,
                     cancel_checker=cancel_checker,
+                    pty=True,
                 )
-            return backend.spawn_background(command)
+            if not pty:
+                return backend.spawn_background(command)
+            return backend.spawn_background(command, pty=True)
+        except BackgroundPtyDependencyUnavailableError:
+            starter_failure = "pty_dependency_unavailable"
+            raise
+        except BackgroundPtyStartError:
+            starter_failure = "pty_start_failed"
+            raise
         except BackgroundProcessUnsupportedError:
             starter_failure = "unsupported"
             raise
         except BackgroundProcessCancelledError:
             starter_failure = "cancelled"
+            raise
+        except Exception:
+            if pty:
+                starter_failure = "pty_start_failed"
             raise
 
     try:
@@ -130,6 +151,16 @@ def _run_terminal_background(
             ),
             cwd=str(getattr(backend, "cwd", "") or ""),
             starter=starter,
+        )
+    except BackgroundPtyDependencyUnavailableError:
+        return _background_error(
+            error_type="pty_dependency_unavailable",
+            error="PTY support is unavailable on this system.",
+        )
+    except BackgroundPtyStartError:
+        return _background_error(
+            error_type="pty_start_failed",
+            error="PTY background process could not be started.",
         )
     except BackgroundProcessUnsupportedError:
         return _background_error(
@@ -148,6 +179,16 @@ def _run_terminal_background(
             error="Active background process limit reached.",
         )
     except ProcessStartError:
+        if starter_failure == "pty_dependency_unavailable":
+            return _background_error(
+                error_type="pty_dependency_unavailable",
+                error="PTY support is unavailable on this system.",
+            )
+        if starter_failure == "pty_start_failed":
+            return _background_error(
+                error_type="pty_start_failed",
+                error="PTY background process could not be started.",
+            )
         if starter_failure == "unsupported":
             return _background_error(
                 error_type="unsupported_backend",
@@ -188,16 +229,30 @@ def _run_terminal_background(
             "error_type": "background_start_incomplete",
             "error": "Background process registration did not complete",
         }, ensure_ascii=False)
+    terminal_mode_metadata = getattr(snapshot, "terminal_mode", "pipe")
+    terminal_mode = getattr(
+        terminal_mode_metadata,
+        "value",
+        terminal_mode_metadata,
+    )
+    if terminal_mode not in {"pipe", "pty"}:
+        terminal_mode = "pipe"
     common = {
         "status": status.value,
         "process_id": snapshot.process_id,
         "pid": snapshot.pid,
+        "terminal_mode": terminal_mode,
+        "interactive": terminal_mode == "pty",
     }
     if status is ProcessStatus.RUNNING:
         return json.dumps({
             "ok": True,
             **common,
-            "output": "Background process started",
+            "output": (
+                "Background PTY process started"
+                if terminal_mode == "pty"
+                else "Background process started"
+            ),
             "error": None,
         }, ensure_ascii=False)
     if status is ProcessStatus.EXITED:
@@ -258,6 +313,19 @@ def run_terminal(args, *, process_manager=None, **kwargs):
             "error_type": "invalid_args",
             "error": "background must be a boolean",
         }, ensure_ascii=False)
+    pty = args.get("pty", False)
+    if not isinstance(pty, bool):
+        return json.dumps({
+            "ok": False,
+            "error_type": "invalid_args",
+            "error": "pty must be a boolean",
+        }, ensure_ascii=False)
+    if pty and not background:
+        return json.dumps({
+            "ok": False,
+            "error_type": "invalid_args",
+            "error": "pty requires background=true",
+        }, ensure_ascii=False)
 
     raw_session_key = kwargs.get("session_key")
     if background:
@@ -278,6 +346,11 @@ def run_terminal(args, *, process_manager=None, **kwargs):
                 error="Background process backend is unavailable.",
             )
         raise
+    if pty and getattr(backend, "backend_type", "unknown") != "local":
+        return _background_error(
+            error_type="pty_unsupported",
+            error="PTY background processes are supported only by LocalBackend.",
+        )
     try:
         command = normalize_terminal_command(args.get("command", ""))
     except ValueError as exc:
@@ -327,6 +400,11 @@ def run_terminal(args, *, process_manager=None, **kwargs):
             # 显式 false 与历史省略参数使用同一前台审批身份。
             approval_args = dict(args)
             approval_args.pop("background", None)
+        if not pty and "pty" in args:
+            # 显式 false 与省略 pty 使用同一审批身份；true 保留在 fingerprint 中。
+            if approval_args is args:
+                approval_args = dict(args)
+            approval_args.pop("pty", None)
         assessment = assess_terminal_operation(
             approval_args,
             normalized_cwd=normalized_cwd,
@@ -364,6 +442,7 @@ def run_terminal(args, *, process_manager=None, **kwargs):
             session_key=session_key,
             process_manager=process_manager,
             cancel_checker=cancel_checker,
+            pty=pty,
         )
 
     if callable(cancel_checker):

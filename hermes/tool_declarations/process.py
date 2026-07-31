@@ -19,11 +19,14 @@ TOOL_DECLARATIONS = (
                 "limits only this wait call and never terminates the process "
                 "on timeout; kill first requests cooperative termination and "
                 "forces termination only when needed; write sends text to "
-                "stdin unchanged; submit appends one newline like Enter; "
-                "close closes stdin to deliver real EOF and never kills the "
-                "process. Stdin is available only for LocalBackend background "
-                "processes using a regular non-PTY pipe. Interactive TUI/PTY "
-                "control is not supported."
+                "stdin unchanged; submit sends transport-specific Enter; "
+                "close delivers real EOF only for regular pipe processes and "
+                "never kills the process. LocalBackend PTY processes support "
+                "write and submit but intentionally reject close because PTY "
+                "EOF is not implemented. PTY output is a raw append stream "
+                "that may contain carriage returns, ANSI sequences, and input "
+                "echo; it is not a virtual screen. Resize and reliable "
+                "full-screen TUI control are not supported."
             ),
             "parameters": {
                 "type": "object",
@@ -47,7 +50,8 @@ TOOL_DECLARATIONS = (
                         "maxLength": 65_536,
                         "description": (
                             "Text sent to stdin for write or submit. write "
-                            "sends it unchanged; submit appends one newline."
+                            "sends it unchanged; submit adds Enter according "
+                            "to the process transport."
                         ),
                     },
                     "include_finished": {
