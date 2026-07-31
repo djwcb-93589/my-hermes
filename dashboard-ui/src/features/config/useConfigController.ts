@@ -219,7 +219,9 @@ export function useConfigController() {
   }, []);
 
   const closeControlDialog = useCallback((): void => {
-    saveAbortRef.current?.abort();
+    if (saveAbortRef.current !== null) {
+      return;
+    }
     setControlDialogOpen(false);
   }, []);
 

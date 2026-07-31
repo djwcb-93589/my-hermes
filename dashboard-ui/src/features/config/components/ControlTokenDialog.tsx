@@ -46,6 +46,9 @@ export function ControlTokenDialog({
   }, [triggerRef]);
 
   const close = (): void => {
+    if (submittingRef.current) {
+      return;
+    }
     if (inputRef.current !== null) {
       inputRef.current.value = "";
     }
@@ -92,6 +95,9 @@ export function ControlTokenDialog({
       aria-labelledby="control-token-title"
       onCancel={(event) => {
         event.preventDefault();
+        if (submittingRef.current) {
+          return;
+        }
         close();
       }}
     >
