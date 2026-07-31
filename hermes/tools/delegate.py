@@ -20,7 +20,6 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
-from hermes.agent_loop import AgentLoop, ParsedToolCall
 from hermes.config import (
     MAX_CHILD_ITERATIONS,
     MODEL,
@@ -30,6 +29,12 @@ from hermes.config import (
 from hermes.delegate_jobs import get_delegate_job_manager
 from hermes.hooks import SyncControlBridge, SyncHookRegistry
 from hermes.session_resources import cleanup_session_resources
+from hermes.subagents import (
+    IsolatedAgentExecutor,
+    IsolatedAgentLoop,
+    IsolatedAgentRunResult,
+    IsolatedAgentRunSpec,
+)
 from hermes.tool_declarations.delegate import TOOL_DECLARATIONS
 from hermes.tools import (
     ExecutionEnvironment,
@@ -129,7 +134,11 @@ def _combine_cancel_checkers(
 # 参数校验(严格)
 # ---------------------------------------------------------------------------
 
-def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str | None]:
+def _validate_args(
+    args: dict,
+    *,
+    tool_registry=registry,
+) -> tuple[str | None, str, list[str] | None, str | None]:
     """严格校验 handle_delegate 入参。
 
     返回 ``(goal, context, toolsets, error_json)``。error_json 非空表示
@@ -159,7 +168,7 @@ def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str |
         )
 
     allowed_toolsets = (
-        registry.toolsets_for_environment(ExecutionEnvironment.DELEGATE)
+        tool_registry.toolsets_for_environment(ExecutionEnvironment.DELEGATE)
         & _ALLOWED_TOOLSETS
     )
     # 严格校验:出现未知 / 不允许的项直接拒绝,不静默过滤。
@@ -182,9 +191,13 @@ def _validate_args(args: dict) -> tuple[str | None, str, list[str] | None, str |
     return goal, context, requested, None
 
 
-def _resolve_delegate_tools(toolsets: list[str]) -> ToolResolution:
-    """从全局 registry 解析子 agent 的 schema 与 dispatch 边界。"""
-    return registry.resolve(
+def _resolve_delegate_tools(
+    toolsets: list[str],
+    *,
+    tool_registry=registry,
+) -> ToolResolution:
+    """从绑定的 registry 解析子 agent 的 schema 与 dispatch 边界。"""
+    return tool_registry.resolve(
         ToolPolicy(
             ExecutionEnvironment.DELEGATE,
             enabled_toolsets=frozenset(toolsets),
@@ -208,57 +221,78 @@ def _build_child_prompt(context: str) -> str:
     return prompt
 
 
+# 兼容已有导入；通用循环策略只在 hermes.subagents.runtime 中维护。
+DelegateAgentLoop = IsolatedAgentLoop
+
+
+def _build_run_spec(
+    *,
+    goal: str,
+    context: str,
+    child_session_key: str,
+    resolution: ToolResolution,
+) -> IsolatedAgentRunSpec:
+    """把 Delegate 已完成的 Prompt 与工具解析结果装配为通用执行计划。"""
+
+    return IsolatedAgentRunSpec(
+        session_key=child_session_key,
+        goal=goal,
+        system_prompt=_build_child_prompt(context),
+        model=MODEL,
+        max_iterations=MAX_CHILD_ITERATIONS,
+        tool_definitions=resolution.definitions,
+        allowed_tool_names=resolution.allowed_tool_names,
+        model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
+    )
+
+
+def _delegate_result_dict(result: IsolatedAgentRunResult) -> dict:
+    """转换为 run_delegate_child 历史兼容的 dict 形状。"""
+
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "summary": result.summary,
+        "iterations": result.iterations,
+        "tools_used": list(result.tools_used),
+        "tool_batches": result.tool_batches,
+        "tool_call_count": result.tool_call_count,
+        "error_type": result.error_type,
+        "error": result.error,
+    }
+
+
+def _internal_delegate_result(exc: BaseException) -> dict:
+    """构造 Executor 接管前基础设施异常的兼容结果。"""
+
+    return {
+        "ok": False,
+        "status": "error",
+        "error_type": "internal_error",
+        "summary": "",
+        "iterations": 0,
+        "tools_used": [],
+        "tool_batches": 0,
+        "tool_call_count": 0,
+        "error": repr(exc),
+    }
+
+
+def _resolve_process_manager(process_manager=None):
+    """为兼容直接调用绑定一次 ProcessManager，不在 Executor 内读全局。"""
+
+    if process_manager is not None:
+        return process_manager
+    bound_manager = getattr(registry, "_process_manager_binding", None)
+    if bound_manager is not None:
+        return bound_manager
+    from hermes.processes import process_manager as default_process_manager
+
+    return default_process_manager
+
+
 # ---------------------------------------------------------------------------
-# DelegateAgentLoop —— 子 agent 专属策略(只继承公共骨架,不沾主会话能力)
-# ---------------------------------------------------------------------------
-
-class DelegateAgentLoop(AgentLoop):
-    """子 agent 循环。
-
-    只继承 AgentLoop 公共骨架:iteration loop / model call / assistant
-    parse / tool_call dispatch / messages append / stop condition。
-
-    明确不启用主会话能力:
-      - 无 DB 持久化(不覆盖 on_assistant_message / on_tool_message 等)
-      - 无 compression(不覆盖 pre_model_call)
-      - 无 fallback / retry / continuation(不启用主会话策略)
-      - 不额外扩大解析器确定的工具能力
-
-    handle_model_error 覆盖为返 ``"abort"``:模型 API 异常走
-    ``status="model_error"`` 路径,而不是默认 ``"raise"`` 冒泡到
-    handle_delegate 的基础设施未预期异常边界。
-
-    构造参数 ``model_kwargs`` 透传给基类,用于 provider-specific 额外
-    参数(extra_body / temperature 等),由调用方决定。
-    """
-
-    def handle_model_error(self, exc, messages) -> str:
-        # 子 agent 不做 fallback / retry;模型异常直接 abort 出 model_error
-        return "abort"
-
-    def __init__(self, *, allowed_tool_names: frozenset[str], **kwargs):
-        """保存由解析器产生的会话级 dispatch 边界。"""
-        super().__init__(**kwargs)
-        self.allowed_tool_names = allowed_tool_names
-
-    def dispatch_one(
-        self,
-        tool_call,
-        parsed_call: ParsedToolCall | None = None,
-    ):
-        """拒绝未暴露在本子会话 schema 中的伪造工具调用。"""
-        parsed = parsed_call or self._parse_tool_call(tool_call)
-        if not parsed.is_dispatchable:
-            return (
-                parsed.error_output or "(error: tool call rejected)",
-                parsed.error_status,
-                parsed.error_detail,
-            )
-        return super().dispatch_one(tool_call, parsed)
-
-
-# ---------------------------------------------------------------------------
-# 共享执行 helper(同步 handle_delegate 和后台 worker 都走这个)
+# 兼容执行入口
 # ---------------------------------------------------------------------------
 
 def run_delegate_child(
@@ -272,12 +306,10 @@ def run_delegate_child(
     parent_run_id: str | None = None,
     process_manager=None,
 ) -> dict:
-    """跑一个子 agent 任务,返回 dict(不是 JSON)。
+    """兼容入口：解析 Delegate 策略后交给通用 Executor 执行。"""
 
-    同步 ``handle_delegate(background=False)`` 和后台 worker 都用这个
-    helper,避免两套 subagent 执行逻辑。会话资源清理在 finally 里保证
-    执行,无论成功 / 异常 / 取消 / max_iter。
-    """
+    executor_started = False
+    active_process_manager = process_manager
     try:
         if callable(cancel_checker) and bool(cancel_checker()):
             return {
@@ -292,60 +324,37 @@ def run_delegate_child(
                 "error": "cancel requested",
             }
 
-        resolution = _resolve_delegate_tools(toolsets)
-        if not resolution.definitions:
-            return {
-                "ok": False, "status": "invalid_args",
-                "summary": "", "iterations": 0, "tools_used": [],
-                "tool_batches": 0, "tool_call_count": 0,
-                "error": (f"no usable tools after applying child restrictions; "
-                          f"toolsets={toolsets!r}"),
-            }
-
-        loop = DelegateAgentLoop(
-            model=MODEL,
-            max_iterations=MAX_CHILD_ITERATIONS,
-            tools=list(resolution.definitions),
-            system_prompt=_build_child_prompt(context),
+        active_process_manager = _resolve_process_manager(process_manager)
+        executor = IsolatedAgentExecutor(
             registry=registry,
             client=_default_client,
-            session_key=child_session_key,
-            allowed_tool_names=resolution.allowed_tool_names,
-            model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
+            process_manager=active_process_manager,
+        )
+        resolution = _resolve_delegate_tools(toolsets)
+        spec = _build_run_spec(
+            goal=goal,
+            context=context,
+            child_session_key=child_session_key,
+            resolution=resolution,
+        )
+        executor_started = True
+        result = executor.execute(
+            spec,
             cancel_checker=cancel_checker,
             tool_context=tool_context,
             hook_registry=hook_registry,
             parent_run_id=parent_run_id,
         )
-        # goal 作为 user message 传入;system prompt 只描述角色 / 约束
-        result = loop.run(goal)
-        return {
-            "ok": result.ok,
-            "status": result.status,
-            "summary": result.summary,
-            "iterations": result.iterations,
-            "tools_used": list(result.tools_used),
-            "tool_batches": result.tool_batches,
-            "tool_call_count": result.tool_call_count,
-            "error_type": result.error_type,
-            "error": result.error,
-        }
+        return _delegate_result_dict(result)
     except Exception as exc:
-        # DelegateAgentLoop.handle_model_error 已返 abort,模型异常不会冒泡
-        # 到这里;真到这里说明是 Delegate 执行基础设施的未预期异常。
-        return {
-            "ok": False, "status": "error",
-            "error_type": "internal_error",
-            "summary": "", "iterations": 0, "tools_used": [],
-            "tool_batches": 0, "tool_call_count": 0,
-            "error": repr(exc),
-        }
+        return _internal_delegate_result(exc)
     finally:
-        # 子循环结束后只释放 child 资源；不触碰 parent 会话。
-        cleanup_session_resources(
-            child_session_key,
-            process_manager=process_manager,
-        )
+        # Executor 一旦进入便拥有清理；此前失败仍由兼容适配器收口。
+        if not executor_started:
+            cleanup_session_resources(
+                child_session_key,
+                process_manager=active_process_manager,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +372,23 @@ def handle_delegate(args, **kwargs) -> str:
     ``background=False``(默认):同步执行,等待子 agent 完成后返回结构化 JSON。
     ``background=True``:提交后台 job,立即返回 job_id,status="submitted"。
     """
-    goal, context, toolsets, err = _validate_args(args)
+    provided_executor = kwargs.get("isolated_agent_executor")
+    active_executor = (
+        provided_executor
+        if isinstance(provided_executor, IsolatedAgentExecutor)
+        else None
+    )
+    tool_registry = (
+        active_executor.registry
+        if active_executor is not None
+        else registry
+    )
+    goal, context, toolsets, err = _validate_args(
+        args,
+        tool_registry=tool_registry,
+    )
     if err is not None:
         return err
-    process_manager = kwargs.get("process_manager")
 
     # 子 agent 的 backend 生命周期在 delegate 返回时结束，无法把待审批操作
     # 安全恢复到原 cwd。远程会话必须让主 agent 直接调用 File/Terminal，确保
@@ -425,14 +447,66 @@ def handle_delegate(args, **kwargs) -> str:
             )
 
     # 只有确定可能启动 child 时才解析工具并分配 child_session_key。
-    if not _resolve_delegate_tools(toolsets).definitions:
+    resolution = _resolve_delegate_tools(
+        toolsets,
+        tool_registry=tool_registry,
+    )
+    if not resolution.definitions:
         return _result(
             False, "invalid_args", "",
             error=(f"no usable tools after applying child restrictions; "
                    f"requested={args.get('toolsets')!r}"),
         )
 
+    try:
+        if active_executor is None:
+            active_process_manager = _resolve_process_manager(
+                kwargs.get("process_manager")
+            )
+            active_executor = IsolatedAgentExecutor(
+                registry=tool_registry,
+                client=_default_client,
+                process_manager=active_process_manager,
+            )
+        else:
+            active_process_manager = active_executor.process_manager
+    except Exception as exc:
+        r = _internal_delegate_result(exc)
+        return _result(
+            r["ok"], r["status"], r["summary"],
+            iterations=r["iterations"],
+            tools_used=r["tools_used"],
+            tool_batches=r["tool_batches"],
+            tool_call_count=r["tool_call_count"],
+            error=r["error"],
+            error_type=r["error_type"],
+        )
+
     child_session_key = f"child-{uuid.uuid4().hex[:12]}"
+    try:
+        spec = _build_run_spec(
+            goal=goal,
+            context=context,
+            child_session_key=child_session_key,
+            resolution=resolution,
+        )
+    except Exception as exc:
+        cleanup_session_resources(
+            child_session_key,
+            process_manager=active_process_manager,
+        )
+        r = _internal_delegate_result(exc)
+        return _result(
+            r["ok"], r["status"], r["summary"],
+            iterations=r["iterations"],
+            tools_used=r["tools_used"],
+            tool_batches=r["tool_batches"],
+            tool_call_count=r["tool_call_count"],
+            child_session_key=child_session_key,
+            error=r["error"],
+            error_type=r["error_type"],
+        )
+
     parent_session_key = kwargs.get("session_key")
     # 这两个值仅来自工具运行时上下文，绝不写入模型参数、消息或工具结果。
     runtime_hook_registry = kwargs.get("hook_registry")
@@ -466,17 +540,14 @@ def handle_delegate(args, **kwargs) -> str:
         # ---------- 同步模式 ----------
         print(f"  [delegate] sync child={child_session_key} goal={goal[:80]!r}")
         try:
-            r = run_delegate_child(
-                goal,
-                context,
-                toolsets,
-                child_session_key,
+            isolated_result = active_executor.execute(
+                spec,
                 cancel_checker=child_cancel_checker,
                 tool_context=child_tool_context,
                 hook_registry=hook_registry,
                 parent_run_id=parent_run_id,
-                process_manager=process_manager,
             )
+            r = _delegate_result_dict(isolated_result)
         finally:
             if isinstance(hook_registry, SyncControlBridge):
                 hook_registry.close()
@@ -515,7 +586,8 @@ def handle_delegate(args, **kwargs) -> str:
 
         def runner() -> dict:
             runtime_registry = None
-            child_loop_started = False
+            worker_took_ownership = False
+            executor_started = False
             try:
                 startup_gate.wait()
                 if not worker_accepted["value"]:
@@ -529,11 +601,12 @@ def handle_delegate(args, **kwargs) -> str:
                         "tool_call_count": 0,
                         "error": "background delegate submission failed",
                     }
+                worker_took_ownership = True
                 runtime_registry = captured_runtime_refs["hook_registry"]
                 runtime_parent_run_id = captured_runtime_refs["parent_run_id"]
-                child_loop_started = True
-                return run_delegate_child(
-                    goal, context, toolsets, child_session_key,
+                executor_started = True
+                isolated_result = active_executor.execute(
+                    spec,
                     cancel_checker=lambda: manager.is_cancel_requested(job_id),
                     tool_context=child_tool_context,
                     hook_registry=(
@@ -546,18 +619,19 @@ def handle_delegate(args, **kwargs) -> str:
                         if isinstance(runtime_parent_run_id, str)
                         else None
                     ),
-                    process_manager=process_manager,
                 )
+                return _delegate_result_dict(isolated_result)
             finally:
                 # Job 终态以外，runner 闭包自身也不再保留运行时 Hook 引用。
                 if isinstance(runtime_registry, SyncControlBridge):
                     runtime_registry.close()
                 captured_runtime_refs["hook_registry"] = None
                 captured_runtime_refs["parent_run_id"] = None
-                if not child_loop_started:
+                # 已接管但尚未进入 Executor 的异常仍由 Delegate runner 收口。
+                if worker_took_ownership and not executor_started:
                     cleanup_session_resources(
                         child_session_key,
-                        process_manager=process_manager,
+                        process_manager=active_process_manager,
                     )
         return runner
 
@@ -572,12 +646,14 @@ def handle_delegate(args, **kwargs) -> str:
         )
     except Exception:
         worker_accepted["value"] = False
-        startup_gate.set()
-        release_submission_refs()
-        cleanup_session_resources(
-            child_session_key,
-            process_manager=process_manager,
-        )
+        try:
+            release_submission_refs()
+            cleanup_session_resources(
+                child_session_key,
+                process_manager=active_process_manager,
+            )
+        finally:
+            startup_gate.set()
         return _json_dumps(
             {
                 "ok": False,
@@ -595,7 +671,7 @@ def handle_delegate(args, **kwargs) -> str:
         # backend 也没真正创建,但保险一道)。
         cleanup_session_resources(
             child_session_key,
-            process_manager=process_manager,
+            process_manager=active_process_manager,
         )
         return _json_dumps(submit_result)
 
@@ -606,12 +682,14 @@ def handle_delegate(args, **kwargs) -> str:
         worker_accepted["value"] = True
     except Exception:
         worker_accepted["value"] = False
-        release_submission_refs()
-        startup_gate.set()
-        cleanup_session_resources(
-            child_session_key,
-            process_manager=process_manager,
-        )
+        try:
+            release_submission_refs()
+            cleanup_session_resources(
+                child_session_key,
+                process_manager=active_process_manager,
+            )
+        finally:
+            startup_gate.set()
         return _json_dumps(
             {
                 "ok": False,
@@ -681,22 +759,35 @@ def handle_delegate_cancel(args, **kwargs) -> str:
 def register(registry, *, process_manager=None):
     """注册 Delegate 的真实 handler。"""
 
-    delegate_task_handler = handle_delegate
-    if process_manager is not None:
-        if not callable(
-            getattr(process_manager, "cleanup_session", None)
-        ):
-            raise TypeError("process_manager must provide cleanup_session()")
+    active_process_manager = process_manager
+    if active_process_manager is None:
+        from hermes.processes import (
+            process_manager as default_process_manager,
+        )
 
-        def delegate_task_handler(args, **kwargs):
-            """绑定应用级共享 ProcessManager，拒绝运行时上下文覆盖。"""
+        active_process_manager = default_process_manager
+    if not callable(
+        getattr(active_process_manager, "cleanup_session", None)
+    ):
+        raise TypeError("process_manager must provide cleanup_session()")
 
-            kwargs.pop("process_manager", None)
-            return handle_delegate(
-                args,
-                process_manager=process_manager,
-                **kwargs,
-            )
+    isolated_agent_executor = IsolatedAgentExecutor(
+        registry=registry,
+        client=_default_client,
+        process_manager=active_process_manager,
+    )
+
+    def delegate_task_handler(args, **kwargs):
+        """固定注册阶段依赖，拒绝工具运行时上下文覆盖执行所有权。"""
+
+        kwargs.pop("process_manager", None)
+        kwargs.pop("executor", None)
+        kwargs.pop("isolated_agent_executor", None)
+        return handle_delegate(
+            args,
+            isolated_agent_executor=isolated_agent_executor,
+            **kwargs,
+        )
 
     register_declared_handlers(
         registry,
