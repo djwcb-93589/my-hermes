@@ -18,17 +18,38 @@ TOOL_DECLARATIONS = (
                 "the next call should pass the returned next_cursor; wait "
                 "limits only this wait call and never terminates the process "
                 "on timeout; kill first requests cooperative termination and "
-                "forces termination only when needed. Background stdin and "
-                "interactive process control are not supported."
+                "forces termination only when needed; write sends text to "
+                "stdin unchanged; submit appends one newline like Enter; "
+                "close closes stdin to deliver real EOF and never kills the "
+                "process. Stdin is available only for LocalBackend background "
+                "processes using a regular non-PTY pipe. Interactive TUI/PTY "
+                "control is not supported."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "poll", "log", "wait", "kill"],
+                        "enum": [
+                            "list",
+                            "poll",
+                            "log",
+                            "wait",
+                            "kill",
+                            "write",
+                            "submit",
+                            "close",
+                        ],
                     },
                     "process_id": {"type": "string"},
+                    "data": {
+                        "type": "string",
+                        "maxLength": 65_536,
+                        "description": (
+                            "Text sent to stdin for write or submit. write "
+                            "sends it unchanged; submit appends one newline."
+                        ),
+                    },
                     "include_finished": {
                         "type": "boolean",
                         "default": True,

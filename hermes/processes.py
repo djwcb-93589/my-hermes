@@ -48,6 +48,12 @@ class BackgroundProcessHandle(Protocol):
     def wait(self, timeout: float | None = None) -> int | None:
         """等待结束；超时时返回 None，结束后返回退出码。"""
 
+    def write_stdin(self, data: str) -> int:
+        """完整写入 Unicode 文本，并返回实际提交的 UTF-8 字节数。"""
+
+    def close_stdin(self) -> bool:
+        """关闭 stdin；本次真实关闭返回 True，之前已关闭返回 False。"""
+
     def interrupt(self) -> bool:
         """发送协作式终止请求时返回 True；调用前已自然结束时返回 False。
 
@@ -101,6 +107,38 @@ class ProcessStatus(str, Enum):
 
 class ProcessError(Exception):
     """后台进程领域的基础异常。"""
+
+
+class ProcessInputError(ProcessError):
+    """后台进程输入操作失败。"""
+
+
+class ProcessInputNotRunningError(ProcessInputError):
+    """后台进程当前不接受输入。"""
+
+
+class ProcessInputUnavailableError(ProcessInputError):
+    """后台句柄没有可用的 stdin 能力。"""
+
+
+class ProcessInputClosedError(ProcessInputError):
+    """后台进程 stdin 已经关闭。"""
+
+
+class ProcessInputBusyError(ProcessInputError):
+    """已有 stdin 操作仍在处理中。"""
+
+
+class ProcessInputDeliveryError(ProcessInputError):
+    """输入写入失败，并明确是否无法确认送达结果。"""
+
+    def __init__(self, message: str, *, delivery_unknown: bool) -> None:
+        super().__init__(message)
+        self.delivery_unknown = bool(delivery_unknown)
+
+
+class ProcessInputCloseError(ProcessInputError):
+    """stdin 关闭结果未能确认。"""
 
 
 class ProcessNotFoundError(ProcessError):
@@ -247,9 +285,13 @@ class ProcessRecord:
     termination_signal_sent: bool = field(default=False, repr=False)
     termination_in_progress: bool = field(default=False, repr=False)
     close_called: bool = field(default=False, repr=False)
+    stdin_closed: bool = field(default=False, repr=False)
     resource_cleanup_pending: bool = field(default=False, repr=False)
     log_read_error_count: int = field(default=0, repr=False)
     poll_error_count: int = field(default=0, repr=False)
+
+
+MAX_PROCESS_STDIN_BYTES: Final[int] = 64 * 1024
 
 
 _TERMINAL_STATUSES: Final[frozenset[ProcessStatus]] = frozenset(
@@ -618,6 +660,85 @@ class ProcessManager:
             if record.completion_event.wait(wait_seconds):
                 return self._snapshot(record)
 
+    def write_stdin(
+        self,
+        session_key: str,
+        process_id: str,
+        data: str,
+    ) -> int:
+        """向当前会话的运行中进程完整写入一段 UTF-8 文本。"""
+
+        record = self._get_owned_record(session_key, process_id)
+        payload_size = self._validate_stdin_data(data)
+        with record.termination_lock:
+            handle = self._input_handle_for_operation(record)
+            with record.handle_lock:
+                self._assert_input_allowed_locked(record, handle)
+                operation = self._get_input_operation(
+                    handle,
+                    "write_stdin",
+                )
+                try:
+                    bytes_written = operation(data)
+                except ProcessInputError:
+                    raise
+                except Exception as error:
+                    raise ProcessInputDeliveryError(
+                        "Process input delivery could not be confirmed",
+                        delivery_unknown=True,
+                    ) from error
+
+                if (
+                    isinstance(bytes_written, bool)
+                    or not isinstance(bytes_written, int)
+                    or bytes_written != payload_size
+                ):
+                    raise ProcessInputDeliveryError(
+                        "Process input delivery could not be confirmed",
+                        delivery_unknown=True,
+                    )
+                return bytes_written
+
+    def close_stdin(
+        self,
+        session_key: str,
+        process_id: str,
+    ) -> bool:
+        """真实关闭当前会话运行中进程的 stdin，重复关闭保持幂等。"""
+
+        record = self._get_owned_record(session_key, process_id)
+        with record.termination_lock:
+            with record.record_lock:
+                if record.stdin_closed:
+                    return False
+
+            handle = self._input_handle_for_operation(record)
+            with record.handle_lock:
+                with record.record_lock:
+                    if record.stdin_closed:
+                        return False
+                self._assert_input_allowed_locked(record, handle)
+                operation = self._get_input_operation(
+                    handle,
+                    "close_stdin",
+                )
+                try:
+                    closed_now = operation()
+                except ProcessInputError:
+                    raise
+                except Exception as error:
+                    raise ProcessInputCloseError(
+                        "Process stdin closure could not be confirmed"
+                    ) from error
+                if not isinstance(closed_now, bool):
+                    raise ProcessInputCloseError(
+                        "Process stdin closure could not be confirmed"
+                    )
+
+                with record.record_lock:
+                    record.stdin_closed = True
+                return closed_now
+
     def kill(
         self,
         session_key: str,
@@ -816,6 +937,91 @@ class ProcessManager:
         except BaseException:
             return None
         return started_cwd
+
+    @staticmethod
+    def _validate_stdin_data(data: str) -> int:
+        """校验输入文本及统一 UTF-8 字节上限，不保留输入副本。"""
+
+        if not isinstance(data, str) or not data:
+            raise ProcessInputError("Process input must be non-empty text")
+        try:
+            encoded = data.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ProcessInputError(
+                "Process input must be valid UTF-8 text"
+            ) from error
+        payload_size = len(encoded)
+        if payload_size > MAX_PROCESS_STDIN_BYTES:
+            raise ProcessInputError("Process input exceeds the size limit")
+        return payload_size
+
+    def _input_handle_for_operation(
+        self,
+        record: ProcessRecord,
+    ) -> BackgroundProcessHandle:
+        """在终止锁内检查记录状态并取得仍受管理的 Handle。"""
+
+        with record.record_lock:
+            if (
+                record.status is not ProcessStatus.RUNNING
+                or record.termination_requested
+            ):
+                raise ProcessInputNotRunningError(
+                    "Process is not accepting input"
+                )
+            if record.stdin_closed:
+                raise ProcessInputClosedError(
+                    "Process stdin is already closed"
+                )
+            handle = record.handle
+            if handle is None or record.close_called:
+                raise ProcessInputUnavailableError(
+                    "Process stdin is not available"
+                )
+            return handle
+
+    @staticmethod
+    def _get_input_operation(
+        handle: BackgroundProcessHandle,
+        operation_name: str,
+    ) -> Callable:
+        """通过公共能力检测取得输入操作，不依赖具体 Backend 类型。"""
+
+        try:
+            operation = getattr(handle, operation_name)
+        except Exception as error:
+            raise ProcessInputUnavailableError(
+                "Process stdin is not available"
+            ) from error
+        if not callable(operation):
+            raise ProcessInputUnavailableError(
+                "Process stdin is not available"
+            )
+        return operation
+
+    @staticmethod
+    def _assert_input_allowed_locked(
+        record: ProcessRecord,
+        handle: BackgroundProcessHandle,
+    ) -> None:
+        """在 Handle 锁内复查状态，封闭自然退出与资源关闭竞态。"""
+
+        with record.record_lock:
+            if (
+                record.status is not ProcessStatus.RUNNING
+                or record.termination_requested
+            ):
+                raise ProcessInputNotRunningError(
+                    "Process is not accepting input"
+                )
+            if record.stdin_closed:
+                raise ProcessInputClosedError(
+                    "Process stdin is already closed"
+                )
+            if record.close_called or record.handle is not handle:
+                raise ProcessInputUnavailableError(
+                    "Process stdin is not available"
+                )
 
     def _adopt_failed_start_cleanup_handle(
         self,
@@ -2085,8 +2291,16 @@ __all__ = [
     "BackgroundProcessHandle",
     "BackgroundProcessOutput",
     "BackgroundProcessStartCleanupError",
+    "MAX_PROCESS_STDIN_BYTES",
     "ProcessError",
     "ProcessCleanupReport",
+    "ProcessInputBusyError",
+    "ProcessInputCloseError",
+    "ProcessInputClosedError",
+    "ProcessInputDeliveryError",
+    "ProcessInputError",
+    "ProcessInputNotRunningError",
+    "ProcessInputUnavailableError",
     "ProcessLimitError",
     "ProcessLogResult",
     "ProcessManager",

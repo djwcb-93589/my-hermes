@@ -38,6 +38,13 @@ from hermes.processes import (
     BackgroundProcessHandle,
     BackgroundProcessOutput,
     BackgroundProcessStartCleanupError,
+    MAX_PROCESS_STDIN_BYTES,
+    ProcessInputBusyError,
+    ProcessInputCloseError,
+    ProcessInputClosedError,
+    ProcessInputDeliveryError,
+    ProcessInputError,
+    ProcessInputUnavailableError,
 )
 
 
@@ -548,9 +555,26 @@ class _DeferredResourceClose:
     error: BaseException | None = None
 
 
+@dataclass(slots=True)
+class _StdinOperation:
+    """由唯一 stdin worker 串行执行的一次输入操作。"""
+
+    kind: str
+    payload: bytes | None = field(default=None, repr=False)
+    completed: threading.Event = field(default_factory=threading.Event)
+    bytes_written: int = 0
+    close_performed: bool = False
+    timed_out: bool = False
+    delivery_unknown: bool = False
+    error: BaseException | None = field(default=None, repr=False)
+
+
 _BACKGROUND_DISPOSE_WAIT_SECONDS = 5.0
 _BACKGROUND_DISPOSE_RETRY_WAIT_SECONDS = 5.0
 _PROCESS_TREE_WAIT_POLL_SECONDS = 0.05
+_BACKGROUND_GATE_ACCEPT_WAIT_SECONDS = 5.0
+_BACKGROUND_GATE_ACCEPT_POLL_SECONDS = 0.05
+_BACKGROUND_GATE_REMOVE_WAIT_SECONDS = 1.0
 
 
 class LocalBackgroundProcessHandle(BackgroundProcessHandle):
@@ -562,6 +586,7 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
     _CLOSE_OUTPUT_WAIT_SECONDS = 0.5
     _PIPE_CLOSE_WAIT_SECONDS = 0.5
     _CLOSE_TOTAL_WAIT_SECONDS = 1.0
+    _STDIN_OPERATION_WAIT_SECONDS = 1.0
 
     def __init__(
         self,
@@ -590,8 +615,14 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         self._output_eof_event = threading.Event()
         self._output_error: Exception | None = None
         self._closed = False
+        self._stdin_condition = threading.Condition()
+        self._stdin_pipe = None
+        self._stdin_supported = False
+        self._stdin_close_requested = False
         self._stdin_closed = True
-        self._stdin_close_state: _DeferredResourceClose | None = None
+        self._stdin_operation: _StdinOperation | None = None
+        self._stdin_worker: threading.Thread | None = None
+        self._stdin_worker_stop = False
         self._stdout_close_state: _DeferredResourceClose | None = None
         self._output_thread: threading.Thread | None = None
 
@@ -607,9 +638,13 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
             self._proc = proc
             if sys.platform != "win32":
                 self._process_group_id = proc.pid
-            self._stdin_closed = False
             self._stdout = proc.stdout
-            self._stdin_closed = proc.stdin is None
+            stdin = proc.stdin
+        with self._stdin_condition:
+            self._stdin_pipe = stdin
+            self._stdin_supported = stdin is not None
+            self._stdin_closed = stdin is None
+            self._stdin_close_requested = stdin is None
 
     def owns_process(self) -> bool:
         """返回最小 Handle 是否已经接管一个成功创建的 Popen。"""
@@ -729,15 +764,20 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 raise RuntimeError(
                     "Background output reader is still running"
                 )
-            if (
-                self._stdin_close_state is not None
-                or self._stdout_close_state is not None
-            ):
+            if self._stdout_close_state is not None:
                 raise RuntimeError(
                     "Background pipe close is still running"
                 )
             if not self._output_eof_event.is_set():
                 raise RuntimeError("Background output EOF is unavailable")
+        with self._stdin_condition:
+            if (
+                self._stdin_operation is not None
+                or self._stdin_worker is not None
+            ):
+                raise RuntimeError(
+                    "Background stdin worker is still running"
+                )
         return self._take_pending_output_batch()
 
     def _take_pending_output_batch(self) -> BackgroundProcessOutput:
@@ -790,6 +830,308 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 proc.wait(timeout=wait_seconds)
             except subprocess.TimeoutExpired:
                 pass
+
+    @staticmethod
+    def _encode_stdin_payload(data: str) -> bytes:
+        """在 Handle 边界再次校验文本与 UTF-8 字节上限。"""
+
+        if not isinstance(data, str):
+            raise ProcessInputError("Process input must be text")
+        try:
+            payload = data.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ProcessInputError(
+                "Process input must be valid UTF-8 text"
+            ) from error
+        if len(payload) > MAX_PROCESS_STDIN_BYTES:
+            raise ProcessInputError("Process input exceeds the size limit")
+        return payload
+
+    def write_stdin(self, data: str) -> int:
+        """通过唯一 stdin worker 完整写入并 flush 一段 UTF-8 文本。"""
+
+        payload = self._encode_stdin_payload(data)
+        deadline = time.monotonic() + self._STDIN_OPERATION_WAIT_SECONDS
+        with self._stdin_condition:
+            if not self._stdin_supported:
+                raise ProcessInputUnavailableError(
+                    "Process stdin is not available"
+                )
+            if self._stdin_closed or self._stdin_close_requested:
+                raise ProcessInputClosedError(
+                    "Process stdin is already closed"
+                )
+            current = self._stdin_operation
+            if current is not None:
+                if current.timed_out:
+                    raise ProcessInputDeliveryError(
+                        "Process input delivery could not be confirmed",
+                        delivery_unknown=True,
+                    )
+                raise ProcessInputBusyError(
+                    "A process input operation is still in progress"
+                )
+
+            self._ensure_stdin_worker_locked()
+            operation = _StdinOperation(
+                kind="write",
+                payload=payload,
+            )
+            # 先唤醒再发布仍安全：worker 只能在 condition 释放后读取状态。
+            self._stdin_condition.notify_all()
+            self._stdin_operation = operation
+
+        self._wait_for_stdin_operation(
+            operation,
+            deadline=deadline,
+            close_operation=False,
+        )
+        if operation.bytes_written != len(payload):
+            raise ProcessInputDeliveryError(
+                "Process input delivery could not be confirmed",
+                delivery_unknown=True,
+            )
+        return operation.bytes_written
+
+    def close_stdin(self) -> bool:
+        """有界关闭真实 stdin pipe；重复关闭返回 False。"""
+
+        deadline = time.monotonic() + self._STDIN_OPERATION_WAIT_SECONDS
+        return self._close_stdin_before(deadline)
+
+    def _close_stdin_before(self, deadline: float) -> bool:
+        """在绝对截止时间前串行收敛 write，并执行或确认一次 close。"""
+
+        while True:
+            with self._stdin_condition:
+                if not self._stdin_supported:
+                    raise ProcessInputUnavailableError(
+                        "Process stdin is not available"
+                    )
+                if self._stdin_closed:
+                    return False
+
+                # 一旦收到 close 请求，任何后续 write 都必须永久拒绝。
+                self._stdin_close_requested = True
+                current = self._stdin_operation
+                if current is None:
+                    self._ensure_stdin_worker_locked()
+                    operation = _StdinOperation(kind="close")
+                    # condition 释放前 worker 不可观察，因此不会丢失发布。
+                    self._stdin_condition.notify_all()
+                    self._stdin_operation = operation
+                    worker = self._stdin_worker
+                    break
+                if current.kind == "close":
+                    operation = current
+                    worker = self._stdin_worker
+                    break
+
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    raise ProcessInputCloseError(
+                        "Process stdin closure could not be confirmed"
+                    )
+                self._stdin_condition.wait(timeout=remaining)
+
+        self._wait_for_stdin_operation(
+            operation,
+            deadline=deadline,
+            close_operation=True,
+        )
+        if not operation.close_performed:
+            raise ProcessInputCloseError(
+                "Process stdin closure could not be confirmed"
+            )
+
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            if worker.is_alive():
+                raise ProcessInputCloseError(
+                    "Process stdin closure could not be confirmed"
+                )
+        return True
+
+    def _ensure_stdin_worker_locked(self) -> None:
+        """在 stdin condition 内确保至多一个串行 worker 存活。"""
+
+        worker = self._stdin_worker
+        if worker is not None and worker.is_alive():
+            return
+        if worker is not None:
+            self._stdin_worker = None
+        self._stdin_worker_stop = False
+        worker = threading.Thread(
+            target=self._stdin_worker_loop,
+            name="hermes-local-background-stdin",
+            daemon=True,
+        )
+        self._stdin_worker = worker
+        try:
+            worker.start()
+        except BaseException as error:
+            if (
+                self._stdin_worker is worker
+                and not worker.is_alive()
+            ):
+                self._stdin_worker = None
+            if not isinstance(error, Exception):
+                raise
+            raise ProcessInputUnavailableError(
+                "Process stdin is not available"
+            ) from error
+
+    def _stdin_worker_loop(self) -> None:
+        """串行执行唯一活动输入操作，不维护无界输入队列。"""
+
+        current_thread = threading.current_thread()
+        try:
+            while True:
+                with self._stdin_condition:
+                    while (
+                        self._stdin_operation is None
+                        and not self._stdin_worker_stop
+                    ):
+                        self._stdin_condition.wait()
+                    if (
+                        self._stdin_worker_stop
+                        and self._stdin_operation is None
+                    ):
+                        return
+                    operation = self._stdin_operation
+
+                if operation is None:
+                    continue
+                self._execute_stdin_operation(operation)
+
+                with self._stdin_condition:
+                    if self._stdin_operation is operation:
+                        self._stdin_operation = None
+                    if (
+                        operation.kind == "close"
+                        and operation.close_performed
+                    ):
+                        self._stdin_worker_stop = True
+                    operation.completed.set()
+                    self._stdin_condition.notify_all()
+        finally:
+            with self._stdin_condition:
+                operation = self._stdin_operation
+                if (
+                    operation is not None
+                    and not operation.completed.is_set()
+                ):
+                    operation.error = RuntimeError(
+                        "Background stdin worker stopped unexpectedly"
+                    )
+                    operation.payload = None
+                    if operation.kind == "write":
+                        operation.delivery_unknown = True
+                    self._stdin_operation = None
+                    operation.completed.set()
+                if self._stdin_worker is current_thread:
+                    self._stdin_worker = None
+                self._stdin_condition.notify_all()
+
+    def _execute_stdin_operation(
+        self,
+        operation: _StdinOperation,
+    ) -> None:
+        """执行一次 write/close，并只在完成事件中发布结果。"""
+
+        with self._stdin_condition:
+            stdin = self._stdin_pipe
+        if stdin is None:
+            operation.error = RuntimeError(
+                "Background process stdin pipe is unavailable"
+            )
+            operation.payload = None
+            return
+
+        try:
+            if operation.kind == "write":
+                payload = operation.payload or b""
+                offset = 0
+                view = memoryview(payload)
+                while offset < len(payload):
+                    # 调用一旦开始，异常可能发生在底层已接收部分字节之后。
+                    operation.delivery_unknown = True
+                    written = stdin.write(view[offset:])
+                    if (
+                        isinstance(written, bool)
+                        or not isinstance(written, int)
+                        or written <= 0
+                        or written > len(payload) - offset
+                    ):
+                        raise OSError("Background stdin write made no progress")
+                    offset += written
+                    operation.bytes_written = offset
+                operation.delivery_unknown = True
+                stdin.flush()
+            elif operation.kind == "close":
+                stdin.close()
+                with self._stdin_condition:
+                    if self._stdin_pipe is stdin:
+                        self._stdin_pipe = None
+                    self._stdin_closed = True
+                operation.close_performed = True
+            else:
+                raise RuntimeError("Unknown background stdin operation")
+        except BaseException as error:
+            operation.error = error
+            if operation.kind == "close":
+                try:
+                    pipe_closed = bool(getattr(stdin, "closed"))
+                except BaseException:
+                    pipe_closed = False
+                if pipe_closed:
+                    with self._stdin_condition:
+                        if self._stdin_pipe is stdin:
+                            self._stdin_pipe = None
+                        self._stdin_closed = True
+                    operation.close_performed = True
+        finally:
+            operation.payload = None
+
+    def _wait_for_stdin_operation(
+        self,
+        operation: _StdinOperation,
+        *,
+        deadline: float,
+        close_operation: bool,
+    ) -> None:
+        """有限等待单次操作；超时保留原操作并报告未知结果。"""
+
+        remaining = max(0.0, deadline - time.monotonic())
+        if not operation.completed.wait(timeout=remaining):
+            with self._stdin_condition:
+                if not operation.completed.is_set():
+                    operation.timed_out = True
+            if not operation.completed.is_set():
+                if close_operation:
+                    raise ProcessInputCloseError(
+                        "Process stdin closure could not be confirmed"
+                    )
+                raise ProcessInputDeliveryError(
+                    "Process input delivery could not be confirmed",
+                    delivery_unknown=True,
+                )
+
+        if operation.error is None:
+            return
+        if close_operation:
+            raise ProcessInputCloseError(
+                "Process stdin closure could not be confirmed"
+            ) from operation.error
+        delivery_unknown = operation.delivery_unknown
+        raise ProcessInputDeliveryError(
+            (
+                "Process input delivery could not be confirmed"
+                if delivery_unknown
+                else "Process input could not be delivered"
+            ),
+            delivery_unknown=delivery_unknown,
+        ) from operation.error
 
     def interrupt(self) -> bool:
         """请求整个本地进程组协作式退出，并返回是否真正发送了信号。"""
@@ -985,14 +1327,20 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                         if self._startup_gate_path == startup_gate_path:
                             self._startup_gate_path = None
 
+            with self._stdin_condition:
+                stdin_released = (
+                    self._stdin_closed
+                    and self._stdin_pipe is None
+                    and self._stdin_operation is None
+                    and self._stdin_worker is None
+                )
             with self._operation_lock:
                 resources_released = (
                     self._job_handle is None
                     and not self._job_assignment_pending
                     and self._output_thread is None
                     and self._stdout is None
-                    and self._stdin_closed
-                    and self._stdin_close_state is None
+                    and stdin_released
                     and self._stdout_close_state is None
                     and self._snapshot_path is None
                     and self._startup_gate_path is None
@@ -1078,83 +1426,39 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
         close_deadline: float,
         errors: list[BaseException],
     ) -> None:
-        """并行启动至多一个 stdin/stdout worker，并在短截止时间内收敛。"""
+        """先收敛唯一 stdin worker，再有限关闭 stdout pipe。"""
+
+        with self._stdin_condition:
+            stdin_needs_close = not self._stdin_closed
+        if stdin_needs_close:
+            try:
+                self._close_stdin_before(close_deadline)
+            except BaseException as error:
+                errors.append(error)
 
         states_to_start: list[_DeferredResourceClose] = []
         states_to_wait: list[_DeferredResourceClose] = []
         with self._operation_lock:
-            proc = self._proc
-            stdin = None
-            if not self._stdin_closed:
-                try:
-                    stdin = None if proc is None else proc.stdin
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    if stdin is None:
-                        self._stdin_closed = True
-                    elif self._stdin_close_state is None:
-                        self._stdin_close_state = (
-                            self._new_deferred_resource_close(
-                                stdin,
-                                name="hermes-local-stdin-close",
-                            )
-                        )
-                        states_to_start.append(
-                            self._stdin_close_state
-                        )
-                    if self._stdin_close_state is not None:
-                        states_to_wait.append(
-                            self._stdin_close_state
-                        )
-
             stdout = self._stdout
             if stdout is not None:
                 if self._stdout_close_state is None:
-                    if (
-                        self._stdin_close_state is not None
-                        and self._stdin_close_state.resource is stdout
-                    ):
-                        self._stdout_close_state = (
-                            self._stdin_close_state
+                    self._stdout_close_state = (
+                        self._new_deferred_resource_close(
+                            stdout,
+                            name="hermes-local-stdout-close",
                         )
-                    else:
-                        self._stdout_close_state = (
-                            self._new_deferred_resource_close(
-                                stdout,
-                                name="hermes-local-stdout-close",
-                            )
-                        )
-                        states_to_start.append(
-                            self._stdout_close_state
-                        )
-                if self._stdout_close_state is not None:
-                    states_to_wait.append(
-                        self._stdout_close_state
                     )
+                    states_to_start.append(self._stdout_close_state)
+                states_to_wait.append(self._stdout_close_state)
 
-        unique_states_to_start = tuple(
-            {
-                id(state): state
-                for state in states_to_start
-                if state is not None
-            }.values()
-        )
-        for state in unique_states_to_start:
+        for state in states_to_start:
             self._start_deferred_resource_close(state)
 
         pipe_deadline = min(
             close_deadline,
             time.monotonic() + self._PIPE_CLOSE_WAIT_SECONDS,
         )
-        unique_states_to_wait = tuple(
-            {
-                id(state): state
-                for state in states_to_wait
-                if state is not None
-            }.values()
-        )
-        for state in unique_states_to_wait:
+        for state in states_to_wait:
             if not state.completed.is_set():
                 state.completed.wait(
                     timeout=self._remaining_close_time(pipe_deadline)
@@ -1170,7 +1474,7 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                 )
 
         with self._operation_lock:
-            for state in unique_states_to_wait:
+            for state in states_to_wait:
                 if not state.completed.is_set():
                     errors.append(
                         RuntimeError(
@@ -1192,19 +1496,10 @@ class LocalBackgroundProcessHandle(BackgroundProcessHandle):
                     continue
                 if state.error is not None:
                     errors.append(state.error)
-                    if self._stdin_close_state is state:
-                        self._stdin_close_state = None
                     if self._stdout_close_state is state:
                         self._stdout_close_state = None
                     continue
 
-                if self._stdin_close_state is state:
-                    current_stdin = (
-                        None if self._proc is None else self._proc.stdin
-                    )
-                    if current_stdin is state.resource:
-                        self._stdin_closed = True
-                    self._stdin_close_state = None
                 if self._stdout_close_state is state:
                     if self._stdout is state.resource:
                         self._stdout = None
@@ -1535,7 +1830,6 @@ class LocalBackend(BaseExecutionEnvironment):
                 wrapped,
                 handle=handle,
                 env=launch_env,
-                wait_for_start_gate=startup_gate_path is not None,
             )
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
@@ -1555,7 +1849,14 @@ class LocalBackend(BaseExecutionEnvironment):
                 )
             if startup_gate_path is not None:
                 self._release_background_start_gate(startup_gate_path)
-                self._close_background_gate_wait_pipe(proc)
+                self._await_background_start_gate_accepted(
+                    startup_gate_path,
+                    proc,
+                    cancel_checker=cancel_checker,
+                )
+                self._remove_accepted_background_start_gate(
+                    startup_gate_path
+                )
 
             if self._cancel_requested(cancel_checker):
                 raise BackgroundProcessCancelledError(
@@ -1637,7 +1938,7 @@ class LocalBackend(BaseExecutionEnvironment):
         if startup_gate_shell is not None:
             quoted_gate = shlex.quote(startup_gate_shell)
             # Popen 不稳定暴露主线程句柄时，使用纯 Bash 内建的启动闸门。
-            # 根 Bash 在加入 Job 前不会启动用户命令或外部子进程，并通过私有管道限速轮询。
+            # 根 Bash 在加入 Job 前不会启动用户命令或外部子进程，并在 stdin 交付前限速轮询。
             parts.extend(
                 [
                     (
@@ -1646,7 +1947,7 @@ class LocalBackend(BaseExecutionEnvironment):
                         "[[ $_hermes_gate == ready ]] && break; "
                         "IFS= read -r -t 0.05 _hermes_gate_wait || :; done"
                     ),
-                    f"rm -f {quoted_gate}",
+                    f"printf 'accepted\\n' > {quoted_gate} || exit",
                 ]
             )
         parts.extend(
@@ -1665,7 +1966,6 @@ class LocalBackend(BaseExecutionEnvironment):
         *,
         handle: LocalBackgroundProcessHandle,
         env: dict[str, str],
-        wait_for_start_gate: bool = False,
     ) -> subprocess.Popen:
         """创建 Bash 后在 helper 返回或抛错前发布给预建 Handle。"""
 
@@ -1675,21 +1975,16 @@ class LocalBackend(BaseExecutionEnvironment):
             if sys.platform == "win32"
             else {"start_new_session": True}
         )
-        gate_wait_options = (
-            {"stdin": subprocess.PIPE}
-            if wait_for_start_gate
-            else {}
-        )
         proc: subprocess.Popen | None = None
         try:
             proc = subprocess.Popen(
                 [bash, "-c", cmd_string],
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=False,
                 env=env,
-                # 此管道只用于 Windows 启动闸门的 Bash 内建等待，不向用户暴露 stdin。
-                **gate_wait_options,
+                # 后台 stdin 始终保留为二进制 pipe，由 Handle 在协议边界编码。
                 **process_group_options,
             )
             handle.attach_process(proc)
@@ -1731,9 +2026,65 @@ class LocalBackend(BaseExecutionEnvironment):
 
         startup_gate_path.write_bytes(b"ready\n")
 
+    def _await_background_start_gate_accepted(
+        self,
+        startup_gate_path: Path,
+        proc: subprocess.Popen,
+        *,
+        cancel_checker: Callable[[], bool] | None,
+    ) -> None:
+        """有限等待 Bash 确认已永久离开 startup gate 的 stdin read。"""
+
+        deadline = time.monotonic() + _BACKGROUND_GATE_ACCEPT_WAIT_SECONDS
+        while True:
+            if self._cancel_requested(cancel_checker):
+                raise BackgroundProcessCancelledError(
+                    "Background process start cancelled"
+                )
+            try:
+                gate_state = startup_gate_path.read_bytes()
+            except OSError:
+                gate_state = b""
+            if gate_state == b"accepted\n":
+                return
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    "Background startup gate acknowledgement failed"
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "Background startup gate acknowledgement failed"
+                )
+            time.sleep(
+                min(_BACKGROUND_GATE_ACCEPT_POLL_SECONDS, remaining)
+            )
+
     @staticmethod
-    def _close_background_gate_wait_pipe(proc: subprocess.Popen) -> None:
-        """关闭仅供启动闸门限速等待的私有 stdin 管道。"""
+    def _remove_accepted_background_start_gate(
+        startup_gate_path: Path,
+    ) -> None:
+        """有限重试删除已接受 gate，规避 Windows 文件句柄关闭瞬间竞态。"""
+
+        deadline = time.monotonic() + _BACKGROUND_GATE_REMOVE_WAIT_SECONDS
+        while True:
+            try:
+                _remove_local_path_strict(startup_gate_path)
+                return
+            except OSError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(
+                    min(_BACKGROUND_GATE_ACCEPT_POLL_SECONDS, remaining)
+                )
+
+    @staticmethod
+    def _close_unmanaged_background_stdin_pipe(
+        proc: subprocess.Popen,
+    ) -> None:
+        """仅在未交给 Handle 的失败清理路径关闭 stdin pipe。"""
 
         try:
             stdin = proc.stdin
@@ -1818,7 +2169,7 @@ class LocalBackend(BaseExecutionEnvironment):
     ) -> None:
         """仅在确认受管进程树结束后释放尚未交给 Handle 的资源。"""
 
-        LocalBackend._close_background_gate_wait_pipe(proc)
+        LocalBackend._close_unmanaged_background_stdin_pipe(proc)
         try:
             _close_windows_job(job_handle)
         except BaseException:

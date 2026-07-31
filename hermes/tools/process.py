@@ -7,7 +7,14 @@ import math
 
 from hermes.backends import INFRASTRUCTURE_CREDENTIAL_ENV_VARS
 from hermes.processes import (
+    MAX_PROCESS_STDIN_BYTES,
     ProcessError,
+    ProcessInputBusyError,
+    ProcessInputCloseError,
+    ProcessInputClosedError,
+    ProcessInputDeliveryError,
+    ProcessInputNotRunningError,
+    ProcessInputUnavailableError,
     ProcessNotFoundError,
     ProcessStatus,
     ProcessTerminationError,
@@ -17,7 +24,16 @@ from hermes.redaction import redact_terminal_output
 from hermes.tool_declarations.process import TOOL_DECLARATIONS
 
 
-_ACTIONS = frozenset({"list", "poll", "log", "wait", "kill"})
+_ACTIONS = frozenset({
+    "list",
+    "poll",
+    "log",
+    "wait",
+    "kill",
+    "write",
+    "submit",
+    "close",
+})
 _ACTION_FIELDS = {
     "list": frozenset({"action", "include_finished"}),
     "poll": frozenset({"action", "process_id", "cursor", "limit"}),
@@ -36,6 +52,9 @@ _ACTION_FIELDS = {
         "cursor",
         "limit",
     }),
+    "write": frozenset({"action", "process_id", "data"}),
+    "submit": frozenset({"action", "process_id", "data"}),
+    "close": frozenset({"action", "process_id"}),
 }
 _WAIT_ACTIVE_STATUSES = frozenset({
     ProcessStatus.STARTING,
@@ -111,6 +130,26 @@ def _validate_process_args(args: object) -> dict:
     if not isinstance(process_id, str) or not process_id.strip():
         raise _InvalidProcessArguments
     validated["process_id"] = process_id
+
+    if action in {"write", "submit"}:
+        if action == "write" and "data" not in args:
+            raise _InvalidProcessArguments
+        data = args.get("data", "")
+        if not isinstance(data, str) or (action == "write" and not data):
+            raise _InvalidProcessArguments
+        payload = data if action == "write" else data + "\n"
+        try:
+            payload_size = len(payload.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise _InvalidProcessArguments from error
+        if payload_size > MAX_PROCESS_STDIN_BYTES:
+            raise _InvalidProcessArguments
+        validated["data"] = data
+        return validated
+
+    if action == "close":
+        return validated
+
     validated["cursor"] = _validate_nonnegative_int(
         args.get("cursor", 0)
     )
@@ -217,6 +256,46 @@ def _run_process_action(
         })
 
     process_id = validated["process_id"]
+    if action in {"write", "submit"}:
+        data = validated["data"]
+        payload = data if action == "write" else data + "\n"
+        bytes_written = process_manager.write_stdin(
+            session_key,
+            process_id,
+            payload,
+        )
+        response = {
+            "ok": True,
+            "action": action,
+            "process_id": process_id,
+            "status": ProcessStatus.RUNNING.value,
+            "bytes_written": bytes_written,
+            "message": (
+                "Process input written"
+                if action == "write"
+                else "Process input submitted"
+            ),
+        }
+        if action == "submit":
+            response["newline_appended"] = True
+        return _json(response)
+
+    if action == "close":
+        closed_now = process_manager.close_stdin(
+            session_key,
+            process_id,
+        )
+        return _json({
+            "ok": True,
+            "action": "close",
+            "process_id": process_id,
+            "status": ProcessStatus.RUNNING.value,
+            "stdin_closed": True,
+            "already_closed": not closed_now,
+            "process_terminated": False,
+            "message": "Process stdin closed",
+        })
+
     cursor = validated["cursor"]
     limit = validated["limit"]
     if action == "poll":
@@ -337,6 +416,46 @@ def run_process(args, *, process_manager=None, **kwargs) -> str:
             "Process wait was cancelled",
             process_terminated=False,
         )
+    except ProcessInputNotRunningError:
+        return _error(
+            "process_not_running",
+            "Process is not accepting input",
+        )
+    except ProcessInputUnavailableError:
+        return _error(
+            "stdin_unsupported",
+            "Process stdin is not available",
+        )
+    except ProcessInputClosedError:
+        return _error(
+            "stdin_closed",
+            "Process stdin is already closed",
+        )
+    except ProcessInputBusyError:
+        return _error(
+            "stdin_busy",
+            "A process input operation is still in progress",
+            retryable=True,
+        )
+    except ProcessInputDeliveryError as error:
+        if error.delivery_unknown:
+            return _error(
+                "process_input_delivery_unknown",
+                "Process input delivery could not be confirmed",
+                delivery_unknown=True,
+                retryable=False,
+            )
+        return _error(
+            "process_input_failed",
+            "Process input could not be delivered",
+            retryable=False,
+        )
+    except ProcessInputCloseError:
+        return _error(
+            "stdin_close_unconfirmed",
+            "Process stdin closure could not be confirmed",
+            retryable=True,
+        )
     except ProcessTerminationError:
         return _error(
             "process_termination_failed",
@@ -365,7 +484,7 @@ def _unknown_status_check() -> dict:
 
 
 def _status_check(record: object, process_manager) -> dict:
-    """仅确认中断的 kill 是否已达到可观察终态，不重新执行操作。"""
+    """仅恢复确认 kill；write/submit/close 一律 unknown 且不重放。"""
 
     if not isinstance(record, dict):
         return _unknown_status_check()
