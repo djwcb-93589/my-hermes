@@ -133,7 +133,9 @@ db_path: database/hermes.db
 # Dashboard 管理 API；正式启动命令为 `uv run python main.py dashboard`。
 # 环境变量 HERMES_DASHBOARD_HOST / PORT / AUTH_REQUIRED 的优先级更高。
 # 非回环地址（包括 0.0.0.0、::、局域网和公网地址）会强制启用认证，
-# 且必须通过 HERMES_WEB_CONTROL_TOKEN 提供至少 32 字符的无首尾空格 Token。
+# 且必须通过 HERMES_WEB_READ_TOKEN 或 HERMES_WEB_CONTROL_TOKEN 提供至少
+# 32 字符的无首尾空格 Token；READ Token 只从环境读取，不写入此文件。
+# 如同时配置 READ 与 CONTROL Token，两者必须使用不同的值。
 # 通配绑定不会自动放行浏览器 Origin；需要浏览器访问时请使用明确的绑定地址。
 dashboard:
   host: 127.0.0.1

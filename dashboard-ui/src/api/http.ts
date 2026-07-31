@@ -1,10 +1,13 @@
-const TOKEN_HEADER = "X-Hermes-Control-Token";
+const READ_TOKEN_HEADER = "X-Hermes-Read-Token";
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+export type HttpAuthenticationMode = "anonymous" | "read_token";
 
 export type HttpErrorCode =
   | "authentication_required"
   | "invalid_response"
   | "network_unavailable"
+  | "permission_forbidden"
   | "request_failed"
   | "request_timeout";
 
@@ -25,21 +28,40 @@ export interface HttpRequestOptions {
   timeoutMs?: number;
 }
 
-export class HttpClient {
-  readonly #readToken: () => string | null;
-  readonly #handleUnauthorized: () => void;
+interface HttpClientOptions {
+  authentication: HttpAuthenticationMode;
+  readToken?: () => string | null;
+  onAuthenticationRejected?: () => void;
+}
 
-  constructor(
-    readToken: () => string | null,
-    handleUnauthorized: () => void,
-  ) {
-    this.#readToken = readToken;
-    this.#handleUnauthorized = handleUnauthorized;
+export class HttpClient {
+  readonly #authentication: HttpAuthenticationMode;
+  readonly #readToken: (() => string | null) | null;
+  readonly #handleAuthenticationRejected: (() => void) | null;
+
+  constructor(options: HttpClientOptions) {
+    this.#authentication = options.authentication;
+    this.#readToken = options.readToken ?? null;
+    this.#handleAuthenticationRejected =
+      options.onAuthenticationRejected ?? null;
+    if (this.#authentication === "read_token" && this.#readToken === null) {
+      throw new Error("read_token authentication requires a token provider");
+    }
   }
 
   async get<T>(path: string, options: HttpRequestOptions = {}): Promise<T> {
     if (!path.startsWith("/api/") && path !== "/healthz") {
       throw new HttpError("request_failed");
+    }
+
+    const headers = new Headers({ Accept: "application/json" });
+    if (this.#authentication === "read_token") {
+      const token = this.#readToken?.() ?? null;
+      if (token === null) {
+        this.#handleAuthenticationRejected?.();
+        throw new HttpError("authentication_required", 401);
+      }
+      headers.set(READ_TOKEN_HEADER, token);
     }
 
     const controller = new AbortController();
@@ -58,12 +80,6 @@ export class HttpClient {
       controller.abort();
     }, timeoutMs);
 
-    const headers = new Headers({ Accept: "application/json" });
-    const token = this.#readToken();
-    if (token !== null) {
-      headers.set(TOKEN_HEADER, token);
-    }
-
     try {
       const response = await fetch(path, {
         method: "GET",
@@ -73,8 +89,18 @@ export class HttpClient {
         cache: "no-store",
       });
       if (response.status === 401 || response.status === 403) {
-        this.#handleUnauthorized();
-        throw new HttpError("authentication_required", response.status);
+        if (
+          this.#authentication === "read_token" ||
+          response.status === 401
+        ) {
+          this.#handleAuthenticationRejected?.();
+        }
+        throw new HttpError(
+          response.status === 401
+            ? "authentication_required"
+            : "permission_forbidden",
+          response.status,
+        );
       }
       if (!response.ok) {
         throw new HttpError("request_failed", response.status);

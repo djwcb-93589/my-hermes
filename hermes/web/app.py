@@ -82,7 +82,8 @@ from hermes.web.routes import (
 )
 from hermes.web.schemas import ErrorResponse
 from hermes.web.security import (
-    TOKEN_HEADER,
+    CONTROL_TOKEN_HEADER,
+    READ_TOKEN_HEADER,
     ControlAuthenticator,
     ControlBadRequest,
     ControlConflict,
@@ -91,6 +92,7 @@ from hermes.web.security import (
     ControlUnavailable,
     DashboardAccessPolicy,
     DashboardPermission,
+    ReadAuthenticator,
     cors_origin_regex,
 )
 
@@ -144,8 +146,10 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
     """使用已校验配置装配唯一的正式 Dashboard 应用实例。"""
     validate_dashboard_config(config)
     authenticator = ControlAuthenticator.from_digest(config.control_token_digest)
+    read_authenticator = ReadAuthenticator.from_digest(config.read_token_digest)
     access_policy = DashboardAccessPolicy(
         authenticator,
+        read_authenticator=read_authenticator,
         read_auth_required=config.auth_required,
         bound_host=config.host,
     )
@@ -252,6 +256,7 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         backend_status_read_service=backend_status_read_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
+        read_authenticator=read_authenticator,
         access_policy=access_policy,
     )
 
@@ -270,6 +275,7 @@ def create_app(
     control_service: CronControlService | None = None,
     control_authenticator: ControlAuthenticator | None = None,
     *,
+    read_authenticator: ReadAuthenticator | None = None,
     access_policy: DashboardAccessPolicy | None = None,
     health_read_service: HealthReadService | None = None,
     session_read_service: SessionReadService | None = None,
@@ -286,8 +292,10 @@ def create_app(
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
+    resolved_read_authenticator = read_authenticator or ReadAuthenticator()
     policy = access_policy or DashboardAccessPolicy(
         authenticator,
+        read_authenticator=resolved_read_authenticator,
         read_auth_required=False,
         bound_host="127.0.0.1",
     )
@@ -329,6 +337,7 @@ def create_app(
     application.state.backend_status_read_service = backend_status_read_service
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
+    application.state.read_authenticator = resolved_read_authenticator
     application.state.dashboard_access_policy = policy
 
     # 不允许任意 Origin；通配绑定没有可安全推导的远程浏览器 Origin。
@@ -341,7 +350,8 @@ def create_app(
         allow_headers=[
             "Accept",
             "Content-Type",
-            TOKEN_HEADER,
+            READ_TOKEN_HEADER,
+            CONTROL_TOKEN_HEADER,
             "Idempotency-Key",
         ],
     )
@@ -364,8 +374,9 @@ def create_app(
         )
         decision = policy.authorize(
             permission,
-            token=request.headers.get(TOKEN_HEADER),
+            control_token=request.headers.get(CONTROL_TOKEN_HEADER),
             origin=request.headers.get("Origin"),
+            read_token=request.headers.get(READ_TOKEN_HEADER),
         )
         if decision.allowed:
             if permission is DashboardPermission.CONTROL:

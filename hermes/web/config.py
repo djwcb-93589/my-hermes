@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from hermes.config_values import hermes_home
 from hermes.configuration.fields import DEFAULT_CONFIG_FIELD_REGISTRY
 from hermes.web.security import (
     ControlAuthenticator,
+    ReadAuthenticator,
     is_loopback_host,
     normalize_dashboard_host,
 )
@@ -40,13 +43,14 @@ class DashboardConfig:
     port: int = _DEFAULT_PORT
     auth_required: bool = _DEFAULT_AUTH_REQUIRED
     db_path: str | None = None
-    control_token_digest: str | None = None
+    control_token_digest: str | None = field(default=None, repr=False)
     config_path: str | None = None
     config_environment: ConfigEnvironment | None = field(
         default=None,
         repr=False,
         compare=False,
     )
+    read_token_digest: str | None = field(default=None, repr=False)
 
 
 def load_dashboard_config() -> DashboardConfig:
@@ -97,7 +101,20 @@ def load_dashboard_config() -> DashboardConfig:
         "HERMES_WEB_CONTROL_TOKEN",
         profile_env,
     )
-    control_token_digest = _token_digest(control_token)
+    control_token_digest = _token_digest(
+        control_token,
+        environment_name="HERMES_WEB_CONTROL_TOKEN",
+        digest_token=ControlAuthenticator.digest_token,
+    )
+    read_token = _environment_or_profile_value(
+        "HERMES_WEB_READ_TOKEN",
+        profile_env,
+    )
+    read_token_digest = _token_digest(
+        read_token,
+        environment_name="HERMES_WEB_READ_TOKEN",
+        digest_token=ReadAuthenticator.digest_token,
+    )
     db_path = _resolve_db_path(raw_config, profile_home, profile_env)
 
     # 非回环地址即使显式关闭认证也必须提升为认证模式。
@@ -110,6 +127,7 @@ def load_dashboard_config() -> DashboardConfig:
         control_token_digest=control_token_digest,
         config_path=str(config_path),
         config_environment=config_environment,
+        read_token_digest=read_token_digest,
     )
     validate_dashboard_config(config)
     return config
@@ -141,13 +159,31 @@ def validate_dashboard_config(config: DashboardConfig) -> None:
         )
     if not ControlAuthenticator.is_valid_digest(config.control_token_digest):
         raise DashboardConfigurationError("dashboard control token digest is invalid")
+    if not ReadAuthenticator.is_valid_digest(config.read_token_digest):
+        raise DashboardConfigurationError("dashboard read token digest is invalid")
+    if (
+        config.control_token_digest is not None
+        and config.read_token_digest is not None
+        and secrets.compare_digest(
+            config.control_token_digest,
+            config.read_token_digest,
+        )
+    ):
+        raise DashboardConfigurationError(
+            "dashboard read and control tokens must be different"
+        )
     if not is_loopback_host(config.host) and not config.auth_required:
         raise DashboardConfigurationError(
             "dashboard authentication is required for a non-loopback host"
         )
-    if config.auth_required and config.control_token_digest is None:
+    if (
+        config.auth_required
+        and config.read_token_digest is None
+        and config.control_token_digest is None
+    ):
         raise DashboardConfigurationError(
-            "HERMES_WEB_CONTROL_TOKEN is required when dashboard authentication is enabled"
+            "HERMES_WEB_READ_TOKEN or HERMES_WEB_CONTROL_TOKEN is required "
+            "when dashboard authentication is enabled"
         )
 
 
@@ -321,13 +357,18 @@ def _parse_bool(value: object, name: str) -> bool:
     raise DashboardConfigurationError(f"{name} must be a boolean")
 
 
-def _token_digest(token: str | None) -> str | None:
+def _token_digest(
+    token: str | None,
+    *,
+    environment_name: str,
+    digest_token: Callable[[object], str | None],
+) -> str | None:
     """将 Token 立即转为摘要；显式提供的非法 Token 直接拒绝启动。"""
     if token is None:
         return None
-    digest = ControlAuthenticator.digest_token(token)
+    digest = digest_token(token)
     if digest is None:
         raise DashboardConfigurationError(
-            "HERMES_WEB_CONTROL_TOKEN must be a trimmed string of at least 32 characters"
+            f"{environment_name} must be a trimmed string of at least 32 characters"
         )
     return digest

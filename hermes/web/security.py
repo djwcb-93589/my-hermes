@@ -10,7 +10,10 @@ from enum import Enum
 from urllib.parse import urlparse
 
 
-TOKEN_HEADER = "X-Hermes-Control-Token"
+CONTROL_TOKEN_HEADER = "X-Hermes-Control-Token"
+READ_TOKEN_HEADER = "X-Hermes-Read-Token"
+# 保留现有公开导入路径，含义始终是 CONTROL Token Header。
+TOKEN_HEADER = CONTROL_TOKEN_HEADER
 _DASHBOARD_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
@@ -34,8 +37,64 @@ class ControlBadRequest(Exception):
     """控制请求缺少或包含无效的客户端幂等标识。"""
 
 
+def _digest_dashboard_token(token: object) -> str | None:
+    """校验两类 Token 的共同形状并返回不可逆摘要。"""
+    if not isinstance(token, str) or len(token) < 32 or token != token.strip():
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_valid_token_digest(token_digest: object) -> bool:
+    """校验摘要形状，不暴露它对应的权限级别。"""
+    if token_digest is None:
+        return True
+    if not isinstance(token_digest, str) or len(token_digest) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in token_digest)
+
+
+class ReadAuthenticator:
+    """仅保存 Dashboard READ Token 摘要，不创建控制主体。"""
+
+    def __init__(self, token_digest: str | None = None):
+        self._token_digest = token_digest
+
+    @classmethod
+    def from_token(cls, token: str | None) -> "ReadAuthenticator":
+        return cls(cls.digest_token(token))
+
+    @classmethod
+    def from_digest(cls, token_digest: str | None) -> "ReadAuthenticator":
+        """从已校验摘要创建只读认证器。"""
+        if not cls.is_valid_digest(token_digest):
+            raise ValueError("dashboard read token digest is invalid")
+        return cls(token_digest)
+
+    @staticmethod
+    def digest_token(token: object) -> str | None:
+        """复用 Dashboard Token 的统一形状并生成不可逆摘要。"""
+        return _digest_dashboard_token(token)
+
+    @staticmethod
+    def is_valid_digest(token_digest: object) -> bool:
+        """校验启动装配传入的是 SHA-256 摘要或空值。"""
+        return _is_valid_token_digest(token_digest)
+
+    @property
+    def is_configured(self) -> bool:
+        """标记当前实例是否具备可验证的 READ Token 摘要。"""
+        return self._token_digest is not None
+
+    def verifies(self, token: str | None) -> bool:
+        """以常量时间比较 READ Token，不产生 CONTROL Principal。"""
+        if self._token_digest is None or not isinstance(token, str):
+            return False
+        candidate = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return secrets.compare_digest(candidate, self._token_digest)
+
+
 class ControlAuthenticator:
-    """仅保存 Dashboard Token 的摘要，不保存明文 Token。"""
+    """仅保存 Dashboard CONTROL Token 摘要，不保存明文 Token。"""
 
     def __init__(self, token_digest: str | None = None):
         self._token_digest = token_digest
@@ -54,18 +113,12 @@ class ControlAuthenticator:
     @staticmethod
     def digest_token(token: object) -> str | None:
         """验证 Token 基本形状并返回不可逆摘要。"""
-        if not isinstance(token, str) or len(token) < 32 or token != token.strip():
-            return None
-        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return _digest_dashboard_token(token)
 
     @staticmethod
     def is_valid_digest(token_digest: object) -> bool:
         """校验启动装配传入的是 SHA-256 摘要或空值。"""
-        if token_digest is None:
-            return True
-        if not isinstance(token_digest, str) or len(token_digest) != 64:
-            return False
-        return all(character in "0123456789abcdef" for character in token_digest)
+        return _is_valid_token_digest(token_digest)
 
     @property
     def is_configured(self) -> bool:
@@ -125,10 +178,12 @@ class DashboardAccessPolicy:
         self,
         authenticator: ControlAuthenticator,
         *,
+        read_authenticator: ReadAuthenticator | None = None,
         read_auth_required: bool,
         bound_host: str,
     ) -> None:
-        self._authenticator = authenticator
+        self._control_authenticator = authenticator
+        self._read_authenticator = read_authenticator or ReadAuthenticator()
         if not isinstance(read_auth_required, bool):
             raise ValueError("dashboard read_auth_required must be a boolean")
         self._read_auth_required = read_auth_required
@@ -143,20 +198,28 @@ class DashboardAccessPolicy:
         self,
         permission: DashboardPermission,
         *,
-        token: str | None,
-        origin: str | None,
+        token: str | None = None,
+        origin: str | None = None,
+        read_token: str | None = None,
+        control_token: str | None = None,
     ) -> AccessDecision:
         """返回统一授权结果；未认证不区分 Token 缺失和错误。"""
+        # token 保留为现有调用方的 CONTROL Token 关键字兼容层。
+        resolved_control_token = (
+            control_token if control_token is not None else token
+        )
         if permission is DashboardPermission.READ:
             if not self._read_auth_required:
                 return AccessDecision(allowed=True)
-            token_decision = self._token_decision(token)
-            if token_decision.allowed:
-                return AccessDecision(allowed=True)
-            return token_decision
+            return self._read_token_decision(
+                read_token=read_token,
+                control_token=resolved_control_token,
+            )
 
         if permission is DashboardPermission.CONTROL:
-            token_decision = self._token_decision(token)
+            token_decision = self._control_token_decision(
+                resolved_control_token
+            )
             if not token_decision.allowed:
                 return token_decision
             if origin is not None and not is_allowed_dashboard_origin(
@@ -176,18 +239,37 @@ class DashboardAccessPolicy:
             error_code="permission_forbidden",
         )
 
-    def _token_decision(
+    def _read_token_decision(
+        self,
+        *,
+        read_token: str | None,
+        control_token: str | None,
+    ) -> AccessDecision:
+        """READ Token 优先；CONTROL Token 仅作为向后兼容的上位凭据。"""
+        if self._read_authenticator.verifies(read_token):
+            return AccessDecision(allowed=True)
+        if self._control_authenticator.verifies(control_token):
+            return AccessDecision(allowed=True)
+        return AccessDecision(
+            allowed=False,
+            status_code=401,
+            error_code="authentication_required",
+        )
+
+    def _control_token_decision(
         self,
         token: str | None,
     ) -> AccessDecision:
         """统一隐藏 Token 是缺失、错误还是未配置的细节。"""
-        if not self._authenticator.is_configured:
+        if not self._control_authenticator.is_configured:
             return AccessDecision(
                 allowed=False,
                 status_code=401,
                 error_code="authentication_required",
             )
-        actor_security_id = self._authenticator.authenticated_security_id(token)
+        actor_security_id = (
+            self._control_authenticator.authenticated_security_id(token)
+        )
         if actor_security_id is None:
             return AccessDecision(
                 allowed=False,

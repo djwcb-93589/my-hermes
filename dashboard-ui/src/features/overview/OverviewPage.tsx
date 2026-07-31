@@ -22,7 +22,7 @@ const FAST_POLL_INTERVAL_MS = 5_000;
 const SLOW_POLL_INTERVAL_MS = 30_000;
 
 export function OverviewPage() {
-  const { client, clearToken } = useAuth();
+  const { client, clearReadToken, state } = useAuth();
   const dashboardQuery = useCallback(
     (signal: AbortSignal) => loadDashboardStatus(client, signal),
     [client],
@@ -114,9 +114,15 @@ export function OverviewPage() {
           <button type="button" className="secondary-button" onClick={refreshAll}>
             刷新全部
           </button>
-          <button type="button" className="text-button" onClick={clearToken}>
-            释放 Token
-          </button>
+          {state === "authenticated_with_read_token" ? (
+            <button
+              type="button"
+              className="text-button"
+              onClick={clearReadToken}
+            >
+              清除 Read Token
+            </button>
+          ) : null}
         </nav>
       </header>
       <main id="main-content" className="main-content">

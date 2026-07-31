@@ -3,10 +3,10 @@ import { type FormEvent, useRef, useState } from "react";
 import { useAuth } from "./AuthContext";
 
 export function TokenPrompt() {
-  const { authenticate, state } = useAuth();
+  const { authenticateReadToken, isAuthenticating } = useAuth();
   const inputRef = useRef<HTMLInputElement>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const isBusy = state === "authenticating";
+  const isBusy = isAuthenticating;
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -15,11 +15,9 @@ export function TokenPrompt() {
       inputRef.current.value = "";
     }
     setMessage(null);
-    const result = await authenticate(submittedToken);
+    const result = await authenticateReadToken(submittedToken);
     if (result === "invalid") {
-      setMessage("Token 无效，请重新输入有效的 Dashboard READ Token。");
-    } else if (result === "unavailable") {
-      setMessage("暂时无法验证 Token，请确认 Dashboard 服务可用后重试。");
+      setMessage("Token 无效，请重新输入有效的 Dashboard Read Token。");
     }
   };
 
@@ -32,12 +30,12 @@ export function TokenPrompt() {
         <p className="eyebrow">MYHERMES DASHBOARD</p>
         <h1 id="auth-title">连接只读运行总览</h1>
         <p className="auth-intro">
-          输入 Dashboard READ Token。Token 仅保存在当前页面内存中，刷新、关闭页面或认证失败后即释放。
+          后端要求只读认证。输入独立的 Dashboard Read Token；它不能用于任何控制操作。
         </p>
         <form onSubmit={submit} className="auth-form">
-          <label htmlFor="dashboard-token">Dashboard READ Token</label>
+          <label htmlFor="dashboard-read-token">Dashboard Read Token</label>
           <input
-            id="dashboard-token"
+            id="dashboard-read-token"
             ref={inputRef}
             type="password"
             minLength={32}
@@ -52,7 +50,7 @@ export function TokenPrompt() {
             Token 不会写入浏览器存储、Cookie、URL 或日志。
           </p>
           <button type="submit" className="primary-button" disabled={isBusy}>
-            {isBusy ? "正在验证…" : "进入 Dashboard"}
+            {isBusy ? "正在验证…" : "使用 Read Token 进入"}
           </button>
           <div id="auth-message" className="auth-message" aria-live="polite">
             {message}

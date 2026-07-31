@@ -674,6 +674,18 @@ tbody tr:hover {
   text-align: center;
 }
 
+.auth-progress {
+  display: flex;
+  justify-content: center;
+  min-height: 4rem;
+  padding-top: 2rem;
+}
+
+.auth-retry {
+  width: 100%;
+  margin-top: 1.5rem;
+}
+
 @media (max-width: 900px) {
   .metric-grid,
   .database-summary {

@@ -13,70 +13,178 @@ import { HttpClient, HttpError } from "../api/http";
 import { readStatus } from "../api/status";
 
 export type AuthenticationState =
-  | "signed_out"
-  | "authenticating"
-  | "signed_in";
+  | "checking_anonymous"
+  | "anonymous"
+  | "read_token_required"
+  | "authenticated_with_read_token"
+  | "unavailable";
 export type AuthenticationResult = "accepted" | "invalid" | "unavailable";
 
 interface AuthContextValue {
   client: HttpClient;
   state: AuthenticationState;
-  authenticate: (token: string) => Promise<AuthenticationResult>;
-  clearToken: () => void;
+  isAuthenticating: boolean;
+  authenticateReadToken: (token: string) => Promise<AuthenticationResult>;
+  clearReadToken: () => void;
+  retryAnonymousProbe: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: PropsWithChildren) {
-  const tokenRef = useRef<string | null>(null);
-  const [state, setState] = useState<AuthenticationState>("signed_out");
+  const readTokenRef = useRef<string | null>(null);
+  const anonymousProbeRef = useRef<AbortController | null>(null);
+  const readAuthenticationRef = useRef<AbortController | null>(null);
+  const [state, setState] = useState<AuthenticationState>(
+    "checking_anonymous",
+  );
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
 
-  const clearToken = useCallback((): void => {
-    tokenRef.current = null;
-    setState("signed_out");
+  const handleAnonymousAuthenticationRequired = useCallback((): void => {
+    readTokenRef.current = null;
+    setIsAuthenticating(false);
+    setState("read_token_required");
   }, []);
 
-  const client = useMemo(
-    () => new HttpClient(() => tokenRef.current, clearToken),
-    [clearToken],
+  const handleReadAuthenticationRejected = useCallback((): void => {
+    readTokenRef.current = null;
+    setIsAuthenticating(false);
+    setState("read_token_required");
+  }, []);
+
+  const anonymousClient = useMemo(
+    () =>
+      new HttpClient({
+        authentication: "anonymous",
+        onAuthenticationRejected: handleAnonymousAuthenticationRequired,
+      }),
+    [handleAnonymousAuthenticationRequired],
+  );
+  const readTokenClient = useMemo(
+    () =>
+      new HttpClient({
+        authentication: "read_token",
+        readToken: () => readTokenRef.current,
+        onAuthenticationRejected: handleReadAuthenticationRejected,
+      }),
+    [handleReadAuthenticationRejected],
   );
 
-  const authenticate = useCallback(
+  const probeAnonymousRead = useCallback(async (): Promise<void> => {
+    anonymousProbeRef.current?.abort();
+    const controller = new AbortController();
+    anonymousProbeRef.current = controller;
+    readTokenRef.current = null;
+    setIsAuthenticating(false);
+    setState("checking_anonymous");
+    try {
+      await readStatus(anonymousClient, controller.signal);
+      if (!controller.signal.aborted) {
+        setState("anonymous");
+      }
+    } catch (error: unknown) {
+      if (controller.signal.aborted) {
+        return;
+      }
+      if (error instanceof HttpError && error.status === 401) {
+        setState("read_token_required");
+      } else {
+        setState("unavailable");
+      }
+    } finally {
+      if (anonymousProbeRef.current === controller) {
+        anonymousProbeRef.current = null;
+      }
+    }
+  }, [anonymousClient]);
+
+  const authenticateReadToken = useCallback(
     async (token: string): Promise<AuthenticationResult> => {
       if (token.length < 32 || token.trim() !== token) {
         return "invalid";
       }
-      tokenRef.current = token;
-      setState("authenticating");
+      readAuthenticationRef.current?.abort();
+      const controller = new AbortController();
+      readAuthenticationRef.current = controller;
+      readTokenRef.current = token;
+      setIsAuthenticating(true);
       try {
-        await readStatus(client);
-        setState("signed_in");
+        await readStatus(readTokenClient, controller.signal);
+        if (controller.signal.aborted) {
+          return "unavailable";
+        }
+        setState("authenticated_with_read_token");
         return "accepted";
       } catch (error: unknown) {
-        tokenRef.current = null;
-        setState("signed_out");
+        if (controller.signal.aborted) {
+          return "unavailable";
+        }
+        readTokenRef.current = null;
         if (
           error instanceof HttpError &&
-          error.code === "authentication_required"
+          (error.status === 401 || error.status === 403)
         ) {
+          setState("read_token_required");
           return "invalid";
         }
+        setState("unavailable");
         return "unavailable";
+      } finally {
+        if (readAuthenticationRef.current === controller) {
+          readAuthenticationRef.current = null;
+        }
+        if (!controller.signal.aborted) {
+          setIsAuthenticating(false);
+        }
       }
     },
-    [client],
+    [readTokenClient],
   );
 
-  useEffect(
-    () => () => {
-      tokenRef.current = null;
-    },
-    [],
-  );
+  const clearReadToken = useCallback((): void => {
+    readAuthenticationRef.current?.abort();
+    readAuthenticationRef.current = null;
+    readTokenRef.current = null;
+    setIsAuthenticating(false);
+    setState("read_token_required");
+  }, []);
 
+  const retryAnonymousProbe = useCallback((): void => {
+    void probeAnonymousRead();
+  }, [probeAnonymousRead]);
+
+  useEffect(() => {
+    void probeAnonymousRead();
+    return () => {
+      anonymousProbeRef.current?.abort();
+      anonymousProbeRef.current = null;
+      readAuthenticationRef.current?.abort();
+      readAuthenticationRef.current = null;
+      readTokenRef.current = null;
+    };
+  }, [probeAnonymousRead]);
+
+  const client =
+    state === "authenticated_with_read_token"
+      ? readTokenClient
+      : anonymousClient;
   const value = useMemo<AuthContextValue>(
-    () => ({ client, state, authenticate, clearToken }),
-    [authenticate, clearToken, client, state],
+    () => ({
+      client,
+      state,
+      isAuthenticating,
+      authenticateReadToken,
+      clearReadToken,
+      retryAnonymousProbe,
+    }),
+    [
+      authenticateReadToken,
+      clearReadToken,
+      client,
+      isAuthenticating,
+      retryAnonymousProbe,
+      state,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
