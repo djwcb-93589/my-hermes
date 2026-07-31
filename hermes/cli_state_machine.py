@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import logging
+import math
 import queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from hermes.cli_approval import execute_cli_approval
 from hermes.config import DB_PATH
@@ -23,10 +26,50 @@ from hermes.db import (
     replace_tool_message_content,
     session_exists,
 )
+from hermes.session_idle import SessionProcessLifecycle
 from hermes.steering import SteerEntry, SteerMailbox
 
 
+if TYPE_CHECKING:
+    from hermes.session_resources import IdleSessionCleanupReport
+
+
+logger = logging.getLogger(__name__)
+
 DEFAULT_CLI_MESSAGE_QUEUE_LIMIT = 20
+DEFAULT_CLI_IDLE_TIMEOUT_SECONDS = 86400.0
+DEFAULT_CLI_IDLE_CLEANUP_INTERVAL_SECONDS = 600.0
+
+
+def _finite_seconds(
+    value: object,
+    field_name: str,
+    *,
+    allow_zero: bool,
+) -> float:
+    """按 Gateway 风格校验 CLI idle 秒数配置。"""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a number") from exc
+    if (
+        not math.isfinite(seconds)
+        or seconds < 0
+        or (not allow_zero and seconds == 0)
+    ):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{field_name} must be a finite {qualifier} number")
+    return seconds
+
+
+class CLIProcessManager(SessionProcessLifecycle, Protocol):
+    """CLI idle maintenance 需要的共享 ProcessManager 最小接口。"""
+
+    def prune(self) -> None:
+        """删除超过 TTL 的终态 Process 记录。"""
 
 
 class CLIMessageQueue:
@@ -97,6 +140,9 @@ class CLIWorkerTask:
     current_session_id: str | None = None
     cancel_event: threading.Event | None = None
     steer_mailbox: SteerMailbox | None = None
+    last_activity_at: float | None = None
+    idle_timeout_seconds: float | None = None
+    foreground_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +157,7 @@ class CLIWorkerResult:
     current_session_id: str | None = None
     error: str | None = None
     pending_steer: tuple[SteerEntry, ...] = ()
+    idle_cleanup_report: IdleSessionCleanupReport | None = None
 
 
 class CLIEventType(str, Enum):
@@ -120,6 +167,7 @@ class CLIEventType(str, Enum):
     WORKER_RESULT = "worker_result"
     STREAM_EVENT = "stream_event"
     CANCEL_REQUEST = "cancel_request"
+    MAINTENANCE_TICK = "maintenance_tick"
     SHUTDOWN = "shutdown"
 
 
@@ -152,12 +200,18 @@ class CLIEvent:
     def cancel_request_event(cls) -> "CLIEvent":
         return cls(event_type=CLIEventType.CANCEL_REQUEST)
 
+    @classmethod
+    def maintenance_tick_event(cls) -> "CLIEvent":
+        return cls(event_type=CLIEventType.MAINTENANCE_TICK)
+
 
 class CLIEventQueue:
     """连接 CLI UI、controller 和 worker 的线程安全事件队列。"""
 
     def __init__(self) -> None:
         self._events: queue.Queue[CLIEvent] = queue.Queue()
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_pending = False
 
     def put(self, event: CLIEvent) -> None:
         self._events.put(event)
@@ -180,6 +234,69 @@ class CLIEventQueue:
     def post_cancel_request(self) -> None:
         self.put(CLIEvent.cancel_request_event())
 
+    def post_maintenance_tick(self) -> bool:
+        """最多保留一个尚未被 Controller 消费的 maintenance tick。"""
+
+        with self._maintenance_lock:
+            if self._maintenance_pending:
+                return False
+            self._maintenance_pending = True
+        self.put(CLIEvent.maintenance_tick_event())
+        return True
+
+    def acknowledge_maintenance_tick(self) -> None:
+        """由 Controller 在消费 maintenance tick 时释放投递资格。"""
+
+        with self._maintenance_lock:
+            self._maintenance_pending = False
+
+
+class CLIMaintenanceTicker:
+    """单线程定期发布去重 maintenance 事件，不接触运行资源。"""
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float,
+        publish_tick: Callable[[], bool],
+    ) -> None:
+        self._interval_seconds = _finite_seconds(
+            interval_seconds,
+            "idle_cleanup_interval_seconds",
+            allow_zero=False,
+        )
+        self._publish_tick = publish_tick
+        self._shutdown_event = threading.Event()
+        self._started = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="hermes-cli-maintenance",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        """启动唯一 maintenance ticker。"""
+
+        if self._started:
+            raise RuntimeError("CLI maintenance ticker has already started")
+        self._started = True
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        """唤醒并等待 ticker 退出。"""
+
+        if not self._started:
+            return
+        self._shutdown_event.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while not self._shutdown_event.wait(self._interval_seconds):
+            try:
+                self._publish_tick()
+            except Exception:
+                logger.warning("CLI maintenance tick publish failed")
+
 
 class CLIWorker:
     """串行执行 CLI 工作，并让每项数据库工作在线程内独占连接。"""
@@ -190,6 +307,7 @@ class CLIWorker:
         stream_sink: Callable[[object], None] | None,
         publish_result: Callable[[CLIWorkerResult], None],
         hook_registry: SyncHookRegistry | None = None,
+        process_manager: CLIProcessManager | None = None,
     ) -> None:
         if hook_registry is not None and not isinstance(
             hook_registry,
@@ -199,6 +317,7 @@ class CLIWorker:
         self._stream_sink = stream_sink
         self._publish_result = publish_result
         self._hook_registry = hook_registry
+        self._process_manager = process_manager
         self._tasks: queue.Queue[CLIWorkerTask | None] = queue.Queue()
         self._results: queue.Queue[CLIWorkerResult] = queue.Queue()
         self._lock = threading.Lock()
@@ -273,6 +392,8 @@ class CLIWorker:
 
     def _execute(self, task: CLIWorkerTask) -> CLIWorkerResult:
         """为单项工作创建、使用并关闭 SQLite 连接。"""
+        if task.kind == "idle_cleanup":
+            return self._run_idle_cleanup_task(task)
         conn = init_db(DB_PATH)
         try:
             if task.kind == "conversation":
@@ -298,6 +419,40 @@ class CLIWorker:
             )
         finally:
             conn.close()
+
+    def _run_idle_cleanup_task(
+        self,
+        task: CLIWorkerTask,
+    ) -> CLIWorkerResult:
+        """在现有 CLI worker 中执行同步 idle 资源清理。"""
+
+        process_manager = self._process_manager
+        if (
+            task.session_id is None
+            or task.last_activity_at is None
+            or task.idle_timeout_seconds is None
+            or process_manager is None
+        ):
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                error="idle cleanup task is invalid",
+            )
+
+        from hermes.session_resources import cleanup_idle_session_resources
+
+        report = cleanup_idle_session_resources(
+            task.session_id,
+            last_activity_at=task.last_activity_at,
+            idle_timeout_seconds=task.idle_timeout_seconds,
+            foreground_active=task.foreground_active,
+            process_manager=process_manager,
+        )
+        return CLIWorkerResult(
+            kind=task.kind,
+            session_id=task.session_id,
+            idle_cleanup_report=report,
+        )
 
     @staticmethod
     def _close_and_drain_steer_mailbox(
@@ -349,19 +504,73 @@ class CLIWorker:
             conversation_result=result,
         )
 
-    @staticmethod
-    def _resume_session(conn, task: CLIWorkerTask) -> CLIWorkerResult:
+    def _resume_session(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
         session_id = task.session_id
         if not session_id or not session_exists(conn, session_id, source="cli"):
             return CLIWorkerResult(
                 kind=task.kind,
                 error=f"session not found: {session_id or ''}",
             )
+        old_session_id = task.current_session_id
+        if (
+            old_session_id
+            and old_session_id != session_id
+            and self._process_manager is not None
+        ):
+            self._release_session_before_resume(old_session_id)
         return CLIWorkerResult(
             kind=task.kind,
             session_id=session_id,
             messages=tuple(get_session_messages(conn, session_id)),
         )
+
+    def _release_session_before_resume(self, session_id: str) -> None:
+        """按共享 Process 保护策略尽力释放离开的旧 session。"""
+
+        from hermes.session_idle import evaluate_session_release
+        from hermes.session_resources import cleanup_session_resources
+
+        process_manager = self._process_manager
+        if process_manager is None:
+            return
+        try:
+            decision = evaluate_session_release(
+                session_id,
+                foreground_active=False,
+                process_manager=process_manager,
+            )
+        except Exception as error:
+            logger.warning(
+                "CLI old session release check failed: exception_type=%s",
+                type(error).__name__,
+            )
+            return
+        if not decision.cleanup_allowed:
+            if decision.reason == "active_processes":
+                logger.debug(
+                    (
+                        "CLI old session retained because active processes "
+                        "exist: count=%d"
+                    ),
+                    decision.active_process_count,
+                )
+            return
+
+        try:
+            report = cleanup_session_resources(
+                session_id,
+                process_manager=process_manager,
+            )
+        except Exception as error:
+            logger.warning(
+                "CLI old session cleanup failed: exception_type=%s",
+                type(error).__name__,
+            )
+            return
+        if report.complete:
+            logger.debug("CLI old session resources cleaned before resume")
+        else:
+            logger.warning("CLI old session resource cleanup incomplete")
 
     def _approve_and_resume(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
         if task.session_id is None or task.approval_request is None:
@@ -510,7 +719,11 @@ class CLIController:
         ui: CLIControllerUI,
         cached_prompt: str,
         tool_policy: object,
-        process_manager: object | None = None,
+        process_manager: CLIProcessManager | None = None,
+        idle_timeout_seconds: float = DEFAULT_CLI_IDLE_TIMEOUT_SECONDS,
+        idle_cleanup_interval_seconds: float = (
+            DEFAULT_CLI_IDLE_CLEANUP_INTERVAL_SECONDS
+        ),
     ) -> None:
         self._events = events
         self._worker = worker
@@ -526,6 +739,16 @@ class CLIController:
         self._shutting_down = False
         self._current_cancel_event: threading.Event | None = None
         self._active_steer_mailbox: SteerMailbox | None = None
+        self._last_activity_at = time.time()
+        self._idle_timeout_seconds = _finite_seconds(
+            idle_timeout_seconds,
+            "idle_timeout_seconds",
+            allow_zero=True,
+        )
+        self._maintenance_ticker = CLIMaintenanceTicker(
+            interval_seconds=idle_cleanup_interval_seconds,
+            publish_tick=self._events.post_maintenance_tick,
+        )
 
     @property
     def current_session_id(self) -> str | None:
@@ -533,20 +756,33 @@ class CLIController:
 
         return self._session_id
 
+    def _mark_activity(self) -> None:
+        """只由 CLI 事件线程刷新用户或前台任务活动时间。"""
+
+        self._last_activity_at = time.time()
+
     def run(self) -> None:
-        """等待输入或 worker 通知；不使用轮询或定时唤醒。"""
-        while True:
-            try:
-                event = self._events.get()
-            except KeyboardInterrupt:
-                # 保留主线程收到外部 SIGINT 时的事件化兼容兜底。
-                self._events.post_cancel_request()
-                continue
-            self._handle_event(event)
-            if event.event_type == CLIEventType.USER_INPUT and not self._shutting_down:
-                self._ui.allow_next_input()
-            if self._shutting_down and not self._running:
-                return
+        """阻塞等待事件，并由单一 ticker 提供去重维护通知。"""
+
+        self._maintenance_ticker.start()
+        try:
+            while True:
+                try:
+                    event = self._events.get()
+                except KeyboardInterrupt:
+                    # 保留主线程收到外部 SIGINT 时的事件化兼容兜底。
+                    self._events.post_cancel_request()
+                    continue
+                self._handle_event(event)
+                if (
+                    event.event_type == CLIEventType.USER_INPUT
+                    and not self._shutting_down
+                ):
+                    self._ui.allow_next_input()
+                if self._shutting_down and not self._running:
+                    return
+        finally:
+            self._maintenance_ticker.shutdown()
 
     def _handle_event(self, event: CLIEvent) -> None:
         if event.event_type == CLIEventType.USER_INPUT:
@@ -566,7 +802,12 @@ class CLIController:
                 self._ui.handle_stream_event(event.stream_event)
             return
         if event.event_type == CLIEventType.CANCEL_REQUEST:
-            self._handle_cancel_request(announce_idle=False)
+            if self._handle_cancel_request(announce_idle=False):
+                self._mark_activity()
+            return
+        if event.event_type == CLIEventType.MAINTENANCE_TICK:
+            self._events.acknowledge_maintenance_tick()
+            self._handle_maintenance_tick()
             return
         if event.event_type == CLIEventType.SHUTDOWN:
             self._begin_shutdown()
@@ -593,7 +834,8 @@ class CLIController:
             self._begin_shutdown()
             return
         if command == "/stop":
-            self._handle_cancel_request(announce_idle=True)
+            if self._handle_cancel_request(announce_idle=True):
+                self._mark_activity()
             return
 
         if command in {"/sessions", "/resume", "/new"} and (
@@ -621,7 +863,8 @@ class CLIController:
             return
 
         if command == "/new":
-            self._reset_current_session()
+            if self._reset_current_session():
+                self._mark_activity()
             return
 
         if command == "/resume":
@@ -635,17 +878,20 @@ class CLIController:
                 else CLIWorkerTask(
                     kind="resume",
                     session_id=self._session_choices.get(selection, selection),
+                    current_session_id=self._session_id,
                 )
             )
-            self._submit_task(task)
+            if self._submit_task(task):
+                self._mark_activity()
             return
         if command == "/sessions":
-            self._submit_task(
+            if self._submit_task(
                 CLIWorkerTask(
                     kind="list_sessions",
                     current_session_id=self._session_id,
                 )
-            )
+            ):
+                self._mark_activity()
             return
         if command.startswith("/"):
             self._ui.show_message(f"unknown command: {command}")
@@ -653,7 +899,7 @@ class CLIController:
 
         self._submit_or_queue_message(user_input)
 
-    def _reset_current_session(self) -> None:
+    def _reset_current_session(self) -> bool:
         """仅在统一资源清理完整成功后放弃当前会话。"""
 
         session_id = self._session_id
@@ -662,7 +908,7 @@ class CLIController:
             self._ui.show_message(
                 "new session will start with your next message"
             )
-            return
+            return True
 
         try:
             from hermes.session_resources import cleanup_session_resources
@@ -679,13 +925,14 @@ class CLIController:
             self._ui.show_message(
                 "session cleanup did not complete; current session was kept"
             )
-            return
+            return False
 
         self._session_id = None
         self._pending_approval = None
         self._ui.show_message(
             "new session will start with your next message"
         )
+        return True
 
     def _handle_pending_approval(self, command: str, argument: str) -> None:
         if self._running:
@@ -709,10 +956,15 @@ class CLIController:
         else:
             self._ui.show_message("enter /approve [once|session] or /deny")
             return
-        if self._session_id is None or not self._submit_task(task, begins_stream=True):
+        if self._session_id is None or not self._submit_task(
+            task,
+            begins_stream=True,
+        ):
             self._ui.show_message("agent is running; approval is still pending.")
+            return
+        self._mark_activity()
 
-    def _submit_or_queue_message(self, user_input: str) -> None:
+    def _submit_or_queue_message(self, user_input: str) -> bool:
         if self._running:
             mailbox = self._active_steer_mailbox
             if mailbox is not None:
@@ -725,24 +977,31 @@ class CLIController:
                 except Exception:
                     submitted = False
                 if submitted:
+                    self._mark_activity()
                     self._ui.show_message("已向当前任务发送引导。")
-                    return
+                    return True
         if self._running or not self._message_queue.is_empty():
             if self._message_queue.enqueue(user_input):
+                self._mark_activity()
                 self._ui.show_message("message queued.")
+                return True
             else:
                 self._ui.show_message(
                     f"message queue is full (limit: {self._message_queue.limit})."
                 )
-            return
+            return False
         task = self._conversation_task(user_input)
-        if not self._submit_task(task, begins_stream=True):
-            if self._message_queue.enqueue(user_input):
-                self._ui.show_message("message queued.")
-            else:
-                self._ui.show_message(
-                    f"message queue is full (limit: {self._message_queue.limit})."
-                )
+        if self._submit_task(task, begins_stream=True):
+            self._mark_activity()
+            return True
+        if self._message_queue.enqueue(user_input):
+            self._mark_activity()
+            self._ui.show_message("message queued.")
+            return True
+        self._ui.show_message(
+            f"message queue is full (limit: {self._message_queue.limit})."
+        )
+        return False
 
     def _conversation_task(self, user_input: str) -> CLIWorkerTask:
         return CLIWorkerTask(
@@ -774,18 +1033,84 @@ class CLIController:
         self._active_steer_mailbox = steer_mailbox
         return True
 
+    def _handle_maintenance_tick(self) -> None:
+        """在事件线程筛选维护任务，并交给现有 CLI worker 执行清理。"""
+
+        if self._shutting_down:
+            return
+        try:
+            if self._process_manager is None:
+                raise RuntimeError("process manager is unavailable")
+            self._process_manager.prune()
+        except Exception as error:
+            logger.warning(
+                "CLI process prune failed: exception_type=%s",
+                type(error).__name__,
+            )
+            return
+
+        foreground_active = bool(
+            self._running
+            or not self._message_queue.is_empty()
+            or self._pending_approval is not None
+        )
+        if self._session_id is None or foreground_active:
+            return
+
+        self._submit_task(
+            CLIWorkerTask(
+                kind="idle_cleanup",
+                session_id=self._session_id,
+                last_activity_at=self._last_activity_at,
+                idle_timeout_seconds=self._idle_timeout_seconds,
+                foreground_active=foreground_active,
+            )
+        )
+
     def _handle_worker_results(self) -> None:
         for result in self._worker.drain_results():
             self._running = False
             self._current_cancel_event = None
             self._active_steer_mailbox = None
+            if result.kind == "idle_cleanup":
+                self._handle_idle_cleanup_result(result)
+                self._submit_next_queued_message()
+                continue
             self._restore_pending_steer(result)
             self._apply_worker_result(result)
+            self._mark_activity()
             if result.kind == "cancel_approval" and result.error is None:
                 self._ui.show_message("当前审批已取消。")
             else:
                 self._ui.show_worker_result(result)
             self._submit_next_queued_message()
+
+    def _handle_idle_cleanup_result(
+        self,
+        result: CLIWorkerResult,
+    ) -> None:
+        """仅在事件线程应用 idle 清理结果，不污染 CLI 对话输出。"""
+
+        if result.error is not None:
+            logger.warning("CLI idle cleanup worker failed")
+            return
+        report = result.idle_cleanup_report
+        if report is None:
+            logger.warning("CLI idle cleanup returned no report")
+            return
+        if not report.attempted:
+            if report.decision.reason == "active_processes":
+                logger.debug(
+                    "CLI idle cleanup skipped: active process count=%d",
+                    report.decision.active_process_count,
+                )
+            return
+        if not report.complete:
+            logger.warning("CLI idle cleanup incomplete")
+            return
+        if result.session_id == self._session_id:
+            self._mark_activity()
+            logger.debug("CLI idle cleanup completed")
 
     def _restore_pending_steer(self, result: CLIWorkerResult) -> None:
         """把 AgentLoop 未消费的 steer 文本原序恢复到普通队首。"""
@@ -863,7 +1188,7 @@ class CLIController:
         self,
         *,
         announce_idle: bool,
-    ) -> None:
+    ) -> bool:
         if self._pending_approval is not None and not self._running:
             task = CLIWorkerTask(
                 kind="cancel_approval",
@@ -872,23 +1197,25 @@ class CLIController:
             )
             if self._session_id is None or not self._submit_task(task):
                 self._ui.show_message("审批取消请求未提交，请重试。")
+                return False
             else:
                 self._ui.show_message("已请求取消当前审批")
-            return
+                return True
         if not self._running:
             if announce_idle:
                 self._ui.show_message("当前没有正在运行的任务。")
-            return
+            return False
         if self._current_cancel_event is None:
             if announce_idle:
                 self._ui.show_message("当前控制任务正在收尾，无法中途停止。")
-            return
+            return False
         if self._current_cancel_event.is_set():
             if announce_idle:
                 self._ui.show_message("当前任务已经请求停止。")
-            return
+            return False
         self._current_cancel_event.set()
         self._ui.show_message("已请求停止当前任务")
+        return True
 
     def _request_current_cancellation(self) -> None:
         if self._current_cancel_event is not None:

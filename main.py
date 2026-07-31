@@ -102,7 +102,9 @@ def cli_loop() -> None:
             stream_sink=events.post_stream_event,
             publish_result=events.post_worker_result,
             hook_registry=hook_registry,
+            process_manager=process_manager,
         )
+        gateway_config = _config.get("gateway", {})
         controller = CLIController(
             events=events,
             worker=worker,
@@ -110,6 +112,14 @@ def cli_loop() -> None:
             cached_prompt=cached_prompt,
             tool_policy=tool_policy,
             process_manager=process_manager,
+            idle_timeout_seconds=gateway_config.get(
+                "session_idle_timeout",
+                86400.0,
+            ),
+            idle_cleanup_interval_seconds=gateway_config.get(
+                "session_cleanup_interval_seconds",
+                600.0,
+            ),
         )
         with patched_cli_stdout():
             cli_ui.show_startup(

@@ -580,6 +580,26 @@ class SessionStore:
         )
         return True
 
+    def finish_foreground_work(
+        self,
+        route_key: str,
+        conversation_id: str,
+        *,
+        completed_at: float | None = None,
+    ) -> bool:
+        """原子结束仍属于同一 conversation 的前台 route 工作。"""
+
+        ctx = self._contexts.get(route_key)
+        if ctx is None or ctx.conversation_id != conversation_id:
+            return False
+        ctx.busy = False
+        ctx.last_activity = (
+            time.time()
+            if completed_at is None
+            else completed_at
+        )
+        return True
+
     @staticmethod
     def save_conversation_list_mapping(
         ctx: SessionContext,

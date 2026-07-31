@@ -4566,6 +4566,7 @@ class GatewayRunner:
         invalidation_event: asyncio.Event,
     ) -> None:
         """投递不需要再次调用模型的持久化回复。"""
+        foreground_conversation_id = ctx.conversation_id
         cancel_reason = None
         try:
             delivered = await self._deliver_outbox(
@@ -4620,7 +4621,10 @@ class GatewayRunner:
                     ctx.dispatching = True
                 ctx.worker_task = None
                 ctx.worker_generation = None
-                ctx.busy = False
+                self.sessions.finish_foreground_work(
+                    route_key,
+                    foreground_conversation_id,
+                )
         if cancel_reason != "shutdown":
             await self._dispatch_next(ctx)
 
@@ -4981,6 +4985,7 @@ class GatewayRunner:
             route_key,
             self._build_gateway_prompt(first_event.source),
         )
+        foreground_conversation_id = ctx.conversation_id
         cancel_reason = None
         try:
             for position, row in enumerate(rows):
@@ -5052,7 +5057,10 @@ class GatewayRunner:
                     ctx.dispatching = True
                 ctx.worker_task = None
                 ctx.worker_generation = None
-                ctx.busy = False
+                self.sessions.finish_foreground_work(
+                    route_key,
+                    foreground_conversation_id,
+                )
         if cancel_reason != "shutdown":
             await self._dispatch_next(ctx)
 
@@ -6614,8 +6622,7 @@ class GatewayRunner:
                         ctx.dispatching = True
                     ctx.worker_task = None
                     ctx.worker_generation = None
-                    ctx.busy = False
-                    self.sessions.mark_foreground_completed(
+                    self.sessions.finish_foreground_work(
                         route_key,
                         foreground_conversation_id,
                     )

@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from hermes.session_idle import (
     SessionIdleDecision,
-    SessionProcessView,
+    SessionProcessLifecycle,
     evaluate_session_idle,
 )
 
 
 if TYPE_CHECKING:
-    from hermes.processes import ProcessCleanupReport, ProcessManager
+    from hermes.processes import ProcessCleanupReport
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,13 @@ _PROCESS_CLEANUP_ERROR = "process_cleanup_error"
 _BROWSER_CLEANUP_ERROR = "browser_cleanup_error"
 _BACKEND_CLEANUP_ERROR = "backend_cleanup_error"
 _LIFECYCLE_BARRIER_ERROR = "lifecycle_barrier_incomplete"
+
+
+class GlobalProcessLifecycle(Protocol):
+    """全局硬清理需要的最小 Process 生命周期接口。"""
+
+    def cleanup_all(self) -> ProcessCleanupReport:
+        """清理全部 Process 资源并返回公共报告。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,28 +134,16 @@ def _log_cleanup_issue(
 
 
 def _run_process_cleanup(
-    process_manager: ProcessManager | None,
+    operation: Callable[[], object],
     *,
-    session_key: str | None,
     scope: str,
 ) -> tuple[ProcessCleanupReport | None, tuple[str, ...]]:
-    """延迟解析 ProcessManager，并校验它返回公共清理报告。"""
+    """执行已绑定的 Process 清理，并校验公共清理报告。"""
 
     try:
-        from hermes.processes import (
-            ProcessCleanupReport,
-            process_manager as default_process_manager,
-        )
+        from hermes.processes import ProcessCleanupReport
 
-        active_manager = (
-            default_process_manager
-            if process_manager is None
-            else process_manager
-        )
-        if session_key is None:
-            report = active_manager.cleanup_all()
-        else:
-            report = active_manager.cleanup_session(session_key)
+        report = operation()
         if not isinstance(report, ProcessCleanupReport):
             raise TypeError("Process cleanup returned an invalid report")
     except Exception as error:
@@ -245,13 +240,24 @@ def _cleanup_all_backends() -> tuple[bool, str | None]:
 def cleanup_session_resources(
     session_key: str,
     *,
-    process_manager: ProcessManager | None = None,
+    process_manager: SessionProcessLifecycle | None = None,
 ) -> SessionResourceCleanupReport:
     """按进程、浏览器、Backend 的依赖顺序清理一个会话。"""
 
+    def run_process_cleanup() -> object:
+        from hermes.processes import (
+            process_manager as default_process_manager,
+        )
+
+        active_manager = (
+            default_process_manager
+            if process_manager is None
+            else process_manager
+        )
+        return active_manager.cleanup_session(session_key)
+
     process_cleanup, process_error_types = _run_process_cleanup(
-        process_manager,
-        session_key=session_key,
+        run_process_cleanup,
         scope="Session",
     )
     browser_cleanup_succeeded, browser_error_type = (
@@ -289,7 +295,7 @@ def cleanup_idle_session_resources(
     last_activity_at: float,
     idle_timeout_seconds: float,
     foreground_active: bool,
-    process_manager: SessionProcessView,
+    process_manager: SessionProcessLifecycle,
 ) -> IdleSessionCleanupReport:
     """仅在共享 idle 策略允许时调用现有完整会话清理。"""
 
@@ -309,7 +315,7 @@ def cleanup_idle_session_resources(
 
     resource_cleanup = cleanup_session_resources(
         session_key,
-        process_manager=cast("ProcessManager", process_manager),
+        process_manager=process_manager,
     )
     return IdleSessionCleanupReport(
         attempted=True,
@@ -320,14 +326,25 @@ def cleanup_idle_session_resources(
 
 def cleanup_all_session_resources(
     *,
-    process_manager: ProcessManager | None = None,
+    process_manager: GlobalProcessLifecycle | None = None,
     lifecycle_barrier_complete: bool = True,
 ) -> GlobalResourceCleanupReport:
     """按进程、浏览器、Backend 的依赖顺序清理全部会话。"""
 
+    def run_process_cleanup() -> object:
+        from hermes.processes import (
+            process_manager as default_process_manager,
+        )
+
+        active_manager = (
+            default_process_manager
+            if process_manager is None
+            else process_manager
+        )
+        return active_manager.cleanup_all()
+
     process_cleanup, process_error_types = _run_process_cleanup(
-        process_manager,
-        session_key=None,
+        run_process_cleanup,
         scope="Global",
     )
     browser_cleanup_succeeded, browser_error_type = _cleanup_all_browsers()
@@ -366,6 +383,7 @@ def cleanup_all_session_resources(
 
 __all__ = [
     "GlobalResourceCleanupReport",
+    "GlobalProcessLifecycle",
     "IdleSessionCleanupReport",
     "SessionResourceCleanupReport",
     "cleanup_all_session_resources",
