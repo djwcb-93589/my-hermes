@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import urlparse
 
@@ -74,10 +74,18 @@ class ControlAuthenticator:
 
     def verifies(self, token: str | None) -> bool:
         """以常量时间比较 Token 摘要，不暴露 Token 配置细节。"""
+        return self.authenticated_security_id(token) is not None
+
+    def authenticated_security_id(self, token: str | None) -> str | None:
+        """为已认证控制主体生成域隔离摘要，不返回或复用 Token 摘要。"""
         if self._token_digest is None or not isinstance(token, str):
-            return False
+            return None
         candidate = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return secrets.compare_digest(candidate, self._token_digest)
+        if not secrets.compare_digest(candidate, self._token_digest):
+            return None
+        return hashlib.sha256(
+            b"hermes-dashboard-control-actor-v1:" + candidate.encode("ascii")
+        ).hexdigest()
 
     def require(self, token: str | None, origin: str | None) -> None:
         """保留旧控制调用方的最小认证接口。"""
@@ -103,6 +111,11 @@ class AccessDecision:
     allowed: bool
     status_code: int | None = None
     error_code: str | None = None
+    actor_security_id: str | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 class DashboardAccessPolicy:
@@ -137,7 +150,10 @@ class DashboardAccessPolicy:
         if permission is DashboardPermission.READ:
             if not self._read_auth_required:
                 return AccessDecision(allowed=True)
-            return self._token_decision(token)
+            token_decision = self._token_decision(token)
+            if token_decision.allowed:
+                return AccessDecision(allowed=True)
+            return token_decision
 
         if permission is DashboardPermission.CONTROL:
             token_decision = self._token_decision(token)
@@ -152,7 +168,7 @@ class DashboardAccessPolicy:
                     status_code=403,
                     error_code="control_origin_forbidden",
                 )
-            return AccessDecision(allowed=True)
+            return token_decision
 
         return AccessDecision(
             allowed=False,
@@ -171,13 +187,17 @@ class DashboardAccessPolicy:
                 status_code=401,
                 error_code="authentication_required",
             )
-        if not self._authenticator.verifies(token):
+        actor_security_id = self._authenticator.authenticated_security_id(token)
+        if actor_security_id is None:
             return AccessDecision(
                 allowed=False,
                 status_code=401,
                 error_code="authentication_required",
             )
-        return AccessDecision(allowed=True)
+        return AccessDecision(
+            allowed=True,
+            actor_security_id=actor_security_id,
+        )
 
 
 def is_loopback_host(host: object) -> bool:

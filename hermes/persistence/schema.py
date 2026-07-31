@@ -26,6 +26,7 @@ from pathlib import Path
 from .database import DBError, _apply_pragmas
 from .migrations.approval import _migrate_v13_to_v14, _migrate_v28_to_v29, _migrate_v29_to_v30, _migrate_v30_to_v31
 from .migrations.background_review import _migrate_v32_to_v33, _migrate_v33_to_v34, _migrate_v34_to_v35
+from .migrations.backend_control import _migrate_v37_to_v38
 from .migrations.core import _migrate_v1_to_v2, _migrate_v26_to_v27
 from .migrations.cron import _migrate_v18_to_v19, _migrate_v19_to_v20, _migrate_v20_to_v21, _migrate_v24_to_v25
 from .migrations.delivery import _migrate_v15_to_v16, _migrate_v16_to_v17, _migrate_v21_to_v22
@@ -38,6 +39,7 @@ from .migrations.tool_execution import _migrate_v25_to_v26, _migrate_v27_to_v28,
 from .schemas import (
     approval,
     background_review,
+    backend_control,
     core,
     cron,
     delivery,
@@ -51,7 +53,7 @@ from .schemas import (
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 37
+LATEST_SCHEMA_VERSION = 38
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -104,6 +106,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     tool_execution.create_schema(conn)
     observation.create_schema(conn)
     runtime.create_schema(conn)
+    backend_control.create_schema(conn)
 
 
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
@@ -127,7 +130,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     v29 -> v30 扩展 Gateway 审批可持久化的浏览器高风险工具，v30 -> v31
     移除审批表中的具体工具名称枚举。v31 -> v32 增加等待人工批准的
     工具执行 Journal 状态，避免审批占位结果被当作执行失败。v35 -> v36
-    增加安全 Observation 表，v36 -> v37 增加 Runtime 当前快照表。
+    增加安全 Observation 表，v36 -> v37 增加 Runtime 当前快照表，
+    v37 -> v38 增加 Gateway Supervisor 控制请求与进程绑定。
     """
     if current < 1:
         # 极少见:有 schema_version 表但版本 < 1,补基础表
@@ -575,6 +579,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 37
+
+    if current < 38:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v37_to_v38(conn)
+            _set_schema_version(conn, 38)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 38
 
     return current
 

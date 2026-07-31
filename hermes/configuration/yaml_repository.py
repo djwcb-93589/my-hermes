@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import hashlib
 import logging
 import os
 import re
@@ -21,6 +20,7 @@ from yaml.nodes import MappingNode
 
 from hermes.config_environment import ConfigEnvironment
 from hermes.config_model import validate_config_mapping
+from hermes.config_revision import revision_for_bytes
 
 from .contracts import (
     MAX_CONFIG_PATCH_CHANGES,
@@ -523,9 +523,7 @@ def _serialize_mapping(raw: Mapping[object, object]) -> bytes:
 
 
 def _revision_for_bytes(payload: bytes) -> ConfigRevision:
-    return ConfigRevision(
-        value=f"sha256:{hashlib.sha256(payload).hexdigest()}"
-    )
+    return ConfigRevision(value=revision_for_bytes(payload))
 
 
 def _mapping_path(

@@ -7,6 +7,16 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hermes.backend_control import (
+    BACKEND_REQUEST_ID_PATTERN,
+    BackendControlAction,
+    BackendControlRequestStatus,
+    BackendObservedState,
+    BackendOwnershipState,
+    BackendResultCode,
+    BackendType,
+    SupervisorInstanceState,
+)
 from hermes.configuration.contracts import (
     MAX_CONFIG_PATCH_CHANGES,
     ConfigApplyMode,
@@ -86,6 +96,67 @@ class StatusResponse(BaseModel):
     gateway_status: str | None = Field(default=None, deprecated=True)
     database_status: str = Field(default="unavailable", deprecated=True)
     current_time: datetime
+
+
+class _BackendApiModel(BaseModel):
+    """Backend API 只接受显式、严格的安全投影字段。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class BackendControlAcceptedResponse(_BackendApiModel):
+    """异步控制意图已经持久化的最小确认。"""
+
+    request_id: str = Field(pattern=BACKEND_REQUEST_ID_PATTERN)
+    action: BackendControlAction
+    status: BackendControlRequestStatus
+
+
+class BackendControlRequestResponse(_BackendApiModel):
+    """控制请求的安全结果，不公开主体、幂等摘要或进程身份。"""
+
+    request_id: str = Field(pattern=BACKEND_REQUEST_ID_PATTERN)
+    backend_type: BackendType
+    action: BackendControlAction
+    status: BackendControlRequestStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    result_code: BackendResultCode | None = None
+    result_reference: str | None = Field(default=None, max_length=64)
+    exception_type: str | None = Field(default=None, max_length=128)
+    forced_termination: bool = False
+
+
+class BackendSupervisorStatusResponse(_BackendApiModel):
+    """Supervisor lease 的有限公开状态。"""
+
+    online: bool
+    lease_expires_at: datetime | None = None
+    instance_state: SupervisorInstanceState
+
+
+class BackendGatewayStatusResponse(_BackendApiModel):
+    """Gateway lease 与受控进程绑定组合出的安全状态。"""
+
+    observed_state: BackendObservedState
+    ownership: BackendOwnershipState
+    lease_active: bool
+    managed: bool
+    started_at: datetime | None = None
+    last_exit_at: datetime | None = None
+    last_exit_code: int | None = None
+    config_changed_since_start: bool | None = None
+    restart_recommended: bool | None = None
+
+
+class BackendStatusResponse(_BackendApiModel):
+    """Backend 当前状态与最近控制请求的只读快照。"""
+
+    observed_at: datetime
+    supervisor: BackendSupervisorStatusResponse
+    gateway: BackendGatewayStatusResponse
+    latest_request: BackendControlRequestResponse | None = None
 
 
 class SessionSummary(BaseModel):

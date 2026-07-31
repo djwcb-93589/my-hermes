@@ -11,7 +11,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from hermes.backend_control import BackendControlError
 from hermes.config_environment import ConfigEnvironment
+from hermes.config_revision import FileConfigRevisionReader
 from hermes.config_values import hermes_home
 from hermes.configuration import (
     DEFAULT_CONFIG_FIELD_REGISTRY,
@@ -23,6 +25,10 @@ from hermes.configuration.yaml_repository import YamlConfigRepository
 from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
+)
+from hermes.persistence.backend_control import (
+    SQLiteBackendControlRepository,
+    SQLiteBackendStatusReadRepository,
 )
 from hermes.persistence.database_diagnostics import (
     SQLiteDatabaseDiagnosticsRepository,
@@ -36,6 +42,10 @@ from hermes.persistence.monitoring_aggregation import (
 )
 from hermes.persistence.runtime import SQLiteRuntimeStatusReadRepository
 from hermes.tool_declarations.catalog import build_toolset_catalog_snapshot
+from hermes.web.backend_service import (
+    BackendControlService,
+    BackendStatusReadService,
+)
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
 from hermes.web.database_diagnostics_service import (
@@ -58,6 +68,7 @@ from hermes.web.read_service import (
 from hermes.web.redaction import DashboardRedactor
 from hermes.web.runtime_status_service import RuntimeStatusReadService
 from hermes.web.routes import (
+    backend,
     catalog,
     config as config_routes,
     cron,
@@ -105,6 +116,26 @@ _CONFIG_ERROR_MESSAGES = {
     "config_shadowed": "配置字段当前由环境覆盖，不能通过文件修改。",
     "config_unavailable": "配置当前不可用。",
     "config_write_failed": "配置无法安全写入。",
+}
+_BACKEND_ERROR_STATUS = {
+    "backend_control_invalid_request": 400,
+    "backend_request_not_found": 404,
+    "backend_control_conflict": 409,
+    "idempotency_conflict": 409,
+    "backend_unmanaged": 409,
+    "backend_ownership_uncertain": 409,
+    "supervisor_unavailable": 503,
+    "backend_control_unavailable": 503,
+}
+_BACKEND_ERROR_MESSAGES = {
+    "backend_control_invalid_request": "后端控制请求参数无效。",
+    "backend_request_not_found": "后端控制请求不存在。",
+    "backend_control_conflict": "当前后端状态不允许执行该控制操作。",
+    "idempotency_conflict": "Idempotency-Key 已用于不同的控制操作。",
+    "backend_unmanaged": "当前 Gateway 不受 Supervisor 管理。",
+    "backend_ownership_uncertain": "当前 Gateway 的进程所有权无法安全确认。",
+    "supervisor_unavailable": "Supervisor 当前不在线。",
+    "backend_control_unavailable": "后端控制基础设施当前不可用。",
 }
 
 
@@ -159,6 +190,19 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         else None
     )
     config_path = config.config_path or str(hermes_home() / "config.yaml")
+    backend_control_service = (
+        BackendControlService(SQLiteBackendControlRepository(config.db_path))
+        if config.db_path is not None
+        else None
+    )
+    backend_status_read_service = (
+        BackendStatusReadService(
+            SQLiteBackendStatusReadRepository(config.db_path),
+            FileConfigRevisionReader(config_path),
+        )
+        if config.db_path is not None
+        else None
+    )
     config_environment = config.config_environment
     if config_environment is None:
         # 兼容直接构造 DashboardConfig 的调用方；正式入口会注入完整快照。
@@ -203,6 +247,8 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         runtime_status_read_service=runtime_status_read_service,
         config_read_service=config_read_service,
         config_write_service=config_write_service,
+        backend_control_service=backend_control_service,
+        backend_status_read_service=backend_status_read_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
         access_policy=access_policy,
@@ -234,6 +280,8 @@ def create_app(
     runtime_status_read_service: RuntimeStatusReadService | None = None,
     config_read_service: ConfigReadService | None = None,
     config_write_service: ConfigWriteService | None = None,
+    backend_control_service: BackendControlService | None = None,
+    backend_status_read_service: BackendStatusReadService | None = None,
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
@@ -276,6 +324,8 @@ def create_app(
     application.state.runtime_status_read_service = runtime_status_read_service
     application.state.config_read_service = config_read_service
     application.state.config_write_service = config_write_service
+    application.state.backend_control_service = backend_control_service
+    application.state.backend_status_read_service = backend_status_read_service
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
     application.state.dashboard_access_policy = policy
@@ -317,6 +367,8 @@ def create_app(
             origin=request.headers.get("Origin"),
         )
         if decision.allowed:
+            if permission is DashboardPermission.CONTROL:
+                request.state.actor_security_id = decision.actor_security_id
             return await call_next(request)
         return _authorization_error_response(decision.status_code, decision.error_code)
 
@@ -372,6 +424,29 @@ def create_app(
         )
         return JSONResponse(
             status_code=_CONFIG_ERROR_STATUS[reason_code],
+            content=jsonable_encoder(body),
+        )
+
+    @application.exception_handler(BackendControlError)
+    async def handle_backend_control_error(
+        request: Request,
+        exc: BackendControlError,
+    ) -> JSONResponse:
+        """只公开受控原因码，不传播持久化或进程异常细节。"""
+        del request
+        reason_code = getattr(
+            exc,
+            "reason_code",
+            "backend_control_unavailable",
+        )
+        if reason_code not in _BACKEND_ERROR_STATUS:
+            reason_code = "backend_control_unavailable"
+        body = ErrorResponse(
+            code=reason_code,
+            message=_BACKEND_ERROR_MESSAGES[reason_code],
+        )
+        return JSONResponse(
+            status_code=_BACKEND_ERROR_STATUS[reason_code],
             content=jsonable_encoder(body),
         )
 
@@ -461,6 +536,7 @@ def create_app(
     application.include_router(database_diagnostics.router)
     application.include_router(runtime.router)
     application.include_router(config_routes.router)
+    application.include_router(backend.router)
     return application
 
 

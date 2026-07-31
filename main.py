@@ -14,10 +14,13 @@ def _selected_runtime_modes(args: list[str]) -> frozenset[str]:
     """识别互斥运行模式，避免依赖分支顺序静默选择入口。"""
     selected: set[str] = set()
     is_plugins_command = bool(args) and args[0] == "plugins"
+    is_supervisor_command = bool(args) and args[0] == "supervisor"
     if not is_plugins_command and "dashboard" in args:
         selected.add("dashboard")
     if is_plugins_command:
         selected.add("plugins")
+    if is_supervisor_command:
+        selected.add("supervisor")
     if "--gateway" in args or "--gateway-unified" in args:
         selected.add("gateway")
     if "--gateway-console" in args:
@@ -202,6 +205,12 @@ def main() -> None:
         from hermes.web.main import run_dashboard
 
         run_dashboard()
+    elif selected == {"supervisor"}:
+        if args != ["supervisor"]:
+            raise SystemExit("supervisor does not accept additional arguments")
+        from hermes.supervisor.main import run_supervisor
+
+        run_supervisor()
     elif selected == {"gateway"}:
         # 统一 Gateway 入口（读取 config.yaml gateway.platforms）
         from hermes.gateway_entry import run_gateway
