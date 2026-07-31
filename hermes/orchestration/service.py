@@ -23,6 +23,7 @@ from hermes.orchestration.models import (
     plain_json_object,
 )
 from hermes.orchestration.store import OrchestrationStore
+from hermes.orchestration.workflow_execution import WorkflowExecutionSnapshot
 
 
 _MAX_TASKS_PER_WORKFLOW = 10_000
@@ -258,6 +259,21 @@ class OrchestrationService:
             raise OrchestrationNotFoundError("workflow was not found")
         return workflow
 
+    def get_workflow_execution_snapshot(
+        self,
+        *,
+        workflow_id: str,
+    ) -> WorkflowExecutionSnapshot:
+        """原子读取 Runner 状态分类所需的完整 Workflow 快照。"""
+
+        return self._store.get_workflow_execution_snapshot(
+            workflow_id=_require_string(
+                workflow_id,
+                "workflow_id",
+                max_length=_MAX_KEY_LENGTH,
+            )
+        )
+
     def get_task(self, task_id: str) -> TaskRecord:
         normalized = _require_string(
             task_id,
@@ -388,6 +404,35 @@ class OrchestrationService:
                 owner_id,
                 "owner_id",
                 max_length=256,
+            ),
+            lease_seconds=_require_lease_seconds(lease_seconds),
+        )
+
+    def reserve_ready_tasks(
+        self,
+        *,
+        workflow_id: str,
+        owner_id: str,
+        limit: int,
+        lease_seconds: float,
+    ) -> tuple[TaskClaim, ...]:
+        """为中央 Runner 原子保留不超过 limit 个 ready Task。"""
+
+        return self._store.reserve_ready_tasks(
+            workflow_id=_require_string(
+                workflow_id,
+                "workflow_id",
+                max_length=_MAX_KEY_LENGTH,
+            ),
+            owner_id=_require_string(
+                owner_id,
+                "owner_id",
+                max_length=256,
+            ),
+            limit=_require_positive_int(
+                limit,
+                "limit",
+                maximum=_MAX_CLAIM_LIMIT,
             ),
             lease_seconds=_require_lease_seconds(lease_seconds),
         )

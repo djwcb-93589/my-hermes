@@ -13,6 +13,7 @@ from hermes.orchestration.models import (
     WorkflowCreateSpec,
     WorkflowRecord,
 )
+from hermes.orchestration.workflow_execution import WorkflowExecutionSnapshot
 
 
 class OrchestrationStore(Protocol):
@@ -23,6 +24,13 @@ class OrchestrationStore(Protocol):
 
     def get_workflow(self, workflow_id: str) -> WorkflowRecord | None:
         """读取 Workflow；不存在时返回 None。"""
+
+    def get_workflow_execution_snapshot(
+        self,
+        *,
+        workflow_id: str,
+    ) -> WorkflowExecutionSnapshot:
+        """在一个只读事务中捕获 Workflow 及其全部 Task。"""
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         """读取 Task；不存在时返回 None。"""
@@ -68,6 +76,16 @@ class OrchestrationStore(Protocol):
         lease_seconds: float,
     ) -> TaskClaim | None:
         """为中央 Runner 原子保留指定 Workflow 的下一个 ready Task。"""
+
+    def reserve_ready_tasks(
+        self,
+        *,
+        workflow_id: str,
+        owner_id: str,
+        limit: int,
+        lease_seconds: float,
+    ) -> tuple[TaskClaim, ...]:
+        """为中央 Runner 原子保留指定 Workflow 的有限批 ready Task。"""
 
     def renew_task_claim(
         self,

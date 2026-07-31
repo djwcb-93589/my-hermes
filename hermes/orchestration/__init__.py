@@ -47,7 +47,11 @@ from hermes.orchestration.store import OrchestrationStore
 from hermes.orchestration.workflow_execution import (
     WorkflowExecutionKind,
     WorkflowExecutionResult,
+    WorkflowExecutionSnapshot,
     WorkflowRunner,
+    WorkflowTaskExecutionHandle,
+    WorkflowTaskExecutionPool,
+    WorkflowTaskExecutionPoolFactory,
 )
 
 
@@ -86,9 +90,13 @@ __all__ = [
     "WorkflowCycleError",
     "WorkflowExecutionKind",
     "WorkflowExecutionResult",
+    "WorkflowExecutionSnapshot",
     "WorkflowRecord",
     "WorkflowRunner",
     "WorkflowRunnerError",
     "WorkflowRunnerValidationError",
     "WorkflowStatus",
+    "WorkflowTaskExecutionHandle",
+    "WorkflowTaskExecutionPool",
+    "WorkflowTaskExecutionPoolFactory",
 ]

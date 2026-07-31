@@ -33,6 +33,7 @@ from hermes.orchestration.models import (
     plain_json_object,
 )
 from hermes.orchestration.store import OrchestrationStore
+from hermes.orchestration.workflow_execution import WorkflowExecutionSnapshot
 
 from .database import _immediate_transaction
 from .read_only import readonly_connection
@@ -82,6 +83,20 @@ def _database_operation(operation: str) -> Iterator[None]:
         raise OrchestrationPersistenceError(
             f"orchestration {operation} failed"
         ) from exc
+
+
+@contextmanager
+def _read_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """显式固定两个查询使用同一个 SQLite 只读快照。"""
+
+    conn.execute("BEGIN")
+    try:
+        yield
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 def _argument_text(
@@ -1147,6 +1162,44 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             with readonly_connection(self._db_path) as conn:
                 return _read_workflow(conn, normalized)
 
+    def get_workflow_execution_snapshot(
+        self,
+        *,
+        workflow_id: str,
+    ) -> WorkflowExecutionSnapshot:
+        normalized = _argument_text(
+            workflow_id,
+            "workflow_id",
+            max_length=128,
+        )
+        with _database_operation("workflow execution snapshot read"):
+            with readonly_connection(self._db_path) as conn:
+                with _read_transaction(conn):
+                    workflow = _require_workflow(conn, normalized)
+                    rows = conn.execute(
+                        f"SELECT {_TASK_COLUMNS} "
+                        "FROM orchestration_tasks WHERE workflow_id=? "
+                        "ORDER BY created_at, task_id",
+                        (normalized,),
+                    ).fetchall()
+                    tasks = tuple(_task_from_row(row) for row in rows)
+                    captured_at = self._now()
+                    try:
+                        snapshot = WorkflowExecutionSnapshot(
+                            workflow=workflow,
+                            tasks=tasks,
+                            captured_at=captured_at,
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                        OrchestrationValidationError,
+                    ) as exc:
+                        raise OrchestrationPersistenceError(
+                            "stored workflow execution snapshot is invalid"
+                        ) from exc
+        return snapshot
+
     def get_task(self, task_id: str) -> TaskRecord | None:
         normalized = _argument_text(task_id, "task_id", max_length=128)
         with _database_operation("task read"):
@@ -1289,12 +1342,33 @@ class SQLiteOrchestrationStore(OrchestrationStore):
         owner_id: str,
         lease_seconds: float,
     ) -> TaskClaim | None:
+        claims = self.reserve_ready_tasks(
+            workflow_id=workflow_id,
+            owner_id=owner_id,
+            limit=1,
+            lease_seconds=lease_seconds,
+        )
+        if len(claims) > 1:
+            raise OrchestrationPersistenceError(
+                "workflow task reservation returned too many claims"
+            )
+        return claims[0] if claims else None
+
+    def reserve_ready_tasks(
+        self,
+        *,
+        workflow_id: str,
+        owner_id: str,
+        limit: int,
+        lease_seconds: float,
+    ) -> tuple[TaskClaim, ...]:
         normalized_workflow_id = _argument_text(
             workflow_id,
             "workflow_id",
             max_length=128,
         )
         owner = _argument_text(owner_id, "owner_id", max_length=256)
+        normalized_limit = _positive_int(limit, "limit", maximum=100)
         normalized_lease_seconds = _positive_number(
             lease_seconds,
             "lease_seconds",
@@ -1303,8 +1377,8 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             raise OrchestrationValidationError(
                 "lease_seconds exceeds its limit"
             )
-        result: TaskClaim | None = None
-        with _database_operation("workflow task reservation"):
+        claims: tuple[TaskClaim, ...] = ()
+        with _database_operation("workflow task batch reservation"):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
                     workflow = _require_workflow(
@@ -1315,16 +1389,11 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                         claims = self._reserve_ready_tasks(
                             conn,
                             owner_id=owner,
-                            limit=1,
+                            limit=normalized_limit,
                             lease_seconds=normalized_lease_seconds,
                             workflow_id=normalized_workflow_id,
                         )
-                        if len(claims) > 1:
-                            raise OrchestrationPersistenceError(
-                                "workflow task reservation returned too many claims"
-                            )
-                        result = claims[0] if claims else None
-        return result
+        return claims
 
     def renew_task_claim(
         self,
