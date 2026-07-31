@@ -616,6 +616,7 @@ def register_all(
     from hermes.tools.file import register as _file
     from hermes.tools.memory import register as _memory
     from hermes.tools.delegate import register as _delegate
+    from hermes.tools.orchestration import register as _orchestration
     from hermes.tools.gateway_send_file import register as _gateway_send_file
     from hermes.tools.media import register as _media
     from hermes.tools.browser import register as _browser
@@ -653,6 +654,12 @@ def register_all(
         )
     # Handler 仍原子注册到 staging；Executor 只绑定最终应用 Registry。
     _delegate(
+        staging_registry,
+        process_manager=active_process_manager,
+        execution_registry=target,
+    )
+    # 编排 Handler 在 staging 原子注册，Worker 只持有正式 target Registry。
+    _orchestration(
         staging_registry,
         process_manager=active_process_manager,
         execution_registry=target,

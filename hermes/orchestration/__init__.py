@@ -1,5 +1,12 @@
 """持久化多 Agent 任务编排的稳定领域入口。"""
 
+from hermes.orchestration.application import (
+    OrchestrationApplication,
+    OrchestrationRunReport,
+    OrchestrationRunRequest,
+    OrchestrationTaskReport,
+    WorkflowRunnerFactory,
+)
 from hermes.orchestration.errors import (
     InvalidTaskTransitionError,
     OrchestrationConflictError,
@@ -60,12 +67,16 @@ __all__ = [
     "AgentRoleSpec",
     "ClaimedTaskExecutor",
     "InvalidTaskTransitionError",
+    "OrchestrationApplication",
     "OrchestrationConflictError",
     "OrchestrationError",
     "OrchestrationNotFoundError",
     "OrchestrationPersistenceError",
+    "OrchestrationRunReport",
+    "OrchestrationRunRequest",
     "OrchestrationService",
     "OrchestrationStore",
+    "OrchestrationTaskReport",
     "OrchestrationValidationError",
     "ResolvedAgentTools",
     "RoleResolver",
@@ -95,6 +106,7 @@ __all__ = [
     "WorkflowRecord",
     "WorkflowRunner",
     "WorkflowRunnerError",
+    "WorkflowRunnerFactory",
     "WorkflowRunnerValidationError",
     "WorkflowTaskSubmissionError",
     "WorkflowStatus",

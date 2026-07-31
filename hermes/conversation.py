@@ -192,7 +192,7 @@ def _dispatch_conversation_tool_call(
     loop,
     tool_call,
     parsed_call: ParsedToolCall | None = None,
-    delegate_hook_registry: SyncHookRegistry | None = None,
+    child_hook_registry: SyncHookRegistry | None = None,
 ):
     """主会话工具分发共享实现,供同步 / 异步循环复用。"""
     parsed = parsed_call or loop._parse_tool_call(tool_call)
@@ -214,16 +214,16 @@ def _dispatch_conversation_tool_call(
     )
     if loop.cancel_checker is not None:
         dispatch_context["cancel_checker"] = loop.cancel_checker
-    # 仅作为 delegate 的运行时参数传递，不进入模型、消息或持久化数据。
-    if parsed.tool_name == "delegate_task":
-        delegate_registry = delegate_hook_registry
-        if delegate_registry is None and isinstance(
+    # 仅供同步子 Agent 运行传递，不进入模型参数、消息或持久化数据。
+    if parsed.tool_name in {"delegate_task", "orchestration_run"}:
+        runtime_hook_registry = child_hook_registry
+        if runtime_hook_registry is None and isinstance(
             getattr(loop, "hook_registry", None),
             SyncHookRegistry,
         ):
-            delegate_registry = loop._delegate_hook_registry()
-        if delegate_registry is not None:
-            dispatch_context["hook_registry"] = delegate_registry
+            runtime_hook_registry = loop._delegate_hook_registry()
+        if runtime_hook_registry is not None:
+            dispatch_context["hook_registry"] = runtime_hook_registry
         if loop.run_id is not None:
             dispatch_context["parent_run_id"] = loop.run_id
     return dispatch_parsed_tool_call(
@@ -733,16 +733,19 @@ class AsyncConversationAgentLoop(AsyncAgentLoop):
         tool_call,
         parsed_call: ParsedToolCall | None = None,
     ) -> tuple[str, str | None, str | None]:
-        delegate_registry = None
-        if self._tool_call_name(tool_call) == "delegate_task":
+        child_hook_registry = None
+        if self._tool_call_name(tool_call) in {
+            "delegate_task",
+            "orchestration_run",
+        }:
             # 必须在 Gateway 所属事件循环中创建快照，不能留给 worker 线程。
-            delegate_registry = self._delegate_hook_registry()
+            child_hook_registry = self._delegate_hook_registry()
         return await asyncio.to_thread(
             _dispatch_conversation_tool_call,
             self,
             tool_call,
             parsed_call,
-            delegate_registry,
+            child_hook_registry,
         )
 
     async def on_tool_message(

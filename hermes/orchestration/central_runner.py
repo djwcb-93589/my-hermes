@@ -105,6 +105,15 @@ _DEFAULT_ERRORS = {
     ),
 }
 
+_TRANSIENT_STOP_KINDS = frozenset({
+    WorkflowExecutionKind.UNAVAILABLE,
+    WorkflowExecutionKind.RETRY_LATER,
+    WorkflowExecutionKind.BLOCKED,
+    WorkflowExecutionKind.BUSY,
+    WorkflowExecutionKind.STEP_LIMIT_REACHED,
+    WorkflowExecutionKind.STALLED,
+})
+
 
 class _RenewalState(Enum):
     """单次 run() 内部用于裁决续租 ClaimLost 的瞬时状态。"""
@@ -897,15 +906,9 @@ class CentralWorkflowRunner:
 
     def _observe_snapshot(self, state: _RunState) -> None:
         snapshot = self._require_snapshot(state)
+        self._reconcile_fresh_terminal_snapshot(state, snapshot)
         status = snapshot.workflow.status
-        if status is WorkflowStatus.COMPLETED:
-            state.propose_stop(WorkflowExecutionKind.COMPLETED)
-            return
-        if status is WorkflowStatus.FAILED:
-            state.propose_stop(WorkflowExecutionKind.FAILED)
-            return
-        if status is WorkflowStatus.CANCELLED:
-            state.propose_stop(WorkflowExecutionKind.CANCELLED)
+        if status is not WorkflowStatus.ACTIVE:
             return
 
         local_task_ids = {
@@ -918,6 +921,69 @@ class CentralWorkflowRunner:
         )
         if has_external_running:
             state.propose_stop(WorkflowExecutionKind.BUSY)
+
+    @staticmethod
+    def _reconcile_fresh_terminal_snapshot(
+        state: _RunState,
+        snapshot: WorkflowExecutionSnapshot,
+    ) -> None:
+        """用最新数据库终态覆盖临时控制状态，保留未知写入与 fencing 风险。"""
+
+        if not state.snapshot_fresh or snapshot is not state.snapshot:
+            return
+        status = snapshot.workflow.status
+        current = state.stop_kind
+        if status is WorkflowStatus.ACTIVE:
+            return
+
+        if status is WorkflowStatus.COMPLETED:
+            if current in {
+                WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
+                WorkflowExecutionKind.CLAIM_LOST,
+            }:
+                return
+            if (
+                current is None
+                or current in _TRANSIENT_STOP_KINDS
+                or current is WorkflowExecutionKind.COMPLETED
+            ):
+                state.stop_kind = WorkflowExecutionKind.COMPLETED
+                state.error_type = None
+                state.error_message = None
+            return
+
+        if status is WorkflowStatus.FAILED:
+            if current in {
+                WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
+                WorkflowExecutionKind.CLAIM_LOST,
+            }:
+                return
+            if (
+                current is None
+                or current in _TRANSIENT_STOP_KINDS
+                or current is WorkflowExecutionKind.FAILED
+            ):
+                state.stop_kind = WorkflowExecutionKind.FAILED
+                state.error_type, state.error_message = _DEFAULT_ERRORS[
+                    WorkflowExecutionKind.FAILED
+                ]
+            return
+
+        if status is WorkflowStatus.CANCELLED:
+            if current is WorkflowExecutionKind.PERSISTENCE_UNKNOWN:
+                return
+            if (
+                current is None
+                or current in _TRANSIENT_STOP_KINDS
+                or current in {
+                    WorkflowExecutionKind.CANCELLED,
+                    WorkflowExecutionKind.CLAIM_LOST,
+                }
+            ):
+                # 保持现有 CANCELLED 高于 CLAIM_LOST 的裁决关系。
+                state.stop_kind = WorkflowExecutionKind.CANCELLED
+                state.error_type = None
+                state.error_message = None
 
     def _resolve_submission_compensation_stop(
         self,
@@ -959,6 +1025,11 @@ class CentralWorkflowRunner:
             state.propose_stop(WorkflowExecutionKind.STALLED)
 
     def _build_result(self, state: _RunState) -> WorkflowExecutionResult:
+        if state.snapshot is not None:
+            self._reconcile_fresh_terminal_snapshot(
+                state,
+                state.snapshot,
+            )
         kind = state.stop_kind
         if kind is None:
             raise WorkflowRunnerError(

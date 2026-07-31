@@ -213,6 +213,29 @@ class WorkflowExecutionResult:
                 raise ValueError(
                     "terminal result does not match the fresh snapshot"
                 )
+            allowed_for_terminal_snapshot = {
+                WorkflowStatus.COMPLETED: frozenset({
+                    WorkflowExecutionKind.COMPLETED,
+                    WorkflowExecutionKind.CLAIM_LOST,
+                    WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
+                }),
+                WorkflowStatus.FAILED: frozenset({
+                    WorkflowExecutionKind.FAILED,
+                    WorkflowExecutionKind.CLAIM_LOST,
+                    WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
+                }),
+                WorkflowStatus.CANCELLED: frozenset({
+                    WorkflowExecutionKind.CANCELLED,
+                    WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
+                }),
+            }
+            allowed_kinds = allowed_for_terminal_snapshot.get(
+                self.snapshot.workflow.status
+            )
+            if allowed_kinds is not None and normalized_kind not in allowed_kinds:
+                raise ValueError(
+                    "fresh terminal snapshot conflicts with result kind"
+                )
 
         object.__setattr__(self, "kind", normalized_kind)
         object.__setattr__(self, "scheduled_task_ids", scheduled_task_ids)
