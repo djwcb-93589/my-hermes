@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -9,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from hermes.config_environment import ConfigEnvironment
 from hermes.config_values import hermes_home
 from hermes.configuration import (
     DEFAULT_CONFIG_FIELD_REGISTRY,
@@ -156,10 +159,21 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         else None
     )
     config_path = config.config_path or str(hermes_home() / "config.yaml")
+    config_environment = config.config_environment
+    if config_environment is None:
+        # 兼容直接构造 DashboardConfig 的调用方；正式入口会注入完整快照。
+        config_environment = ConfigEnvironment.from_sources(
+            allowed_keys=(
+                DEFAULT_CONFIG_FIELD_REGISTRY.environment_override_keys
+            ),
+            process_environment=os.environ,
+            profile_environment={},
+        )
     # Repository 构造不读取或写入配置文件，故障隔离到具体请求。
     config_repository = YamlConfigRepository(
         config_path,
         DEFAULT_CONFIG_FIELD_REGISTRY,
+        config_environment,
     )
     config_read_service = ConfigReadService(
         config_repository,

@@ -26,6 +26,7 @@ from .contracts import (
     ConfigValueInvalid,
     ConfigValueSource,
     normalize_config_value,
+    safe_stored_config_value,
 )
 from .fields import ConfigFieldRegistry
 
@@ -89,18 +90,7 @@ class ConfigWriteService:
             repository_result = self._repository.apply_patch(
                 normalized_patch,
             )
-            result = self._result(repository_result, normalized_patch)
-            apply_mode = ",".join(
-                mode.value for mode in result.apply_modes
-            ) or "none"
-            logger.info(
-                "Dashboard config write completed: "
-                "config_stage=commit changed_field_count=%d "
-                "apply_mode=%s outcome=success",
-                len(result.changed_fields),
-                apply_mode,
-            )
-            return result
+            return self._result(repository_result, normalized_patch)
         except ConfigManagementError as exc:
             _log_failure("write", exc)
             raise
@@ -135,9 +125,8 @@ class ConfigWriteService:
                 raise ConfigFieldUnknown()
             if not spec.writable or spec.sensitive:
                 raise ConfigFieldReadOnly()
-            if (
-                stored_by_name[spec.public_name].source
-                is ConfigValueSource.ENVIRONMENT
+            if _is_environment_shadowed(
+                stored_by_name[spec.public_name]
             ):
                 raise ConfigShadowed()
             try:
@@ -242,20 +231,11 @@ def _project_snapshot(
             )
             continue
 
-        file_value = _validated_repository_value(
+        file_value = _validated_file_value(stored.file_value)
+        environment_shadowed = _is_environment_shadowed(stored)
+        effective_value = _validated_effective_value(
             spec,
-            stored.file_value,
-            source=stored.source,
-            allow_missing=(
-                stored.source
-                in {ConfigValueSource.DEFAULT, ConfigValueSource.DERIVED}
-            ),
-        )
-        effective_value = _validated_repository_value(
-            spec,
-            stored.effective_value,
-            source=stored.source,
-            allow_missing=False,
+            stored,
         )
         projected.append(
             ConfigFieldDescriptor(
@@ -270,29 +250,46 @@ def _project_snapshot(
                 file_value=file_value,
                 effective_value=effective_value,
                 description=spec.description,
+                shadowed_by_environment=environment_shadowed,
             )
         )
     return tuple(projected)
 
 
-def _validated_repository_value(
-    spec: ConfigFieldSpec,
+def _validated_file_value(
     value: object,
-    *,
-    source: ConfigValueSource,
-    allow_missing: bool,
 ):
-    """环境来源刻意隐藏值；其他来源必须仍满足字段声明。"""
-    if source is ConfigValueSource.ENVIRONMENT:
-        if value is not None:
-            raise ConfigUnavailable()
-        return None
-    if allow_missing and value is None:
-        return None
+    """只执行有界安全复制，保留 YAML 中存储值的原始标量语义。"""
     try:
-        return normalize_config_value(spec, value)
+        return safe_stored_config_value(value)
     except (TypeError, ValueError) as exc:
         raise ConfigUnavailable() from exc
+
+
+def _validated_effective_value(
+    spec: ConfigFieldSpec,
+    stored: ConfigStoredField,
+):
+    """环境来源刻意隐藏值；其他来源必须满足正式字段声明。"""
+    if _is_environment_shadowed(stored):
+        if (
+            stored.source is not ConfigValueSource.ENVIRONMENT
+            or stored.effective_value is not None
+        ):
+            raise ConfigUnavailable()
+        return None
+    try:
+        return normalize_config_value(spec, stored.effective_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigUnavailable() from exc
+
+
+def _is_environment_shadowed(stored: ConfigStoredField) -> bool:
+    """兼容旧 Repository 的 environment 来源，并统一为显式覆盖标记。"""
+    return (
+        stored.shadowed_by_environment
+        or stored.source is ConfigValueSource.ENVIRONMENT
+    )
 
 
 def _restart_targets(
@@ -315,8 +312,7 @@ def _log_failure(stage: str, exc: Exception) -> None:
     """日志只记录稳定阶段和异常类型，不记录字段、值或修订号。"""
     logger.warning(
         "Dashboard config operation failed: "
-        "config_stage=%s changed_field_count=0 apply_mode=none "
-        "outcome=failed exception_type=%s",
+        "config_stage=%s outcome=failed exception_type=%s",
         stage,
         type(exc).__name__,
     )

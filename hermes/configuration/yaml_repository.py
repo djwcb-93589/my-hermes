@@ -12,13 +12,14 @@ import stat
 import tempfile
 import threading
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
+from hermes.config_environment import ConfigEnvironment
 from hermes.config_model import validate_config_mapping
 
 from .contracts import (
@@ -42,6 +43,7 @@ from .contracts import (
     ConfigValueSource,
     ConfigWriteFailed,
     normalize_config_value,
+    safe_stored_config_value,
 )
 from .fields import ConfigFieldRegistry
 
@@ -49,9 +51,7 @@ from .fields import ConfigFieldRegistry
 logger = logging.getLogger(__name__)
 
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
-_ENVIRONMENT_PLACEHOLDER_PATTERN = re.compile(
-    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
-)
+_ENVIRONMENT_PLACEHOLDER_PATTERN = re.compile(r"\$\{(\w+)\}")
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -111,12 +111,13 @@ class _ReadDocument:
 class YamlConfigRepository:
     """只负责安全读取、完整校验和原子写入配置文件。"""
 
-    __slots__ = ("_path", "_process_lock", "_registry")
+    __slots__ = ("_environment", "_path", "_process_lock", "_registry")
 
     def __init__(
         self,
         path: str | os.PathLike[str],
         registry: ConfigFieldRegistry,
+        environment: ConfigEnvironment | None = None,
     ) -> None:
         try:
             normalized_path = Path(path)
@@ -124,20 +125,44 @@ class YamlConfigRepository:
             raise TypeError("config path is invalid") from exc
         if not isinstance(registry, ConfigFieldRegistry):
             raise TypeError("registry must be a ConfigFieldRegistry")
+        if environment is not None and not isinstance(
+            environment,
+            ConfigEnvironment,
+        ):
+            raise TypeError("environment must be a ConfigEnvironment or None")
         self._path = normalized_path
         self._registry = registry
+        self._environment = (
+            ConfigEnvironment.empty()
+            if environment is None
+            else environment
+        )
         self._process_lock = threading.RLock()
 
     def read_snapshot(self) -> ConfigRepositorySnapshot:
         """读取一次稳定的原始文件，并只投影注册字段。"""
         try:
             document = self._read_document()
-            return self._snapshot_from_document(document)
+            snapshot = self._snapshot_from_document(document)
+            _log_operation_success(
+                "read",
+                environment_source_present=self._environment.source_present,
+                shadowed_field_count=_shadowed_field_count(snapshot.fields),
+            )
+            return snapshot
         except ConfigManagementError as exc:
-            _log_operation_failure("read", exc)
+            _log_operation_failure(
+                "read",
+                exc,
+                environment_source_present=self._environment.source_present,
+            )
             raise
         except Exception as exc:
-            _log_operation_failure("read", exc)
+            _log_operation_failure(
+                "read",
+                exc,
+                environment_source_present=self._environment.source_present,
+            )
             raise ConfigUnavailable() from exc
 
     def apply_patch(
@@ -145,8 +170,7 @@ class YamlConfigRepository:
         patch: ConfigPatch,
     ) -> ConfigRepositoryWriteResult:
         """在进程锁和跨进程文件锁内完成乐观并发原子修改。"""
-        changed_count = 0
-        apply_mode = "none"
+        shadowed_field_count = 0
         try:
             self._validate_patch_shape(patch)
             # 在创建伴生锁文件前先拒绝缺失或不安全的配置目标。
@@ -160,9 +184,12 @@ class YamlConfigRepository:
                     field.name: field
                     for field in self._project_fields(document)
                 }
+                shadowed_field_count = sum(
+                    field.shadowed_by_environment
+                    for field in stored_by_name.values()
+                )
                 updated = copy.deepcopy(document.raw_mapping)
                 changed_names: list[str] = []
-                changed_specs = []
                 seen: set[str] = set()
 
                 for change in patch.changes:
@@ -177,7 +204,7 @@ class YamlConfigRepository:
                     stored = stored_by_name.get(spec.public_name)
                     if stored is None:
                         raise ConfigUnavailable()
-                    if stored.source is ConfigValueSource.ENVIRONMENT:
+                    if stored.shadowed_by_environment:
                         raise ConfigShadowed()
                     try:
                         normalized_value = normalize_config_value(
@@ -195,23 +222,26 @@ class YamlConfigRepository:
                         _yaml_compatible_value(normalized_value),
                     )
                     changed_names.append(spec.public_name)
-                    changed_specs.append(spec)
 
-                changed_count = len(changed_names)
-                apply_mode = _apply_mode_summary(changed_specs)
                 if not changed_names:
                     self._assert_revision_unchanged(document.revision)
-                    _log_operation_success(0, "none")
+                    _log_operation_success(
+                        "commit",
+                        environment_source_present=(
+                            self._environment.source_present
+                        ),
+                        shadowed_field_count=shadowed_field_count,
+                    )
                     return ConfigRepositoryWriteResult(
                         previous_revision=document.revision,
                         new_revision=document.revision,
                         changed_fields=(),
                     )
 
-                _validate_complete_mapping(updated)
+                _validate_complete_mapping(updated, self._environment)
                 serialized = _serialize_mapping(updated)
                 # 对最终将要写入的字节再次解析和正式校验。
-                _parse_and_validate(serialized)
+                _parse_and_validate(serialized, self._environment)
                 temp_path = self._write_temporary(
                     serialized,
                     mode=document.mode,
@@ -232,7 +262,13 @@ class YamlConfigRepository:
                     _remove_temporary_best_effort(temp_path)
 
                 new_revision = _revision_for_bytes(serialized)
-                _log_operation_success(changed_count, apply_mode)
+                _log_operation_success(
+                    "commit",
+                    environment_source_present=(
+                        self._environment.source_present
+                    ),
+                    shadowed_field_count=shadowed_field_count,
+                )
                 return ConfigRepositoryWriteResult(
                     previous_revision=document.revision,
                     new_revision=new_revision,
@@ -242,16 +278,16 @@ class YamlConfigRepository:
             _log_operation_failure(
                 "write",
                 exc,
-                changed_count=changed_count,
-                apply_mode=apply_mode,
+                environment_source_present=self._environment.source_present,
+                shadowed_field_count=shadowed_field_count,
             )
             raise
         except Exception as exc:
             _log_operation_failure(
                 "write",
                 exc,
-                changed_count=changed_count,
-                apply_mode=apply_mode,
+                environment_source_present=self._environment.source_present,
+                shadowed_field_count=shadowed_field_count,
             )
             raise ConfigWriteFailed() from exc
 
@@ -273,7 +309,10 @@ class YamlConfigRepository:
 
     def _read_document(self) -> _ReadDocument:
         raw_bytes, mode = _read_regular_file(self._path)
-        raw_mapping, validated = _parse_and_validate(raw_bytes)
+        raw_mapping, validated = _parse_and_validate(
+            raw_bytes,
+            self._environment,
+        )
         return _ReadDocument(
             raw_mapping=raw_mapping,
             validated_mapping=validated,
@@ -295,81 +334,35 @@ class YamlConfigRepository:
         document: _ReadDocument,
     ) -> tuple[ConfigStoredField, ...]:
         projected: list[ConfigStoredField] = []
+        by_name: dict[str, ConfigStoredField] = {}
         for spec in self._registry.fields:
-            file_present, raw_value = _mapping_path(
-                document.raw_mapping,
-                spec.config_path,
+            stored = _project_registered_field(
+                spec,
+                document,
+                self._environment,
             )
-            effective_present, effective_value = _mapping_path(
-                document.validated_mapping,
-                spec.config_path,
-            )
-            environment_resolved = (
-                file_present
-                and _contains_environment_placeholder(raw_value)
-                and raw_value != effective_value
-            )
+            projected.append(stored)
+            by_name[spec.public_name] = stored
 
-            if spec.sensitive:
-                source = _value_source(
-                    file_present=file_present,
-                    environment_resolved=environment_resolved,
-                    has_default=spec.has_default,
-                )
-                configured = _sensitive_value_configured(
-                    raw_value,
-                    effective_value,
-                    file_present=file_present,
-                    effective_present=effective_present,
-                    environment_resolved=environment_resolved,
-                )
-                projected.append(
-                    ConfigStoredField(
-                        name=spec.public_name,
-                        source=source,
-                        configured=configured,
-                    )
-                )
+        for index, spec in enumerate(self._registry.fields):
+            if spec.inherits_from is None:
                 continue
-
-            if environment_resolved:
-                projected.append(
-                    ConfigStoredField(
-                        name=spec.public_name,
-                        source=ConfigValueSource.ENVIRONMENT,
-                        configured=True,
-                    )
-                )
+            stored = by_name[spec.public_name]
+            inherited = by_name.get(spec.inherits_from)
+            if (
+                stored.configured
+                or inherited is None
+                or not inherited.configured
+            ):
                 continue
-
-            if not effective_present:
-                raise ConfigInvalid()
-            try:
-                normalized_effective = normalize_config_value(
-                    spec,
-                    effective_value,
-                )
-            except (TypeError, ValueError) as exc:
-                raise ConfigInvalid() from exc
-            source = _value_source(
-                file_present=file_present,
-                environment_resolved=False,
-                has_default=spec.has_default,
+            derived = replace(
+                stored,
+                source=ConfigValueSource.DERIVED,
+                configured=True,
+                shadowed_by_environment=False,
             )
-            file_value = (
-                normalized_effective
-                if source is ConfigValueSource.FILE
-                else None
-            )
-            projected.append(
-                ConfigStoredField(
-                    name=spec.public_name,
-                    source=source,
-                    configured=file_present or spec.has_default,
-                    file_value=file_value,
-                    effective_value=normalized_effective,
-                )
-            )
+            projected[index] = derived
+            by_name[spec.public_name] = derived
         return tuple(projected)
 
     def _assert_revision_unchanged(
@@ -477,6 +470,7 @@ def _read_regular_file(path: Path) -> tuple[bytes, int]:
 
 def _parse_and_validate(
     raw_bytes: bytes,
+    environment: ConfigEnvironment,
 ) -> tuple[dict[object, object], dict]:
     try:
         raw_text = raw_bytes.decode("utf-8-sig")
@@ -490,6 +484,7 @@ def _parse_and_validate(
         validated = validate_config_mapping(
             copy.deepcopy(raw_mapping),
             expand_environment=True,
+            environment=environment,
         )
     except ConfigManagementError:
         raise
@@ -500,11 +495,15 @@ def _parse_and_validate(
     return raw_mapping, validated
 
 
-def _validate_complete_mapping(raw: Mapping[object, object]) -> None:
+def _validate_complete_mapping(
+    raw: Mapping[object, object],
+    environment: ConfigEnvironment,
+) -> None:
     try:
         validate_config_mapping(
             copy.deepcopy(raw),
             expand_environment=True,
+            environment=environment,
         )
     except Exception as exc:
         raise ConfigInvalid() from exc
@@ -539,6 +538,97 @@ def _mapping_path(
             return False, None
         current = current[part]
     return True, current
+
+
+def _project_registered_field(
+    spec: ConfigFieldSpec,
+    document: _ReadDocument,
+    environment: ConfigEnvironment,
+) -> ConfigStoredField:
+    """按固定环境快照投影一个字段，环境值永不进入返回对象。"""
+    file_present, raw_value = _mapping_path(
+        document.raw_mapping,
+        spec.config_path,
+    )
+    effective_present, effective_value = _mapping_path(
+        document.validated_mapping,
+        spec.config_path,
+    )
+    has_placeholder = (
+        file_present and _contains_environment_placeholder(raw_value)
+    )
+    reference_resolved = (
+        has_placeholder and raw_value != effective_value
+    )
+    direct_value = environment.first_nonempty(
+        spec.environment_override_keys
+    )
+    environment_sourced = direct_value is not None or reference_resolved
+
+    if spec.sensitive:
+        configured = (
+            True
+            if direct_value is not None
+            else _sensitive_value_configured(
+                raw_value,
+                effective_value,
+                file_present=file_present,
+                effective_present=effective_present,
+                environment_resolved=reference_resolved,
+            )
+        )
+        return ConfigStoredField(
+            name=spec.public_name,
+            source=(
+                ConfigValueSource.ENVIRONMENT
+                if environment_sourced
+                else _value_source(
+                    file_present=file_present,
+                    environment_resolved=False,
+                    has_default=spec.has_default,
+                )
+            ),
+            configured=configured,
+            shadowed_by_environment=environment_sourced,
+        )
+
+    if not effective_present and direct_value is None:
+        raise ConfigInvalid()
+    try:
+        normalized_effective = normalize_config_value(
+            spec,
+            direct_value if direct_value is not None else effective_value,
+        )
+        file_value = (
+            None
+            if not file_present or has_placeholder
+            else safe_stored_config_value(raw_value)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigInvalid() from exc
+
+    if environment_sourced:
+        return ConfigStoredField(
+            name=spec.public_name,
+            source=ConfigValueSource.ENVIRONMENT,
+            configured=True,
+            file_value=file_value,
+            effective_value=None,
+            shadowed_by_environment=True,
+        )
+    source = _value_source(
+        file_present=file_present,
+        environment_resolved=False,
+        has_default=spec.has_default,
+    )
+    return ConfigStoredField(
+        name=spec.public_name,
+        source=source,
+        configured=file_present or spec.has_default,
+        file_value=file_value,
+        effective_value=normalized_effective,
+        shadowed_by_environment=False,
+    )
 
 
 def _mapping_with_path_value(
@@ -613,19 +703,11 @@ def _sensitive_value_configured(
     if candidate is None:
         return False
     if type(candidate) is str:
-        return bool(candidate.strip())
+        # 正式运行时用 ``or`` 选择 API Key，只有空字符串会回退。
+        return bool(candidate)
     if type(candidate) in (list, tuple, dict):
         return bool(candidate)
     return True
-
-
-def _apply_mode_summary(specs: list[ConfigFieldSpec]) -> str:
-    modes: list[str] = []
-    for spec in specs:
-        mode = spec.apply_mode.value
-        if mode not in modes:
-            modes.append(mode)
-    return ",".join(modes) or "none"
 
 
 @contextlib.contextmanager
@@ -738,13 +820,26 @@ def _remove_temporary_best_effort(path: Path | None) -> None:
         pass
 
 
-def _log_operation_success(changed_count: int, apply_mode: str) -> None:
+def _shadowed_field_count(
+    fields: tuple[ConfigStoredField, ...],
+) -> int:
+    return sum(field.shadowed_by_environment for field in fields)
+
+
+def _log_operation_success(
+    stage: str,
+    *,
+    environment_source_present: bool,
+    shadowed_field_count: int,
+) -> None:
     logger.info(
         "Dashboard config repository operation completed: "
-        "config_stage=commit changed_field_count=%d apply_mode=%s "
+        "config_stage=%s environment_source_present=%s "
+        "shadowed_field_count=%d "
         "outcome=success exception_type=none",
-        changed_count,
-        apply_mode,
+        stage,
+        environment_source_present,
+        shadowed_field_count,
     )
 
 
@@ -752,16 +847,17 @@ def _log_operation_failure(
     stage: str,
     exc: Exception,
     *,
-    changed_count: int = 0,
-    apply_mode: str = "none",
+    environment_source_present: bool,
+    shadowed_field_count: int = 0,
 ) -> None:
     logger.warning(
         "Dashboard config repository operation failed: "
-        "config_stage=%s changed_field_count=%d apply_mode=%s "
+        "config_stage=%s environment_source_present=%s "
+        "shadowed_field_count=%d "
         "outcome=failed exception_type=%s",
         stage,
-        changed_count,
-        apply_mode,
+        environment_source_present,
+        shadowed_field_count,
         type(exc).__name__,
     )
 

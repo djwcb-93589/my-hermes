@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, TypeAlias
+
+from hermes.config_environment import is_config_environment_key
 
 
 MAX_CONFIG_PATCH_CHANGES = 32
@@ -159,6 +161,11 @@ class ConfigFieldSpec:
     has_default: bool = False
     default_value: ConfigValue = None
     description: str | None = None
+    environment_override_keys: tuple[str, ...] = field(
+        default=(),
+        repr=False,
+    )
+    inherits_from: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -201,6 +208,23 @@ class ConfigFieldSpec:
             or "\r" in self.description
         ):
             raise ValueError("config field description is invalid")
+        if (
+            type(self.environment_override_keys) is not tuple
+            or len(set(self.environment_override_keys))
+            != len(self.environment_override_keys)
+            or any(
+                not is_config_environment_key(key)
+                for key in self.environment_override_keys
+            )
+        ):
+            raise ValueError("config field environment overrides are invalid")
+        if self.inherits_from is not None and (
+            type(self.inherits_from) is not str
+            or not _PUBLIC_NAME_PATTERN.fullmatch(self.inherits_from)
+            or self.inherits_from == self.public_name
+            or not self.sensitive
+        ):
+            raise ValueError("config field inheritance is invalid")
         if self.has_default:
             object.__setattr__(
                 self,
@@ -218,6 +242,7 @@ class ConfigStoredField:
     configured: bool
     file_value: ConfigValue = None
     effective_value: ConfigValue = None
+    shadowed_by_environment: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -229,8 +254,15 @@ class ConfigStoredField:
             raise TypeError("stored config field source is invalid")
         if type(self.configured) is not bool:
             raise TypeError("stored config configured flag is invalid")
-        if not _is_config_value(self.file_value) or not _is_config_value(
-            self.effective_value
+        if type(self.shadowed_by_environment) is not bool:
+            raise TypeError("stored config shadowed flag is invalid")
+        if self.shadowed_by_environment and (
+            self.source is not ConfigValueSource.ENVIRONMENT
+        ):
+            raise ValueError("shadowed config source must be environment")
+        if (
+            not _is_safe_stored_config_value(self.file_value)
+            or not _is_safe_stored_config_value(self.effective_value)
         ):
             raise TypeError("stored config field value is invalid")
 
@@ -266,6 +298,7 @@ class ConfigFieldDescriptor:
     file_value: ConfigValue = None
     effective_value: ConfigValue = None
     description: str | None = None
+    shadowed_by_environment: bool = False
 
     def __post_init__(self) -> None:
         if type(self.name) is not str:
@@ -277,6 +310,7 @@ class ConfigFieldDescriptor:
             or type(self.sensitive) is not bool
             or type(self.nullable) is not bool
             or type(self.configured) is not bool
+            or type(self.shadowed_by_environment) is not bool
         ):
             raise TypeError("config descriptor flags are invalid")
         if not isinstance(self.apply_mode, ConfigApplyMode):
@@ -286,6 +320,7 @@ class ConfigFieldDescriptor:
             or self.source is not None
             or self.file_value is not None
             or self.effective_value is not None
+            or self.shadowed_by_environment
         ):
             raise ValueError("sensitive config descriptor exposes values")
         if not self.sensitive and not isinstance(
@@ -293,8 +328,13 @@ class ConfigFieldDescriptor:
             ConfigValueSource,
         ):
             raise TypeError("ordinary config descriptor source is invalid")
-        if not _is_config_value(self.file_value) or not _is_config_value(
-            self.effective_value
+        if self.shadowed_by_environment and (
+            self.source is not ConfigValueSource.ENVIRONMENT
+        ):
+            raise ValueError("shadowed descriptor source must be environment")
+        if (
+            not _is_safe_stored_config_value(self.file_value)
+            or not _is_safe_stored_config_value(self.effective_value)
         ):
             raise TypeError("config descriptor value is invalid")
 
@@ -469,6 +509,53 @@ def _is_config_value(value: object) -> bool:
     )
 
 
+def _is_safe_stored_config_value(value: object) -> bool:
+    try:
+        safe_stored_config_value(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def safe_stored_config_value(value: object) -> ConfigValue:
+    """把 YAML 字段值转成有界 JSON 安全值，不执行正式语义规范化。"""
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is int:
+        if value < -MAX_CONFIG_INTEGER or value > MAX_CONFIG_INTEGER:
+            raise ValueError("stored config integer is outside the boundary")
+        return value
+    if type(value) is float:
+        if not math.isfinite(value) or abs(value) > MAX_CONFIG_NUMBER:
+            raise ValueError("stored config number is outside the boundary")
+        return value
+    if type(value) is str:
+        if (
+            len(value) > MAX_CONFIG_STRING_LENGTH
+            or "\n" in value
+            or "\r" in value
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("stored config string is outside the boundary")
+        return value
+    if type(value) in (list, tuple):
+        if len(value) > MAX_CONFIG_LIST_ITEMS:
+            raise ValueError("stored config list is outside the boundary")
+        normalized: list[str] = []
+        for item in value:
+            if (
+                type(item) is not str
+                or len(item) > MAX_CONFIG_LIST_ITEM_LENGTH
+                or "\n" in item
+                or "\r" in item
+                or any(ord(character) < 32 for character in item)
+            ):
+                raise ValueError("stored config list item is invalid")
+            normalized.append(item)
+        return tuple(normalized)
+    raise TypeError("stored config value type is unsupported")
+
+
 def normalize_config_value(
     spec: ConfigFieldSpec,
     value: object,
@@ -563,4 +650,5 @@ __all__ = [
     "ConfigWriteFailed",
     "contains_sensitive_config_name",
     "normalize_config_value",
+    "safe_stored_config_value",
 ]

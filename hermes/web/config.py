@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
+from hermes.config_environment import (
+    ConfigEnvironment,
+    environment_reference_keys,
+)
 from hermes.config_values import hermes_home
+from hermes.configuration.fields import DEFAULT_CONFIG_FIELD_REGISTRY
 from hermes.web.security import (
     ControlAuthenticator,
     is_loopback_host,
@@ -37,6 +42,11 @@ class DashboardConfig:
     db_path: str | None = None
     control_token_digest: str | None = None
     config_path: str | None = None
+    config_environment: ConfigEnvironment | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def load_dashboard_config() -> DashboardConfig:
@@ -45,6 +55,10 @@ def load_dashboard_config() -> DashboardConfig:
     profile_env = _read_profile_env(profile_home)
     config_path = profile_home / "config.yaml"
     raw_config = _read_config_mapping(profile_home)
+    config_environment = _build_config_environment(
+        raw_config,
+        profile_env,
+    )
     dashboard = raw_config.get("dashboard", {})
     if dashboard is None:
         dashboard = {}
@@ -95,6 +109,7 @@ def load_dashboard_config() -> DashboardConfig:
         db_path=db_path,
         control_token_digest=control_token_digest,
         config_path=str(config_path),
+        config_environment=config_environment,
     )
     validate_dashboard_config(config)
     return config
@@ -116,6 +131,13 @@ def validate_dashboard_config(config: DashboardConfig) -> None:
     ):
         raise DashboardConfigurationError(
             "dashboard config_path must be a non-empty string or null"
+        )
+    if config.config_environment is not None and not isinstance(
+        config.config_environment,
+        ConfigEnvironment,
+    ):
+        raise DashboardConfigurationError(
+            "dashboard config environment is invalid"
         )
     if not ControlAuthenticator.is_valid_digest(config.control_token_digest):
         raise DashboardConfigurationError("dashboard control token digest is invalid")
@@ -154,6 +176,29 @@ def _read_profile_env(profile_home: Path) -> dict[str, str]:
             normalized = normalized[1:-1]
         values[name] = normalized
     return values
+
+
+def _build_config_environment(
+    raw_config: dict[str, object],
+    profile_env: dict[str, str],
+) -> ConfigEnvironment:
+    """只快照配置引用和显式直接覆盖需要的环境键。"""
+    try:
+        allowed_keys = tuple(dict.fromkeys(
+            (
+                *environment_reference_keys(raw_config),
+                *DEFAULT_CONFIG_FIELD_REGISTRY.environment_override_keys,
+            )
+        ))
+        return ConfigEnvironment.from_sources(
+            allowed_keys=allowed_keys,
+            process_environment=os.environ,
+            profile_environment=profile_env,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DashboardConfigurationError(
+            "dashboard config environment cannot be resolved"
+        ) from exc
 
 
 def _read_config_mapping(profile_home: Path) -> dict[str, object]:

@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping
 
 from hermes.approval_security import ApprovalSecurityPolicy
+from hermes.config_environment import ConfigEnvironment
 from hermes.config_values import expand_env_vars as _expand_env_vars
 from hermes.path_policy import PathAccessPolicy
 
@@ -506,14 +507,24 @@ def validate_config_mapping(
     raw: Mapping[str, object],
     *,
     expand_environment: bool = True,
+    environment: ConfigEnvironment | None = None,
 ) -> dict:
     """返回经过完整正式校验的独立配置副本。"""
     if not isinstance(raw, Mapping):
         raise ValueError("config must be a mapping")
+    if environment is not None and not isinstance(
+        environment,
+        ConfigEnvironment,
+    ):
+        raise TypeError("environment must be a ConfigEnvironment or None")
 
     config = copy.deepcopy(dict(raw))
     if expand_environment:
-        config = _expand_env_vars(config)
+        config = (
+            _expand_env_vars(config)
+            if environment is None
+            else environment.expand(config)
+        )
 
     _validate_gateway_config(config)
     _validate_filesystem_security_config(config)

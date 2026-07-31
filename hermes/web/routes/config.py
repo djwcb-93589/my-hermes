@@ -138,6 +138,7 @@ def _field_response(
         apply_mode=descriptor.apply_mode,
         nullable=descriptor.nullable,
         configured=descriptor.configured,
+        shadowed_by_environment=descriptor.shadowed_by_environment,
         description=descriptor.description,
     )
 

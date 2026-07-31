@@ -701,6 +701,7 @@ class ConfigValueFieldResponse(_ConfigApiModel):
     apply_mode: ConfigApplyMode
     nullable: bool
     configured: bool
+    shadowed_by_environment: bool = False
     description: str | None = Field(default=None, max_length=256)
 
 

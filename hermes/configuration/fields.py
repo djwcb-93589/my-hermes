@@ -16,7 +16,7 @@ from .contracts import (
 class ConfigFieldRegistry:
     """不可变的显式配置字段目录，不接受运行时任意路径。"""
 
-    __slots__ = ("_by_name", "_fields")
+    __slots__ = ("_by_name", "_environment_override_keys", "_fields")
 
     def __init__(self, fields: tuple[ConfigFieldSpec, ...]) -> None:
         if type(fields) is not tuple or not fields:
@@ -32,8 +32,21 @@ class ConfigFieldRegistry:
                 raise ValueError("config field registry contains duplicate paths")
             by_name[field.public_name] = field
             paths.add(field.config_path)
+        for field in fields:
+            if field.inherits_from is not None:
+                inherited = by_name.get(field.inherits_from)
+                if inherited is None or inherited.sensitive != field.sensitive:
+                    raise ValueError(
+                        "config field inheritance target is invalid"
+                    )
+                _validate_inheritance_chain(field, by_name)
         self._fields = fields
         self._by_name = MappingProxyType(by_name)
+        self._environment_override_keys = tuple(dict.fromkeys(
+            key
+            for field in fields
+            for key in field.environment_override_keys
+        ))
 
     @property
     def fields(self) -> tuple[ConfigFieldSpec, ...]:
@@ -43,6 +56,27 @@ class ConfigFieldRegistry:
         if type(name) is not str:
             return None
         return self._by_name.get(name)
+
+    @property
+    def environment_override_keys(self) -> tuple[str, ...]:
+        """返回构建环境快照需要的固定内部键，不用于 API 投影。"""
+        return self._environment_override_keys
+
+
+def _validate_inheritance_chain(
+    field: ConfigFieldSpec,
+    by_name: dict[str, ConfigFieldSpec],
+) -> None:
+    visited = {field.public_name}
+    current = field
+    while current.inherits_from is not None:
+        if current.inherits_from in visited:
+            raise ValueError("config field inheritance contains a cycle")
+        visited.add(current.inherits_from)
+        inherited = by_name.get(current.inherits_from)
+        if inherited is None:
+            raise ValueError("config field inheritance target is invalid")
+        current = inherited
 
 
 _GATEWAY_RESTART = ConfigApplyMode.GATEWAY_RESTART
@@ -75,6 +109,8 @@ def _sensitive_field(
     name: str,
     *,
     apply_mode: ConfigApplyMode = _GATEWAY_RESTART,
+    environment_override_keys: tuple[str, ...] = (),
+    inherits_from: str | None = None,
 ) -> ConfigFieldSpec:
     return ConfigFieldSpec(
         public_name=name,
@@ -85,6 +121,8 @@ def _sensitive_field(
         apply_mode=apply_mode,
         nullable=False,
         has_default=False,
+        environment_override_keys=environment_override_keys,
+        inherits_from=inherits_from,
     )
 
 
@@ -213,10 +251,13 @@ DEFAULT_CONFIG_FIELD_REGISTRY = ConfigFieldRegistry((
     _sensitive_field(
         "api_key",
         apply_mode=_APPLICATION_RESTART,
+        environment_override_keys=("OPENAI_API_KEY",),
     ),
     _sensitive_field(
         "fallback.api_key",
         apply_mode=_APPLICATION_RESTART,
+        environment_override_keys=("FALLBACK_API_KEY",),
+        inherits_from="api_key",
     ),
     _sensitive_field("gateway.platforms.feishu.app_secret"),
     _sensitive_field("gateway.platforms.feishu.verification_token"),
