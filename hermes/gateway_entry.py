@@ -9,10 +9,14 @@ Runner 统一编排初始化、Gateway 恢复、Adapter Inbox 恢复和开放接
 from __future__ import annotations
 
 import asyncio
-import signal
 
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
+from hermes.gateway.shutdown_signals import (
+    install_gateway_shutdown_signals,
+    start_gateway_until_shutdown,
+    wait_for_gateway_shutdown,
+)
 from hermes.hooks import AsyncHookRegistry
 from hermes.persistence.runtime import SQLiteRuntimeStatusPublisher
 from hermes.plugins import AsyncPluginRuntime
@@ -25,28 +29,32 @@ async def run_gateway():
     print(f"=== Hermes Gateway ===")
     print(f"Model: {MODEL}")
 
-    register_all(process_manager=process_manager)
-    hook_registry = AsyncHookRegistry()
-    plugin_runtime = AsyncPluginRuntime(
-        hook_registry,
-        plugins_config=_config["plugins"],
-    )
-    plugin_runtime.load()
-    plugin_summary = plugin_runtime.summary
-    print(
-        "Plugins: "
-        f"loaded={plugin_summary.loaded} "
-        f"skipped={plugin_summary.skipped} "
-        f"failed={plugin_summary.failed}"
-    )
+    shutdown_event = asyncio.Event()
+    shutdown_signals = install_gateway_shutdown_signals(shutdown_event)
     runtime_state = {"runner": None}
-    runtime_status_publisher = SQLiteRuntimeStatusPublisher(DB_PATH)
+    plugin_runtime = None
     try:
+        register_all(process_manager=process_manager)
+        hook_registry = AsyncHookRegistry()
+        plugin_runtime = AsyncPluginRuntime(
+            hook_registry,
+            plugins_config=_config["plugins"],
+        )
+        plugin_runtime.load()
+        plugin_summary = plugin_runtime.summary
+        print(
+            "Plugins: "
+            f"loaded={plugin_summary.loaded} "
+            f"skipped={plugin_summary.skipped} "
+            f"failed={plugin_summary.failed}"
+        )
+        runtime_status_publisher = SQLiteRuntimeStatusPublisher(DB_PATH)
         await _run_gateway_impl(
             hook_registry,
             runtime_state,
             process_manager,
             runtime_status_publisher,
+            shutdown_event,
         )
     finally:
         try:
@@ -54,8 +62,12 @@ async def run_gateway():
             if runner is not None:
                 await runner.stop()
         finally:
-            plugin_runtime.close()
-            print("  [gateway] stopped")
+            try:
+                if plugin_runtime is not None:
+                    plugin_runtime.close()
+            finally:
+                shutdown_signals.close()
+                print("  [gateway] stopped")
 
 
 async def _run_gateway_impl(
@@ -63,6 +75,7 @@ async def _run_gateway_impl(
     runtime_state,
     active_process_manager=None,
     runtime_status_publisher=None,
+    shutdown_event=None,
 ) -> None:
     """构造 Adapter 并运行 Gateway；资源释放统一由外层负责。"""
     # Runner 会按平台配置把同一工具集同时用于 prompt、API schema 和
@@ -219,8 +232,13 @@ async def _run_gateway_impl(
         return
 
     try:
+        if shutdown_event is None:
+            shutdown_event = asyncio.Event()
+        if not isinstance(shutdown_event, asyncio.Event):
+            raise TypeError("gateway shutdown event is invalid")
         # start() 内部严格分阶段；返回前飞书 Webhook 不会接收业务事件。
-        await runner.start()
+        if not await start_gateway_until_shutdown(runner.start, shutdown_event):
+            return
 
         # 等待所有 adapter 停止(CLI /quit 或信号)
         while runner.adapters:
@@ -234,6 +252,7 @@ async def _run_gateway_impl(
             )
             if not any_running:
                 break
-            await asyncio.sleep(0.5)
+            if await wait_for_gateway_shutdown(shutdown_event, 0.5):
+                break
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass

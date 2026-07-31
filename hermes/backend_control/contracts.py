@@ -93,6 +93,7 @@ class BackendResultCode(str, Enum):
     START_FAILED = "start_failed"
     STOP_FAILED = "stop_failed"
     RESTART_FAILED = "restart_failed"
+    GATEWAY_EXITED_BEFORE_READY = "gateway_exited_before_ready"
     CONTROL_TIMEOUT = "control_timeout"
     SUPERVISOR_LEASE_LOST = "supervisor_lease_lost"
 

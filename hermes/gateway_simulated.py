@@ -7,6 +7,11 @@ import asyncio
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
 from hermes.gateway.adapters.simulated import SimulatedAdapter
+from hermes.gateway.shutdown_signals import (
+    install_gateway_shutdown_signals,
+    start_gateway_until_shutdown,
+    wait_for_gateway_shutdown,
+)
 from hermes.hooks import AsyncHookRegistry
 from hermes.persistence.runtime import SQLiteRuntimeStatusPublisher
 from hermes.plugins import AsyncPluginRuntime
@@ -18,23 +23,26 @@ async def run_gateway_simulated():
     print(f"Model: {MODEL}")
     print("Replaying scripted messages to demo batching + dedup...\n")
 
-    hook_registry = AsyncHookRegistry()
-    plugin_runtime = AsyncPluginRuntime(
-        hook_registry,
-        plugins_config=_config["plugins"],
-    )
-    plugin_runtime.load()
-    plugin_summary = plugin_runtime.summary
-    print(
-        "Plugins: "
-        f"loaded={plugin_summary.loaded} "
-        f"skipped={plugin_summary.skipped} "
-        f"failed={plugin_summary.failed}"
-    )
+    shutdown_event = asyncio.Event()
+    shutdown_signals = install_gateway_shutdown_signals(shutdown_event)
+    plugin_runtime = None
     runner = None
     sim = None
 
     try:
+        hook_registry = AsyncHookRegistry()
+        plugin_runtime = AsyncPluginRuntime(
+            hook_registry,
+            plugins_config=_config["plugins"],
+        )
+        plugin_runtime.load()
+        plugin_summary = plugin_runtime.summary
+        print(
+            "Plugins: "
+            f"loaded={plugin_summary.loaded} "
+            f"skipped={plugin_summary.skipped} "
+            f"failed={plugin_summary.failed}"
+        )
         runner = GatewayRunner(
             config=_config,
             db_path=DB_PATH,
@@ -43,9 +51,10 @@ async def run_gateway_simulated():
         )
         sim = SimulatedAdapter()
         runner.add_adapter(sim)
-        await runner.start()
-        while sim._running:
-            await asyncio.sleep(0.5)
+        await start_gateway_until_shutdown(runner.start, shutdown_event)
+        while not shutdown_event.is_set() and sim._running:
+            if await wait_for_gateway_shutdown(shutdown_event, 0.5):
+                break
     except KeyboardInterrupt:
         pass
     finally:
@@ -53,7 +62,11 @@ async def run_gateway_simulated():
             if runner is not None:
                 await runner.stop()
         finally:
-            plugin_runtime.close()
+            try:
+                if plugin_runtime is not None:
+                    plugin_runtime.close()
+            finally:
+                shutdown_signals.close()
 
     print("\n--- Simulation Summary ---")
     print(f"Replies sent: {len(sim._replies)}")

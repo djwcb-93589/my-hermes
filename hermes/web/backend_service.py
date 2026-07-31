@@ -34,11 +34,7 @@ class BackendControlService:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        if not callable(
-            getattr(repository, "supervisor_online", None)
-        ) or not callable(
-            getattr(repository, "create_or_get_request", None)
-        ):
+        if not callable(getattr(repository, "create_or_get_request", None)):
             raise TypeError("backend control repository is invalid")
         if not callable(clock):
             raise TypeError("backend control clock is invalid")
@@ -68,8 +64,6 @@ class BackendControlService:
             f"{BackendType.GATEWAY.value}:{action.value}".encode("ascii")
         ).hexdigest()
         created_at = _clock_value(self._clock)
-        if not self._repository.supervisor_online(observed_at=created_at):
-            raise BackendControlUnavailable("supervisor_unavailable")
         return self._repository.create_or_get_request(
             request_id=str(uuid.uuid4()),
             backend_type=BackendType.GATEWAY,
