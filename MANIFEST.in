@@ -1,2 +1,3 @@
 recursive-include hermes/skills/bundled/skills *
 recursive-include hermes/skills/bundled/skills .myhermes.json
+recursive-include hermes/web/frontend_dist *

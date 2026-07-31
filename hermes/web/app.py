@@ -51,6 +51,7 @@ from hermes.web.control_service import CronControlService
 from hermes.web.database_diagnostics_service import (
     DatabaseDiagnosticsService,
 )
+from hermes.web.frontend import install_dashboard_frontend
 from hermes.web.monitoring_aggregation_service import (
     MonitoringAggregationService,
 )
@@ -537,6 +538,7 @@ def create_app(
     application.include_router(runtime.router)
     application.include_router(config_routes.router)
     application.include_router(backend.router)
+    install_dashboard_frontend(application)
     return application
 
 

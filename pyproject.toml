@@ -25,6 +25,10 @@ dependencies = [
 include = ["hermes", "hermes.*", "browser", "browser.*", "documents", "documents.*"]
 
 [tool.setuptools.package-data]
+"hermes.web" = [
+    "frontend_dist/index.html",
+    "frontend_dist/assets/*",
+]
 "documents.docx" = [
     "node_runtime/bundle-manifest.json",
     "node_runtime/package.json",
