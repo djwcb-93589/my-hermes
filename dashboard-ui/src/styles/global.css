@@ -197,7 +197,8 @@ a:focus-visible {
 
 .primary-button,
 .secondary-button,
-.text-button {
+.text-button
+.danger-button {
   min-height: 2.5rem;
   border-radius: 0.65rem;
   font-weight: 700;
@@ -238,6 +239,17 @@ a:focus-visible {
   padding: 0.45rem 0.75rem;
   background: transparent;
   color: var(--accent-strong);
+}
+
+.danger-button {
+  border: 1px solid #b42318;
+  background: #b42318;
+  color: #ffffff;
+}
+
+.danger-button:hover:not(:disabled) {
+  border-color: #912018;
+  background: #912018;
 }
 
 .text-button:hover {
