@@ -143,6 +143,18 @@ class CLIWorkerTask:
     last_activity_at: float | None = None
     idle_timeout_seconds: float | None = None
     foreground_active: bool = False
+    deferred_session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CLISessionReleaseResult:
+    """worker 返回的单个旧 session 释放结果。"""
+
+    session_id: str
+    completed: bool
+    retry: bool
+    reason: str
+    error_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +170,9 @@ class CLIWorkerResult:
     error: str | None = None
     pending_steer: tuple[SteerEntry, ...] = ()
     idle_cleanup_report: IdleSessionCleanupReport | None = None
+    idle_cleanup_error_type: str | None = None
+    prior_session_release: CLISessionReleaseResult | None = None
+    deferred_session_release: CLISessionReleaseResult | None = None
 
 
 class CLIEventType(str, Enum):
@@ -379,10 +394,25 @@ class CLIWorker:
             try:
                 result = self._execute(task)
             except Exception as exc:
+                deferred_release = (
+                    CLISessionReleaseResult(
+                        session_id=task.deferred_session_id,
+                        completed=False,
+                        retry=True,
+                        reason="worker_exception",
+                        error_type=type(exc).__name__,
+                    )
+                    if (
+                        task.kind == "idle_cleanup"
+                        and task.deferred_session_id is not None
+                    )
+                    else None
+                )
                 result = CLIWorkerResult(
                     kind=task.kind,
                     session_id=task.session_id,
                     error=f"worker task failed: {type(exc).__name__}",
+                    deferred_session_release=deferred_release,
                 )
             self._results.put(result)
             try:
@@ -424,34 +454,61 @@ class CLIWorker:
         self,
         task: CLIWorkerTask,
     ) -> CLIWorkerResult:
-        """在现有 CLI worker 中执行同步 idle 资源清理。"""
+        """在现有 CLI worker 中串行执行当前与旧 session 维护。"""
 
         process_manager = self._process_manager
-        if (
-            task.session_id is None
-            or task.last_activity_at is None
-            or task.idle_timeout_seconds is None
-            or process_manager is None
-        ):
+        if task.session_id is None and task.deferred_session_id is None:
             return CLIWorkerResult(
                 kind=task.kind,
-                session_id=task.session_id,
                 error="idle cleanup task is invalid",
             )
 
-        from hermes.session_resources import cleanup_idle_session_resources
+        idle_cleanup_report = None
+        idle_cleanup_error_type = None
+        if task.session_id is not None:
+            if (
+                task.last_activity_at is None
+                or task.idle_timeout_seconds is None
+                or process_manager is None
+            ):
+                idle_cleanup_error_type = "InvalidMaintenanceTask"
+            else:
+                from hermes.session_resources import (
+                    cleanup_idle_session_resources,
+                )
 
-        report = cleanup_idle_session_resources(
-            task.session_id,
-            last_activity_at=task.last_activity_at,
-            idle_timeout_seconds=task.idle_timeout_seconds,
-            foreground_active=task.foreground_active,
-            process_manager=process_manager,
-        )
+                try:
+                    idle_cleanup_report = cleanup_idle_session_resources(
+                        task.session_id,
+                        last_activity_at=task.last_activity_at,
+                        idle_timeout_seconds=task.idle_timeout_seconds,
+                        foreground_active=task.foreground_active,
+                        process_manager=process_manager,
+                    )
+                except Exception as error:
+                    idle_cleanup_error_type = type(error).__name__
+
+        deferred_release = None
+        deferred_session_id = task.deferred_session_id
+        if deferred_session_id is not None:
+            if deferred_session_id == task.current_session_id:
+                deferred_release = CLISessionReleaseResult(
+                    session_id=deferred_session_id,
+                    completed=False,
+                    retry=False,
+                    reason="current_session",
+                )
+            else:
+                deferred_release = self._release_session_resources(
+                    deferred_session_id,
+                )
+
         return CLIWorkerResult(
             kind=task.kind,
             session_id=task.session_id,
-            idle_cleanup_report=report,
+            idle_cleanup_report=idle_cleanup_report,
+            idle_cleanup_error_type=idle_cleanup_error_type,
+            deferred_session_release=deferred_release,
         )
 
     @staticmethod
@@ -511,28 +568,45 @@ class CLIWorker:
                 kind=task.kind,
                 error=f"session not found: {session_id or ''}",
             )
+        messages = tuple(get_session_messages(conn, session_id))
         old_session_id = task.current_session_id
-        if (
-            old_session_id
-            and old_session_id != session_id
-            and self._process_manager is not None
-        ):
-            self._release_session_before_resume(old_session_id)
+        prior_session_release = None
+        if old_session_id and old_session_id != session_id:
+            prior_session_release = self._release_session_before_resume(
+                old_session_id,
+            )
         return CLIWorkerResult(
             kind=task.kind,
             session_id=session_id,
-            messages=tuple(get_session_messages(conn, session_id)),
+            messages=messages,
+            prior_session_release=prior_session_release,
         )
 
-    def _release_session_before_resume(self, session_id: str) -> None:
+    def _release_session_before_resume(
+        self,
+        session_id: str,
+    ) -> CLISessionReleaseResult:
         """按共享 Process 保护策略尽力释放离开的旧 session。"""
+
+        return self._release_session_resources(session_id)
+
+    def _release_session_resources(
+        self,
+        session_id: str,
+    ) -> CLISessionReleaseResult:
+        """评估并尽力清理旧 session，不向 Controller 传递异常对象。"""
 
         from hermes.session_idle import evaluate_session_release
         from hermes.session_resources import cleanup_session_resources
 
         process_manager = self._process_manager
         if process_manager is None:
-            return
+            return CLISessionReleaseResult(
+                session_id=session_id,
+                completed=False,
+                retry=True,
+                reason="process_state_unknown",
+            )
         try:
             decision = evaluate_session_release(
                 session_id,
@@ -540,21 +614,20 @@ class CLIWorker:
                 process_manager=process_manager,
             )
         except Exception as error:
-            logger.warning(
-                "CLI old session release check failed: exception_type=%s",
-                type(error).__name__,
+            return CLISessionReleaseResult(
+                session_id=session_id,
+                completed=False,
+                retry=True,
+                reason="process_state_unknown",
+                error_type=type(error).__name__,
             )
-            return
         if not decision.cleanup_allowed:
-            if decision.reason == "active_processes":
-                logger.debug(
-                    (
-                        "CLI old session retained because active processes "
-                        "exist: count=%d"
-                    ),
-                    decision.active_process_count,
-                )
-            return
+            return CLISessionReleaseResult(
+                session_id=session_id,
+                completed=False,
+                retry=True,
+                reason=decision.reason,
+            )
 
         try:
             report = cleanup_session_resources(
@@ -562,15 +635,26 @@ class CLIWorker:
                 process_manager=process_manager,
             )
         except Exception as error:
-            logger.warning(
-                "CLI old session cleanup failed: exception_type=%s",
-                type(error).__name__,
+            return CLISessionReleaseResult(
+                session_id=session_id,
+                completed=False,
+                retry=True,
+                reason="cleanup_exception",
+                error_type=type(error).__name__,
             )
-            return
         if report.complete:
-            logger.debug("CLI old session resources cleaned before resume")
-        else:
-            logger.warning("CLI old session resource cleanup incomplete")
+            return CLISessionReleaseResult(
+                session_id=session_id,
+                completed=True,
+                retry=False,
+                reason="cleanup_completed",
+            )
+        return CLISessionReleaseResult(
+            session_id=session_id,
+            completed=False,
+            retry=True,
+            reason="cleanup_incomplete",
+        )
 
     def _approve_and_resume(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
         if task.session_id is None or task.approval_request is None:
@@ -735,6 +819,8 @@ class CLIController:
         self._pending_approval: dict | None = None
         self._session_choices: dict[str, str] = {}
         self._message_queue = CLIMessageQueue()
+        self._deferred_release_sessions: deque[str] = deque()
+        self._deferred_release_members: set[str] = set()
         self._running = False
         self._shutting_down = False
         self._current_cancel_event: threading.Event | None = None
@@ -760,6 +846,56 @@ class CLIController:
         """只由 CLI 事件线程刷新用户或前台任务活动时间。"""
 
         self._last_activity_at = time.time()
+
+    def _defer_session_release(self, session_id: str) -> bool:
+        """把旧 session 去重加入稳定顺序的延迟回收队列。"""
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+        if session_id == self._session_id:
+            self._forget_deferred_session(session_id)
+            return False
+        if session_id in self._deferred_release_members:
+            return False
+        self._deferred_release_sessions.append(session_id)
+        self._deferred_release_members.add(session_id)
+        return True
+
+    def _forget_deferred_session(self, session_id: str) -> bool:
+        """从延迟回收队列和 membership set 同时移除 session。"""
+
+        removed = session_id in self._deferred_release_members
+        self._deferred_release_members.discard(session_id)
+        while True:
+            try:
+                self._deferred_release_sessions.remove(session_id)
+                removed = True
+            except ValueError:
+                return removed
+
+    def _take_next_deferred_session(self) -> str | None:
+        """按队首取出一个旧 session，并保持 deque/set 一致。"""
+
+        while self._deferred_release_sessions:
+            session_id = self._deferred_release_sessions.popleft()
+            if session_id not in self._deferred_release_members:
+                continue
+            self._deferred_release_members.remove(session_id)
+            if session_id == self._session_id:
+                continue
+            return session_id
+        return None
+
+    def _requeue_deferred_session(self, session_id: str) -> bool:
+        """把仍需重试的旧 session 追加到队尾。"""
+
+        return self._defer_session_release(session_id)
+
+    def _clear_deferred_sessions(self) -> None:
+        """只清空 CLI 私有记录，实际退出清理由全局路径负责。"""
+
+        self._deferred_release_sessions.clear()
+        self._deferred_release_members.clear()
 
     def run(self) -> None:
         """阻塞等待事件，并由单一 ticker 提供去重维护通知。"""
@@ -928,6 +1064,7 @@ class CLIController:
             return False
 
         self._session_id = None
+        self._forget_deferred_session(session_id)
         self._pending_approval = None
         self._ui.show_message(
             "new session will start with your next message"
@@ -1038,33 +1175,143 @@ class CLIController:
 
         if self._shutting_down:
             return
-        try:
-            if self._process_manager is None:
-                raise RuntimeError("process manager is unavailable")
-            self._process_manager.prune()
-        except Exception as error:
+        if self._process_manager is None:
             logger.warning(
-                "CLI process prune failed: exception_type=%s",
-                type(error).__name__,
+                "CLI process prune failed: process manager unavailable"
             )
             return
+        else:
+            try:
+                self._process_manager.prune()
+            except Exception as error:
+                logger.warning(
+                    "CLI process prune failed: exception_type=%s",
+                    type(error).__name__,
+                )
 
+        if self._running:
+            return
         foreground_active = bool(
-            self._running
-            or not self._message_queue.is_empty()
+            not self._message_queue.is_empty()
             or self._pending_approval is not None
         )
-        if self._session_id is None or foreground_active:
+        current_session_id = self._session_id
+        idle_session_id = (
+            None if foreground_active else current_session_id
+        )
+        deferred_session_id = self._take_next_deferred_session()
+        if (
+            deferred_session_id is not None
+            and deferred_session_id == current_session_id
+        ):
+            self._forget_deferred_session(deferred_session_id)
+            deferred_session_id = None
+
+        if idle_session_id is None and deferred_session_id is None:
             return
 
-        self._submit_task(
+        submitted = self._submit_task(
             CLIWorkerTask(
                 kind="idle_cleanup",
-                session_id=self._session_id,
+                session_id=idle_session_id,
+                deferred_session_id=deferred_session_id,
+                current_session_id=current_session_id,
                 last_activity_at=self._last_activity_at,
                 idle_timeout_seconds=self._idle_timeout_seconds,
                 foreground_active=foreground_active,
             )
+        )
+        if not submitted and deferred_session_id is not None:
+            self._requeue_deferred_session(deferred_session_id)
+
+    def _apply_session_release_result(
+        self,
+        release: CLISessionReleaseResult | None,
+        *,
+        source: str,
+    ) -> None:
+        """在事件线程应用旧 session 释放结果并维护公平重试。"""
+
+        if release is None:
+            return
+        session_id = release.session_id
+        if self._shutting_down:
+            self._forget_deferred_session(session_id)
+            return
+        if session_id == self._session_id:
+            self._forget_deferred_session(session_id)
+            if source == "maintenance":
+                logger.debug(
+                    "CLI resumed session removed from deferred cleanup"
+                )
+            return
+        if release.completed:
+            self._forget_deferred_session(session_id)
+            if source == "resume":
+                logger.debug(
+                    "CLI old session resources cleaned before resume"
+                )
+            else:
+                logger.debug("CLI deferred session cleanup completed")
+            return
+        if not release.retry:
+            self._forget_deferred_session(session_id)
+            return
+
+        self._requeue_deferred_session(session_id)
+        if release.reason == "active_processes":
+            if source == "resume":
+                logger.debug(
+                    "CLI old session deferred because active processes exist"
+                )
+            else:
+                logger.debug(
+                    (
+                        "CLI deferred session cleanup will retry: "
+                        "reason=active_processes"
+                    )
+                )
+            return
+        if release.reason == "process_state_unknown":
+            if source == "resume" or release.error_type is not None:
+                if release.error_type is None:
+                    logger.warning(
+                        (
+                            "CLI old session deferred because process state "
+                            "is unavailable"
+                        )
+                    )
+                else:
+                    logger.warning(
+                        (
+                            "CLI session release deferred because process "
+                            "state is unavailable: exception_type=%s"
+                        ),
+                        release.error_type,
+                    )
+            else:
+                logger.debug(
+                    (
+                        "CLI deferred session cleanup will retry: "
+                        "reason=process_state_unknown"
+                    )
+                )
+            return
+        if release.reason == "cleanup_incomplete":
+            if source == "resume":
+                logger.warning(
+                    "CLI old session cleanup incomplete; deferred release queued"
+                )
+            else:
+                logger.warning("CLI deferred session cleanup incomplete")
+            return
+        logger.warning(
+            (
+                "CLI deferred session cleanup will retry: "
+                "reason=%s exception_type=%s"
+            ),
+            release.reason,
+            release.error_type or "unknown",
         )
 
     def _handle_worker_results(self) -> None:
@@ -1089,28 +1336,42 @@ class CLIController:
         self,
         result: CLIWorkerResult,
     ) -> None:
-        """仅在事件线程应用 idle 清理结果，不污染 CLI 对话输出。"""
+        """仅在事件线程应用当前与 deferred session 的维护结果。"""
 
         if result.error is not None:
             logger.warning("CLI idle cleanup worker failed")
-            return
-        report = result.idle_cleanup_report
-        if report is None:
+        elif result.idle_cleanup_error_type is not None:
+            logger.warning(
+                "CLI idle cleanup failed: exception_type=%s",
+                result.idle_cleanup_error_type,
+            )
+        elif result.session_id is not None and result.idle_cleanup_report is None:
             logger.warning("CLI idle cleanup returned no report")
-            return
-        if not report.attempted:
+        elif (
+            result.idle_cleanup_report is not None
+            and not result.idle_cleanup_report.attempted
+        ):
+            report = result.idle_cleanup_report
             if report.decision.reason == "active_processes":
                 logger.debug(
                     "CLI idle cleanup skipped: active process count=%d",
                     report.decision.active_process_count,
                 )
-            return
-        if not report.complete:
+        elif (
+            result.idle_cleanup_report is not None
+            and not result.idle_cleanup_report.complete
+        ):
             logger.warning("CLI idle cleanup incomplete")
-            return
-        if result.session_id == self._session_id:
+        elif (
+            result.idle_cleanup_report is not None
+            and result.session_id == self._session_id
+        ):
             self._mark_activity()
             logger.debug("CLI idle cleanup completed")
+        self._apply_session_release_result(
+            result.deferred_session_release,
+            source="maintenance",
+        )
 
     def _restore_pending_steer(self, result: CLIWorkerResult) -> None:
         """把 AgentLoop 未消费的 steer 文本原序恢复到普通队首。"""
@@ -1145,9 +1406,21 @@ class CLIController:
         if result.kind == "resume":
             if result.error is None:
                 self._session_id = result.session_id
+                if (
+                    result.session_id is not None
+                    and self._forget_deferred_session(result.session_id)
+                ):
+                    logger.debug(
+                        "CLI resumed session removed from deferred cleanup"
+                    )
+                self._apply_session_release_result(
+                    result.prior_session_release,
+                    source="resume",
+                )
             return
         if result.session_id is not None:
             self._session_id = result.session_id
+            self._forget_deferred_session(result.session_id)
         if result.kind in {"deny", "cancel_approval"}:
             if result.error is None:
                 self._pending_approval = None
@@ -1178,6 +1451,8 @@ class CLIController:
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._maintenance_ticker.shutdown()
+        self._clear_deferred_sessions()
         cleared = self._message_queue.clear()
         if cleared:
             self._ui.show_message(f"discarded {cleared} queued message(s)")
