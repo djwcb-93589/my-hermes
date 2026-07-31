@@ -72,7 +72,7 @@ export function BackendPage() {
       </header>
 
       <aside className="configuration-boundary-note">
-        本页面不读取 PID、命令行、进程列表、SQLite 或 lease 表，也不会接触运行时 Python 对象；真实安全决策始终由后端 Supervisor 控制链完成。
+        本页面只使用 Dashboard 已公开的安全 HTTP 投影；真实状态识别与生命周期决策始终由后端 Supervisor 控制链完成。
       </aside>
 
       <BackendOperationFeedback
@@ -129,13 +129,11 @@ export function BackendPage() {
             buttonRefs={buttonRefs}
             onAction={controller.beginAction}
           />
-          {currentRequest !== null || view.latestRequest !== null ? (
-            <BackendRequestStatus
-              request={currentRequest ?? view.latestRequest!}
-              current={currentRequest !== null}
-              queryError={requestQueryError}
-            />
-          ) : null}
+          <BackendRequestStatus
+            request={currentRequest ?? view.latestRequest}
+            current={currentRequest !== null}
+            queryError={requestQueryError}
+          />
         </>
       ) : null}
 

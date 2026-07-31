@@ -32,7 +32,8 @@ const BACKEND_REQUEST_ID =
 const SAFE_REFERENCE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SAFE_EXCEPTION_TYPE = /^[A-Za-z][A-Za-z0-9_.]{0,127}$/;
-const TIMEZONE_SUFFIX = /(?:Z|[+-]\d{2}:\d{2})$/i;
+const ISO_TIMESTAMP =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
 const BACKEND_ACTIONS: readonly BackendControlAction[] = [
   "start",
   "stop",
@@ -322,12 +323,62 @@ function timestampValue(value: unknown): string {
   if (
     typeof value !== "string" ||
     value.length > 64 ||
-    !TIMEZONE_SUFFIX.test(value) ||
+    !ISO_TIMESTAMP.test(value) ||
+    !hasValidTimestampParts(value) ||
     !Number.isFinite(Date.parse(value))
   ) {
     invalidResponse();
   }
   return value;
+}
+
+function hasValidTimestampParts(value: string): boolean {
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const hour = Number(value.slice(11, 13));
+  const minute = Number(value.slice(14, 16));
+  const second = Number(value.slice(17, 19));
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth(year, month) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false;
+  }
+  if (value.endsWith("Z")) {
+    return true;
+  }
+  const offsetIndex = Math.max(value.lastIndexOf("+"), value.lastIndexOf("-"));
+  const offsetHour = Number(value.slice(offsetIndex + 1, offsetIndex + 3));
+  const offsetMinute = Number(value.slice(offsetIndex + 4, offsetIndex + 6));
+  return (
+    offsetIndex >= 19 &&
+    offsetHour <= 14 &&
+    offsetMinute <= 59 &&
+    (offsetHour < 14 || offsetMinute === 0)
+  );
+}
+
+function daysInMonth(year: number, month: number): number {
+  switch (month) {
+    case 2:
+      return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+        ? 29
+        : 28;
+    case 4:
+    case 6:
+    case 9:
+    case 11:
+      return 30;
+    default:
+      return 31;
+  }
 }
 
 function nullableTimestamp(value: unknown): string | null {

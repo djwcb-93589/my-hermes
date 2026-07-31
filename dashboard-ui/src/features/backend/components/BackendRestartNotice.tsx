@@ -7,7 +7,7 @@ export function BackendRestartNotice({ visible }: BackendRestartNoticeProps) {
     return null;
   }
   return (
-    <aside className="restart-notice backend-restart-notice">
+    <aside className="restart-notice backend-restart-notice" role="status">
       <div>
         <strong>建议重启 Gateway 以应用新配置</strong>
         <span>

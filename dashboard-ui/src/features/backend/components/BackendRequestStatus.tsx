@@ -3,7 +3,7 @@ import { formatBackendTimestamp } from "../backendFormat";
 import type { ControlRequestViewModel } from "../backendModels";
 
 interface BackendRequestStatusProps {
-  request: ControlRequestViewModel;
+  request: ControlRequestViewModel | null;
   current: boolean;
   queryError?: string | null;
 }
@@ -13,6 +13,22 @@ export function BackendRequestStatus({
   current,
   queryError = null,
 }: BackendRequestStatusProps) {
+  if (request === null) {
+    return (
+      <section
+        className="content-card backend-request-card"
+        aria-labelledby="backend-request-title"
+      >
+        <div className="backend-card-heading">
+          <div>
+            <p className="eyebrow">CONTROL REQUEST</p>
+            <h2 id="backend-request-title">当前或最近请求</h2>
+          </div>
+        </div>
+        <div className="panel-state">尚无可展示的 Gateway 控制请求。</div>
+      </section>
+    );
+  }
   return (
     <section
       className="content-card backend-request-card"

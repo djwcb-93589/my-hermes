@@ -197,7 +197,6 @@ a:focus-visible {
 
 .primary-button,
 .secondary-button,
-.danger-button,
 .text-button {
   min-height: 2.5rem;
   border-radius: 0.65rem;
@@ -225,19 +224,6 @@ a:focus-visible {
 .secondary-button:hover {
   border-color: #58729a;
   background: #1a2638;
-}
-
-.danger-button {
-  border: 1px solid rgb(255 139 146 / 72%);
-  padding: 0.75rem 1rem;
-  border-radius: 0.65rem;
-  background: rgb(255 139 146 / 14%);
-  color: #ffc2c6;
-  font-weight: 700;
-}
-
-.danger-button:hover:not(:disabled) {
-  background: rgb(255 139 146 / 23%);
 }
 
 .button-link {
