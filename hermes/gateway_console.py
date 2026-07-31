@@ -7,6 +7,7 @@ from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
 from hermes.gateway.adapters.console import ConsoleAdapter
 from hermes.hooks import AsyncHookRegistry
+from hermes.persistence.runtime import SQLiteRuntimeStatusPublisher
 from hermes.plugins import AsyncPluginRuntime
 
 
@@ -36,6 +37,7 @@ async def run_gateway_console():
             config=_config,
             db_path=DB_PATH,
             hook_registry=hook_registry,
+            runtime_status_publisher=SQLiteRuntimeStatusPublisher(DB_PATH),
         )
         runner.add_adapter(ConsoleAdapter())
         await runner.start()

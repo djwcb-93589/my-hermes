@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -17,6 +18,10 @@ from hermes.config import (
     MODEL,
     MODEL_MAX_OUTPUT_TOKENS,
     client as _default_client,
+)
+from hermes.observability.runtime import (
+    RuntimeComponentState,
+    RuntimeProbeResult,
 )
 from hermes.persistence.schema import init_db
 from hermes.review.contracts import (
@@ -31,6 +36,7 @@ from hermes.tools import registry, register_all
 
 
 logger = logging.getLogger(__name__)
+_BACKGROUND_REVIEW_SHUTDOWN_WAIT_SECONDS = 10.0
 
 
 class _QueuedClaimValidation(Enum):
@@ -92,6 +98,25 @@ class BackgroundReviewCoordinator:
         self.driver_registry = driver_registry
         self.executor = executor
         self.enabled = enabled
+
+    def runtime_probe(self) -> RuntimeProbeResult:
+        """返回 Coordinator 与 Executor 的基础设施摘要。"""
+        result = self.executor.runtime_probe()
+        return RuntimeProbeResult(
+            state=result.state,
+            metadata={
+                **result.metadata,
+                "enabled": self.enabled,
+                "phase": "ready",
+            },
+        )
+
+    def shutdown(
+        self,
+        timeout_seconds: float = _BACKGROUND_REVIEW_SHUTDOWN_WAIT_SECONDS,
+    ) -> int:
+        """停止接收并有限等待 Background Review worker 收口。"""
+        return self.executor.shutdown(timeout_seconds)
 
     def _fail_submission(
         self,
@@ -282,7 +307,27 @@ class BackgroundReviewExecutor:
         self._active_jobs = 0
         self._pending_jobs: deque[ReviewClaim] = deque()
         self._scheduled_claims: set[tuple[ReviewKind, str, str]] = set()
+        self._worker_threads: set[threading.Thread] = set()
+        self._accepting = True
+        self._shutdown_event = threading.Event()
         register_all(self.registry)
+
+    def runtime_probe(self) -> RuntimeProbeResult:
+        """返回执行器的有限队列摘要，不读取 Review 内容或领取身份。"""
+        with self._lock:
+            worker_count = self._active_jobs
+            queue_depth = len(self._pending_jobs)
+        return RuntimeProbeResult(
+            state=(
+                RuntimeComponentState.RUNNING
+                if worker_count
+                else RuntimeComponentState.IDLE
+            ),
+            metadata={
+                "queue_depth": queue_depth,
+                "worker_count": worker_count,
+            },
+        )
 
     def submit(self, *, claim: ReviewClaim) -> bool:
         """提交已领取的审视任务，并立即返回。"""
@@ -304,11 +349,14 @@ class BackgroundReviewExecutor:
         claim_key = self._claim_key(claim)
         start_immediately = False
         queue_full = False
+        shutting_down = False
         with self._lock:
-            if claim_key in self._scheduled_claims:
+            if not self._accepting:
+                shutting_down = True
+            elif claim_key in self._scheduled_claims:
                 logger.debug("background review claim is already scheduled")
                 return True
-            if self._pending_jobs:
+            elif self._pending_jobs:
                 if len(self._pending_jobs) < self.config.max_pending_jobs:
                     self._pending_jobs.append(claim)
                     self._scheduled_claims.add(claim_key)
@@ -326,6 +374,13 @@ class BackgroundReviewExecutor:
                 return True
             else:
                 queue_full = True
+        if shutting_down:
+            self._fail_claim_safely(
+                driver,
+                claim,
+                "review_executor_shutting_down",
+            )
+            return False
         if queue_full:
             logger.warning("background review queue is full")
             self._fail_claim_safely(driver, claim, "review_queue_full")
@@ -357,11 +412,15 @@ class BackgroundReviewExecutor:
     def _release_reserved_claim(self, claim: ReviewClaim) -> None:
         """释放已经占用的并发槽位，不执行数据库操作。"""
         with self._lock:
-            claim_key = self._claim_key(claim)
-            if claim_key not in self._scheduled_claims:
-                return
-            self._active_jobs -= 1
-            self._scheduled_claims.discard(claim_key)
+            self._release_reserved_claim_locked(claim)
+
+    def _release_reserved_claim_locked(self, claim: ReviewClaim) -> None:
+        """在执行器锁内释放已经预留的并发槽位。"""
+        claim_key = self._claim_key(claim)
+        if claim_key not in self._scheduled_claims:
+            return
+        self._active_jobs -= 1
+        self._scheduled_claims.discard(claim_key)
 
     def _start_reserved_worker(
         self,
@@ -369,19 +428,51 @@ class BackgroundReviewExecutor:
         claim: ReviewClaim,
     ) -> bool:
         """启动已预留并发槽位的 worker；失败时只释放当前 claim。"""
-        worker = threading.Thread(
-            target=self._run_worker,
-            args=(driver, claim),
-            name=f"background-review-{claim.session_id}",
-            daemon=True,
-        )
         try:
-            worker.start()
+            worker = threading.Thread(
+                target=self._run_worker,
+                args=(driver, claim),
+                name=f"background-review-{claim.session_id}",
+                daemon=True,
+            )
         except Exception as exc:
             self._release_reserved_claim(claim)
             logger.warning(
                 "background review worker could not start: %s",
                 type(exc).__name__,
+            )
+            self._fail_claim_safely(driver, claim, "review_worker_start_failed")
+            return False
+        rejected = False
+        start_error: Exception | None = None
+        with self._lock:
+            if not self._accepting:
+                self._release_reserved_claim_locked(claim)
+                rejected = True
+            else:
+                self._worker_threads = {
+                    thread
+                    for thread in self._worker_threads
+                    if thread.is_alive()
+                }
+                self._worker_threads.add(worker)
+                try:
+                    worker.start()
+                except Exception as exc:
+                    self._worker_threads.discard(worker)
+                    self._release_reserved_claim_locked(claim)
+                    start_error = exc
+        if rejected:
+            self._fail_claim_safely(
+                driver,
+                claim,
+                "review_executor_shutting_down",
+            )
+            return False
+        if start_error is not None:
+            logger.warning(
+                "background review worker could not start: %s",
+                type(start_error).__name__,
             )
             self._fail_claim_safely(driver, claim, "review_worker_start_failed")
             return False
@@ -391,7 +482,8 @@ class BackgroundReviewExecutor:
         """按 FIFO 顺序取出下一项，并在锁内预留一个并发槽位。"""
         with self._lock:
             if (
-                self._active_jobs >= self.config.max_concurrent_jobs
+                not self._accepting
+                or self._active_jobs >= self.config.max_concurrent_jobs
                 or not self._pending_jobs
             ):
                 return None
@@ -456,6 +548,14 @@ class BackgroundReviewExecutor:
             if not driver.claim_is_valid(conn, claim):
                 logger.debug("background review worker lost its claim before loading")
                 return
+            if self._shutdown_event.is_set():
+                self._fail_claim(
+                    driver,
+                    conn,
+                    claim,
+                    "review_executor_shutting_down",
+                )
+                return
             try:
                 run_spec = driver.prepare_run(conn, claim)
             except Exception as exc:
@@ -468,6 +568,14 @@ class BackgroundReviewExecutor:
                 return
             if not driver.claim_is_valid(conn, claim):
                 logger.debug("background review worker lost its claim after loading")
+                return
+            if self._shutdown_event.is_set():
+                self._fail_claim(
+                    driver,
+                    conn,
+                    claim,
+                    "review_executor_shutting_down",
+                )
                 return
             resolution = self.registry.resolve(run_spec.tool_policy)
             if not resolution.definitions:
@@ -485,7 +593,10 @@ class BackgroundReviewExecutor:
                 client=self.client,
                 session_key=claim.session_id,
                 model_kwargs={"max_tokens": MODEL_MAX_OUTPUT_TOKENS},
-                cancel_checker=lambda: not driver.claim_is_valid(conn, claim),
+                cancel_checker=lambda: (
+                    self._shutdown_event.is_set()
+                    or not driver.claim_is_valid(conn, claim)
+                ),
                 tool_context=run_spec.tool_context,
             )
             result = loop.run("")
@@ -512,6 +623,52 @@ class BackgroundReviewExecutor:
                 conn.close()
             self._release_reserved_claim(claim)
             self._start_next_pending_job()
+
+    def shutdown(
+        self,
+        timeout_seconds: float = _BACKGROUND_REVIEW_SHUTDOWN_WAIT_SECONDS,
+    ) -> int:
+        """停止接收、释放排队领取并有限等待已启动 worker。"""
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+        ):
+            raise ValueError("timeout_seconds must be a non-negative number")
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout_seconds must be a non-negative number")
+
+        with self._lock:
+            self._accepting = False
+            self._shutdown_event.set()
+            pending_claims = tuple(self._pending_jobs)
+            self._pending_jobs.clear()
+            for claim in pending_claims:
+                self._scheduled_claims.discard(self._claim_key(claim))
+            workers = tuple(self._worker_threads)
+
+        for claim in pending_claims:
+            driver = self.driver_registry.get(claim.kind)
+            if driver is None:
+                continue
+            self._fail_claim_safely(
+                driver,
+                claim,
+                "review_executor_shutting_down",
+            )
+
+        deadline = time.monotonic() + timeout
+        current_thread = threading.current_thread()
+        for worker in workers:
+            if worker is current_thread or not worker.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        # 当前线程无法 join 自身，但只要仍存活就必须计入未完成结果，
+        # 避免调用方过早宣称 Executor 已经停止。
+        return sum(worker.is_alive() for worker in workers)
 
     def _fail_claim(
         self,
@@ -617,3 +774,38 @@ def get_background_review_coordinator() -> BackgroundReviewCoordinator:
         if _background_review_coordinator is None:
             _background_review_coordinator = _build_default_coordinator()
         return _background_review_coordinator
+
+
+def probe_background_review_runtime() -> RuntimeProbeResult:
+    """探测惰性 Coordinator，不为 Heartbeat 提前初始化模型或工具依赖。"""
+    with _coordinator_lock:
+        coordinator = _background_review_coordinator
+    if coordinator is None:
+        enabled = BACKGROUND_REVIEW_CONFIG["enabled"] is True
+        return RuntimeProbeResult(
+            state=RuntimeComponentState.IDLE,
+            metadata={
+                "enabled": enabled,
+                "phase": "lazy" if enabled else "inactive",
+                "queue_depth": 0,
+                "worker_count": 0,
+            },
+        )
+    return coordinator.runtime_probe()
+
+
+def shutdown_background_review_runtime(
+    timeout_seconds: float = _BACKGROUND_REVIEW_SHUTDOWN_WAIT_SECONDS,
+) -> int:
+    """关闭已初始化 Coordinator；未初始化时不创建任何运行时对象。"""
+    global _background_review_coordinator
+    with _coordinator_lock:
+        coordinator = _background_review_coordinator
+    if coordinator is None:
+        return 0
+    unfinished_workers = coordinator.shutdown(timeout_seconds)
+    if unfinished_workers == 0:
+        with _coordinator_lock:
+            if _background_review_coordinator is coordinator:
+                _background_review_coordinator = None
+    return unfinished_workers

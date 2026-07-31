@@ -17,6 +17,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
+from hermes.observability.runtime import (
+    RuntimeComponentState,
+    RuntimeProbeResult,
+)
+
 
 MAX_BACKGROUND_DELEGATE_JOBS = 3
 _SHUTDOWN_WAIT_SECONDS = 10.0
@@ -67,6 +72,26 @@ class DelegateJobManager:
         self._lock = threading.Lock()
         self.max_jobs = max_jobs
         self._accepting = True
+
+    def runtime_probe(self) -> RuntimeProbeResult:
+        """返回 Manager 级存活摘要，不读取 Delegate 任务正文或结果。"""
+        with self._lock:
+            if not self._accepting:
+                raise RuntimeError("Delegate job manager is not accepting work")
+            worker_count = sum(
+                job.status in ("queued", "running")
+                for job in self._jobs.values()
+            )
+        return RuntimeProbeResult(
+            state=(
+                RuntimeComponentState.RUNNING
+                if worker_count
+                else RuntimeComponentState.IDLE
+            ),
+            metadata={
+                "worker_count": worker_count,
+            },
+        )
 
     # ---------- 查询:两种视图 ----------
 
@@ -383,6 +408,18 @@ def get_delegate_job_manager() -> DelegateJobManager:
         if _manager is None:
             _manager = DelegateJobManager()
         return _manager
+
+
+def probe_delegate_job_manager() -> RuntimeProbeResult:
+    """探测惰性 Manager；尚未创建时按无任务的存活能力处理。"""
+    with _manager_lock:
+        manager = _manager
+    if manager is None:
+        return RuntimeProbeResult(
+            state=RuntimeComponentState.IDLE,
+            metadata={"worker_count": 0},
+        )
+    return manager.runtime_probe()
 
 
 def shutdown_delegate_jobs(

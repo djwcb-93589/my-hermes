@@ -14,6 +14,7 @@ import signal
 from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
 from hermes.hooks import AsyncHookRegistry
+from hermes.persistence.runtime import SQLiteRuntimeStatusPublisher
 from hermes.plugins import AsyncPluginRuntime
 from hermes.processes import process_manager
 from hermes.tools import register_all
@@ -39,11 +40,13 @@ async def run_gateway():
         f"failed={plugin_summary.failed}"
     )
     runtime_state = {"runner": None}
+    runtime_status_publisher = SQLiteRuntimeStatusPublisher(DB_PATH)
     try:
         await _run_gateway_impl(
             hook_registry,
             runtime_state,
             process_manager,
+            runtime_status_publisher,
         )
     finally:
         try:
@@ -59,6 +62,7 @@ async def _run_gateway_impl(
     hook_registry,
     runtime_state,
     active_process_manager=None,
+    runtime_status_publisher=None,
 ) -> None:
     """构造 Adapter 并运行 Gateway；资源释放统一由外层负责。"""
     # Runner 会按平台配置把同一工具集同时用于 prompt、API schema 和
@@ -70,6 +74,7 @@ async def _run_gateway_impl(
         db_path=DB_PATH,
         hook_registry=hook_registry,
         process_manager=active_process_manager,
+        runtime_status_publisher=runtime_status_publisher,
     )
     runtime_state["runner"] = runner
 

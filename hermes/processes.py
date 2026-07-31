@@ -11,6 +11,11 @@ import threading
 import time
 from typing import Callable, Final, Protocol
 
+from hermes.observability.runtime import (
+    RuntimeComponentState,
+    RuntimeProbeResult,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class BackgroundProcessOutput:
@@ -508,6 +513,21 @@ class ProcessManager:
             )
         )
         return tuple(snapshots)
+
+    def runtime_probe(self) -> RuntimeProbeResult:
+        """返回 Manager 级存活摘要，不暴露进程身份、命令或输出。"""
+        with self._registry_lock:
+            worker_count = len(self._running)
+        return RuntimeProbeResult(
+            state=(
+                RuntimeComponentState.RUNNING
+                if worker_count
+                else RuntimeComponentState.IDLE
+            ),
+            metadata={
+                "worker_count": worker_count,
+            },
+        )
 
     def poll(self, session_key: str, process_id: str) -> ProcessSnapshot:
         """只读且非阻塞地返回一个后台进程的当前快照。"""

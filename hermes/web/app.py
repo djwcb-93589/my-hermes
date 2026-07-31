@@ -21,6 +21,7 @@ from hermes.persistence.monitoring import (
 from hermes.persistence.monitoring_aggregation import (
     SQLiteMonitoringAggregationRepository,
 )
+from hermes.persistence.runtime import SQLiteRuntimeStatusReadRepository
 from hermes.tool_declarations.catalog import build_toolset_catalog_snapshot
 from hermes.web.config import DashboardConfig, validate_dashboard_config
 from hermes.web.control_service import CronControlService
@@ -42,12 +43,14 @@ from hermes.web.read_service import (
     SessionReadService,
 )
 from hermes.web.redaction import DashboardRedactor
+from hermes.web.runtime_status_service import RuntimeStatusReadService
 from hermes.web.routes import (
     catalog,
     cron,
     database_diagnostics,
     monitoring,
     monitoring_aggregation,
+    runtime,
     sessions,
     status,
 )
@@ -112,6 +115,13 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         if config.db_path is not None
         else None
     )
+    runtime_status_read_service = (
+        RuntimeStatusReadService(
+            SQLiteRuntimeStatusReadRepository(config.db_path),
+        )
+        if config.db_path is not None
+        else None
+    )
     read_service = ReadService(
         context=read_context,
         redactor=redactor,
@@ -129,6 +139,7 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         monitoring_read_service=monitoring_read_service,
         monitoring_aggregation_service=monitoring_aggregation_service,
         database_diagnostics_service=database_diagnostics_service,
+        runtime_status_read_service=runtime_status_read_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
         access_policy=access_policy,
@@ -157,6 +168,7 @@ def create_app(
     monitoring_read_service: MonitoringReadService | None = None,
     monitoring_aggregation_service: MonitoringAggregationService | None = None,
     database_diagnostics_service: DatabaseDiagnosticsService | None = None,
+    runtime_status_read_service: RuntimeStatusReadService | None = None,
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
@@ -196,6 +208,7 @@ def create_app(
     application.state.database_diagnostics_service = (
         database_diagnostics_service
     )
+    application.state.runtime_status_read_service = runtime_status_read_service
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
     application.state.dashboard_access_policy = policy
@@ -340,6 +353,7 @@ def create_app(
     application.include_router(monitoring.router)
     application.include_router(monitoring_aggregation.router)
     application.include_router(database_diagnostics.router)
+    application.include_router(runtime.router)
     return application
 
 

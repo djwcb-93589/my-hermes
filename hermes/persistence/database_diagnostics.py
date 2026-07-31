@@ -61,6 +61,20 @@ _TOOL_EXECUTION_REQUIRED_COLUMNS = frozenset({
     "created_at",
     "updated_at",
 })
+_RUNTIME_REQUIRED_COLUMNS = frozenset({
+    "component_type",
+    "component_id",
+    "instance_id",
+    "reported_state",
+    "started_at",
+    "heartbeat_at",
+    "stopped_at",
+    "error_type",
+    "heartbeat_interval_seconds",
+    "stale_after_seconds",
+    "metadata_json",
+    "updated_at",
+})
 _OBSERVATION_REQUIRED_INDEXES = frozenset({
     "idx_observations_created",
     "idx_observations_run",
@@ -70,6 +84,11 @@ _OBSERVATION_REQUIRED_INDEXES = frozenset({
 })
 _TOOL_EXECUTION_REQUIRED_INDEXES = frozenset({
     "idx_tool_executions_monitoring_order",
+})
+_RUNTIME_REQUIRED_INDEXES = frozenset({
+    "idx_runtime_snapshots_component_type",
+    "idx_runtime_snapshots_reported_state",
+    "idx_runtime_snapshots_heartbeat",
 })
 _REQUIRED_INDEX_CHECKS = (
     (
@@ -95,6 +114,18 @@ _REQUIRED_INDEX_CHECKS = (
     (
         "idx_tool_executions_monitoring_order",
         (("updated_at", 1), ("execution_id", 1)),
+    ),
+    (
+        "idx_runtime_snapshots_component_type",
+        (("component_type", 0),),
+    ),
+    (
+        "idx_runtime_snapshots_reported_state",
+        (("reported_state", 0),),
+    ),
+    (
+        "idx_runtime_snapshots_heartbeat",
+        (("heartbeat_at", 0),),
     ),
 )
 _JOURNAL_MODES = {
@@ -141,7 +172,7 @@ class SQLiteDatabaseDiagnosticsRepository:
             raise _repository_error(DatabaseDiagnosticReason.DATA_INVALID)
 
     def read_schema_facts(self, timeout_ms: int) -> DatabaseSchemaFacts:
-        """读取版本和 M3.1/M3.2 必需结构，不执行 DDL 或迁移。"""
+        """读取版本、监控事件与 Runtime 当前表结构，不执行 DDL 或迁移。"""
         deadline_ns = _probe_deadline_ns(timeout_ms)
         try:
             with _diagnostic_connection(
@@ -184,11 +215,17 @@ class SQLiteDatabaseDiagnosticsRepository:
                 tool_execution_column_rows = conn.execute(
                     "PRAGMA table_info(tool_executions)"
                 ).fetchall()
+                runtime_column_rows = conn.execute(
+                    "PRAGMA table_info(runtime_component_snapshots)"
+                ).fetchall()
                 observation_index_rows = conn.execute(
                     "PRAGMA index_list(observations)"
                 ).fetchall()
                 tool_execution_index_rows = conn.execute(
                     "PRAGMA index_list(tool_executions)"
+                ).fetchall()
+                runtime_index_rows = conn.execute(
+                    "PRAGMA index_list(runtime_component_snapshots)"
                 ).fetchall()
                 index_signature_rows = (
                     (
@@ -232,6 +269,27 @@ class SQLiteDatabaseDiagnosticsRepository:
                             "'idx_tool_executions_monitoring_order')"
                         ).fetchall(),
                     ),
+                    (
+                        "idx_runtime_snapshots_component_type",
+                        conn.execute(
+                            "PRAGMA index_xinfo("
+                            "'idx_runtime_snapshots_component_type')"
+                        ).fetchall(),
+                    ),
+                    (
+                        "idx_runtime_snapshots_reported_state",
+                        conn.execute(
+                            "PRAGMA index_xinfo("
+                            "'idx_runtime_snapshots_reported_state')"
+                        ).fetchall(),
+                    ),
+                    (
+                        "idx_runtime_snapshots_heartbeat",
+                        conn.execute(
+                            "PRAGMA index_xinfo("
+                            "'idx_runtime_snapshots_heartbeat')"
+                        ).fetchall(),
+                    ),
                 )
         except sqlite3.Error as exc:
             raise _sqlite_repository_error(exc) from exc
@@ -266,12 +324,20 @@ class SQLiteDatabaseDiagnosticsRepository:
                 tool_execution_column_rows,
                 name_position=1,
             )
+            runtime_columns = _pragma_names(
+                runtime_column_rows,
+                name_position=1,
+            )
             observation_indexes = _pragma_names(
                 observation_index_rows,
                 name_position=1,
             )
             tool_execution_indexes = _pragma_names(
                 tool_execution_index_rows,
+                name_position=1,
+            )
+            runtime_indexes = _pragma_names(
+                runtime_index_rows,
                 name_position=1,
             )
             signatures = {
@@ -286,11 +352,13 @@ class SQLiteDatabaseDiagnosticsRepository:
                     _TOOL_EXECUTION_REQUIRED_COLUMNS
                     <= tool_execution_columns
                 )
+                and _RUNTIME_REQUIRED_COLUMNS <= runtime_columns
                 and _OBSERVATION_REQUIRED_INDEXES <= observation_indexes
                 and (
                     _TOOL_EXECUTION_REQUIRED_INDEXES
                     <= tool_execution_indexes
                 )
+                and _RUNTIME_REQUIRED_INDEXES <= runtime_indexes
                 and all(
                     signatures[index_name] == expected
                     for index_name, expected in _REQUIRED_INDEX_CHECKS

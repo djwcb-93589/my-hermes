@@ -8,6 +8,7 @@ from hermes.config import _config, DB_PATH, MODEL
 from hermes.gateway.runner import GatewayRunner
 from hermes.gateway.adapters.simulated import SimulatedAdapter
 from hermes.hooks import AsyncHookRegistry
+from hermes.persistence.runtime import SQLiteRuntimeStatusPublisher
 from hermes.plugins import AsyncPluginRuntime
 
 
@@ -38,6 +39,7 @@ async def run_gateway_simulated():
             config=_config,
             db_path=DB_PATH,
             hook_registry=hook_registry,
+            runtime_status_publisher=SQLiteRuntimeStatusPublisher(DB_PATH),
         )
         sim = SimulatedAdapter()
         runner.add_adapter(sim)

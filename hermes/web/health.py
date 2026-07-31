@@ -24,6 +24,7 @@ _REQUIRED_TABLES = frozenset({
     "tool_executions",
     "model_call_events",
     "observations",
+    "runtime_component_snapshots",
 })
 
 

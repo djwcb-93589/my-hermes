@@ -25,6 +25,13 @@ from hermes.observability.monitoring_aggregation import (
     MonitoringGranularity,
     ToolErrorCategory,
 )
+from hermes.observability.runtime import (
+    MAX_RUNTIME_OFFSET,
+    MAX_RUNTIME_PAGE_LIMIT,
+    RuntimeComponentEffectiveStatus,
+    RuntimeComponentFreshness,
+    RuntimeComponentState,
+)
 from hermes.tool_policy import ExecutionEnvironment
 from hermes.web.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 
@@ -335,6 +342,80 @@ class RunTimelineResponse(MonitoringPaginationResponse):
 
     run_id: str
     items: list[ObservationResponse]
+
+
+class RuntimeComponentResponse(_MonitoringResponseModel):
+    """长期运行组件当前实例的类型化安全状态。"""
+
+    component_type: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$",
+    )
+    component_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$",
+    )
+    instance_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$",
+    )
+    reported_state: RuntimeComponentState
+    freshness: RuntimeComponentFreshness
+    effective_status: RuntimeComponentEffectiveStatus
+    started_at: datetime | None = None
+    heartbeat_at: datetime
+    heartbeat_age_seconds: _NonNegativeFiniteFloat
+    heartbeat_interval_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, allow_inf_nan=False),
+    ]
+    stale_after_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, allow_inf_nan=False),
+    ]
+    is_stale: _StrictBool
+    stopped_at: datetime | None = None
+    error_type: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$",
+    )
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_runtime_status(self) -> Self:
+        """拒绝跨层转换时产生的相互矛盾心跳状态。"""
+        if self.stale_after_seconds <= self.heartbeat_interval_seconds:
+            raise ValueError(
+                "stale_after_seconds must exceed heartbeat_interval_seconds"
+            )
+        if self.is_stale != (
+            self.freshness is RuntimeComponentFreshness.STALE
+        ):
+            raise ValueError("is_stale must match freshness")
+        return self
+
+
+class RuntimeComponentListResponse(_MonitoringResponseModel):
+    """固定上限的当前 Runtime Component 列表。"""
+
+    observed_at: datetime
+    items: list[RuntimeComponentResponse] = Field(
+        max_length=MAX_RUNTIME_PAGE_LIMIT,
+    )
+    limit: Annotated[
+        int,
+        Field(strict=True, ge=1, le=MAX_RUNTIME_PAGE_LIMIT),
+    ]
+    offset: Annotated[
+        int,
+        Field(strict=True, ge=0, le=MAX_RUNTIME_OFFSET),
+    ]
+    has_more: _StrictBool
 
 
 class MonitoringWindowResponse(_MonitoringResponseModel):

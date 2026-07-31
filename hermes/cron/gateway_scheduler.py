@@ -28,6 +28,10 @@ from hermes.db import (
 )
 from hermes.gateway.persistence import GatewayPersistence
 from hermes.hooks import SyncHookRegistry
+from hermes.observability.runtime import (
+    RuntimeComponentState,
+    RuntimeProbeResult,
+)
 
 
 @dataclass
@@ -178,6 +182,29 @@ class GatewayCronScheduler:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._running.clear()
+
+    def runtime_probe(self) -> RuntimeProbeResult:
+        """返回不读取任务内容的 Scheduler 基础设施存活摘要。"""
+        dispatcher = self._dispatch_task
+        if (
+            not self._accepting
+            or not self._lease_is_valid()
+            or dispatcher is None
+            or dispatcher.done()
+        ):
+            raise RuntimeError("Cron scheduler is not live")
+        worker_count = len(self._running)
+        return RuntimeProbeResult(
+            state=(
+                RuntimeComponentState.RUNNING
+                if worker_count
+                else RuntimeComponentState.IDLE
+            ),
+            metadata={
+                "mode": "lease_bound",
+                "worker_count": worker_count,
+            },
+        )
 
     async def tick(self) -> None:
         """供调度循环和手工 tick 共用的一次无重入扫描。"""

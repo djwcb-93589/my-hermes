@@ -123,6 +123,9 @@ from hermes.gateway.progressive_output import (
 )
 from hermes.persistence.gateway import delete_gateway_conversation_for_route
 from hermes.gateway.runtime_lease import GatewayRuntimeLease
+from hermes.gateway.runtime_components import (
+    build_gateway_runtime_components,
+)
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
 from hermes.cron.executor import CronExecutor
@@ -144,6 +147,10 @@ from hermes.gateway.types import (
 )
 from hermes.prompt import build_system_prompt
 from hermes.redaction import redact_explicit_secrets
+from hermes.observability.runtime import (
+    RuntimeProbeResult,
+    RuntimeStatusPublisher,
+)
 from hermes.tools import (
     ApprovalMode,
     ExecutionEnvironment,
@@ -159,6 +166,22 @@ _GATEWAY_CONTEXT_FIELDS = (
     "include_user_profile",
     "include_project_context",
 )
+
+
+def _probe_delegate_runtime() -> RuntimeProbeResult:
+    """延迟探测 Delegate Manager，避免仅为监控创建进程级单例。"""
+    from hermes.delegate_jobs import probe_delegate_job_manager
+
+    return probe_delegate_job_manager()
+
+
+def _probe_background_review_runtime() -> RuntimeProbeResult:
+    """延迟探测 Background Review，不为监控初始化 Coordinator。"""
+    from hermes.review.runtime import probe_background_review_runtime
+
+    return probe_background_review_runtime()
+
+
 _GATEWAY_CONTEXT_POLICY_DEFAULTS = {
     "default": {
         "include_soul": True,
@@ -794,6 +817,7 @@ class GatewayRunner:
         *,
         hook_registry: AsyncHookRegistry | None = None,
         process_manager=None,
+        runtime_status_publisher: RuntimeStatusPublisher | None = None,
     ):
         # Gateway 的配置校验依赖全局元数据，先完成幂等注册。
         if process_manager is None:
@@ -961,6 +985,19 @@ class GatewayRunner:
             misfire_grace_seconds=self.cron_misfire_grace_seconds,
             execution_finished=self._prepare_cron_delivery,
         )
+        if runtime_status_publisher is None:
+            self._runtime_components = build_gateway_runtime_components(
+                publisher=None,
+            )
+        else:
+            self._runtime_components = build_gateway_runtime_components(
+                publisher=runtime_status_publisher,
+                cron_probe=self._cron_scheduler.runtime_probe,
+                process_probe=self._process_manager.runtime_probe,
+                delegate_probe=_probe_delegate_runtime,
+                background_review_probe=_probe_background_review_runtime,
+            )
+        self._owns_runtime_lifecycle = False
         self.outbound_delivery = OutboundDeliveryService(
             self.db_path,
             self.file_transfer_config,
@@ -1655,11 +1692,8 @@ class GatewayRunner:
                 f"lease_epoch={self._runtime_lease_epoch}"
             )
 
-        # 失租等同 shutdown：保留可恢复 Outbox，不把它误标为用户取消。
-        for adapter in self.adapters.values():
-            adapter.revoke_receiving()
-        self._cron_scheduler.revoke()
-        self.sessions.cancel_all(reason="shutdown")
+        # 先保证统一关闭一定被调度；后续同步撤销即使部分失败，也不能让
+        # Runtime Heartbeat 在已经失租后继续存活。
         if (
             self._lease_shutdown_task is None
             or self._lease_shutdown_task.done()
@@ -1667,6 +1701,30 @@ class GatewayRunner:
             self._lease_shutdown_task = asyncio.create_task(
                 self.stop(),
                 name="gateway-lease-loss-shutdown",
+            )
+
+        # 失租等同 shutdown：保留可恢复 Outbox，不把它误标为用户取消。
+        for name, adapter in self.adapters.items():
+            try:
+                adapter.revoke_receiving()
+            except Exception as exc:
+                print(
+                    f"  [gateway] {name} receive revoke failed: "
+                    f"{type(exc).__name__}"
+                )
+        try:
+            self._cron_scheduler.revoke()
+        except Exception as exc:
+            print(
+                "  [gateway] Cron revoke failed: "
+                f"{type(exc).__name__}"
+            )
+        try:
+            self.sessions.cancel_all(reason="shutdown")
+        except Exception as exc:
+            print(
+                "  [gateway] session cancellation failed: "
+                f"{type(exc).__name__}"
             )
 
     async def _await_operation_completion(
@@ -1740,6 +1798,28 @@ class GatewayRunner:
             process_manager=self._process_manager,
             lifecycle_barrier_complete=lifecycle_barrier_complete,
         )
+
+    async def _shutdown_background_review_runtime(self) -> bool:
+        """停止接收并有限等待已初始化的 Background Review worker。"""
+        from hermes.review.runtime import shutdown_background_review_runtime
+
+        try:
+            unfinished_workers = await self._await_blocking_operation(
+                shutdown_background_review_runtime,
+            )
+        except Exception as exc:
+            print(
+                "  [gateway] background review shutdown incomplete: "
+                f"exception={type(exc).__name__}"
+            )
+            return False
+        if unfinished_workers:
+            print(
+                "  [gateway] background review shutdown incomplete: "
+                f"active_workers={unfinished_workers}"
+            )
+            return False
+        return True
 
     async def _session_cleanup_loop(self) -> None:
         """周期清理没有运行、排队或持久投递负担的空闲会话。"""
@@ -2832,19 +2912,62 @@ class GatewayRunner:
         self._startup_in_progress = False
         raise RuntimeError("gateway runtime lease lost during startup")
 
-    async def _abort_startup_after_lease(self) -> None:
+    async def _abort_startup_after_lease(
+        self,
+        error_type: str = "GatewayStartupFailed",
+    ) -> None:
         """启动恢复失败时停止已创建资源并尽早交还租约。"""
+        try:
+            await self._runtime_components.fail_startup(error_type)
+        except (Exception, asyncio.CancelledError) as exc:
+            print(
+                "  [gateway] startup Runtime cleanup failed: "
+                f"exception={type(exc).__name__}"
+            )
         self._accepting_external_messages = False
         self._route_admission_closed = True
-        self._runtime_lease.revoke()
-        await self._cancel_background_tasks()
-        active_tasks = self.sessions.cancel_all(reason="shutdown")
-        if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+        try:
+            self._runtime_lease.revoke()
+        except Exception as exc:
+            print(
+                "  [gateway] startup lease revoke failed: "
+                f"exception={type(exc).__name__}"
+            )
+        try:
+            await self._cron_scheduler.stop()
+        except (Exception, asyncio.CancelledError) as exc:
+            print(
+                "  [gateway] startup Cron cleanup failed: "
+                f"exception={type(exc).__name__}"
+            )
+        try:
+            await self._cancel_background_tasks()
+        except (Exception, asyncio.CancelledError) as exc:
+            print(
+                "  [gateway] startup background cleanup failed: "
+                f"exception={type(exc).__name__}"
+            )
+        try:
+            active_tasks = self.sessions.cancel_all(reason="shutdown")
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+        except (Exception, asyncio.CancelledError) as exc:
+            print(
+                "  [gateway] startup session cleanup failed: "
+                f"exception={type(exc).__name__}"
+            )
+        if self._owns_runtime_lifecycle:
+            try:
+                await self._shutdown_background_review_runtime()
+            except (Exception, asyncio.CancelledError) as exc:
+                print(
+                    "  [gateway] startup review cleanup failed: "
+                    f"exception={type(exc).__name__}"
+                )
         for adapter in self.adapters.values():
             try:
                 await adapter.disconnect()
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 print(
                     "  [gateway] startup adapter disconnect failed: "
                     f"platform={adapter.platform_name} "
@@ -2853,12 +2976,18 @@ class GatewayRunner:
         if self._runtime_lease_acquired:
             try:
                 await self._runtime_lease.release()
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 print(
                     "  [gateway] runtime lease release failed: "
                     f"{type(exc).__name__}"
                 )
-        self._close_cron_observation_bridge()
+        try:
+            self._close_cron_observation_bridge()
+        except Exception as exc:
+            print(
+                "  [gateway] startup observation bridge cleanup failed: "
+                f"exception={type(exc).__name__}"
+            )
 
     async def tick_cron(self) -> None:
         """供受控手工入口复用同一 lease、claim 与无重入边界。"""
@@ -2922,7 +3051,15 @@ class GatewayRunner:
             raise RuntimeError(
                 "another active Gateway instance holds the runtime lease"
             )
-        self._start_runtime_lease_heartbeat()
+        self._owns_runtime_lifecycle = True
+        try:
+            self._runtime_components.starting()
+            self._start_runtime_lease_heartbeat()
+        except Exception as exc:
+            await self._abort_startup_after_lease(type(exc).__name__)
+            self._lifecycle_phase = "startup_failed"
+            self._startup_in_progress = False
+            raise
 
         self._lifecycle_phase = "gateway_tool_execution_recovery"
         try:
@@ -2940,8 +3077,8 @@ class GatewayRunner:
                     task_name="gateway-tool-execution-recovery",
                 )
             await self._require_startup_runtime_lease()
-        except Exception:
-            await self._abort_startup_after_lease()
+        except Exception as exc:
+            await self._abort_startup_after_lease(type(exc).__name__)
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
             raise
@@ -2976,8 +3113,8 @@ class GatewayRunner:
             await self._require_startup_runtime_lease()
             if recovered:
                 print(f"  [gateway:cron] recovered interrupted runs={recovered}")
-        except Exception:
-            await self._abort_startup_after_lease()
+        except Exception as exc:
+            await self._abort_startup_after_lease(type(exc).__name__)
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
             raise
@@ -3016,7 +3153,7 @@ class GatewayRunner:
                 "  [gateway] terminal delivery reconciliation failed: "
                 f"{type(exc).__name__}"
             )
-            await self._abort_startup_after_lease()
+            await self._abort_startup_after_lease(type(exc).__name__)
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
             raise
@@ -3028,9 +3165,9 @@ class GatewayRunner:
             self._lifecycle_phase = "gateway_queue_restore"
             await self._restore_queued_messages()
             await self._require_startup_runtime_lease()
-        except Exception:
+        except Exception as exc:
             # Gateway 自身持久状态无法完成恢复时不能开放外部入口。
-            await self._abort_startup_after_lease()
+            await self._abort_startup_after_lease(type(exc).__name__)
             self._lifecycle_phase = "startup_failed"
             self._startup_in_progress = False
             raise
@@ -3075,11 +3212,17 @@ class GatewayRunner:
         # completed 记录为准，不让启动快照变成长生命周期内存真相源。
         self._startup_message_states.clear()
         self._lifecycle_phase = "running"
-        self._start_session_cleanup()
-        self._start_retention_cleanup()
-        self._start_file_delivery_dispatcher()
-        self._start_cron_delivery_preparation()
-        self._cron_scheduler.start()
+        try:
+            self._start_session_cleanup()
+            self._start_retention_cleanup()
+            self._start_file_delivery_dispatcher()
+            self._start_cron_delivery_preparation()
+            self._cron_scheduler.start()
+            self._runtime_components.start_heartbeats()
+        except Exception as exc:
+            await self._abort_startup_after_lease(type(exc).__name__)
+            self._lifecycle_phase = "startup_failed"
+            raise
 
     async def stop(self):
         """取消运行中任务,断开 adapter,关闭模型客户端并清理 backend。"""
@@ -3089,11 +3232,33 @@ class GatewayRunner:
                 and not self._runtime_lease_acquired
             ):
                 return
+
+            cleanup_error: BaseException | None = None
+
+            def record_cleanup_error(
+                stage: str,
+                error: BaseException,
+            ) -> None:
+                """记录首个清理异常并继续收口，最终恢复原有失败可见性。"""
+                nonlocal cleanup_error
+                if cleanup_error is None:
+                    cleanup_error = error
+                print(
+                    "  [gateway] shutdown cleanup failed: "
+                    f"stage={stage} exception={type(error).__name__}"
+                )
+
             self._lifecycle_phase = "stopping"
             self._accepting_external_messages = False
             self._route_admission_closed = True
-            self._runtime_lease.revoke()
-            self._cron_scheduler.revoke()
+            try:
+                self._runtime_lease.revoke()
+            except Exception as exc:
+                record_cleanup_error("runtime_lease_revoke", exc)
+            try:
+                self._cron_scheduler.revoke()
+            except Exception as exc:
+                record_cleanup_error("cron_revoke", exc)
 
             # 先同步关闭所有外部入站资格，不能在等待 worker 时继续落库。
             for name, adapter in self.adapters.items():
@@ -3108,37 +3273,91 @@ class GatewayRunner:
                     self._receiving_adapters.discard(name)
             self._receiving_adapters.clear()
 
+            try:
+                await self._runtime_components.stop_heartbeats()
+            except asyncio.CancelledError as exc:
+                record_cleanup_error("runtime_heartbeat_stop", exc)
+            except Exception as exc:
+                print(
+                    "  [gateway] Runtime heartbeat cleanup failed: "
+                    f"exception={type(exc).__name__}"
+                )
+            try:
+                self._runtime_components.stopping()
+            except Exception as exc:
+                print(
+                    "  [gateway] Runtime stopping publish failed: "
+                    f"exception={type(exc).__name__}"
+                )
+
             # 入站关闭后先等待已经进入 admission 的请求完成 worker 登记，
             # 再统一取消，避免 global cleanup 漏过迟到的工具调用。
-            await self._drain_route_admissions()
+            try:
+                await self._drain_route_admissions()
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("route_admission_drain", exc)
 
-            # admission 收口后再停止 heartbeat / housekeeping 和 route worker。
-            await self._cron_scheduler.stop()
-            await self._cancel_background_tasks()
+            # admission 收口后再停止 Gateway lease heartbeat、housekeeping
+            # 和 route worker。
+            cron_shutdown_complete = False
+            try:
+                await self._cron_scheduler.stop()
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("cron_stop", exc)
+            else:
+                cron_shutdown_complete = True
+            try:
+                await self._cancel_background_tasks()
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("background_task_cancel", exc)
             try:
                 await self.persistence.call(
                     reset_gateway_uploading_file_deliveries,
                     **self._runtime_fence_kwargs(),
                 )
+            except asyncio.CancelledError as exc:
+                record_cleanup_error("file_delivery_reset", exc)
             except Exception as exc:
                 # 当前 lease 已失效时由下一实例的启动恢复再次执行，不阻塞关闭。
                 print(
                     "  [gateway:audit] event=file_delivery_shutdown_reset_failed "
                     f"exception={type(exc).__name__}"
                 )
-            active_tasks = self.sessions.cancel_all(reason="shutdown")
-            if active_tasks:
-                await asyncio.gather(*active_tasks, return_exceptions=True)
+            try:
+                active_tasks = self.sessions.cancel_all(reason="shutdown")
+                if active_tasks:
+                    await asyncio.gather(
+                        *active_tasks,
+                        return_exceptions=True,
+                    )
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("session_cancel", exc)
 
-            from hermes.delegate_jobs import shutdown_delegate_jobs
+            background_review_lifecycle_complete = False
+            if self._owns_runtime_lifecycle:
+                try:
+                    background_review_lifecycle_complete = (
+                        await self._shutdown_background_review_runtime()
+                    )
+                except asyncio.CancelledError as exc:
+                    record_cleanup_error("background_review_stop", exc)
+                except Exception as exc:
+                    print(
+                        "  [gateway] background review shutdown incomplete: "
+                        f"exception={type(exc).__name__}"
+                    )
 
             delegate_lifecycle_complete = False
             try:
+                from hermes.delegate_jobs import shutdown_delegate_jobs
+
                 unfinished_delegate_jobs = (
                     await self._await_blocking_operation(
                         shutdown_delegate_jobs,
                     )
                 )
+            except asyncio.CancelledError as error:
+                record_cleanup_error("delegate_stop", error)
             except Exception as error:
                 print(
                     "  [gateway] delegate shutdown incomplete: "
@@ -3154,26 +3373,37 @@ class GatewayRunner:
                         f"active_jobs={len(unfinished_delegate_jobs)}"
                     )
 
-            resource_cleanup = await self._cleanup_all_session_resources(
-                lifecycle_barrier_complete=delegate_lifecycle_complete,
-            )
-            if not resource_cleanup.complete:
-                process_cleanup = resource_cleanup.process_cleanup
-                unresolved_count = (
-                    0
-                    if process_cleanup is None
-                    else len(
-                        process_cleanup.unresolved_process_ids
+            process_lifecycle_complete = False
+            try:
+                resource_cleanup = await self._cleanup_all_session_resources(
+                    lifecycle_barrier_complete=delegate_lifecycle_complete,
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("session_resource_cleanup", exc)
+            else:
+                process_lifecycle_complete = (
+                    resource_cleanup.process_cleanup is not None
+                    and resource_cleanup.process_cleanup.complete
+                )
+                if not resource_cleanup.complete:
+                    process_cleanup = resource_cleanup.process_cleanup
+                    unresolved_count = (
+                        0
+                        if process_cleanup is None
+                        else len(
+                            process_cleanup.unresolved_process_ids
+                        )
                     )
-                )
-                print(
-                    "  [gateway] global resource cleanup incomplete: "
-                    f"unresolved_processes={unresolved_count}"
-                )
+                    print(
+                        "  [gateway] global resource cleanup incomplete: "
+                        f"unresolved_processes={unresolved_count}"
+                    )
 
             for adapter in self.adapters.values():
                 try:
                     await adapter.disconnect()
+                except asyncio.CancelledError as exc:
+                    record_cleanup_error("adapter_disconnect", exc)
                 except Exception as exc:
                     print(
                         "  [gateway] adapter disconnect failed: "
@@ -3184,6 +3414,8 @@ class GatewayRunner:
             if self._runtime_lease_acquired:
                 try:
                     await self._runtime_lease.release()
+                except asyncio.CancelledError as exc:
+                    record_cleanup_error("runtime_lease_release", exc)
                 except Exception as exc:
                     print(
                         "  [gateway] runtime lease release failed: "
@@ -3193,6 +3425,8 @@ class GatewayRunner:
             if self._async_client is not None:
                 try:
                     await self._async_client.close()
+                except asyncio.CancelledError as exc:
+                    record_cleanup_error("model_client_close", exc)
                 except Exception as exc:
                     print(
                         "  [gateway] model client close failed: "
@@ -3205,9 +3439,33 @@ class GatewayRunner:
             self._startup_in_progress = False
             try:
                 await self.persistence.close()
-            finally:
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("persistence_close", exc)
+            try:
                 self._close_cron_observation_bridge()
+            except Exception as exc:
+                record_cleanup_error("observation_bridge_close", exc)
+            finally:
+                try:
+                    self._runtime_components.complete(
+                        {
+                            "cron_scheduler": cron_shutdown_complete,
+                            "process_manager": process_lifecycle_complete,
+                            "delegate_manager": delegate_lifecycle_complete,
+                            "background_review": (
+                                background_review_lifecycle_complete
+                            ),
+                        }
+                    )
+                except Exception as exc:
+                    print(
+                        "  [gateway] Runtime terminal publish failed: "
+                        f"exception={type(exc).__name__}"
+                    )
+                self._owns_runtime_lifecycle = False
             self._lifecycle_phase = "stopped"
+            if cleanup_error is not None:
+                raise cleanup_error
 
     # ----- 消息路由 -----
 
