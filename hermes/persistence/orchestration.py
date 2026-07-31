@@ -879,6 +879,141 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             )
         return expires_at
 
+    def _reserve_ready_tasks(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        limit: int,
+        lease_seconds: float,
+        workflow_id: str | None = None,
+    ) -> tuple[TaskClaim, ...]:
+        """在调用方写事务内复用唯一的 ready Task 保留状态机。"""
+
+        now = self._now()
+        expires_at = self._lease_expiry(now, lease_seconds)
+        scope_clause = ""
+        candidate_parameters: list[object] = [
+            WorkflowStatus.ACTIVE.value,
+            TaskStatus.READY.value,
+        ]
+        if workflow_id is not None:
+            scope_clause = " AND task.workflow_id=?"
+            candidate_parameters.append(workflow_id)
+        candidate_parameters.append(limit)
+        rows = conn.execute(
+            "SELECT task.task_id "
+            "FROM orchestration_tasks AS task "
+            "JOIN orchestration_workflows AS workflow "
+            "ON workflow.workflow_id=task.workflow_id "
+            "WHERE workflow.status=? "
+            "AND task.status=? "
+            "AND task.attempt_count < task.max_attempts"
+            f"{scope_clause} "
+            "ORDER BY task.priority DESC, task.ready_at, "
+            "task.created_at, task.task_id "
+            "LIMIT ?",
+            tuple(candidate_parameters),
+        ).fetchall()
+
+        claims: list[TaskClaim] = []
+        for row in rows:
+            if not isinstance(row, tuple) or len(row) != 1:
+                raise OrchestrationPersistenceError(
+                    "ready task candidate row is invalid"
+                )
+            task_id = _stored_text(row[0], "task_id")
+            if task_id is None:
+                raise OrchestrationPersistenceError(
+                    "ready task candidate row is invalid"
+                )
+            run_id = self._new_id("run")
+            claim_token = self._new_claim_token(
+                run_id=run_id,
+                worker_id=owner_id,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE orchestration_tasks
+                SET status=?, claim_owner=?, claim_token=?,
+                    claim_expires_at=?,
+                    started_at=COALESCE(started_at, ?),
+                    updated_at=?
+                WHERE task_id=? AND status=?
+                  AND (? IS NULL OR workflow_id=?)
+                  AND attempt_count < max_attempts
+                  AND EXISTS (
+                      SELECT 1
+                      FROM orchestration_workflows AS workflow
+                      WHERE workflow.workflow_id=
+                            orchestration_tasks.workflow_id
+                        AND workflow.status=?
+                  )
+                """,
+                (
+                    TaskStatus.RUNNING.value,
+                    owner_id,
+                    claim_token,
+                    expires_at,
+                    now,
+                    now,
+                    task_id,
+                    TaskStatus.READY.value,
+                    workflow_id,
+                    workflow_id,
+                    WorkflowStatus.ACTIVE.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            run_number = _next_task_run_number(conn, task_id)
+            task = _require_task(conn, task_id)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO orchestration_task_runs (
+                        run_id, workflow_id, task_id,
+                        attempt_number, worker_id, claim_token,
+                        status, session_key, claimed_at,
+                        started_at, heartbeat_at, finished_at,
+                        result_summary, result_metadata_json,
+                        error_type, error_message
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?,
+                        NULL, NULL, NULL, NULL, NULL
+                    )
+                    """,
+                    (
+                        run_id,
+                        task.workflow_id,
+                        task.task_id,
+                        run_number,
+                        owner_id,
+                        claim_token,
+                        TaskRunStatus.CLAIMED.value,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise OrchestrationPersistenceError(
+                    "task claim identifiers conflicted"
+                ) from exc
+            run = _read_run_by_claim(conn, task.task_id, claim_token)
+            if run is None:
+                raise OrchestrationPersistenceError(
+                    "claimed task run could not be read back"
+                )
+            workflow = _require_workflow(conn, task.workflow_id)
+            claims.append(_claim_record(
+                workflow=workflow,
+                task=task,
+                run=run,
+                claim_token=claim_token,
+                claim_expires_at=expires_at,
+            ))
+        return tuple(claims)
+
     def create_workflow(self, spec: WorkflowCreateSpec) -> WorkflowRecord:
         if not isinstance(spec, WorkflowCreateSpec):
             raise OrchestrationValidationError(
@@ -1135,119 +1270,61 @@ class SQLiteOrchestrationStore(OrchestrationStore):
     ) -> tuple[TaskClaim, ...]:
         worker = _argument_text(worker_id, "worker_id", max_length=256)
         normalized_limit = _positive_int(limit, "limit", maximum=100)
-        claims: list[TaskClaim] = []
+        claims: tuple[TaskClaim, ...] = ()
         with _database_operation("task claim"):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
-                    now = self._now()
-                    expires_at = self._lease_expiry(now, lease_seconds)
-                    candidates = conn.execute(
-                        """
-                        SELECT task.task_id
-                        FROM orchestration_tasks AS task
-                        JOIN orchestration_workflows AS workflow
-                          ON workflow.workflow_id=task.workflow_id
-                        WHERE workflow.status=?
-                          AND task.status=?
-                          AND task.attempt_count < task.max_attempts
-                        ORDER BY task.priority DESC, task.ready_at,
-                                 task.created_at, task.task_id
-                        LIMIT ?
-                        """,
-                        (
-                            WorkflowStatus.ACTIVE.value,
-                            TaskStatus.READY.value,
-                            normalized_limit,
-                        ),
-                    ).fetchall()
-                    for (task_id,) in candidates:
-                        run_id = self._new_id("run")
-                        claim_token = self._new_claim_token(
-                            run_id=run_id,
-                            worker_id=worker,
-                        )
-                        cursor = conn.execute(
-                            """
-                            UPDATE orchestration_tasks
-                            SET status=?, claim_owner=?, claim_token=?,
-                                claim_expires_at=?,
-                                started_at=COALESCE(started_at, ?),
-                                updated_at=?
-                            WHERE task_id=? AND status=?
-                              AND attempt_count < max_attempts
-                              AND EXISTS (
-                                  SELECT 1
-                                  FROM orchestration_workflows AS workflow
-                                  WHERE workflow.workflow_id=
-                                        orchestration_tasks.workflow_id
-                                    AND workflow.status=?
-                              )
-                            """,
-                            (
-                                TaskStatus.RUNNING.value,
-                                worker,
-                                claim_token,
-                                expires_at,
-                                now,
-                                now,
-                                task_id,
-                                TaskStatus.READY.value,
-                                WorkflowStatus.ACTIVE.value,
-                            ),
-                        )
-                        if cursor.rowcount != 1:
-                            continue
-                        run_number = _next_task_run_number(conn, str(task_id))
-                        task = _require_task(conn, str(task_id))
-                        try:
-                            conn.execute(
-                                """
-                                INSERT INTO orchestration_task_runs (
-                                    run_id, workflow_id, task_id,
-                                    attempt_number, worker_id, claim_token,
-                                    status, session_key, claimed_at,
-                                    started_at, heartbeat_at, finished_at,
-                                    result_summary, result_metadata_json,
-                                    error_type, error_message
-                                ) VALUES (
-                                    ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?,
-                                    NULL, NULL, NULL, NULL, NULL
-                                )
-                                """,
-                                (
-                                    run_id,
-                                    task.workflow_id,
-                                    task.task_id,
-                                    run_number,
-                                    worker,
-                                    claim_token,
-                                    TaskRunStatus.CLAIMED.value,
-                                    now,
-                                    now,
-                                ),
-                            )
-                        except sqlite3.IntegrityError as exc:
-                            raise OrchestrationPersistenceError(
-                                "task claim identifiers conflicted"
-                            ) from exc
-                        run = _read_run_by_claim(
+                    claims = self._reserve_ready_tasks(
+                        conn,
+                        owner_id=worker,
+                        limit=normalized_limit,
+                        lease_seconds=lease_seconds,
+                    )
+        return claims
+
+    def reserve_next_ready_task(
+        self,
+        *,
+        workflow_id: str,
+        owner_id: str,
+        lease_seconds: float,
+    ) -> TaskClaim | None:
+        normalized_workflow_id = _argument_text(
+            workflow_id,
+            "workflow_id",
+            max_length=128,
+        )
+        owner = _argument_text(owner_id, "owner_id", max_length=256)
+        normalized_lease_seconds = _positive_number(
+            lease_seconds,
+            "lease_seconds",
+        )
+        if normalized_lease_seconds > 86_400:
+            raise OrchestrationValidationError(
+                "lease_seconds exceeds its limit"
+            )
+        result: TaskClaim | None = None
+        with _database_operation("workflow task reservation"):
+            with existing_write_connection(self._db_path) as conn:
+                with _immediate_transaction(conn):
+                    workflow = _require_workflow(
+                        conn,
+                        normalized_workflow_id,
+                    )
+                    if workflow.status is WorkflowStatus.ACTIVE:
+                        claims = self._reserve_ready_tasks(
                             conn,
-                            task.task_id,
-                            claim_token,
+                            owner_id=owner,
+                            limit=1,
+                            lease_seconds=normalized_lease_seconds,
+                            workflow_id=normalized_workflow_id,
                         )
-                        if run is None:
+                        if len(claims) > 1:
                             raise OrchestrationPersistenceError(
-                                "claimed task run could not be read back"
+                                "workflow task reservation returned too many claims"
                             )
-                        workflow = _require_workflow(conn, task.workflow_id)
-                        claims.append(_claim_record(
-                            workflow=workflow,
-                            task=task,
-                            run=run,
-                            claim_token=claim_token,
-                            claim_expires_at=expires_at,
-                        ))
-        return tuple(claims)
+                        result = claims[0] if claims else None
+        return result
 
     def renew_task_claim(
         self,

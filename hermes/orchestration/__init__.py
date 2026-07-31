@@ -14,6 +14,8 @@ from hermes.orchestration.errors import (
     TaskToolResolutionError,
     UnknownAgentRoleError,
     WorkflowCycleError,
+    WorkflowRunnerError,
+    WorkflowRunnerValidationError,
 )
 from hermes.orchestration.execution import (
     ClaimedTaskExecutor,
@@ -42,6 +44,11 @@ from hermes.orchestration.roles import (
     StaticRoleRegistry,
 )
 from hermes.orchestration.store import OrchestrationStore
+from hermes.orchestration.workflow_execution import (
+    WorkflowExecutionKind,
+    WorkflowExecutionResult,
+    WorkflowRunner,
+)
 
 
 __all__ = [
@@ -77,6 +84,11 @@ __all__ = [
     "UnknownAgentRoleError",
     "WorkflowCreateSpec",
     "WorkflowCycleError",
+    "WorkflowExecutionKind",
+    "WorkflowExecutionResult",
     "WorkflowRecord",
+    "WorkflowRunner",
+    "WorkflowRunnerError",
+    "WorkflowRunnerValidationError",
     "WorkflowStatus",
 ]

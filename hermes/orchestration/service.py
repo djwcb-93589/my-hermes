@@ -369,6 +369,29 @@ class OrchestrationService:
             lease_seconds=_require_lease_seconds(lease_seconds),
         )
 
+    def reserve_next_ready_task(
+        self,
+        *,
+        workflow_id: str,
+        owner_id: str,
+        lease_seconds: float,
+    ) -> TaskClaim | None:
+        """为中央 Runner 原子保留指定 Workflow 的一个 ready Task。"""
+
+        return self._store.reserve_next_ready_task(
+            workflow_id=_require_string(
+                workflow_id,
+                "workflow_id",
+                max_length=_MAX_KEY_LENGTH,
+            ),
+            owner_id=_require_string(
+                owner_id,
+                "owner_id",
+                max_length=256,
+            ),
+            lease_seconds=_require_lease_seconds(lease_seconds),
+        )
+
     def renew_task_claim(
         self,
         *,

@@ -60,6 +60,15 @@ class OrchestrationStore(Protocol):
     ) -> tuple[TaskClaim, ...]:
         """原子领取 ready Task，并为每个 Task 创建 Run。"""
 
+    def reserve_next_ready_task(
+        self,
+        *,
+        workflow_id: str,
+        owner_id: str,
+        lease_seconds: float,
+    ) -> TaskClaim | None:
+        """为中央 Runner 原子保留指定 Workflow 的下一个 ready Task。"""
+
     def renew_task_claim(
         self,
         *,

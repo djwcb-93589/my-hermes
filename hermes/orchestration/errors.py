@@ -35,6 +35,14 @@ class OrchestrationPersistenceError(OrchestrationError):
     """SQLite 编排事实不可读、不可写或不满足持久化约束。"""
 
 
+class WorkflowRunnerError(OrchestrationError):
+    """Workflow Runner 无法安全完成调用或构造稳定结果。"""
+
+
+class WorkflowRunnerValidationError(WorkflowRunnerError):
+    """Workflow Runner 的构造参数或运行参数无效。"""
+
+
 class TaskExecutionError(OrchestrationError):
     """单任务执行准备阶段的稳定错误。"""
 
@@ -106,4 +114,6 @@ __all__ = [
     "TaskToolResolutionError",
     "UnknownAgentRoleError",
     "WorkflowCycleError",
+    "WorkflowRunnerError",
+    "WorkflowRunnerValidationError",
 ]
