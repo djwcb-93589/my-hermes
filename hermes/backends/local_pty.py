@@ -58,6 +58,16 @@ _START_GATE_POLL_SECONDS = 0.05
 _START_GATE_REMOVE_WAIT_SECONDS = 1.0
 _FAILED_START_WAIT_SECONDS = 5.0
 _FAILED_START_RETRY_WAIT_SECONDS = 5.0
+_PTY_WRITE_RESULT_BYTE_COUNT = "byte_count"
+_PTY_WRITE_RESULT_CONPTY_ZERO_SENTINEL = "conpty_zero_sentinel"
+_PTY_WRITE_RESULT_CONTRACTS = frozenset({
+    _PTY_WRITE_RESULT_BYTE_COUNT,
+    _PTY_WRITE_RESULT_CONPTY_ZERO_SENTINEL,
+})
+
+
+class _ConPtyPlatformBackend(str):
+    """标记由本模块明确选择的 pywinpty ConPTY backend。"""
 
 
 _WINDOWS_BOOTSTRAP = """
@@ -191,7 +201,9 @@ def load_local_pty_binding() -> tuple[object, object | None]:
             from winpty import Backend, PtyProcess
 
             # pywinpty 3 将 falsy 0 当成“未指定”；字符串 "0" 可稳定强制 ConPTY。
-            platform_backend = str(int(Backend.ConPTY))
+            platform_backend = _ConPtyPlatformBackend(
+                str(int(Backend.ConPTY))
+            )
         else:
             from ptyprocess import PtyProcess
 
@@ -215,9 +227,16 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
         *,
         started_cwd: str,
         snapshot_path: Path,
+        write_result_contract: str = _PTY_WRITE_RESULT_BYTE_COUNT,
     ) -> None:
+        if (
+            not isinstance(write_result_contract, str)
+            or write_result_contract not in _PTY_WRITE_RESULT_CONTRACTS
+        ):
+            raise ValueError("PTY write result contract is invalid")
         # 构造函数只发布最小所有者；Job、PTY 和线程均在后续阶段建立。
         self._started_cwd = started_cwd
+        self._write_result_contract = write_result_contract
         self._snapshot_path: Path | None = snapshot_path
         self._startup_gate_path: Path | None = None
         self._transport: object | None = None
@@ -1036,7 +1055,8 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
 
         try:
             if sys.platform == "win32":
-                # pywinpty 接收 str，但返回实际写入的 UTF-8 字节数。
+                # 公开接口声明返回字节数，pywinpty 3.x ConPTY 成功时可能返回 0。
+                # 该差异只由显式 transport contract 解释，其他 transport 仍严格计数。
                 expected_bytes = len(payload.encode("utf-8"))
                 operation.delivery_unknown = True
                 written = write(payload)
@@ -1048,11 +1068,19 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
                 ):
                     raise OSError("PTY input write returned an invalid result")
                 if written == expected_bytes:
-                    operation.bytes_written = written
+                    operation.bytes_written = expected_bytes
+                    operation.delivery_unknown = False
+                    return
+                if (
+                    written == 0
+                    and self._write_result_contract
+                    == _PTY_WRITE_RESULT_CONPTY_ZERO_SENTINEL
+                ):
+                    operation.bytes_written = expected_bytes
                     operation.delivery_unknown = False
                     return
                 if written == 0:
-                    # 明确的零字节结果表示没有送达，不自动重试。
+                    # byte-count contract 的零字节结果表示没有送达。
                     operation.delivery_unknown = False
                     raise OSError("PTY input write made no progress")
                 # 字节边界可能落在多字节字符中；部分写入不得续写或重放。
@@ -1351,9 +1379,19 @@ def spawn_local_pty_background(
 ) -> BackgroundProcessHandle:
     """创建并初始化平台 PTY；失败清理无法确认时把 Handle 移交 Manager。"""
 
+    write_result_contract = _PTY_WRITE_RESULT_BYTE_COUNT
+    transport_backend = pty_platform_backend
+    if (
+        sys.platform == "win32"
+        and isinstance(pty_platform_backend, _ConPtyPlatformBackend)
+    ):
+        write_result_contract = _PTY_WRITE_RESULT_CONPTY_ZERO_SENTINEL
+        transport_backend = str(pty_platform_backend)
+
     handle = LocalPtyBackgroundProcessHandle(
         started_cwd=started_cwd,
         snapshot_path=snapshot_path,
+        write_result_contract=write_result_contract,
     )
     try:
         _raise_if_cancelled(cancel_checker)
@@ -1377,7 +1415,7 @@ def spawn_local_pty_background(
                     bootstrap_command,
                     cwd=started_cwd,
                     env=env,
-                    backend=pty_platform_backend,
+                    backend=transport_backend,
                 )
             )
             _raise_if_cancelled(cancel_checker)
