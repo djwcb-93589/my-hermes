@@ -36,12 +36,14 @@ class DashboardConfig:
     auth_required: bool = _DEFAULT_AUTH_REQUIRED
     db_path: str | None = None
     control_token_digest: str | None = None
+    config_path: str | None = None
 
 
 def load_dashboard_config() -> DashboardConfig:
     """按环境变量、profile、YAML、默认值顺序解析 Dashboard 配置。"""
     profile_home = hermes_home()
     profile_env = _read_profile_env(profile_home)
+    config_path = profile_home / "config.yaml"
     raw_config = _read_config_mapping(profile_home)
     dashboard = raw_config.get("dashboard", {})
     if dashboard is None:
@@ -92,6 +94,7 @@ def load_dashboard_config() -> DashboardConfig:
         auth_required=auth_required,
         db_path=db_path,
         control_token_digest=control_token_digest,
+        config_path=str(config_path),
     )
     validate_dashboard_config(config)
     return config
@@ -107,6 +110,13 @@ def validate_dashboard_config(config: DashboardConfig) -> None:
         raise DashboardConfigurationError("dashboard.auth_required must be a boolean")
     if config.db_path is not None and not isinstance(config.db_path, str):
         raise DashboardConfigurationError("dashboard db_path must be a string or null")
+    if config.config_path is not None and (
+        not isinstance(config.config_path, str)
+        or not config.config_path.strip()
+    ):
+        raise DashboardConfigurationError(
+            "dashboard config_path must be a non-empty string or null"
+        )
     if not ControlAuthenticator.is_valid_digest(config.control_token_digest):
         raise DashboardConfigurationError("dashboard control token digest is invalid")
     if not is_loopback_host(config.host) and not config.auth_required:

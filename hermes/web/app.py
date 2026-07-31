@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from hermes.config_values import hermes_home
+from hermes.configuration import (
+    DEFAULT_CONFIG_FIELD_REGISTRY,
+    ConfigManagementError,
+    ConfigReadService,
+    ConfigWriteService,
+)
+from hermes.configuration.yaml_repository import YamlConfigRepository
 from hermes.observability.contracts import (
     CapabilityDescriptor,
     ToolsetDescriptor,
@@ -46,6 +56,7 @@ from hermes.web.redaction import DashboardRedactor
 from hermes.web.runtime_status_service import RuntimeStatusReadService
 from hermes.web.routes import (
     catalog,
+    config as config_routes,
     cron,
     database_diagnostics,
     monitoring,
@@ -70,6 +81,28 @@ from hermes.web.security import (
 
 
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_CONFIG_ERROR_STATUS = {
+    "config_invalid": 400,
+    "config_field_unknown": 400,
+    "config_field_read_only": 400,
+    "config_value_invalid": 400,
+    "config_not_found": 404,
+    "config_conflict": 409,
+    "config_shadowed": 409,
+    "config_unavailable": 503,
+    "config_write_failed": 503,
+}
+_CONFIG_ERROR_MESSAGES = {
+    "config_invalid": "配置文件未通过安全校验。",
+    "config_field_unknown": "配置字段不受支持。",
+    "config_field_read_only": "配置字段不允许修改。",
+    "config_value_invalid": "配置修改请求无效。",
+    "config_not_found": "配置文件不存在。",
+    "config_conflict": "配置已经变更，请重新读取后再提交。",
+    "config_shadowed": "配置字段当前由环境覆盖，不能通过文件修改。",
+    "config_unavailable": "配置当前不可用。",
+    "config_write_failed": "配置无法安全写入。",
+}
 
 
 def build_dashboard_app(config: DashboardConfig) -> FastAPI:
@@ -122,6 +155,20 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         if config.db_path is not None
         else None
     )
+    config_path = config.config_path or str(hermes_home() / "config.yaml")
+    # Repository 构造不读取或写入配置文件，故障隔离到具体请求。
+    config_repository = YamlConfigRepository(
+        config_path,
+        DEFAULT_CONFIG_FIELD_REGISTRY,
+    )
+    config_read_service = ConfigReadService(
+        config_repository,
+        DEFAULT_CONFIG_FIELD_REGISTRY,
+    )
+    config_write_service = ConfigWriteService(
+        config_repository,
+        DEFAULT_CONFIG_FIELD_REGISTRY,
+    )
     read_service = ReadService(
         context=read_context,
         redactor=redactor,
@@ -140,6 +187,8 @@ def build_dashboard_app(config: DashboardConfig) -> FastAPI:
         monitoring_aggregation_service=monitoring_aggregation_service,
         database_diagnostics_service=database_diagnostics_service,
         runtime_status_read_service=runtime_status_read_service,
+        config_read_service=config_read_service,
+        config_write_service=config_write_service,
         control_service=CronControlService(config.db_path),
         control_authenticator=authenticator,
         access_policy=access_policy,
@@ -169,6 +218,8 @@ def create_app(
     monitoring_aggregation_service: MonitoringAggregationService | None = None,
     database_diagnostics_service: DatabaseDiagnosticsService | None = None,
     runtime_status_read_service: RuntimeStatusReadService | None = None,
+    config_read_service: ConfigReadService | None = None,
+    config_write_service: ConfigWriteService | None = None,
 ) -> FastAPI:
     """创建不启动运行时组件的应用；正式启动应使用 build_dashboard_app。"""
     authenticator = control_authenticator or ControlAuthenticator()
@@ -209,6 +260,8 @@ def create_app(
         database_diagnostics_service
     )
     application.state.runtime_status_read_service = runtime_status_read_service
+    application.state.config_read_service = config_read_service
+    application.state.config_write_service = config_write_service
     application.state.control_service = control_service
     application.state.control_authenticator = authenticator
     application.state.dashboard_access_policy = policy
@@ -219,7 +272,7 @@ def create_app(
         allow_origins=[],
         allow_origin_regex=cors_origin_regex(policy.bound_host),
         allow_credentials=False,
-        allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
+        allow_methods=["GET", "HEAD", "POST", "PATCH", "OPTIONS"],
         allow_headers=[
             "Accept",
             "Content-Type",
@@ -289,6 +342,45 @@ def create_app(
         )
         return JSONResponse(status_code=400, content=jsonable_encoder(body))
 
+    @application.exception_handler(ConfigManagementError)
+    async def handle_config_error(
+        request: Request,
+        exc: ConfigManagementError,
+    ) -> JSONResponse:
+        """只按稳定原因码映射配置错误，不传播底层异常信息。"""
+        del request
+        reason_code = getattr(exc, "reason_code", "config_unavailable")
+        if reason_code not in _CONFIG_ERROR_STATUS:
+            reason_code = "config_unavailable"
+        body = ErrorResponse(
+            code=reason_code,
+            message=_CONFIG_ERROR_MESSAGES[reason_code],
+        )
+        return JSONResponse(
+            status_code=_CONFIG_ERROR_STATUS[reason_code],
+            content=jsonable_encoder(body),
+        )
+
+    @application.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        """配置 PATCH 校验失败时不回显请求值，其余路由保持原行为。"""
+        if (
+            request.method == "PATCH"
+            and request.url.path == "/api/config"
+        ):
+            body = ErrorResponse(
+                code="config_value_invalid",
+                message=_CONFIG_ERROR_MESSAGES["config_value_invalid"],
+            )
+            return JSONResponse(
+                status_code=400,
+                content=jsonable_encoder(body),
+            )
+        return await request_validation_exception_handler(request, exc)
+
     @application.exception_handler(ControlUnavailable)
     async def handle_control_unavailable(
         request: Request,
@@ -354,6 +446,7 @@ def create_app(
     application.include_router(monitoring_aggregation.router)
     application.include_router(database_diagnostics.router)
     application.include_router(runtime.router)
+    application.include_router(config_routes.router)
     return application
 
 

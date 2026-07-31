@@ -7,6 +7,12 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hermes.configuration.contracts import (
+    MAX_CONFIG_PATCH_CHANGES,
+    ConfigApplyMode,
+    ConfigValueSource,
+    ConfigValueType,
+)
 from hermes.observability.database_diagnostics import (
     DATABASE_DIAGNOSTICS_BUDGET_MS,
     MAX_DATABASE_DIAGNOSTIC_PROBES,
@@ -664,6 +670,120 @@ class DatabaseHealthResponse(_MonitoringResponseModel):
     storage: DatabaseStorageMetricsResponse | None = None
     journal: DatabaseJournalMetricsResponse | None = None
     probes: DatabaseProbeSetResponse
+
+
+_ConfigResponseValue = bool | int | float | str | list[str] | None
+_CONFIG_PUBLIC_NAME_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
+_CONFIG_REVISION_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_MAX_CONFIG_RESPONSE_FIELDS = 128
+
+
+class _ConfigApiModel(BaseModel):
+    """配置 API 的严格模型，不接受或透传未知字段。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ConfigValueFieldResponse(_ConfigApiModel):
+    """普通配置字段的文件值、有效值与有限来源投影。"""
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_CONFIG_PUBLIC_NAME_PATTERN,
+    )
+    file_value: _ConfigResponseValue
+    effective_value: _ConfigResponseValue
+    source: ConfigValueSource
+    value_type: ConfigValueType
+    writable: bool
+    sensitive: Literal[False] = False
+    apply_mode: ConfigApplyMode
+    nullable: bool
+    configured: bool
+    description: str | None = Field(default=None, max_length=256)
+
+
+class SensitiveConfigFieldResponse(_ConfigApiModel):
+    """敏感配置只公开是否设置，不公开值、来源或摘要。"""
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_CONFIG_PUBLIC_NAME_PATTERN,
+    )
+    configured: bool
+    writable: Literal[False] = False
+    sensitive: Literal[True] = True
+
+
+ConfigFieldResponse = Annotated[
+    ConfigValueFieldResponse | SensitiveConfigFieldResponse,
+    Field(discriminator="sensitive"),
+]
+
+
+class ConfigSnapshotResponse(_ConfigApiModel):
+    """显式字段注册表内的当前配置安全快照。"""
+
+    revision: str = Field(
+        min_length=71,
+        max_length=71,
+        pattern=_CONFIG_REVISION_PATTERN,
+    )
+    fields: list[ConfigFieldResponse] = Field(
+        max_length=_MAX_CONFIG_RESPONSE_FIELDS,
+    )
+
+
+class ConfigPatchChangeRequest(_ConfigApiModel):
+    """按公共名称提交的单项修改，不接受配置路径。"""
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_CONFIG_PUBLIC_NAME_PATTERN,
+    )
+    value: object
+
+
+class ConfigPatchRequest(_ConfigApiModel):
+    """带乐观并发修订号的有界配置修改。"""
+
+    expected_revision: str = Field(
+        min_length=71,
+        max_length=71,
+        pattern=_CONFIG_REVISION_PATTERN,
+    )
+    changes: list[ConfigPatchChangeRequest] = Field(
+        min_length=1,
+        max_length=MAX_CONFIG_PATCH_CHANGES,
+    )
+
+
+class ConfigPatchResultResponse(_ConfigApiModel):
+    """配置提交结果只提供变更名称和后续应用提示。"""
+
+    previous_revision: str = Field(
+        min_length=71,
+        max_length=71,
+        pattern=_CONFIG_REVISION_PATTERN,
+    )
+    new_revision: str = Field(
+        min_length=71,
+        max_length=71,
+        pattern=_CONFIG_REVISION_PATTERN,
+    )
+    changed_fields: list[str] = Field(
+        max_length=MAX_CONFIG_PATCH_CHANGES,
+    )
+    apply_modes: list[ConfigApplyMode] = Field(
+        max_length=len(ConfigApplyMode),
+    )
+    restart_required: bool
+    restart_targets: list[
+        Literal["gateway", "dashboard", "application"]
+    ] = Field(max_length=3)
 
 
 class CronControlResponse(BaseModel):
