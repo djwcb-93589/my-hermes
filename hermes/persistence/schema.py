@@ -13,9 +13,10 @@
     schema -> schemas/* (各领域 DDL)
     schema -> migrations/* (各版本迁移函数)
 
-领域持久化模块 (gateway、delivery、approval、cron、feishu) 不得反向
-依赖本模块,以避免循环。``LATEST_SCHEMA_VERSION`` 是少数允许被领域
-模块引用的常量,因为运行期健康检查需要用它确认数据库已就绪。
+领域持久化模块 (gateway、delivery、approval、cron、feishu、
+orchestration) 不得反向依赖本模块,以避免循环。
+``LATEST_SCHEMA_VERSION`` 是少数允许被领域模块引用的常量,因为运行期
+健康检查需要用它确认数据库已就绪。
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from .migrations.feishu import _migrate_v9_to_v10, _migrate_v10_to_v11, _migrate
 from .migrations.gateway import _migrate_v2_to_v3, _migrate_v3_to_v4, _migrate_v4_to_v5, _migrate_v5_to_v6, _migrate_v6_to_v7, _migrate_v7_to_v8, _migrate_v8_to_v9, _migrate_v11_to_v12, _migrate_v12_to_v13, _migrate_v14_to_v15
 from .migrations.mixed import _migrate_v22_to_v23, _migrate_v23_to_v24
 from .migrations.observation import _migrate_v35_to_v36
+from .migrations.orchestration import _migrate_v38_to_v39
 from .migrations.runtime import _migrate_v36_to_v37
 from .migrations.tool_execution import _migrate_v25_to_v26, _migrate_v27_to_v28, _migrate_v31_to_v32
 from .schemas import (
@@ -46,6 +48,7 @@ from .schemas import (
     feishu,
     gateway,
     observation,
+    orchestration,
     runtime,
     tool_execution,
 )
@@ -53,7 +56,7 @@ from .schemas import (
 # 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 38
+LATEST_SCHEMA_VERSION = 39
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -90,7 +93,8 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
 
     顺序与历史 migration 累积结果保持一致:Gateway 基础表 -> Gateway
     ownership/lease -> Approval -> Delivery -> Gateway fencing triggers
-    -> Feishu Inbox / pending attachment -> Cron。各领域通过公开的
+    -> Feishu Inbox / pending attachment -> Cron -> Observation / Runtime
+    -> Backend Control -> Orchestration。各领域通过公开的
     ``create_schema`` 入口创建自身表结构,Gateway 的 fencing triggers
     因顺序依赖单独由 ``create_fencing_triggers`` 暴露。
     """
@@ -107,6 +111,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     observation.create_schema(conn)
     runtime.create_schema(conn)
     backend_control.create_schema(conn)
+    orchestration.create_schema(conn)
 
 
 def _migrate(conn: sqlite3.Connection, current: int) -> int:
@@ -131,7 +136,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     移除审批表中的具体工具名称枚举。v31 -> v32 增加等待人工批准的
     工具执行 Journal 状态，避免审批占位结果被当作执行失败。v35 -> v36
     增加安全 Observation 表，v36 -> v37 增加 Runtime 当前快照表，
-    v37 -> v38 增加 Gateway Supervisor 控制请求与进程绑定。
+    v37 -> v38 增加 Gateway Supervisor 控制请求与进程绑定，v38 -> v39
+    增加持久化 Workflow、Task、Dependency 与 Task Run 事实表。
     """
     if current < 1:
         # 极少见:有 schema_version 表但版本 < 1,补基础表
@@ -591,6 +597,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 38
+
+    if current < 39:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v38_to_v39(conn)
+            _set_schema_version(conn, 39)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 39
 
     return current
 
