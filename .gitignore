@@ -20,7 +20,6 @@ cache/
 飞书Gateway性能测试报告.md
 config origin.yaml
 SOUL.md
-memories/
 数据脱敏和安全边界笔记.md
 *.md
 !README.md
@@ -28,7 +27,6 @@ memories/
 !开发说明/*.md
 cache
 !README.md
-!memories
 !SOUL.md
 !飞书操作手册.md
 .claude
@@ -47,6 +45,22 @@ scripts/
 !/documents/docx/node_runtime/vendor/LICENSE.docx.txt
 !/hermes/skills/bundled/
 !/hermes/skills/bundled/**
+/hermes/skills/bundled/**/__pycache__/
+/hermes/skills/bundled/**/*.py[cod]
+
+# 用户 Skill 属于本地运行时状态，只保留仓库示例骨架。
+/skills/*
+!/skills/README.md
+!/skills/example/
+/skills/example/*
+!/skills/example/SKILL.example.md
+
+# 自进化记忆属于个人状态，只保留无个人数据的示例文件。
+/memories/*
+!/memories/README.md
+!/memories/MEMORY.example.md
+!/memories/USER.example.md
+
 computer_use_tests/
 tests_docx/
 tests_process/
