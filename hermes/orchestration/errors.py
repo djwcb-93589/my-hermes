@@ -43,6 +43,28 @@ class WorkflowRunnerValidationError(WorkflowRunnerError):
     """Workflow Runner 的构造参数或运行参数无效。"""
 
 
+class WorkflowTaskSubmissionError(WorkflowRunnerError):
+    """Pool 提交失败，并明确报告 Worker 接收状态。"""
+
+    def __init__(
+        self,
+        safe_message: str,
+        *,
+        accepted: bool | None,
+    ) -> None:
+        if (
+            type(safe_message) is not str
+            or not safe_message.strip()
+            or len(safe_message) > 1_000
+        ):
+            raise ValueError("safe_message must be a non-empty bounded string")
+        if accepted is not None and type(accepted) is not bool:
+            raise TypeError("accepted must be a boolean or None")
+        super().__init__(safe_message)
+        self.safe_message = safe_message
+        self.accepted = accepted
+
+
 class TaskExecutionError(OrchestrationError):
     """单任务执行准备阶段的稳定错误。"""
 
@@ -116,4 +138,5 @@ __all__ = [
     "WorkflowCycleError",
     "WorkflowRunnerError",
     "WorkflowRunnerValidationError",
+    "WorkflowTaskSubmissionError",
 ]

@@ -307,7 +307,11 @@ class WorkflowTaskExecutionPool(Protocol):
         tool_context: Mapping[str, object] | None = None,
         external_cancel_checker: Callable[[], bool] | None = None,
     ) -> WorkflowTaskExecutionHandle:
-        """提交一个已经被中央 Runner 保留的 TaskClaim。"""
+        """提交已保留 Claim。
+
+        成功返回 Handle；失败抛 WorkflowTaskSubmissionError，并由 accepted
+        明确任务是否已进入执行接收边界。
+        """
 
     def close(self, *, wait: bool) -> None:
         """幂等关闭 Pool；wait=True 时等待 Worker 协作式退出。"""

@@ -16,6 +16,7 @@ from hermes.orchestration.errors import (
     WorkflowCycleError,
     WorkflowRunnerError,
     WorkflowRunnerValidationError,
+    WorkflowTaskSubmissionError,
 )
 from hermes.orchestration.execution import (
     ClaimedTaskExecutor,
@@ -95,6 +96,7 @@ __all__ = [
     "WorkflowRunner",
     "WorkflowRunnerError",
     "WorkflowRunnerValidationError",
+    "WorkflowTaskSubmissionError",
     "WorkflowStatus",
     "WorkflowTaskExecutionHandle",
     "WorkflowTaskExecutionPool",

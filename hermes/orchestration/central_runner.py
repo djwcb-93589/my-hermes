@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 
 from hermes.orchestration.errors import (
     OrchestrationConflictError,
@@ -14,6 +15,7 @@ from hermes.orchestration.errors import (
     TaskClaimLostError,
     WorkflowRunnerError,
     WorkflowRunnerValidationError,
+    WorkflowTaskSubmissionError,
 )
 from hermes.orchestration.execution import (
     ClaimedTaskExecutor,
@@ -22,6 +24,7 @@ from hermes.orchestration.execution import (
 )
 from hermes.orchestration.models import (
     TaskClaim,
+    TaskRecord,
     TaskStatus,
     WorkflowStatus,
 )
@@ -43,18 +46,23 @@ _MAX_CONCURRENCY = 16
 _MAX_LEASE_SECONDS = 86_400.0
 _MAX_POLL_INTERVAL_SECONDS = 60.0
 _MAX_STEPS = 10_000
+_SUBMISSION_FAILURE_ERROR_TYPE = "workflow_task_submission_failed"
+_SUBMISSION_FAILURE_MESSAGE = (
+    "one or more reserved tasks could not be submitted for execution"
+)
+_SUBMISSION_RELEASE_REASON = "workflow_task_submission_failed"
 
 _STOP_PRIORITY = {
     WorkflowExecutionKind.PERSISTENCE_UNKNOWN: 100,
     WorkflowExecutionKind.CANCELLED: 90,
     WorkflowExecutionKind.CLAIM_LOST: 80,
     WorkflowExecutionKind.FAILED: 70,
-    WorkflowExecutionKind.COMPLETED: 60,
-    WorkflowExecutionKind.UNAVAILABLE: 55,
-    WorkflowExecutionKind.RETRY_LATER: 50,
-    WorkflowExecutionKind.BLOCKED: 40,
-    WorkflowExecutionKind.BUSY: 30,
-    WorkflowExecutionKind.STEP_LIMIT_REACHED: 20,
+    WorkflowExecutionKind.UNAVAILABLE: 65,
+    WorkflowExecutionKind.RETRY_LATER: 60,
+    WorkflowExecutionKind.BLOCKED: 50,
+    WorkflowExecutionKind.BUSY: 40,
+    WorkflowExecutionKind.STEP_LIMIT_REACHED: 30,
+    WorkflowExecutionKind.COMPLETED: 20,
     WorkflowExecutionKind.STALLED: 10,
 }
 
@@ -98,6 +106,13 @@ _DEFAULT_ERRORS = {
 }
 
 
+class _RenewalState(Enum):
+    """单次 run() 内部用于裁决续租 ClaimLost 的瞬时状态。"""
+
+    ACTIVE = "active"
+    CLAIM_LOST_PENDING = "claim_lost_pending"
+
+
 @dataclass(slots=True)
 class _ActiveTaskExecution:
     """一次 run() 内部持有的本地 Worker 与 Claim 租约记录。"""
@@ -106,6 +121,15 @@ class _ActiveTaskExecution:
     handle: WorkflowTaskExecutionHandle
     next_renew_at: float
     submission_order: int
+    renewal_state: _RenewalState = _RenewalState.ACTIVE
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimReleaseSummary:
+    """一次批次补偿的聚合事实，不包含 Claim 或 fencing token。"""
+
+    claim_lost: bool
+    persistence_unknown: bool
 
 
 @dataclass(slots=True)
@@ -124,10 +148,19 @@ class _RunState:
     refresh_degraded: bool = False
     cancel_requested: bool = False
     cancel_attempted: bool = False
+    submission_failure_draining: bool = False
+    submission_compensation_claim_lost: bool = False
 
     @property
     def submitted_steps(self) -> int:
         return len(self.scheduled_task_ids)
+
+    @property
+    def has_renewal_pending(self) -> bool:
+        return any(
+            active.renewal_state is _RenewalState.CLAIM_LOST_PENDING
+            for active in self.active.values()
+        )
 
     def propose_stop(
         self,
@@ -334,23 +367,44 @@ class CentralWorkflowRunner:
 
         # 活动 Worker 可能等待不可取消的系统调用，因此使用状态约束循环，
         # 不使用会绕过协作式收尾的固定墙钟超时。
-        while state.active or state.stop_kind is None:
+        while (
+            state.active
+            or state.stop_kind is None
+            or state.submission_failure_draining
+        ):
             if (
                 state.stop_kind is not WorkflowExecutionKind.PERSISTENCE_UNKNOWN
                 and self._is_cancelled(cancel_checker)
             ):
                 self._begin_workflow_cancel(state)
 
-            self._renew_due_claims(state)
             released_completed = self._collect_completed(state)
             if (
                 released_completed
                 and not state.cancel_attempted
+                and (
+                    state.stop_kind
+                    is not WorkflowExecutionKind.PERSISTENCE_UNKNOWN
+                )
                 and self._is_cancelled(cancel_checker)
             ):
                 self._begin_workflow_cancel(state)
 
-            if state.stop_kind is WorkflowExecutionKind.PERSISTENCE_UNKNOWN:
+            if (
+                state.stop_kind is WorkflowExecutionKind.PERSISTENCE_UNKNOWN
+                and not state.submission_failure_draining
+            ):
+                self._request_cancel_all(state)
+                if not state.active:
+                    return self._build_result(state)
+                self._sleep_for_workers(state)
+                continue
+
+            self._renew_due_claims(state)
+            if (
+                state.stop_kind is WorkflowExecutionKind.PERSISTENCE_UNKNOWN
+                and not state.submission_failure_draining
+            ):
                 self._request_cancel_all(state)
                 if not state.active:
                     return self._build_result(state)
@@ -359,6 +413,7 @@ class CentralWorkflowRunner:
 
             if not self._refresh_snapshot(state):
                 if not state.active:
+                    self._resolve_submission_compensation_stop(state)
                     state.propose_stop(WorkflowExecutionKind.UNAVAILABLE)
                     return self._build_result(state)
                 state.refresh_degraded = True
@@ -366,6 +421,7 @@ class CentralWorkflowRunner:
                 continue
 
             self._observe_snapshot(state)
+            self._resolve_submission_compensation_stop(state)
             if state.stop_kind is not None:
                 if state.stop_kind in {
                     WorkflowExecutionKind.CANCELLED,
@@ -390,6 +446,22 @@ class CentralWorkflowRunner:
                     continue
                 state.propose_stop(WorkflowExecutionKind.RETRY_LATER)
                 return self._build_result(state)
+
+            if state.submission_compensation_claim_lost:
+                if not state.active:
+                    raise WorkflowRunnerError(
+                        "submission compensation state has no active task"
+                    )
+                self._sleep_for_workers(state)
+                continue
+
+            if state.has_renewal_pending:
+                if not state.active:
+                    raise WorkflowRunnerError(
+                        "renewal pending state has no active task"
+                    )
+                self._sleep_for_workers(state)
+                continue
 
             if state.submitted_steps >= self._max_steps:
                 state.propose_stop(
@@ -437,8 +509,7 @@ class CentralWorkflowRunner:
                         self._request_cancel_for_unsafe_stop(state)
                     if state.active:
                         self._sleep_for_workers(state)
-                        continue
-                    return self._build_result(state)
+                    continue
 
                 if not self._refresh_snapshot(state):
                     if state.active:
@@ -530,7 +601,7 @@ class CentralWorkflowRunner:
         tool_context: Mapping[str, object] | None,
         next_renew_at: float,
     ) -> None:
-        for claim in claims:
+        for index, claim in enumerate(claims):
             try:
                 handle = pool.submit(
                     claim,
@@ -539,27 +610,31 @@ class CentralWorkflowRunner:
                     tool_context=tool_context,
                     external_cancel_checker=cancel_checker,
                 )
-            except Exception:
-                state.snapshot_fresh = False
-                state.propose_stop(
-                    WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
-                    error_type="task_execution_result_unknown",
-                    error_message="task execution result is unknown",
+            except WorkflowTaskSubmissionError as exc:
+                release_from = index if exc.accepted is False else index + 1
+                self._finish_submission_failure(
+                    state,
+                    claims_to_release=claims[release_from:],
+                    acceptance_unknown=exc.accepted is not False,
                 )
-                self._request_cancel_all(state)
+                return
+            except Exception:
+                self._finish_submission_failure(
+                    state,
+                    claims_to_release=claims[index + 1:],
+                    acceptance_unknown=True,
+                )
                 return
             if not self._valid_handle(claim, handle):
                 try:
                     handle.request_cancel()
                 except Exception:
                     pass
-                state.snapshot_fresh = False
-                state.propose_stop(
-                    WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
-                    error_type="task_execution_result_unknown",
-                    error_message="task execution result is unknown",
+                self._finish_submission_failure(
+                    state,
+                    claims_to_release=claims[index + 1:],
+                    acceptance_unknown=True,
                 )
-                self._request_cancel_all(state)
                 return
             submission_order = len(state.scheduled_task_ids)
             state.scheduled_task_ids.append(claim.task.task_id)
@@ -570,13 +645,68 @@ class CentralWorkflowRunner:
                 submission_order=submission_order,
             )
 
+    def _finish_submission_failure(
+        self,
+        state: _RunState,
+        *,
+        claims_to_release: tuple[TaskClaim, ...],
+        acceptance_unknown: bool,
+    ) -> None:
+        state.submission_failure_draining = True
+        summary = self._release_unsubmitted_claims(claims_to_release)
+        if claims_to_release:
+            state.snapshot_fresh = False
+        if summary.claim_lost:
+            state.submission_compensation_claim_lost = True
+        if acceptance_unknown or summary.persistence_unknown:
+            state.propose_stop(
+                WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
+                error_type=_SUBMISSION_FAILURE_ERROR_TYPE,
+                error_message=_SUBMISSION_FAILURE_MESSAGE,
+            )
+        elif not summary.claim_lost:
+            state.propose_stop(
+                WorkflowExecutionKind.RETRY_LATER,
+                error_type=_SUBMISSION_FAILURE_ERROR_TYPE,
+                error_message=_SUBMISSION_FAILURE_MESSAGE,
+            )
+        self._request_cancel_all(state)
+
+    def _release_unsubmitted_claims(
+        self,
+        claims: tuple[TaskClaim, ...],
+    ) -> _ClaimReleaseSummary:
+        claim_lost = False
+        persistence_unknown = False
+        for claim in claims:
+            try:
+                released = self._service.release_task_claim(
+                    task_id=claim.task.task_id,
+                    claim_token=claim.claim_token,
+                    reason=_SUBMISSION_RELEASE_REASON,
+                )
+            except TaskClaimLostError:
+                claim_lost = True
+                continue
+            except Exception:
+                persistence_unknown = True
+                continue
+            if not self._valid_released_claim(claim, released):
+                persistence_unknown = True
+        return _ClaimReleaseSummary(
+            claim_lost=claim_lost,
+            persistence_unknown=persistence_unknown,
+        )
+
     def _renew_due_claims(self, state: _RunState) -> None:
         if not self._renew_allowed(state) or not state.active:
             return
         now = self._clock_now()
         for active in tuple(state.active.values()):
             if (
-                self._handle_done(active.handle)
+                active.renewal_state
+                is _RenewalState.CLAIM_LOST_PENDING
+                or self._handle_done(active.handle)
                 or now < active.next_renew_at
             ):
                 continue
@@ -587,9 +717,13 @@ class CentralWorkflowRunner:
                     lease_seconds=self._lease_seconds,
                 )
             except TaskClaimLostError:
-                state.propose_stop(WorkflowExecutionKind.CLAIM_LOST)
-                self._request_cancel_all(state)
-                return
+                active.renewal_state = _RenewalState.CLAIM_LOST_PENDING
+                state.snapshot_fresh = False
+                try:
+                    active.handle.request_cancel()
+                except Exception:
+                    pass
+                continue
             except OrchestrationValidationError as exc:
                 raise WorkflowRunnerError(
                     "workflow claim renewal arguments were rejected"
@@ -620,12 +754,66 @@ class CentralWorkflowRunner:
         released_completed = False
         for active in completed:
             state.active.pop(active.claim.run.run_id, None)
+            renewal_pending = (
+                active.renewal_state
+                is _RenewalState.CLAIM_LOST_PENDING
+            )
             try:
                 outcome = active.handle.result()
             except Exception:
-                outcome = self._unknown_outcome(active.claim)
+                outcome = self._unknown_outcome(
+                    active.claim,
+                    renewal_pending=renewal_pending,
+                )
             if not self._valid_outcome(active.claim, outcome):
-                outcome = self._unknown_outcome(active.claim)
+                outcome = self._unknown_outcome(
+                    active.claim,
+                    renewal_pending=renewal_pending,
+                )
+            elif (
+                renewal_pending
+                and outcome.kind
+                not in {
+                    TaskExecutionOutcomeKind.COMPLETED,
+                    TaskExecutionOutcomeKind.FAILED,
+                    TaskExecutionOutcomeKind.BLOCKED,
+                    TaskExecutionOutcomeKind.RELEASED,
+                    TaskExecutionOutcomeKind.CLAIM_LOST,
+                    TaskExecutionOutcomeKind.PERSISTENCE_UNKNOWN,
+                }
+            ):
+                outcome = self._unknown_outcome(
+                    active.claim,
+                    renewal_pending=True,
+                )
+            elif (
+                renewal_pending
+                and outcome.kind
+                in {
+                    TaskExecutionOutcomeKind.CLAIM_LOST,
+                    TaskExecutionOutcomeKind.PERSISTENCE_UNKNOWN,
+                }
+                and outcome.persisted
+            ):
+                outcome = self._unknown_outcome(
+                    active.claim,
+                    renewal_pending=True,
+                )
+            elif (
+                renewal_pending
+                and outcome.kind
+                in {
+                    TaskExecutionOutcomeKind.COMPLETED,
+                    TaskExecutionOutcomeKind.FAILED,
+                    TaskExecutionOutcomeKind.BLOCKED,
+                    TaskExecutionOutcomeKind.RELEASED,
+                }
+                and not outcome.persisted
+            ):
+                outcome = self._unknown_outcome(
+                    active.claim,
+                    renewal_pending=True,
+                )
             state.task_outcomes.append(outcome)
             state.snapshot_fresh = False
 
@@ -636,16 +824,25 @@ class CentralWorkflowRunner:
                 state.propose_stop(WorkflowExecutionKind.CLAIM_LOST)
                 self._request_cancel_all(state)
             elif outcome.kind is TaskExecutionOutcomeKind.PERSISTENCE_UNKNOWN:
+                result_unknown = outcome.error_type in {
+                    "task_execution_result_unknown",
+                    "renewal_completion_result_unknown",
+                }
                 state.propose_stop(
                     WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
                     error_type=(
-                        "task_execution_result_unknown"
-                        if outcome.error_type == "task_execution_result_unknown"
+                        outcome.error_type
+                        if result_unknown
                         else "persistence_unknown"
                     ),
                     error_message=(
-                        "task execution result is unknown"
-                        if outcome.error_type == "task_execution_result_unknown"
+                        (
+                            "renewal completion result is unknown"
+                            if outcome.error_type
+                            == "renewal_completion_result_unknown"
+                            else "task execution result is unknown"
+                        )
+                        if result_unknown
                         else "task persistence outcome is unknown"
                     ),
                 )
@@ -722,6 +919,28 @@ class CentralWorkflowRunner:
         if has_external_running:
             state.propose_stop(WorkflowExecutionKind.BUSY)
 
+    def _resolve_submission_compensation_stop(
+        self,
+        state: _RunState,
+    ) -> None:
+        if (
+            not state.submission_compensation_claim_lost
+            or state.active
+        ):
+            return
+        if state.snapshot_fresh:
+            status = self._require_snapshot(state).workflow.status
+            if status in {
+                WorkflowStatus.CANCELLED,
+                WorkflowStatus.FAILED,
+            }:
+                return
+        state.propose_stop(
+            WorkflowExecutionKind.CLAIM_LOST,
+            error_type=_SUBMISSION_FAILURE_ERROR_TYPE,
+            error_message=_SUBMISSION_FAILURE_MESSAGE,
+        )
+
     def _classify_idle_state(self, state: _RunState) -> None:
         snapshot = self._require_snapshot(state)
         self._observe_snapshot(state)
@@ -776,11 +995,17 @@ class CentralWorkflowRunner:
             return
         delay = self._poll_interval_seconds
         if self._renew_allowed(state):
-            now = self._clock_now()
-            next_renew_at = min(
-                active.next_renew_at for active in state.active.values()
+            renewable = tuple(
+                active
+                for active in state.active.values()
+                if active.renewal_state is _RenewalState.ACTIVE
             )
-            delay = min(delay, max(0.0, next_renew_at - now))
+            if renewable:
+                now = self._clock_now()
+                next_renew_at = min(
+                    active.next_renew_at for active in renewable
+                )
+                delay = min(delay, max(0.0, next_renew_at - now))
         if delay <= 0:
             return
         try:
@@ -810,11 +1035,15 @@ class CentralWorkflowRunner:
         return (
             not state.cancel_requested
             and state.stop_kind not in {
-                WorkflowExecutionKind.PERSISTENCE_UNKNOWN,
                 WorkflowExecutionKind.CANCELLED,
                 WorkflowExecutionKind.CLAIM_LOST,
                 WorkflowExecutionKind.COMPLETED,
             }
+            and (
+                state.stop_kind
+                is not WorkflowExecutionKind.PERSISTENCE_UNKNOWN
+                or state.submission_failure_draining
+            )
         )
 
     @staticmethod
@@ -863,6 +1092,22 @@ class CentralWorkflowRunner:
         )
 
     @staticmethod
+    def _valid_released_claim(
+        claim: TaskClaim,
+        released: object,
+    ) -> bool:
+        return (
+            isinstance(released, TaskRecord)
+            and released.workflow_id == claim.workflow.workflow_id
+            and released.task_id == claim.task.task_id
+            and released.status is TaskStatus.READY
+            and released.attempt_count == claim.task.attempt_count
+            and released.claim_owner is None
+            and released.claim_token is None
+            and released.claim_expires_at is None
+        )
+
+    @staticmethod
     def _same_claim(original: TaskClaim, renewed: object) -> bool:
         return (
             isinstance(renewed, TaskClaim)
@@ -873,7 +1118,21 @@ class CentralWorkflowRunner:
         )
 
     @staticmethod
-    def _unknown_outcome(claim: TaskClaim) -> TaskExecutionOutcome:
+    def _unknown_outcome(
+        claim: TaskClaim,
+        *,
+        renewal_pending: bool = False,
+    ) -> TaskExecutionOutcome:
+        error_type = (
+            "renewal_completion_result_unknown"
+            if renewal_pending
+            else "task_execution_result_unknown"
+        )
+        error_message = (
+            "renewal completion result is unknown"
+            if renewal_pending
+            else "task execution result is unknown"
+        )
         return TaskExecutionOutcome(
             kind=TaskExecutionOutcomeKind.PERSISTENCE_UNKNOWN,
             workflow_id=claim.workflow.workflow_id,
@@ -882,8 +1141,8 @@ class CentralWorkflowRunner:
             session_key=None,
             runtime_status=None,
             summary=None,
-            error_type="task_execution_result_unknown",
-            error_message="task execution result is unknown",
+            error_type=error_type,
+            error_message=error_message,
             retryable=False,
             persisted=False,
         )

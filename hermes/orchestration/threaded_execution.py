@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, RLock
 
+from hermes.orchestration.errors import WorkflowTaskSubmissionError
 from hermes.orchestration.execution import (
     ClaimedTaskExecutor,
     TaskExecutionOutcome,
@@ -58,8 +59,6 @@ class _ThreadedWorkflowTaskExecutionHandle:
 
     def bind_future(self, future: Future[TaskExecutionOutcome]) -> None:
         with self._lock:
-            if self._future is not None:
-                raise RuntimeError("workflow task handle is already bound")
             self._future = future
 
     def mark_completed(self, order: int) -> None:
@@ -157,13 +156,31 @@ class ThreadedWorkflowTaskExecutionPool:
         external_cancel_checker: Callable[[], bool] | None = None,
     ) -> WorkflowTaskExecutionHandle:
         if not isinstance(claim, TaskClaim):
-            raise TypeError("claim must be a TaskClaim")
+            raise WorkflowTaskSubmissionError(
+                "workflow task submission input is invalid",
+                accepted=False,
+            )
         if (
             external_cancel_checker is not None
             and not callable(external_cancel_checker)
         ):
-            raise TypeError("external_cancel_checker must be callable")
-        cancel_event = Event()
+            raise WorkflowTaskSubmissionError(
+                "workflow task cancellation input is invalid",
+                accepted=False,
+            )
+        try:
+            cancel_event = Event()
+            admission_gate = Event()
+            submission_accepted = Event()
+            handle = _ThreadedWorkflowTaskExecutionHandle(
+                claim,
+                cancel_event,
+            )
+        except Exception as exc:
+            raise WorkflowTaskSubmissionError(
+                "workflow task submission could not be prepared",
+                accepted=False,
+            ) from exc
 
         def combined_cancel_checker() -> bool:
             if cancel_event.is_set():
@@ -173,10 +190,12 @@ class ThreadedWorkflowTaskExecutionPool:
                 and bool(external_cancel_checker())
             )
 
-        handle = _ThreadedWorkflowTaskExecutionHandle(claim, cancel_event)
-
         def execute_claim() -> TaskExecutionOutcome:
             try:
+                admission_gate.wait()
+                if not submission_accepted.is_set():
+                    # submit() 抛出时可能已入队，但绝不进入 Agent 执行边界。
+                    return handle._unknown_outcome()
                 return self._task_executor.execute_claim(
                     claim,
                     cancel_checker=combined_cancel_checker,
@@ -190,10 +209,31 @@ class ThreadedWorkflowTaskExecutionPool:
 
         with self._lock:
             if self._closed:
-                raise RuntimeError("workflow task execution pool is closed")
-            future = self._executor.submit(execute_claim)
+                raise WorkflowTaskSubmissionError(
+                    "workflow task execution pool is closed",
+                    accepted=False,
+                )
+            try:
+                self._handles.append(handle)
+            except Exception as exc:
+                raise WorkflowTaskSubmissionError(
+                    "workflow task submission could not be prepared",
+                    accepted=False,
+                ) from exc
+            try:
+                future = self._executor.submit(execute_claim)
+            except BaseException as exc:
+                self._handles.pop()
+                admission_gate.set()
+                if isinstance(exc, Exception):
+                    raise WorkflowTaskSubmissionError(
+                        "workflow task was not accepted for execution",
+                        accepted=False,
+                    ) from exc
+                raise
             handle.bind_future(future)
-            self._handles.append(handle)
+            submission_accepted.set()
+            admission_gate.set()
         return handle
 
     def close(self, *, wait: bool) -> None:
