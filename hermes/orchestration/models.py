@@ -275,6 +275,8 @@ class TaskRecord:
     status: TaskStatus
     priority: int
     max_attempts: int
+    # 已消耗的正式执行预算数：completed、failed、abandoned 消耗，
+    # blocked、cancelled 不消耗。
     attempt_count: int
     workdir: str | None
     input_metadata: Mapping[str, object]
@@ -326,6 +328,7 @@ class TaskRunRecord:
     run_id: str
     workflow_id: str
     task_id: str
+    # Task 的单调递增 Run 序号，包含 block 后重领，不等于 attempt_count。
     attempt_number: int
     worker_id: str
     claim_token: str

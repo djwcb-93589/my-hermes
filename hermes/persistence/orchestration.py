@@ -59,6 +59,11 @@ _ACTIVE_RUN_STATUSES = (
     TaskRunStatus.CLAIMED.value,
     TaskRunStatus.RUNNING.value,
 )
+# Workflow 失败后，已 running 的同伴仍可结束自身 Run，但不得推进依赖或重试。
+_WORKER_WRITABLE_WORKFLOW_STATUSES = frozenset({
+    WorkflowStatus.ACTIVE,
+    WorkflowStatus.FAILED,
+})
 
 
 @contextmanager
@@ -457,18 +462,21 @@ def _require_task(
     return task
 
 
-def _require_claim(
+def _require_live_claim(
     conn: sqlite3.Connection,
     task_id: str,
     claim_token: str,
-) -> tuple[TaskRecord, TaskRunRecord]:
-    """在调用方写事务内验证 Task 与 Run 的同一 fencing token。"""
+    now: float,
+) -> tuple[TaskRecord, TaskRunRecord, WorkflowRecord]:
+    """在写事务内验证仍未过期的 Task、Run 与 Workflow fencing 边界。"""
 
     task = _read_task(conn, task_id)
     if (
         task is None
         or task.status is not TaskStatus.RUNNING
         or task.claim_token != claim_token
+        or task.claim_expires_at is None
+        or task.claim_expires_at <= now
     ):
         raise TaskClaimLostError("task claim is no longer current")
     run = _read_run_by_claim(conn, task_id, claim_token)
@@ -479,13 +487,100 @@ def _require_claim(
             TaskRunStatus.CLAIMED,
             TaskRunStatus.RUNNING,
         }
+        or run.finished_at is not None
     ):
         raise TaskClaimLostError("task run claim is no longer current")
     if run.workflow_id != task.workflow_id:
         raise OrchestrationPersistenceError(
             "stored task claim relationship is invalid"
         )
-    return task, run
+    workflow = _read_workflow(conn, task.workflow_id)
+    if workflow is None:
+        raise OrchestrationPersistenceError(
+            "stored task claim workflow is missing"
+        )
+    if workflow.status not in _WORKER_WRITABLE_WORKFLOW_STATUSES:
+        raise TaskClaimLostError("task claim workflow is no longer writable")
+    return task, run, workflow
+
+
+def _require_expired_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_token: str,
+    now: float,
+) -> tuple[TaskRecord, TaskRunRecord, WorkflowRecord]:
+    """在恢复事务内验证到期 Claim；此路径不接受仍有效的 Worker Claim。"""
+
+    task = _read_task(conn, task_id)
+    if (
+        task is None
+        or task.status is not TaskStatus.RUNNING
+        or task.claim_token != claim_token
+        or task.claim_expires_at is None
+        or task.claim_expires_at > now
+    ):
+        raise OrchestrationPersistenceError(
+            "expired task claim relationship is invalid"
+        )
+    run = _read_run_by_claim(conn, task_id, claim_token)
+    if (
+        run is None
+        or run.claim_token != claim_token
+        or run.status not in {
+            TaskRunStatus.CLAIMED,
+            TaskRunStatus.RUNNING,
+        }
+        or run.finished_at is not None
+        or run.workflow_id != task.workflow_id
+    ):
+        raise OrchestrationPersistenceError(
+            "expired task run relationship is invalid"
+        )
+    workflow = _read_workflow(conn, task.workflow_id)
+    if workflow is None:
+        raise OrchestrationPersistenceError(
+            "expired task claim workflow is missing"
+        )
+    if workflow.status not in _WORKER_WRITABLE_WORKFLOW_STATUSES:
+        raise OrchestrationPersistenceError(
+            "expired task claim workflow is invalid"
+        )
+    return task, run, workflow
+
+
+def _next_task_run_number(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> int:
+    """在 claim 写事务内按持久化 Run 历史分配单调递增序号。"""
+
+    row = conn.execute(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1 "
+        "FROM orchestration_task_runs WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or len(row) != 1:
+        raise OrchestrationPersistenceError(
+            "next task run number could not be calculated"
+        )
+    run_number = _stored_int(row[0], "next attempt_number")
+    if run_number < 1:
+        raise OrchestrationPersistenceError(
+            "stored task run sequence is invalid"
+        )
+    return run_number
+
+
+def _next_consumed_attempt_count(task: TaskRecord) -> int:
+    """计算当前正式执行终结后应写入的预算消耗数。"""
+
+    next_count = task.attempt_count + 1
+    if task.attempt_count < 0 or next_count > task.max_attempts:
+        raise OrchestrationPersistenceError(
+            "running task execution budget is invalid"
+        )
+    return next_count
 
 
 def _claim_record(
@@ -1030,8 +1125,7 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                         cursor = conn.execute(
                             """
                             UPDATE orchestration_tasks
-                            SET status=?, attempt_count=attempt_count + 1,
-                                claim_owner=?, claim_token=?,
+                            SET status=?, claim_owner=?, claim_token=?,
                                 claim_expires_at=?,
                                 started_at=COALESCE(started_at, ?),
                                 updated_at=?
@@ -1059,6 +1153,7 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                         )
                         if cursor.rowcount != 1:
                             continue
+                        run_number = _next_task_run_number(conn, str(task_id))
                         task = _require_task(conn, str(task_id))
                         try:
                             conn.execute(
@@ -1079,7 +1174,7 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                                     run_id,
                                     task.workflow_id,
                                     task.task_id,
-                                    task.attempt_count,
+                                    run_number,
                                     worker,
                                     claim_token,
                                     TaskRunStatus.CLAIMED.value,
@@ -1131,13 +1226,19 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
                     now = self._now()
+                    _task, _run, workflow = _require_live_claim(
+                        conn,
+                        normalized_task_id,
+                        token,
+                        now,
+                    )
                     expires_at = self._lease_expiry(now, lease_seconds)
-                    _require_claim(conn, normalized_task_id, token)
                     task_cursor = conn.execute(
                         """
                         UPDATE orchestration_tasks
                         SET claim_expires_at=?, updated_at=?
                         WHERE task_id=? AND status=? AND claim_token=?
+                          AND claim_expires_at>?
                         """,
                         (
                             expires_at,
@@ -1145,6 +1246,7 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             normalized_task_id,
                             TaskStatus.RUNNING.value,
                             token,
+                            now,
                         ),
                     )
                     run_cursor = conn.execute(
@@ -1153,12 +1255,24 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                         SET heartbeat_at=?
                         WHERE task_id=? AND claim_token=?
                           AND status IN (?, ?)
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_tasks AS current_task
+                              WHERE current_task.task_id=?
+                                AND current_task.status=?
+                                AND current_task.claim_token=?
+                                AND current_task.claim_expires_at>?
+                          )
                         """,
                         (
                             now,
                             normalized_task_id,
                             token,
                             *_ACTIVE_RUN_STATUSES,
+                            normalized_task_id,
+                            TaskStatus.RUNNING.value,
+                            token,
+                            now,
                         ),
                     )
                     if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
@@ -1171,7 +1285,6 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                         raise OrchestrationPersistenceError(
                             "renewed task run could not be read back"
                         )
-                    workflow = _require_workflow(conn, task.workflow_id)
                     result = _claim_record(
                         workflow=workflow,
                         task=task,
@@ -1204,10 +1317,11 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
                     now = self._now()
-                    _task, run = _require_claim(
+                    _task, run, _workflow = _require_live_claim(
                         conn,
                         normalized_task_id,
                         token,
+                        now,
                     )
                     if run.status is TaskRunStatus.CLAIMED:
                         cursor = conn.execute(
@@ -1216,6 +1330,14 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             SET status=?, session_key=?, started_at=?,
                                 heartbeat_at=?
                             WHERE run_id=? AND claim_token=? AND status=?
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM orchestration_tasks AS current_task
+                                  WHERE current_task.task_id=?
+                                    AND current_task.status=?
+                                    AND current_task.claim_token=?
+                                    AND current_task.claim_expires_at>?
+                              )
                             """,
                             (
                                 TaskRunStatus.RUNNING.value,
@@ -1225,6 +1347,10 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                                 run.run_id,
                                 token,
                                 TaskRunStatus.CLAIMED.value,
+                                normalized_task_id,
+                                TaskStatus.RUNNING.value,
+                                token,
+                                now,
                             ),
                         )
                     elif run.session_key == session_key:
@@ -1233,12 +1359,24 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             UPDATE orchestration_task_runs
                             SET heartbeat_at=?
                             WHERE run_id=? AND claim_token=? AND status=?
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM orchestration_tasks AS current_task
+                                  WHERE current_task.task_id=?
+                                    AND current_task.status=?
+                                    AND current_task.claim_token=?
+                                    AND current_task.claim_expires_at>?
+                              )
                             """,
                             (
                                 now,
                                 run.run_id,
                                 token,
                                 TaskRunStatus.RUNNING.value,
+                                normalized_task_id,
+                                TaskStatus.RUNNING.value,
+                                token,
+                                now,
                             ),
                         )
                     else:
@@ -1293,11 +1431,13 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
                     now = self._now()
-                    task, run = _require_claim(
+                    task, run, workflow = _require_live_claim(
                         conn,
                         normalized_task_id,
                         token,
+                        now,
                     )
+                    new_attempt_count = _next_consumed_attempt_count(task)
                     run_cursor = conn.execute(
                         """
                         UPDATE orchestration_task_runs
@@ -1306,6 +1446,16 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             error_message=NULL
                         WHERE run_id=? AND claim_token=?
                           AND status IN (?, ?)
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_tasks AS current_task
+                              WHERE current_task.task_id=?
+                                AND current_task.status=?
+                                AND current_task.claim_token=?
+                                AND current_task.claim_expires_at>?
+                                AND current_task.attempt_count
+                                    < current_task.max_attempts
+                          )
                         """,
                         (
                             TaskRunStatus.COMPLETED.value,
@@ -1315,20 +1465,29 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             run.run_id,
                             token,
                             *_ACTIVE_RUN_STATUSES,
+                            normalized_task_id,
+                            TaskStatus.RUNNING.value,
+                            token,
+                            now,
                         ),
                     )
                     task_cursor = conn.execute(
                         """
                         UPDATE orchestration_tasks
-                        SET status=?, claim_owner=NULL, claim_token=NULL,
+                        SET status=?, attempt_count=?,
+                            claim_owner=NULL, claim_token=NULL,
                             claim_expires_at=NULL, result_summary=?,
                             result_metadata_json=?, error_type=NULL,
                             error_message=NULL, blocked_reason=NULL,
                             finished_at=?, updated_at=?
                         WHERE task_id=? AND status=? AND claim_token=?
+                          AND claim_expires_at>?
+                          AND attempt_count=?
+                          AND attempt_count < max_attempts
                         """,
                         (
                             TaskStatus.COMPLETED.value,
+                            new_attempt_count,
                             result_summary,
                             encoded_metadata,
                             now,
@@ -1336,13 +1495,14 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             normalized_task_id,
                             TaskStatus.RUNNING.value,
                             token,
+                            now,
+                            task.attempt_count,
                         ),
                     )
                     if run_cursor.rowcount != 1 or task_cursor.rowcount != 1:
                         raise TaskClaimLostError(
                             "task claim was lost during completion"
                         )
-                    workflow = _require_workflow(conn, task.workflow_id)
                     if workflow.status is WorkflowStatus.ACTIVE:
                         _advance_direct_downstream(
                             conn,
@@ -1394,12 +1554,13 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
                     now = self._now()
-                    task, run = _require_claim(
+                    task, run, workflow = _require_live_claim(
                         conn,
                         normalized_task_id,
                         token,
+                        now,
                     )
-                    workflow = _require_workflow(conn, task.workflow_id)
+                    new_attempt_count = _next_consumed_attempt_count(task)
                     run_cursor = conn.execute(
                         """
                         UPDATE orchestration_task_runs
@@ -1407,6 +1568,16 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             error_message=?
                         WHERE run_id=? AND claim_token=?
                           AND status IN (?, ?)
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_tasks AS current_task
+                              WHERE current_task.task_id=?
+                                AND current_task.status=?
+                                AND current_task.claim_token=?
+                                AND current_task.claim_expires_at>?
+                                AND current_task.attempt_count
+                                    < current_task.max_attempts
+                          )
                         """,
                         (
                             TaskRunStatus.FAILED.value,
@@ -1416,12 +1587,16 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             run.run_id,
                             token,
                             *_ACTIVE_RUN_STATUSES,
+                            normalized_task_id,
+                            TaskStatus.RUNNING.value,
+                            token,
+                            now,
                         ),
                     )
                     should_retry = (
                         retryable
                         and workflow.status is WorkflowStatus.ACTIVE
-                        and task.attempt_count < task.max_attempts
+                        and new_attempt_count < task.max_attempts
                     )
                     if should_retry:
                         target_status = TaskStatus.READY
@@ -1434,13 +1609,18 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                     task_cursor = conn.execute(
                         """
                         UPDATE orchestration_tasks
-                        SET status=?, claim_owner=NULL, claim_token=NULL,
+                        SET status=?, attempt_count=?, claim_owner=NULL,
+                            claim_token=NULL,
                             claim_expires_at=NULL, ready_at=?, finished_at=?,
                             error_type=?, error_message=?, updated_at=?
                         WHERE task_id=? AND status=? AND claim_token=?
+                          AND claim_expires_at>?
+                          AND attempt_count=?
+                          AND attempt_count < max_attempts
                         """,
                         (
                             target_status.value,
+                            new_attempt_count,
                             ready_at,
                             finished_at,
                             normalized_error_type,
@@ -1449,6 +1629,8 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             normalized_task_id,
                             TaskStatus.RUNNING.value,
                             token,
+                            now,
+                            task.attempt_count,
                         ),
                     )
                     if run_cursor.rowcount != 1 or task_cursor.rowcount != 1:
@@ -1490,12 +1672,12 @@ class SQLiteOrchestrationStore(OrchestrationStore):
             with existing_write_connection(self._db_path) as conn:
                 with _immediate_transaction(conn):
                     now = self._now()
-                    task, run = _require_claim(
+                    _task, run, workflow = _require_live_claim(
                         conn,
                         normalized_task_id,
                         token,
+                        now,
                     )
-                    workflow = _require_workflow(conn, task.workflow_id)
                     if workflow.status is not WorkflowStatus.ACTIVE:
                         raise InvalidTaskTransitionError(
                             "task cannot block after workflow termination"
@@ -1507,6 +1689,18 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             error_message=?
                         WHERE run_id=? AND claim_token=?
                           AND status IN (?, ?)
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_tasks AS current_task
+                              JOIN orchestration_workflows AS current_workflow
+                                ON current_workflow.workflow_id=
+                                   current_task.workflow_id
+                              WHERE current_task.task_id=?
+                                AND current_task.status=?
+                                AND current_task.claim_token=?
+                                AND current_task.claim_expires_at>?
+                                AND current_workflow.status=?
+                          )
                         """,
                         (
                             TaskRunStatus.BLOCKED.value,
@@ -1516,6 +1710,11 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             run.run_id,
                             token,
                             *_ACTIVE_RUN_STATUSES,
+                            normalized_task_id,
+                            TaskStatus.RUNNING.value,
+                            token,
+                            now,
+                            WorkflowStatus.ACTIVE.value,
                         ),
                     )
                     task_cursor = conn.execute(
@@ -1526,6 +1725,14 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             error_type=NULL, error_message=NULL,
                             finished_at=NULL, updated_at=?
                         WHERE task_id=? AND status=? AND claim_token=?
+                          AND claim_expires_at>?
+                          AND EXISTS (
+                              SELECT 1
+                              FROM orchestration_workflows AS current_workflow
+                              WHERE current_workflow.workflow_id=
+                                    orchestration_tasks.workflow_id
+                                AND current_workflow.status=?
+                          )
                         """,
                         (
                             TaskStatus.BLOCKED.value,
@@ -1534,6 +1741,8 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                             normalized_task_id,
                             TaskStatus.RUNNING.value,
                             token,
+                            now,
+                            WorkflowStatus.ACTIVE.value,
                         ),
                     )
                     if run_cursor.rowcount != 1 or task_cursor.rowcount != 1:
@@ -1834,6 +2043,8 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                           ON run.task_id=task.task_id
                          AND run.claim_token=task.claim_token
                         WHERE task.status=?
+                          AND task.claim_token IS NOT NULL
+                          AND task.claim_expires_at IS NOT NULL
                           AND task.claim_expires_at<=?
                           AND run.status IN (?, ?)
                         ORDER BY task.claim_expires_at, task.task_id
@@ -1849,46 +2060,22 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                     for raw_task_id, raw_claim_token in candidates:
                         task_id_value = str(raw_task_id)
                         token = str(raw_claim_token)
-                        task, run = _require_claim(
+                        task, run, workflow = _require_expired_claim(
                             conn,
                             task_id_value,
                             token,
+                            now,
                         )
-                        workflow = _require_workflow(conn, task.workflow_id)
+                        new_attempt_count = _next_consumed_attempt_count(task)
                         should_retry = (
                             workflow.status is WorkflowStatus.ACTIVE
-                            and task.attempt_count < task.max_attempts
+                            and new_attempt_count < task.max_attempts
                         )
                         target_status = (
                             TaskStatus.READY
                             if should_retry
                             else TaskStatus.FAILED
                         )
-                        task_cursor = conn.execute(
-                            """
-                            UPDATE orchestration_tasks
-                            SET status=?, claim_owner=NULL, claim_token=NULL,
-                                claim_expires_at=NULL, ready_at=?,
-                                error_type=?, error_message=?, finished_at=?,
-                                updated_at=?
-                            WHERE task_id=? AND status=? AND claim_token=?
-                              AND claim_expires_at<=?
-                            """,
-                            (
-                                target_status.value,
-                                now if should_retry else task.ready_at,
-                                "claim_expired",
-                                "task claim lease expired",
-                                None if should_retry else now,
-                                now,
-                                task.task_id,
-                                TaskStatus.RUNNING.value,
-                                token,
-                                now,
-                            ),
-                        )
-                        if task_cursor.rowcount != 1:
-                            continue
                         run_cursor = conn.execute(
                             """
                             UPDATE orchestration_task_runs
@@ -1896,6 +2083,16 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                                 error_message=?
                             WHERE run_id=? AND claim_token=?
                               AND status IN (?, ?)
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM orchestration_tasks AS current_task
+                                  WHERE current_task.task_id=?
+                                    AND current_task.status=?
+                                    AND current_task.claim_token=?
+                                    AND current_task.claim_expires_at<=?
+                                    AND current_task.attempt_count
+                                        < current_task.max_attempts
+                              )
                             """,
                             (
                                 TaskRunStatus.ABANDONED.value,
@@ -1905,11 +2102,43 @@ class SQLiteOrchestrationStore(OrchestrationStore):
                                 run.run_id,
                                 token,
                                 *_ACTIVE_RUN_STATUSES,
+                                task.task_id,
+                                TaskStatus.RUNNING.value,
+                                token,
+                                now,
                             ),
                         )
-                        if run_cursor.rowcount != 1:
+                        task_cursor = conn.execute(
+                            """
+                            UPDATE orchestration_tasks
+                            SET status=?, attempt_count=?, claim_owner=NULL,
+                                claim_token=NULL, claim_expires_at=NULL,
+                                ready_at=?,
+                                error_type=?, error_message=?, finished_at=?,
+                                updated_at=?
+                            WHERE task_id=? AND status=? AND claim_token=?
+                              AND claim_expires_at<=?
+                              AND attempt_count=?
+                              AND attempt_count < max_attempts
+                            """,
+                            (
+                                target_status.value,
+                                new_attempt_count,
+                                now if should_retry else task.ready_at,
+                                "claim_expired",
+                                "task claim lease expired",
+                                None if should_retry else now,
+                                now,
+                                task.task_id,
+                                TaskStatus.RUNNING.value,
+                                token,
+                                now,
+                                task.attempt_count,
+                            ),
+                        )
+                        if run_cursor.rowcount != 1 or task_cursor.rowcount != 1:
                             raise OrchestrationPersistenceError(
-                                "expired task claim has no active run"
+                                "expired task claim changed during recovery"
                             )
                         recovered_task_ids.append(task.task_id)
                         if (

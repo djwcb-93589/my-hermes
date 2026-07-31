@@ -35,7 +35,7 @@ from .migrations.feishu import _migrate_v9_to_v10, _migrate_v10_to_v11, _migrate
 from .migrations.gateway import _migrate_v2_to_v3, _migrate_v3_to_v4, _migrate_v4_to_v5, _migrate_v5_to_v6, _migrate_v6_to_v7, _migrate_v7_to_v8, _migrate_v8_to_v9, _migrate_v11_to_v12, _migrate_v12_to_v13, _migrate_v14_to_v15
 from .migrations.mixed import _migrate_v22_to_v23, _migrate_v23_to_v24
 from .migrations.observation import _migrate_v35_to_v36
-from .migrations.orchestration import _migrate_v38_to_v39
+from .migrations.orchestration import _migrate_v38_to_v39, _migrate_v39_to_v40
 from .migrations.runtime import _migrate_v36_to_v37
 from .migrations.tool_execution import _migrate_v25_to_v26, _migrate_v27_to_v28, _migrate_v31_to_v32
 from .schemas import (
@@ -53,10 +53,10 @@ from .schemas import (
     tool_execution,
 )
 
-# 当前最新 schema 版本。每次升级表结构时 +1,并在 _migrate 里加对应分支。
+# 当前最新 schema 版本。每次升级表结构或持久化语义时 +1,并在 _migrate 里加对应分支。
 # 为什么需要 schema version:让 db 启动时知道结构处于哪个版本,需要的话
 # 按顺序执行 migration,避免依赖用户手动删库升级。
-LATEST_SCHEMA_VERSION = 39
+LATEST_SCHEMA_VERSION = 40
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
@@ -137,7 +137,8 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
     工具执行 Journal 状态，避免审批占位结果被当作执行失败。v35 -> v36
     增加安全 Observation 表，v36 -> v37 增加 Runtime 当前快照表，
     v37 -> v38 增加 Gateway Supervisor 控制请求与进程绑定，v38 -> v39
-    增加持久化 Workflow、Task、Dependency 与 Task Run 事实表。
+    增加持久化 Workflow、Task、Dependency 与 Task Run 事实表，v39 -> v40
+    按正式终结的 Run 历史重算 Task 已消耗的执行预算。
     """
     if current < 1:
         # 极少见:有 schema_version 表但版本 < 1,补基础表
@@ -609,6 +610,18 @@ def _migrate(conn: sqlite3.Connection, current: int) -> int:
         else:
             conn.commit()
             current = 39
+
+    if current < 40:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v39_to_v40(conn)
+            _set_schema_version(conn, 40)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            current = 40
 
     return current
 
