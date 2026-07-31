@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+
+from hermes.session_idle import (
+    SessionIdleDecision,
+    SessionProcessView,
+    evaluate_session_idle,
+)
 
 
 if TYPE_CHECKING:
@@ -47,6 +53,26 @@ class SessionResourceCleanupReport:
         """返回 Backend 是否因进程清理未完成而保留。"""
 
         return not self.backend_cleanup_attempted
+
+
+@dataclass(frozen=True, slots=True)
+class IdleSessionCleanupReport:
+    """自动 idle 判断及其资源清理结果。"""
+
+    attempted: bool
+    decision: SessionIdleDecision
+    resource_cleanup: SessionResourceCleanupReport | None
+
+    @property
+    def complete(self) -> bool:
+        """未尝试时没有清理缺口；尝试后返回真实清理结果。"""
+
+        if not self.attempted:
+            return True
+        return (
+            self.resource_cleanup is not None
+            and self.resource_cleanup.complete
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +283,41 @@ def cleanup_session_resources(
     )
 
 
+def cleanup_idle_session_resources(
+    session_key: str,
+    *,
+    last_activity_at: float,
+    idle_timeout_seconds: float,
+    foreground_active: bool,
+    process_manager: SessionProcessView,
+) -> IdleSessionCleanupReport:
+    """仅在共享 idle 策略允许时调用现有完整会话清理。"""
+
+    decision = evaluate_session_idle(
+        session_key,
+        last_activity_at=last_activity_at,
+        idle_timeout_seconds=idle_timeout_seconds,
+        foreground_active=foreground_active,
+        process_manager=process_manager,
+    )
+    if not decision.cleanup_allowed:
+        return IdleSessionCleanupReport(
+            attempted=False,
+            decision=decision,
+            resource_cleanup=None,
+        )
+
+    resource_cleanup = cleanup_session_resources(
+        session_key,
+        process_manager=cast("ProcessManager", process_manager),
+    )
+    return IdleSessionCleanupReport(
+        attempted=True,
+        decision=decision,
+        resource_cleanup=resource_cleanup,
+    )
+
+
 def cleanup_all_session_resources(
     *,
     process_manager: ProcessManager | None = None,
@@ -305,7 +366,9 @@ def cleanup_all_session_resources(
 
 __all__ = [
     "GlobalResourceCleanupReport",
+    "IdleSessionCleanupReport",
     "SessionResourceCleanupReport",
     "cleanup_all_session_resources",
+    "cleanup_idle_session_resources",
     "cleanup_session_resources",
 ]

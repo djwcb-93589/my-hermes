@@ -1784,6 +1784,27 @@ class GatewayRunner:
             process_manager=self._process_manager,
         )
 
+    async def _cleanup_idle_session_resources(
+        self,
+        session_key: str,
+        *,
+        last_activity_at: float,
+        idle_timeout_seconds: float,
+        foreground_active: bool,
+    ):
+        """使用共享策略执行受 Process 生命周期保护的自动清理。"""
+
+        from hermes.session_resources import cleanup_idle_session_resources
+
+        return await self._await_blocking_operation(
+            cleanup_idle_session_resources,
+            session_key,
+            last_activity_at=last_activity_at,
+            idle_timeout_seconds=idle_timeout_seconds,
+            foreground_active=foreground_active,
+            process_manager=self._process_manager,
+        )
+
     async def _cleanup_all_session_resources(
         self,
         *,
@@ -1829,6 +1850,15 @@ class GatewayRunner:
                 if self._lifecycle_phase != "running":
                     return
                 try:
+                    await self._await_blocking_operation(
+                        self._process_manager.prune,
+                    )
+                except Exception as exc:
+                    print(
+                        "  [gateway] process prune failed: "
+                        f"{type(exc).__name__}"
+                    )
+                try:
                     protected = await self.persistence.call(
                         get_gateway_routes_with_pending_outbox,
                     )
@@ -1848,9 +1878,37 @@ class GatewayRunner:
                                 current_protected,
                             ):
                                 continue
-                            report = await self._cleanup_session_resources(
-                                conversation_id,
+                            ctx = self.sessions.get(route_key)
+                            if (
+                                ctx is None
+                                or ctx.conversation_id != conversation_id
+                            ):
+                                continue
+                            foreground_active = bool(
+                                ctx.busy
+                                or ctx.dispatching
+                                or ctx.pending
+                                or (
+                                    ctx.worker_task is not None
+                                    and not ctx.worker_task.done()
+                                )
+                                or (
+                                    ctx.active_task is not None
+                                    and not ctx.active_task.done()
+                                )
                             )
+                            report = (
+                                await self._cleanup_idle_session_resources(
+                                    conversation_id,
+                                    last_activity_at=ctx.last_activity,
+                                    idle_timeout_seconds=(
+                                        self.sessions.idle_timeout
+                                    ),
+                                    foreground_active=foreground_active,
+                                )
+                            )
+                            if not report.attempted:
+                                continue
                             if not report.complete:
                                 incomplete += 1
                                 continue
@@ -6073,6 +6131,7 @@ class GatewayRunner:
         ctx = await self.sessions.get_or_create_async(
             route_key, self._build_gateway_prompt(event.source),
         )
+        foreground_conversation_id = ctx.conversation_id
         if generation is None:
             generation = (
                 ctx.worker_generation
@@ -6556,6 +6615,10 @@ class GatewayRunner:
                     ctx.worker_task = None
                     ctx.worker_generation = None
                     ctx.busy = False
+                    self.sessions.mark_foreground_completed(
+                        route_key,
+                        foreground_conversation_id,
+                    )
 
         if cancel_reason != "shutdown":
             await self._dispatch_next(ctx)

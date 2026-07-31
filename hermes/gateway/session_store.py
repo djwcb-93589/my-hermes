@@ -561,6 +561,25 @@ class SessionStore:
         """读取现有运行期上下文，不创建会话或刷新活跃时间。"""
         return self._contexts.get(route_key)
 
+    def mark_foreground_completed(
+        self,
+        route_key: str,
+        conversation_id: str,
+        *,
+        completed_at: float | None = None,
+    ) -> bool:
+        """仅刷新仍属于同一 route 的前台任务完成时间。"""
+
+        ctx = self._contexts.get(route_key)
+        if ctx is None or ctx.conversation_id != conversation_id:
+            return False
+        ctx.last_activity = (
+            time.time()
+            if completed_at is None
+            else completed_at
+        )
+        return True
+
     @staticmethod
     def save_conversation_list_mapping(
         ctx: SessionContext,
