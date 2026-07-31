@@ -1,7 +1,24 @@
+import { createBrowserRouter, RouterProvider } from "react-router-dom";
+
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import { AuthenticationStatus } from "./auth/AuthenticationStatus";
 import { TokenPrompt } from "./auth/TokenPrompt";
+import { AppShell } from "./components/AppShell";
+import { ConfigPage } from "./features/config/ConfigPage";
 import { OverviewPage } from "./features/overview/OverviewPage";
+
+const router = createBrowserRouter([
+  {
+    path: "/",
+    element: <AppShell />,
+    children: [
+      { index: true, element: <OverviewPage /> },
+      { path: "overview", element: <OverviewPage /> },
+      { path: "config", element: <ConfigPage /> },
+      { path: "config/*", element: <ConfigPage /> },
+    ],
+  },
+]);
 
 function DashboardApplication() {
   const { state } = useAuth();
@@ -14,7 +31,7 @@ function DashboardApplication() {
       return <AuthenticationStatus mode="unavailable" />;
     case "anonymous":
     case "authenticated_with_read_token":
-      return <OverviewPage />;
+      return <RouterProvider router={router} />;
   }
 }
 

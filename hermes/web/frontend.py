@@ -14,7 +14,7 @@ from starlette.types import Scope
 _FRONTEND_DIST_DIRECTORY = Path(__file__).resolve().parent / "frontend_dist"
 _IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _INDEX_CACHE_CONTROL = "no-cache"
-_FRONTEND_ROUTE_PREFIXES = ("overview",)
+_FRONTEND_ROUTE_PREFIXES = ("overview", "config")
 
 
 class _ImmutableStaticFiles(StaticFiles):

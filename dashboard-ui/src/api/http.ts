@@ -1,4 +1,5 @@
 const READ_TOKEN_HEADER = "X-Hermes-Read-Token";
+const CONTROL_TOKEN_HEADER = "X-Hermes-Control-Token";
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 export type HttpAuthenticationMode = "anonymous" | "read_token";
@@ -14,12 +15,18 @@ export type HttpErrorCode =
 export class HttpError extends Error {
   readonly code: HttpErrorCode;
   readonly status: number | null;
+  readonly publicCode: string | null;
 
-  constructor(code: HttpErrorCode, status: number | null = null) {
+  constructor(
+    code: HttpErrorCode,
+    status: number | null = null,
+    publicCode: string | null = null,
+  ) {
     super(code);
     this.name = "HttpError";
     this.code = code;
     this.status = status;
+    this.publicCode = publicCode;
   }
 }
 
@@ -33,6 +40,103 @@ interface HttpClientOptions {
   readToken?: () => string | null;
   onAuthenticationRejected?: () => void;
 }
+
+interface TransportRequestOptions extends HttpRequestOptions {
+  method: "GET" | "PATCH";
+  headers: Headers;
+  body?: object;
+  allowedPublicErrorCodes?: readonly string[];
+}
+
+class HttpTransport {
+  async request<T>(
+    path: string,
+    options: TransportRequestOptions,
+  ): Promise<T> {
+    let requestBody: string | undefined;
+    try {
+      requestBody =
+        options.body === undefined
+          ? undefined
+          : JSON.stringify(options.body);
+    } catch {
+      throw new HttpError("request_failed");
+    }
+
+    const controller = new AbortController();
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    let timedOut = false;
+    const abortFromCaller = (): void => controller.abort();
+    if (options.signal?.aborted === true) {
+      controller.abort();
+    } else {
+      options.signal?.addEventListener("abort", abortFromCaller, {
+        once: true,
+      });
+    }
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      const response = await fetch(path, {
+        method: options.method,
+        headers: options.headers,
+        body: requestBody,
+        signal: controller.signal,
+        credentials: "omit",
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        const publicCode = await readAllowedPublicErrorCode(
+          response,
+          options.allowedPublicErrorCodes ?? [],
+        );
+        if (response.status === 401) {
+          throw new HttpError(
+            "authentication_required",
+            response.status,
+            publicCode,
+          );
+        }
+        if (response.status === 403) {
+          throw new HttpError(
+            "permission_forbidden",
+            response.status,
+            publicCode,
+          );
+        }
+        throw new HttpError("request_failed", response.status, publicCode);
+      }
+      const contentType = response.headers.get("Content-Type") ?? "";
+      if (!contentType.toLowerCase().includes("application/json")) {
+        throw new HttpError("invalid_response", response.status);
+      }
+      try {
+        return (await response.json()) as T;
+      } catch {
+        throw new HttpError("invalid_response", response.status);
+      }
+    } catch (error: unknown) {
+      if (error instanceof HttpError) {
+        throw error;
+      }
+      if (controller.signal.aborted) {
+        if (timedOut) {
+          throw new HttpError("request_timeout");
+        }
+        throw error;
+      }
+      throw new HttpError("network_unavailable");
+    } finally {
+      window.clearTimeout(timeoutId);
+      options.signal?.removeEventListener("abort", abortFromCaller);
+    }
+  }
+}
+
+const transport = new HttpTransport();
 
 export class HttpClient {
   readonly #authentication: HttpAuthenticationMode;
@@ -64,67 +168,90 @@ export class HttpClient {
       headers.set(READ_TOKEN_HEADER, token);
     }
 
-    const controller = new AbortController();
-    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    let timedOut = false;
-    const abortFromCaller = (): void => controller.abort();
-    if (options.signal?.aborted === true) {
-      controller.abort();
-    } else {
-      options.signal?.addEventListener("abort", abortFromCaller, {
-        once: true,
-      });
-    }
-    const timeoutId = window.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
-
     try {
-      const response = await fetch(path, {
+      return await transport.request<T>(path, {
         method: "GET",
         headers,
-        signal: controller.signal,
-        credentials: "omit",
-        cache: "no-store",
+        ...options,
       });
-      if (response.status === 401 || response.status === 403) {
-        if (
-          this.#authentication === "read_token" ||
-          response.status === 401
-        ) {
-          this.#handleAuthenticationRejected?.();
-        }
-        throw new HttpError(
-          response.status === 401
-            ? "authentication_required"
-            : "permission_forbidden",
-          response.status,
-        );
-      }
-      if (!response.ok) {
-        throw new HttpError("request_failed", response.status);
-      }
-      const contentType = response.headers.get("Content-Type") ?? "";
-      if (!contentType.toLowerCase().includes("application/json")) {
-        throw new HttpError("invalid_response", response.status);
-      }
-      const payload: unknown = await response.json();
-      return payload as T;
     } catch (error: unknown) {
-      if (error instanceof HttpError) {
-        throw error;
+      if (
+        error instanceof HttpError &&
+        (error.status === 401 ||
+          (this.#authentication === "read_token" && error.status === 403))
+      ) {
+        this.#handleAuthenticationRejected?.();
       }
-      if (controller.signal.aborted) {
-        if (timedOut) {
-          throw new HttpError("request_timeout");
-        }
-        throw error;
-      }
-      throw new HttpError("network_unavailable");
-    } finally {
-      window.clearTimeout(timeoutId);
-      options.signal?.removeEventListener("abort", abortFromCaller);
+      throw error;
     }
+  }
+}
+
+interface ConfigControlRequestOptions extends HttpRequestOptions {
+  allowedPublicErrorCodes?: readonly string[];
+}
+
+export class EphemeralConfigControlClient {
+  #controlToken: string | null;
+
+  constructor(controlToken: string) {
+    if (typeof controlToken !== "string" || controlToken.length === 0) {
+      throw new HttpError("authentication_required", 401);
+    }
+    this.#controlToken = controlToken;
+  }
+
+  async patchConfig<T>(
+    body: object,
+    options: ConfigControlRequestOptions = {},
+  ): Promise<T> {
+    const controlToken = this.#controlToken;
+    if (controlToken === null) {
+      throw new HttpError("authentication_required", 401);
+    }
+    const headers = new Headers({
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    });
+    try {
+      headers.set(CONTROL_TOKEN_HEADER, controlToken);
+    } catch {
+      throw new HttpError("authentication_required", 401);
+    }
+    return transport.request<T>("/api/config", {
+      method: "PATCH",
+      headers,
+      body,
+      ...options,
+    });
+  }
+
+  dispose(): void {
+    this.#controlToken = null;
+  }
+}
+
+async function readAllowedPublicErrorCode(
+  response: Response,
+  allowedCodes: readonly string[],
+): Promise<string | null> {
+  if (allowedCodes.length === 0) {
+    return null;
+  }
+  const contentType = response.headers.get("Content-Type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return null;
+  }
+  try {
+    const payload: unknown = await response.json();
+    if (typeof payload !== "object" || payload === null) {
+      return null;
+    }
+    const code = Reflect.get(payload, "code");
+    return typeof code === "string" && allowedCodes.includes(code)
+      ? code
+      : null;
+  } catch {
+    return null;
   }
 }
