@@ -3,7 +3,9 @@
 from hermes.subagents.contracts import (
     IsolatedAgentRunResult,
     IsolatedAgentRunSpec,
+    IsolatedAgentSessionInitializer,
 )
+from hermes.subagents.errors import IsolatedAgentSessionSetupError
 from hermes.subagents.runtime import (
     IsolatedAgentExecutor,
 )
@@ -13,4 +15,6 @@ __all__ = [
     "IsolatedAgentExecutor",
     "IsolatedAgentRunResult",
     "IsolatedAgentRunSpec",
+    "IsolatedAgentSessionInitializer",
+    "IsolatedAgentSessionSetupError",
 ]

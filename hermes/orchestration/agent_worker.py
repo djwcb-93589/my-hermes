@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -20,6 +21,7 @@ from hermes.orchestration.execution import (
     TaskExecutionOutcome,
     TaskExecutionOutcomeKind,
     TaskSessionPreparer,
+    TaskSessionSetupPlan,
     TaskToolResolver,
 )
 from hermes.orchestration.models import (
@@ -35,6 +37,8 @@ from hermes.subagents import (
     IsolatedAgentExecutor,
     IsolatedAgentRunResult,
     IsolatedAgentRunSpec,
+    IsolatedAgentSessionInitializer,
+    IsolatedAgentSessionSetupError,
 )
 from hermes.tool_policy import (
     ApprovalMode,
@@ -44,6 +48,9 @@ from hermes.tool_policy import (
     normalize_tool_risk_level,
 )
 from hermes.tools import ToolPolicy, ToolRegistry
+
+
+logger = logging.getLogger(__name__)
 
 
 _DEFAULT_MAX_GOAL_CHARS = 200_000
@@ -67,6 +74,7 @@ _FORBIDDEN_TOOL_CONTEXT_KEYS = frozenset({
     "parent_session_history",
 })
 _PREPARATION_ERROR_MESSAGES = {
+    "agent_execution_spec_invalid": "isolated agent execution plan is invalid",
     "dependency_state_invalid": "a direct task dependency is not completed",
     "role_invalid": "agent role configuration is invalid",
     "task_context_invalid": "task execution context is invalid",
@@ -227,18 +235,27 @@ class _TaskPromptBuilder:
         return goal
 
 
-class NoWorkdirTaskSessionPreparer:
-    """无 Backend 耦合的默认实现，仅支持未指定 workdir 的任务。"""
+class _NoOpTaskSessionSetupPlan:
+    """不创建任何资源的不可变 Session 初始化计划。"""
 
     __slots__ = ()
 
-    def prepare(
+    def prepare(self) -> None:
+        return None
+
+
+class NoWorkdirTaskSessionPreparer:
+    """无副作用规划默认 Session，并拒绝非空 workdir。"""
+
+    __slots__ = ()
+
+    def plan(
         self,
         *,
         session_key: str,
         workdir: str | None,
-    ) -> None:
-        if type(session_key) is not str or not session_key:
+    ) -> TaskSessionSetupPlan:
+        if type(session_key) is not str or not session_key.strip():
             raise TaskSessionPreparationError(
                 "task session key is invalid",
                 error_type="task_session_key_invalid",
@@ -248,6 +265,7 @@ class NoWorkdirTaskSessionPreparer:
                 "task workdir is not supported by the configured session preparer",
                 error_type="workdir_not_supported",
             )
+        return _NoOpTaskSessionSetupPlan()
 
 
 class RegistryTaskToolResolver:
@@ -369,8 +387,8 @@ class IsolatedAgentTaskExecutor:
             if session_preparer is None
             else session_preparer
         )
-        if not callable(getattr(active_preparer, "prepare", None)):
-            raise TypeError("session_preparer must provide prepare()")
+        if not callable(getattr(active_preparer, "plan", None)):
+            raise TypeError("session_preparer must provide plan()")
         if (
             type(max_goal_chars) is not int
             or not 1 <= max_goal_chars <= _MAX_GOAL_CHARS
@@ -395,20 +413,18 @@ class IsolatedAgentTaskExecutor:
         tool_context: Mapping[str, object] | None = None,
     ) -> TaskExecutionOutcome:
         self._validate_claim_snapshot(claim)
-        session_key: str | None = None
 
         try:
             dependencies = self._service.list_task_dependencies(
                 task_id=claim.task.task_id
             )
-        except Exception:
-            return self._persistence_unknown_outcome(
+        except Exception as exc:
+            return self._release_pre_execution_claim(
                 claim,
-                session_key=None,
-                runtime_status=None,
-                summary=None,
+                error=exc,
             )
 
+        session_key: str | None = None
         try:
             self._validate_runtime_inputs(
                 cancel_checker=cancel_checker,
@@ -435,9 +451,20 @@ class IsolatedAgentTaskExecutor:
                 claim,
                 tool_context,
             )
-            self._prepare_session(
+            session_setup_plan = self._plan_session(
                 session_key=session_key,
                 workdir=claim.task.workdir,
+            )
+            spec = self._build_run_spec(
+                session_key=session_key,
+                goal=goal,
+                system_prompt=system_prompt,
+                role=role,
+                resolved_tools=resolved_tools,
+            )
+            session_initializer = self._build_session_initializer(
+                session_key=session_key,
+                setup_plan=session_setup_plan,
             )
         except TaskExecutionError as exc:
             return self._persist_preparation_failure(
@@ -478,33 +505,13 @@ class IsolatedAgentTaskExecutor:
             )
 
         try:
-            spec = IsolatedAgentRunSpec(
-                session_key=session_key,
-                goal=goal,
-                system_prompt=system_prompt,
-                model=role.model,
-                max_iterations=role.max_iterations,
-                tool_definitions=resolved_tools.definitions,
-                allowed_tool_names=resolved_tools.allowed_tool_names,
-                model_kwargs=role.model_kwargs,
-            )
-        except Exception:
-            return self._persist_runtime_failure(
-                claim,
-                session_key=session_key,
-                runtime_status="invalid_spec",
-                error_type="agent_execution_spec_invalid",
-                retryable=False,
-                summary=None,
-            )
-
-        try:
             result = self._agent_executor.execute(
                 spec,
                 cancel_checker=cancel_checker,
                 tool_context=runtime_tool_context,
                 hook_registry=hook_registry,
                 parent_run_id=parent_run_id,
+                session_initializer=session_initializer,
             )
         except Exception:
             return self._persist_runtime_failure(
@@ -614,14 +621,14 @@ class IsolatedAgentTaskExecutor:
             )
         return resolved
 
-    def _prepare_session(
+    def _plan_session(
         self,
         *,
         session_key: str,
         workdir: str | None,
-    ) -> None:
+    ) -> TaskSessionSetupPlan:
         try:
-            self._session_preparer.prepare(
+            plan = self._session_preparer.plan(
                 session_key=session_key,
                 workdir=workdir,
             )
@@ -629,8 +636,89 @@ class IsolatedAgentTaskExecutor:
             raise
         except Exception as exc:
             raise TaskSessionPreparationError(
-                "task session could not be prepared"
+                "task session setup could not be planned"
             ) from exc
+        if not callable(getattr(plan, "prepare", None)):
+            raise TaskSessionPreparationError(
+                "task session preparer returned an invalid setup plan"
+            )
+        return plan
+
+    @staticmethod
+    def _build_run_spec(
+        *,
+        session_key: str,
+        goal: str,
+        system_prompt: str,
+        role: AgentRoleSpec,
+        resolved_tools: ResolvedAgentTools,
+    ) -> IsolatedAgentRunSpec:
+        """在状态写入前构造并冻结完整隔离执行计划。"""
+
+        try:
+            return IsolatedAgentRunSpec(
+                session_key=session_key,
+                goal=goal,
+                system_prompt=system_prompt,
+                model=role.model,
+                max_iterations=role.max_iterations,
+                tool_definitions=resolved_tools.definitions,
+                allowed_tool_names=resolved_tools.allowed_tool_names,
+                model_kwargs=role.model_kwargs,
+            )
+        except Exception as exc:
+            raise TaskExecutionError(
+                "isolated agent execution plan is invalid",
+                error_type="agent_execution_spec_invalid",
+            ) from exc
+
+    @staticmethod
+    def _build_session_initializer(
+        *,
+        session_key: str,
+        setup_plan: TaskSessionSetupPlan,
+    ) -> IsolatedAgentSessionInitializer:
+        """把编排 SetupPlan 适配为 Runtime 的通用初始化器。"""
+
+        expected_session_key = session_key
+
+        def initialize_session(*, session_key: str) -> None:
+            if session_key != expected_session_key:
+                raise IsolatedAgentSessionSetupError(
+                    "isolated agent session key does not match setup plan",
+                    error_type="task_session_key_invalid",
+                    retryable=False,
+                )
+            try:
+                setup_plan.prepare()
+            except TaskSessionPreparationError as exc:
+                error_type = IsolatedAgentTaskExecutor._safe_error_type(
+                    exc.error_type,
+                    fallback="task_session_preparation_failed",
+                )
+                safe_message = (
+                    IsolatedAgentTaskExecutor._safe_preparation_message(exc)
+                )
+                raise IsolatedAgentSessionSetupError(
+                    safe_message,
+                    error_type=error_type,
+                    retryable=exc.retryable,
+                ) from None
+            except Exception as exc:
+                logger.error(
+                    (
+                        "Orchestration task session setup failed: "
+                        "exception_type=%s"
+                    ),
+                    type(exc).__name__,
+                )
+                raise IsolatedAgentSessionSetupError(
+                    "isolated agent session setup failed",
+                    error_type="isolated_session_setup_failed",
+                    retryable=False,
+                ) from None
+
+        return initialize_session
 
     @staticmethod
     def _build_session_key(claim: TaskClaim) -> str:
@@ -690,6 +778,67 @@ class IsolatedAgentTaskExecutor:
         copied["orchestration_task_id"] = claim.task.task_id
         copied["orchestration_run_id"] = claim.run.run_id
         return copied
+
+    def _release_pre_execution_claim(
+        self,
+        claim: TaskClaim,
+        *,
+        error: BaseException,
+    ) -> TaskExecutionOutcome:
+        """依赖读取失败时释放未执行 Claim，不消耗正式执行预算。"""
+
+        logger.warning(
+            (
+                "Orchestration task preparation read failed: "
+                "workflow_id=%s task_id=%s run_id=%s exception_type=%s"
+            ),
+            claim.workflow.workflow_id,
+            claim.task.task_id,
+            claim.run.run_id,
+            type(error).__name__,
+        )
+        try:
+            self._service.release_task_claim(
+                task_id=claim.task.task_id,
+                claim_token=claim.claim_token,
+                reason="task_preparation_persistence_unavailable",
+            )
+        except TaskClaimLostError:
+            return self._claim_lost_outcome(
+                claim,
+                session_key=None,
+                runtime_status=None,
+                summary=None,
+            )
+        except Exception as exc:
+            logger.warning(
+                (
+                    "Orchestration pre-execution claim release unknown: "
+                    "workflow_id=%s task_id=%s run_id=%s "
+                    "exception_type=%s"
+                ),
+                claim.workflow.workflow_id,
+                claim.task.task_id,
+                claim.run.run_id,
+                type(exc).__name__,
+            )
+            return self._persistence_unknown_outcome(
+                claim,
+                session_key=None,
+                runtime_status=None,
+                summary=None,
+            )
+        return self._outcome(
+            claim,
+            kind=TaskExecutionOutcomeKind.RELEASED,
+            session_key=None,
+            runtime_status=None,
+            summary=None,
+            error_type="task_preparation_persistence_unavailable",
+            error_message="task preparation data could not be read",
+            retryable=True,
+            persisted=True,
+        )
 
     def _persist_runtime_result(
         self,
@@ -1079,6 +1228,8 @@ class IsolatedAgentTaskExecutor:
         runtime_status: str | None,
         summary: str | None,
     ) -> TaskExecutionOutcome:
+        """报告已尝试状态写入、但无法确认事务是否提交。"""
+
         return self._outcome(
             claim,
             kind=TaskExecutionOutcomeKind.PERSISTENCE_UNKNOWN,

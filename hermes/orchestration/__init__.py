@@ -21,6 +21,7 @@ from hermes.orchestration.execution import (
     TaskExecutionOutcome,
     TaskExecutionOutcomeKind,
     TaskSessionPreparer,
+    TaskSessionSetupPlan,
     TaskToolResolver,
 )
 from hermes.orchestration.models import (
@@ -68,6 +69,7 @@ __all__ = [
     "TaskRunRecord",
     "TaskRunStatus",
     "TaskSessionPreparer",
+    "TaskSessionSetupPlan",
     "TaskSessionPreparationError",
     "TaskStatus",
     "TaskToolResolutionError",

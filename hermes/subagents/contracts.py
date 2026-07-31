@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Protocol
 
 
 def _freeze_value(value: object) -> object:
@@ -97,6 +98,13 @@ def _freeze_mapping(
     if not isinstance(frozen, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
     return frozen
+
+
+class IsolatedAgentSessionInitializer(Protocol):
+    """在 Executor 已接管 Session 后执行一次通用初始化。"""
+
+    def __call__(self, *, session_key: str) -> None:
+        """仅按可信 session_key 初始化可被统一清理的资源。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +238,7 @@ class IsolatedAgentRunResult:
 
 
 __all__ = [
+    "IsolatedAgentSessionInitializer",
     "IsolatedAgentRunResult",
     "IsolatedAgentRunSpec",
 ]

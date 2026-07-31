@@ -17,7 +17,10 @@ if TYPE_CHECKING:
 
 
 class TaskExecutionOutcomeKind(StrEnum):
-    """同时说明 Agent 结果与持久化落点的一次执行结果。"""
+    """同时说明 Agent 结果与持久化落点的一次执行结果。
+
+    PERSISTENCE_UNKNOWN 仅表示已尝试状态变更，但无法确认事务是否提交。
+    """
 
     COMPLETED = "completed"
     FAILED = "failed"
@@ -177,16 +180,23 @@ class TaskToolResolver(Protocol):
         """解析角色工具；不可用或被完整过滤的工具集必须失败。"""
 
 
-class TaskSessionPreparer(Protocol):
-    """在 Agent 启动前准备一次独立 Session 的窄端口。"""
+class TaskSessionSetupPlan(Protocol):
+    """在 Runtime 接管 Session 后执行的独立初始化计划。"""
 
-    def prepare(
+    def prepare(self) -> None:
+        """初始化可被统一清理的资源；不得自行承担最终清理。"""
+
+
+class TaskSessionPreparer(Protocol):
+    """在状态写入前生成无资源副作用的 Session 初始化计划。"""
+
+    def plan(
         self,
         *,
         session_key: str,
         workdir: str | None,
-    ) -> None:
-        """准备必须失败原子；不得改变其他 Session 或进程级 cwd。"""
+    ) -> TaskSessionSetupPlan:
+        """只校验并冻结参数，不创建 Backend、目录、文件或进程。"""
 
 
 class ClaimedTaskExecutor(Protocol):
@@ -210,5 +220,6 @@ __all__ = [
     "TaskExecutionOutcome",
     "TaskExecutionOutcomeKind",
     "TaskSessionPreparer",
+    "TaskSessionSetupPlan",
     "TaskToolResolver",
 ]

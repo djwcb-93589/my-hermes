@@ -12,7 +12,9 @@ from hermes.session_resources import cleanup_session_resources
 from hermes.subagents.contracts import (
     IsolatedAgentRunResult,
     IsolatedAgentRunSpec,
+    IsolatedAgentSessionInitializer,
 )
+from hermes.subagents.errors import IsolatedAgentSessionSetupError
 
 
 if TYPE_CHECKING:
@@ -158,6 +160,7 @@ class IsolatedAgentExecutor:
         tool_context: Mapping[str, object] | None = None,
         hook_registry: SyncHookRegistry | None = None,
         parent_run_id: str | None = None,
+        session_initializer: IsolatedAgentSessionInitializer | None = None,
     ) -> IsolatedAgentRunResult:
         """校验完整计划，并在接受有效 session 后独占最终清理。"""
 
@@ -181,6 +184,13 @@ class IsolatedAgentExecutor:
                 validation_error = self._validate_spec_fields(spec)
                 if validation_error is not None:
                     result = self._invalid_spec_result(validation_error)
+                elif (
+                    session_initializer is not None
+                    and not callable(session_initializer)
+                ):
+                    result = self._invalid_spec_result(
+                        "session_initializer must be callable"
+                    )
                 elif callable(cancel_checker) and bool(cancel_checker()):
                     result = self._cancelled_result()
                 else:
@@ -198,28 +208,35 @@ class IsolatedAgentExecutor:
                         raise TypeError(
                             "model_kwargs must resolve to a dict"
                         )
-                    loop = IsolatedAgentLoop(
-                        model=spec.model,
-                        max_iterations=spec.max_iterations,
-                        tools=tools,
-                        system_prompt=spec.system_prompt,
-                        registry=self._registry,
-                        client=self._client,
+                    setup_result = self._initialize_session(
+                        session_initializer,
                         session_key=spec.session_key,
-                        allowed_tool_names=spec.allowed_tool_names,
-                        model_kwargs=model_kwargs,
-                        cancel_checker=cancel_checker,
-                        tool_context=(
-                            dict(tool_context)
-                            if tool_context is not None
-                            else None
-                        ),
-                        hook_registry=hook_registry,
-                        parent_run_id=parent_run_id,
                     )
-                    result = self._from_agent_loop_result(
-                        loop.run(spec.goal)
-                    )
+                    if setup_result is not None:
+                        result = setup_result
+                    else:
+                        loop = IsolatedAgentLoop(
+                            model=spec.model,
+                            max_iterations=spec.max_iterations,
+                            tools=tools,
+                            system_prompt=spec.system_prompt,
+                            registry=self._registry,
+                            client=self._client,
+                            session_key=spec.session_key,
+                            allowed_tool_names=spec.allowed_tool_names,
+                            model_kwargs=model_kwargs,
+                            cancel_checker=cancel_checker,
+                            tool_context=(
+                                dict(tool_context)
+                                if tool_context is not None
+                                else None
+                            ),
+                            hook_registry=hook_registry,
+                            parent_run_id=parent_run_id,
+                        )
+                        result = self._from_agent_loop_result(
+                            loop.run(spec.goal)
+                        )
         except Exception as exc:
             result = self._internal_error_result(exc)
         finally:
@@ -294,6 +311,36 @@ class IsolatedAgentExecutor:
         return None
 
     @staticmethod
+    def _initialize_session(
+        initializer: IsolatedAgentSessionInitializer | None,
+        *,
+        session_key: str,
+    ) -> IsolatedAgentRunResult | None:
+        """在 Executor 所有权内初始化 Session，并收敛安全错误。"""
+
+        if initializer is None:
+            return None
+        try:
+            initializer(session_key=session_key)
+        except IsolatedAgentSessionSetupError as exc:
+            return IsolatedAgentExecutor._session_setup_error_result(
+                safe_message=exc.safe_message,
+                error_type=exc.error_type,
+                retryable=exc.retryable,
+            )
+        except Exception as exc:
+            logger.error(
+                "Isolated Agent session setup failed: exception_type=%s",
+                type(exc).__name__,
+            )
+            return IsolatedAgentExecutor._session_setup_error_result(
+                safe_message="isolated agent session setup failed",
+                error_type="isolated_session_setup_failed",
+                retryable=False,
+            )
+        return None
+
+    @staticmethod
     def _from_agent_loop_result(
         result: AgentLoopResult,
     ) -> IsolatedAgentRunResult:
@@ -330,6 +377,31 @@ class IsolatedAgentExecutor:
             error_type="cancelled",
             fatal=True,
             retryable=False,
+            approval_request=None,
+            tool_batches=0,
+            tool_call_count=0,
+        )
+
+    @staticmethod
+    def _session_setup_error_result(
+        *,
+        safe_message: str,
+        error_type: str,
+        retryable: bool,
+    ) -> IsolatedAgentRunResult:
+        """构造不泄漏初始化参数的稳定 Session setup 失败。"""
+
+        return IsolatedAgentRunResult(
+            ok=False,
+            status="error",
+            summary="",
+            messages=(),
+            iterations=0,
+            tools_used=(),
+            error=safe_message,
+            error_type=error_type,
+            fatal=not retryable,
+            retryable=retryable,
             approval_request=None,
             tool_batches=0,
             tool_call_count=0,
