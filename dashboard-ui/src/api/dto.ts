@@ -29,8 +29,51 @@ export type BackendOwnership =
   | "unmanaged"
   | "none"
   | "uncertain";
+export type BackendControlAction = "start" | "stop" | "restart";
+export type BackendControlRequestStatus =
+  | "pending"
+  | "claimed"
+  | "executing"
+  | "succeeded"
+  | "failed"
+  | "rejected";
+export type BackendResultCode =
+  | "started"
+  | "stopped"
+  | "restarted"
+  | "already_running"
+  | "already_stopped"
+  | "unmanaged_instance"
+  | "ownership_uncertain"
+  | "control_conflict"
+  | "start_failed"
+  | "stop_failed"
+  | "restart_failed"
+  | "gateway_exited_before_ready"
+  | "control_timeout"
+  | "supervisor_lease_lost";
 
-export interface BackendStatusResponseDto {
+export interface BackendControlAcceptedApiResponse {
+  request_id: string;
+  action: BackendControlAction;
+  status: BackendControlRequestStatus;
+}
+
+export interface BackendControlRequestApiResponse {
+  request_id: string;
+  backend_type: "gateway";
+  action: BackendControlAction;
+  status: BackendControlRequestStatus;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  result_code: BackendResultCode | null;
+  result_reference: string | null;
+  exception_type: string | null;
+  forced_termination: boolean;
+}
+
+export interface BackendStatusApiResponse {
   observed_at: string;
   supervisor: {
     online: boolean;
@@ -48,7 +91,10 @@ export interface BackendStatusResponseDto {
     config_changed_since_start: boolean | null;
     restart_recommended: boolean | null;
   };
+  latest_request: BackendControlRequestApiResponse | null;
 }
+
+export type BackendStatusResponseDto = BackendStatusApiResponse;
 
 export type RuntimeReportedState =
   | "starting"

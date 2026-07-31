@@ -33,6 +33,7 @@ export class HttpError extends Error {
 export interface HttpRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  allowedPublicErrorCodes?: readonly string[];
 }
 
 interface HttpClientOptions {
@@ -42,10 +43,9 @@ interface HttpClientOptions {
 }
 
 interface TransportRequestOptions extends HttpRequestOptions {
-  method: "GET" | "PATCH";
+  method: "GET" | "PATCH" | "POST";
   headers: Headers;
   body?: object;
-  allowedPublicErrorCodes?: readonly string[];
 }
 
 class HttpTransport {
@@ -170,9 +170,9 @@ export class HttpClient {
 
     try {
       return await transport.request<T>(path, {
+        ...options,
         method: "GET",
         headers,
-        ...options,
       });
     } catch (error: unknown) {
       if (
@@ -187,11 +187,9 @@ export class HttpClient {
   }
 }
 
-interface ConfigControlRequestOptions extends HttpRequestOptions {
-  allowedPublicErrorCodes?: readonly string[];
-}
+export type GatewayControlTransportAction = "start" | "stop" | "restart";
 
-export class EphemeralConfigControlClient {
+export class EphemeralControlTransport {
   #controlToken: string | null;
 
   constructor(controlToken: string) {
@@ -203,31 +201,75 @@ export class EphemeralConfigControlClient {
 
   async patchConfig<T>(
     body: object,
-    options: ConfigControlRequestOptions = {},
+    options: HttpRequestOptions = {},
   ): Promise<T> {
-    const controlToken = this.#controlToken;
-    if (controlToken === null) {
-      throw new HttpError("authentication_required", 401);
-    }
-    const headers = new Headers({
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    });
-    try {
-      headers.set(CONTROL_TOKEN_HEADER, controlToken);
-    } catch {
-      throw new HttpError("authentication_required", 401);
-    }
+    const headers = this.#headers();
+    headers.set("Content-Type", "application/json");
     return transport.request<T>("/api/config", {
+      ...options,
       method: "PATCH",
       headers,
       body,
+    });
+  }
+
+  async postGatewayAction<T>(
+    action: GatewayControlTransportAction,
+    idempotencyKey: string,
+    options: HttpRequestOptions = {},
+  ): Promise<T> {
+    const path = gatewayControlPath(action);
+    if (
+      typeof idempotencyKey !== "string" ||
+      idempotencyKey.trim() !== idempotencyKey ||
+      idempotencyKey.length < 8 ||
+      idempotencyKey.length > 128
+    ) {
+      throw new HttpError("request_failed");
+    }
+    const headers = this.#headers();
+    try {
+      headers.set("Idempotency-Key", idempotencyKey);
+    } catch {
+      throw new HttpError("request_failed");
+    }
+    return transport.request<T>(path, {
       ...options,
+      method: "POST",
+      headers,
     });
   }
 
   dispose(): void {
     this.#controlToken = null;
+  }
+
+  #headers(): Headers {
+    const controlToken = this.#controlToken;
+    if (controlToken === null) {
+      throw new HttpError("authentication_required", 401);
+    }
+    const headers = new Headers({ Accept: "application/json" });
+    try {
+      headers.set(CONTROL_TOKEN_HEADER, controlToken);
+    } catch {
+      throw new HttpError("authentication_required", 401);
+    }
+    return headers;
+  }
+}
+
+// 保留 M6.2 的公开导入名称，实际 Token 生命周期仍由同一传输实现负责。
+export { EphemeralControlTransport as EphemeralConfigControlClient };
+
+function gatewayControlPath(action: GatewayControlTransportAction): string {
+  switch (action) {
+    case "start":
+      return "/api/backend/gateway/start";
+    case "stop":
+      return "/api/backend/gateway/stop";
+    case "restart":
+      return "/api/backend/gateway/restart";
   }
 }
 

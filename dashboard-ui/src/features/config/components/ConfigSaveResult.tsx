@@ -1,3 +1,5 @@
+import { Link } from "react-router-dom";
+
 import type { ConfigSaveResultViewModel } from "../configModels";
 
 interface ConfigSaveResultProps {
@@ -20,9 +22,14 @@ export function ConfigSaveResult({
         <h2>配置修改已提交</h2>
       </div>
       {result.restartRequired ? (
-        <p className="restart-result">
-          配置已保存，需要重启 Gateway 才能生效
-        </p>
+        <div className="restart-result config-restart-result">
+          <span>配置已保存，需要重启 Gateway 才能生效</span>
+          {result.restartTargets.some((target) => target.code === "gateway") ? (
+            <Link className="secondary-button button-link" to="/backend">
+              前往 Backend 页面
+            </Link>
+          ) : null}
+        </div>
       ) : (
         <p>本次变更不需要执行重启操作。</p>
       )}
@@ -59,4 +66,3 @@ export function ConfigSaveResult({
     </aside>
   );
 }
-

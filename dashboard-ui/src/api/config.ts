@@ -1,5 +1,5 @@
 import {
-  EphemeralConfigControlClient,
+  EphemeralControlTransport,
   HttpError,
   type HttpClient,
 } from "./http";
@@ -132,7 +132,7 @@ export async function patchConfig(
   request: ConfigPatchApiRequest,
   signal?: AbortSignal,
 ): Promise<ConfigPatchApiResponse> {
-  const client = new EphemeralConfigControlClient(controlToken);
+  const client = new EphemeralControlTransport(controlToken);
   try {
     const payload = await client.patchConfig<unknown>(request, {
       signal,

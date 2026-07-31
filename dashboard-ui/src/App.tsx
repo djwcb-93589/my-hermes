@@ -4,6 +4,7 @@ import { AuthProvider, useAuth } from "./auth/AuthContext";
 import { AuthenticationStatus } from "./auth/AuthenticationStatus";
 import { TokenPrompt } from "./auth/TokenPrompt";
 import { AppShell } from "./components/AppShell";
+import { BackendPage } from "./features/backend/BackendPage";
 import { ConfigPage } from "./features/config/ConfigPage";
 import { OverviewPage } from "./features/overview/OverviewPage";
 
@@ -16,6 +17,8 @@ const router = createBrowserRouter([
       { path: "overview", element: <OverviewPage /> },
       { path: "config", element: <ConfigPage /> },
       { path: "config/*", element: <ConfigPage /> },
+      { path: "backend", element: <BackendPage /> },
+      { path: "backend/*", element: <BackendPage /> },
     ],
   },
 ]);

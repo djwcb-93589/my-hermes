@@ -33,6 +33,7 @@ export function AppShell() {
               Overview
             </NavLink>
             <NavLink to="/config">Configuration</NavLink>
+            <NavLink to="/backend">Backend</NavLink>
           </nav>
           {state === "authenticated_with_read_token" ? (
             <button
