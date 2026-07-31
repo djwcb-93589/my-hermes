@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 from collections import deque
 from collections.abc import Callable
+import ctypes
 from dataclasses import dataclass, field
 import errno
 import os
@@ -20,9 +21,9 @@ from hermes.backends import (
     BackgroundPtyDependencyUnavailableError,
     BackgroundPtyStartError,
 )
+from hermes.backends import local as _local_backend
 from hermes.backends.local import (
     BackgroundProcessCleanupError,
-    _assign_windows_pid_to_job,
     _close_windows_job_strict,
     _create_windows_job,
     _posix_process_group_exists,
@@ -73,14 +74,23 @@ while True:
     except OSError:
         state = b""
     if state == b"ready\\n":
-        gate.write_bytes(b"accepted\\n")
         break
     if time.monotonic() >= deadline:
         raise SystemExit(125)
     time.sleep(0.05)
 
 try:
-    result = subprocess.call(sys.argv[2:])
+    child = subprocess.Popen(sys.argv[2:])
+except BaseException:
+    raise SystemExit(126)
+
+try:
+    gate.write_bytes(b"accepted\\n")
+except BaseException:
+    raise SystemExit(127)
+
+try:
+    result = child.wait()
 except BaseException:
     result = 126
 raise SystemExit(result)
@@ -128,6 +138,51 @@ class _PtyStartFailureContext(RuntimeError):
         super().__init__(message)
 
 
+def _open_windows_process_handle_for_job(pid: int) -> object:
+    """打开可分配到 Job 的临时进程句柄，不把句柄值写入异常。"""
+
+    if sys.platform != "win32":
+        raise RuntimeError("Windows process handles are unavailable")
+    process_handle = _local_backend._kernel32.OpenProcess(
+        _local_backend._PROCESS_SET_QUOTA
+        | _local_backend._PROCESS_TERMINATE,
+        False,
+        pid,
+    )
+    if not process_handle:
+        raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+    return process_handle
+
+
+def _assign_windows_process_handle_to_job(
+    process_handle: object,
+    job_handle: object | None,
+) -> None:
+    """使用已归 Handle 所有的临时进程句柄执行 Job 分配。"""
+
+    if sys.platform != "win32" or not job_handle:
+        raise RuntimeError("Windows Job handle is unavailable")
+    if not _local_backend._kernel32.AssignProcessToJobObject(
+        job_handle,
+        process_handle,
+    ):
+        raise OSError(
+            ctypes.get_last_error(),
+            "AssignProcessToJobObject failed",
+        )
+
+
+def _close_windows_process_handle_strict(
+    process_handle: object,
+) -> None:
+    """严格关闭临时进程句柄；失败时由 PTY Handle 保留所有权。"""
+
+    if sys.platform != "win32":
+        return
+    if not _local_backend._kernel32.CloseHandle(process_handle):
+        raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+
+
 def load_local_pty_binding() -> tuple[object, object | None]:
     """加载 PTY 类及显式 ConPTY 选择，缺失时绝不回退 pipe。"""
 
@@ -171,6 +226,8 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
         self._job_handle: object | None = None
         self._job_assigned = False
         self._job_assignment_pending = False
+        self._windows_process_handle_lock = threading.Lock()
+        self._pending_windows_process_handles: list[object] = []
         self._last_exit_code: int | None = None
         self._tree_exit_confirmed = False
 
@@ -317,6 +374,52 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
         with self._operation_lock:
             return self._transport is not None
 
+    def owns_managed_resources(self) -> bool:
+        """返回启动失败后是否仍有资源必须通过公共 Handle 重试释放。"""
+
+        with self._operation_lock:
+            owns_resources = any((
+                self._transport is not None,
+                self._transport_close_state is not None,
+                self._job_handle is not None,
+                self._snapshot_path is not None,
+                self._startup_gate_path is not None,
+            ))
+        if owns_resources:
+            return True
+        with self._windows_process_handle_lock:
+            return bool(self._pending_windows_process_handles)
+
+    def _open_owned_windows_process_handle(self, pid: int) -> object:
+        """OpenProcess 成功后立即把临时句柄登记为 Handle 私有资源。"""
+
+        with self._windows_process_handle_lock:
+            process_handle = _open_windows_process_handle_for_job(pid)
+            self._pending_windows_process_handles.append(process_handle)
+            return process_handle
+
+    def _close_owned_windows_process_handle(
+        self,
+        process_handle: object,
+    ) -> None:
+        """成功 CloseHandle 后才移除 pending 所有权，失败可继续重试。"""
+
+        with self._windows_process_handle_lock:
+            pending_index = next(
+                (
+                    index
+                    for index, pending_handle in enumerate(
+                        self._pending_windows_process_handles
+                    )
+                    if pending_handle is process_handle
+                ),
+                None,
+            )
+            if pending_index is None:
+                return
+            _close_windows_process_handle_strict(process_handle)
+            del self._pending_windows_process_handles[pending_index]
+
     def assign_windows_job(self) -> None:
         """通过 ConPTY PID 临时打开句柄，并在放行 bootstrap 前加入 Job。"""
 
@@ -330,15 +433,29 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
             pid = self._require_pid_locked()
             job_handle = self._job_handle
             self._job_assignment_pending = True
+
+        process_handle = self._open_owned_windows_process_handle(pid)
         try:
-            _assign_windows_pid_to_job(pid, job_handle)
-        except BaseException:
-            # 分配或临时句柄关闭失败时保留 unknown，清理会同时覆盖 Job 与 PID。
+            _assign_windows_process_handle_to_job(
+                process_handle,
+                job_handle,
+            )
+        except BaseException as assignment_error:
+            try:
+                self._close_owned_windows_process_handle(process_handle)
+            except BaseException as close_error:
+                combined_error = RuntimeError(
+                    "Windows Job assignment and process handle release failed"
+                )
+                combined_error._assignment_error = assignment_error
+                combined_error._close_error = close_error
+                raise combined_error from assignment_error
             raise
         else:
             with self._operation_lock:
                 self._job_assigned = True
                 self._job_assignment_pending = False
+            self._close_owned_windows_process_handle(process_handle)
 
     def start_output_reader(self) -> None:
         """在树级终止能力就绪后启动唯一 PTY reader。"""
@@ -406,6 +523,17 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
 
         return self.poll() is not None
 
+    def startup_process_exit_code(self) -> int | None:
+        """只查询 Windows bootstrap 根进程，用于 accepted 前快速失败。"""
+
+        if sys.platform != "win32":
+            raise RuntimeError("PTY startup process is Windows-only")
+        with self._operation_lock:
+            transport = self._transport
+            if transport is None:
+                raise RuntimeError("PTY process handle is not initialized")
+            return self._transport_exit_code(transport)
+
     def read_available(self) -> BackgroundProcessOutput:
         """原子交付 PTY 原始追加流、丢弃计数和 reader 错误。"""
 
@@ -455,6 +583,11 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
     def interrupt(self) -> bool:
         """POSIX 向 PGID 发 SIGINT；Windows 经 ConPTY 写入 Ctrl+C。"""
 
+        with self._operation_lock:
+            if self._transport is None and self._pid is None:
+                # 启动失败可能只留下 Job 或临时句柄，此时从未有可中断的进程。
+                return False
+
         if sys.platform != "win32":
             with self._operation_lock:
                 process_group_id = self._process_group_id
@@ -482,6 +615,11 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
 
     def kill(self) -> bool:
         """强制终止整个 Windows Job 或保存的 POSIX 进程组。"""
+
+        with self._operation_lock:
+            if self._transport is None and self._pid is None:
+                # 返回 False 后 ProcessManager 仍会通过 poll 确认，并重试释放剩余资源。
+                return False
 
         if sys.platform != "win32":
             with self._operation_lock:
@@ -601,6 +739,8 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
                     if self._output_thread is output_thread:
                         self._output_thread = None
 
+        self._release_pending_windows_process_handles(errors)
+
         if errors:
             self._raise_close_error(errors)
 
@@ -633,6 +773,10 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
             resources_released = resources_released and (
                 self._input_worker is None and self._input_operation is None
             )
+        with self._windows_process_handle_lock:
+            resources_released = resources_released and not (
+                self._pending_windows_process_handles
+            )
         if errors or not resources_released:
             if not errors:
                 errors.append(RuntimeError("PTY process resources remain open"))
@@ -647,7 +791,12 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
             return 0 if self._last_exit_code is None else self._last_exit_code
         transport = self._transport
         if transport is None:
-            raise RuntimeError("PTY process handle is not initialized")
+            # 仅持有 Job、临时 handle 或路径的失败启动也可交给 Manager 重试 close。
+            if self._pid is not None:
+                raise RuntimeError("PTY process status is unavailable")
+            self._last_exit_code = 0
+            self._tree_exit_confirmed = True
+            return 0
 
         root_exit_code = self._transport_exit_code(transport)
         if sys.platform == "win32":
@@ -886,13 +1035,32 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
             return
 
         try:
-            operation.delivery_unknown = True
             if sys.platform == "win32":
-                # pywinpty 的高层 API 接收 str；正常返回表示整段已交给 ConPTY。
-                write(payload)
-                operation.bytes_written = len(payload.encode("utf-8"))
-                return
+                # pywinpty 接收 str，但返回实际写入的 UTF-8 字节数。
+                expected_bytes = len(payload.encode("utf-8"))
+                operation.delivery_unknown = True
+                written = write(payload)
+                if (
+                    isinstance(written, bool)
+                    or not isinstance(written, int)
+                    or written < 0
+                    or written > expected_bytes
+                ):
+                    raise OSError("PTY input write returned an invalid result")
+                if written == expected_bytes:
+                    operation.bytes_written = written
+                    operation.delivery_unknown = False
+                    return
+                if written == 0:
+                    # 明确的零字节结果表示没有送达，不自动重试。
+                    operation.delivery_unknown = False
+                    raise OSError("PTY input write made no progress")
+                # 字节边界可能落在多字节字符中；部分写入不得续写或重放。
+                operation.bytes_written = written
+                operation.delivery_unknown = True
+                raise OSError("PTY input write was incomplete")
 
+            operation.delivery_unknown = True
             encoded = payload.encode("utf-8")
             offset = 0
             while offset < len(encoded):
@@ -906,6 +1074,7 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
                     raise OSError("PTY input write made no progress")
                 offset += written
                 operation.bytes_written = offset
+            operation.delivery_unknown = False
         except BaseException as error:
             operation.error = error
 
@@ -1116,6 +1285,20 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
         finally:
             state.completed.set()
 
+    def _release_pending_windows_process_handles(
+        self,
+        errors: list[BaseException],
+    ) -> None:
+        """逐个重试临时 Windows handle，成功项才从 pending 集合移除。"""
+
+        with self._windows_process_handle_lock:
+            pending_handles = tuple(self._pending_windows_process_handles)
+        for process_handle in pending_handles:
+            try:
+                self._close_owned_windows_process_handle(process_handle)
+            except BaseException as error:
+                errors.append(error)
+
     def _release_owned_paths(self, errors: list[BaseException]) -> None:
         """严格删除 snapshot/gate；失败路径保留引用供下一次 close。"""
 
@@ -1227,12 +1410,13 @@ def spawn_local_pty_background(
         try:
             _dispose_pty_before_return(handle)
         except BackgroundProcessCleanupError as cleanup_error:
-            if handle.owns_process():
-                try:
-                    # 清理未确认时尽量恢复 transport reader，后续 Manager 可持续排空输出。
-                    handle.start_output_reader()
-                except BaseException as reader_error:
-                    cleanup_error._reader_start_error = reader_error
+            if handle.owns_managed_resources():
+                if handle.owns_process():
+                    try:
+                        # 清理未确认时尽量恢复 reader，后续 Manager 可持续排空输出。
+                        handle.start_output_reader()
+                    except BaseException as reader_error:
+                        cleanup_error._reader_start_error = reader_error
                 handoff_error = BackgroundProcessStartCleanupError(
                     "PTY process start failed and cleanup could not be confirmed",
                     handle=handle,
@@ -1354,6 +1538,10 @@ def _await_windows_gate_accepted(
             state = b""
         if state == b"accepted\n":
             return
+        if handle.startup_process_exit_code() is not None:
+            raise BackgroundPtyStartError(
+                "PTY background process could not be started"
+            )
         if handle.poll() is not None:
             raise BackgroundPtyStartError(
                 "PTY background process could not be started"
