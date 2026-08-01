@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
@@ -13,8 +12,9 @@ from pathlib import Path
 
 import yaml
 
-from hermes._io_utils import LockTimeout, atomic_write_text, file_lock
+from hermes._io_utils import LockTimeout, atomic_write_text
 from hermes.config import HERMES_HOME
+from hermes.skill_locking import acquire_skill_lock, skill_lock_target
 
 
 SKILLS_DIR = HERMES_HOME / "skills"
@@ -156,14 +156,11 @@ class SkillRepository:
 
     def _skill_lock_target(self, name: str) -> Path:
         """返回操作锁目标，file_lock 会生成 ``.locks/<name>.lock``。"""
-        return self.skills_dir / ".locks" / name
+        return skill_lock_target(self.skills_dir, name)
 
-    @contextlib.contextmanager
     def _skill_operation_lock(self, name: str):
         """为同一个 Skill 的全部写操作提供唯一的跨进程锁。"""
-        self._skill_lock_target(name).parent.mkdir(parents=True, exist_ok=True)
-        with file_lock(self._skill_lock_target(name)):
-            yield
+        return acquire_skill_lock(self.skills_dir, name)
 
     @staticmethod
     def _governance_payload(record: dict) -> str:
