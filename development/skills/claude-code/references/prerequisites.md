@@ -6,7 +6,7 @@
 
 1. **Backend 能力**：supervised PTY 需要 `LocalBackend`。可信运行时上下文已经公开给出 Backend 类型时可以预先判断；否则不要读取 Backend 实例、session registry、ToolRegistry 或 runtime 私有字段，直接通过 Terminal Tool 的公开调用尝试启动。
 2. **Tool 可用性**：只依据当前 Agent 已公开、可调用的 Tool 确认同一可信 session 拥有 Terminal Tool 和 Process Tool；不要探查私有注册表。
-3. **工作目录**：明确 Claude Code 的目标工作目录。先确认当前 Terminal cwd 与目标一致；不要依赖提示文本让 Claude Code自行猜测目录。
+3. **工作目录与授权**：明确 Claude Code 的目标工作目录。先确认当前 Terminal cwd 与目标一致；对于修改任务，还要确认用户已授权目标和修改范围。不要依赖提示文本让 Claude Code 自行猜测目录，也不要把纯分析授权扩展为修改授权。
 4. **CLI 可用性**：通过 Git Bash/POSIX 语义执行公开检查：
 
    ```text
@@ -15,7 +15,9 @@
    ```
 
    `command -v` 失败表示命令不可用；`claude --version` 只用于诊断、报告和辅助识别明显过旧版本，不以固定版本字符串作为唯一能力依据。`claude --help` 可以辅助诊断：出现 flag 是支持信号，未出现不能判定不支持。不要自动安装、升级、降级或改写 PATH。
-5. **PTY 必要性**：根据任务是否需要交互、纠偏或持续监督选择模式。print 模式足够时使用 one-shot。
+5. **认证就绪**：Claude Code 必须已经完成认证。`claude --version` 成功不代表认证就绪；不要自动启动登录流程、输入凭证或读取 Claude Code 私有配置。无法从用户确认或安全的公开结果确认认证可用时，停止启动并报告；运行中出现登录或凭证提示时同样停止自动操作。
+6. **cwd 会话互斥**：依据当前 Agent 已保存的 `process_id` 和 Process Tool 的公开 `list`/状态结果，确认同一 cwd 没有已知的活跃 Claude Code 会话。公开结果不足以排除重复会话时，不要根据 PID、Handle、command 私有字段或系统进程猜测，应向用户报告并确认后再继续。
+7. **PTY 必要性**：根据任务是否需要交互、纠偏或持续监督选择模式。print 模式足够时使用 one-shot。
 
 ## 模式能力检查
 

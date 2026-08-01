@@ -1,20 +1,48 @@
 ---
 name: claude-code
-description: Use when the user asks my-hermes to delegate coding work to Claude Code, monitor Claude Code progress, or steer an active Claude Code session. Prefer one-shot mode for non-interactive tasks and supervised PTY only when mid-task intervention is required.
-version: 0.2.0
+description: >-
+  Supervise Claude Code for repository-scale analysis, coordinated multi-file
+  changes, or long-running coding that needs incremental observation or
+  mid-task guidance. Use myHermes tools instead for simple shell/File/Terminal
+  work, tiny single-file changes, or small read-only tasks. Do not select when
+  cwd or modification authority is unclear, Claude Code is unavailable or
+  unauthenticated, or the cwd already has an active Claude Code session.
+version: 0.3.0
 platforms:
   - windows
   - linux
   - darwin
 metadata:
-  development_stage: local_user_preview
-  agent_integration: local_user
+  development_stage: agent_discovery
+  agent_integration: discovery_and_selection
   supports_one_shot: true
   supports_supervised_pty: true
   requires_process_input: true
 ---
 
 # Claude Code 主动监督
+
+## 选择边界
+
+只在目标 cwd 明确、用户已授权相应代码工作、Claude Code 已安装并认证，并且同一 cwd 没有活跃 Claude Code 会话时选择本 Skill。
+
+适用场景：
+
+- 仓库级代码分析或需要理解较大代码库；
+- 跨多个文件的协调修改；
+- 需要持续运行、增量观察和阶段判断的编码任务；
+- 需要多轮补充要求或中途纠偏；
+- 需要 Claude Code 长时间处理代码库，并由上层 Agent 主动监督。
+
+不要用于：
+
+- 一条普通 shell 命令，或简单 File/Terminal 操作；
+- 单文件极小修改，或只读取少量文件的任务；
+- cwd 不明确，或修改任务缺少用户授权；
+- Claude Code 未安装、未认证，或同一 cwd 已存在活跃会话；
+- myHermes 自身工具可以直接、可靠完成的任务。
+
+不要仅因任务提到“代码”就选择本 Skill。先使用完成任务所需的最小能力；简单任务继续优先使用现有 File 或 Terminal Tool。
 
 ## 职责边界
 
