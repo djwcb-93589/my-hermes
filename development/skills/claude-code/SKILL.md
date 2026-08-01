@@ -1,12 +1,13 @@
 ---
 name: claude-code
 description: >-
-  Supervise Claude Code for repository-scale analysis, coordinated multi-file
-  changes, or long-running coding that needs incremental observation or
-  mid-task guidance. Use myHermes tools instead for simple shell/File/Terminal
-  work, tiny single-file changes, or small read-only tasks. Do not select when
-  cwd or modification authority is unclear, Claude Code is unavailable or
-  unauthenticated, or the cwd already has an active Claude Code session.
+  Use for repository-scale analysis, coordinated multi-file changes, or
+  long-running coding work that may need progress monitoring and follow-up
+  instructions. Select and read this Skill when task scope, cwd, and user
+  authorization are clear; then run the required installation-state,
+  authentication, tool, PTY, and active-session preflight before launch. If
+  preflight fails, do not launch. Prefer normal File or Terminal operations for
+  small, direct tasks.
 version: 0.3.0
 platforms:
   - windows
@@ -22,9 +23,9 @@ metadata:
 
 # Claude Code 主动监督
 
-## 选择边界
+## 选择与启动边界
 
-只在目标 cwd 明确、用户已授权相应代码工作、Claude Code 已安装并认证，并且同一 cwd 没有活跃 Claude Code 会话时选择本 Skill。
+先根据任务本身判断是否匹配，不要在读取本 Skill 前调用 Terminal 或 Process 检查 Claude Code。任务范围、cwd 和用户授权明确，并且具备下列任一特征时，先调用 `skill_view(name="claude-code")`：
 
 适用场景：
 
@@ -34,15 +35,25 @@ metadata:
 - 需要多轮补充要求或中途纠偏；
 - 需要 Claude Code 长时间处理代码库，并由上层 Agent 主动监督。
 
-不要用于：
+以下任务不应选择本 Skill：
 
 - 一条普通 shell 命令，或简单 File/Terminal 操作；
 - 单文件极小修改，或只读取少量文件的任务；
 - cwd 不明确，或修改任务缺少用户授权；
-- Claude Code 未安装、未认证，或同一 cwd 已存在活跃会话；
-- myHermes 自身工具可以直接、可靠完成的任务。
+- myHermes 自身工具可以直接、可靠完成的任务；
+- 既不需要仓库级或多文件处理，也不需要长期监控或多轮控制的任务。
 
 不要仅因任务提到“代码”就选择本 Skill。先使用完成任务所需的最小能力；简单任务继续优先使用现有 File 或 Terminal Tool。
+
+```text
+任务适配判断
+→ skill_view
+→ 阅读正文及当前任务需要的 references
+→ 执行启动 preflight
+→ 全部通过后才启动 Claude Code
+```
+
+读取后，按 [prerequisites.md](references/prerequisites.md) 检查 Claude Code 安装与认证、Terminal/Process、所选模式需要的 PTY 或 pipe、cwd 会话互斥和授权风险。任一检查失败只表示当前不能启动：保留“本 Skill 已正确选择和读取”的事实，停止启动并报告具体阻断原因；不要自动安装、认证、终止已有会话或放宽权限。
 
 ## 职责边界
 
@@ -59,7 +70,7 @@ metadata:
 
 ## 加载指引
 
-启动前读取：
+选择本 Skill 后、启动前读取：
 
 - [prerequisites.md](references/prerequisites.md)：前置检查与任务约束提取。
 - [mode-selection.md](references/mode-selection.md)：one-shot 与 supervised PTY 的选择。
