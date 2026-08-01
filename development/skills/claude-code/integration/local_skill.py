@@ -931,7 +931,7 @@ def _trust_block_reason(trust_state: SkillTrustStoreState) -> str | None:
 def _management_block_reason(target: Path) -> str | None:
     """组合治理 sidecar 与通用 trust 状态，不读取存储格式。"""
 
-    governance_reason = _governance_reason(target) if installed else None
+    governance_reason = _governance_reason(target)
     if governance_reason is not None:
         return governance_reason
     return _trust_block_reason(inspect_skill_trust_state(SKILL_NAME))
