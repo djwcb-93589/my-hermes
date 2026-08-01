@@ -77,11 +77,12 @@ def atomic_write_text(
 ) -> None:
     """同目录写临时文件 -> flush/fsync -> os.replace 原子替换。
 
+    调用方传入的换行符按原样编码，不执行平台换行转换。
     异常时清理临时文件并重新抛出,旧文件保持不变。
     """
     tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        with open(tmp_path, "w", encoding=encoding) as f:
+        with open(tmp_path, "w", encoding=encoding, newline="") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())

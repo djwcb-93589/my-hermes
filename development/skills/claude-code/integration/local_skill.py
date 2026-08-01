@@ -745,15 +745,24 @@ def _read_ownership_state(skills_root: Path, target: Path) -> OwnershipState:
                 error_type="ownership_record_invalid",
                 error="ownership record exceeds the size limit",
             )
-        raw_text = raw_bytes.decode("utf-8")
-        data = json.loads(raw_text)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except OSError:
         return _ownership_failure(
             exists=True,
             error_type="ownership_record_invalid",
             error="ownership record is unreadable or invalid JSON",
         )
+
     fingerprint = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+        data = json.loads(raw_text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _ownership_failure(
+            exists=True,
+            error_type="ownership_record_invalid",
+            error="ownership record is unreadable or invalid JSON",
+            fingerprint=fingerprint,
+        )
     if not isinstance(data, dict):
         return _ownership_failure(
             exists=True,
@@ -876,7 +885,7 @@ def _write_ownership_record(
     target: Path,
     payload: str,
 ) -> OwnershipState:
-    """原子写入并重新读取所有权记录。"""
+    """原子写入并返回重新读取的所有权记录状态。"""
 
     state_dir, state_path = _ownership_paths(skills_root)
     if _lexists(state_path):
@@ -906,11 +915,6 @@ def _write_ownership_record(
             "ownership record could not be written atomically",
         ) from exc
     state = _read_ownership_state(skills_root, target)
-    if not state.valid:
-        raise LocalSkillError(
-            "state_write_failed",
-            "ownership record could not be verified after writing",
-        )
     return state
 
 
@@ -1076,44 +1080,50 @@ def _remove_staging(staging: Path | None, skills_root: Path) -> None:
         )
 
 
+def _read_rollback_ownership_fingerprint(state_path: Path) -> str:
+    """读取回滚校验使用的所有权记录原始字节指纹。"""
+
+    if _is_link_like(state_path) or not state_path.is_file():
+        raise LocalSkillError(
+            "rollback_failed",
+            "ownership record changed before rollback",
+        )
+    try:
+        state_stat = state_path.lstat()
+        if (
+            not stat.S_ISREG(state_stat.st_mode)
+            or state_stat.st_size > OWNERSHIP_MAX_BYTES
+        ):
+            raise LocalSkillError(
+                "rollback_failed",
+                "ownership record is unsafe to read during rollback",
+            )
+        state_bytes = state_path.read_bytes()
+        if len(state_bytes) > OWNERSHIP_MAX_BYTES:
+            raise LocalSkillError(
+                "rollback_failed",
+                "ownership record changed size during rollback",
+            )
+    except OSError as exc:
+        raise LocalSkillError(
+            "rollback_failed",
+            "ownership record could not be verified for rollback",
+        ) from exc
+    return hashlib.sha256(state_bytes).hexdigest()
+
+
 def _rollback_published_install_checked(
     skills_root: Path,
     target: Path,
     *,
     expected_revision: str,
-    expected_state_fingerprint: str,
+    expected_state_fingerprint: str | None,
 ) -> None:
     """仅在目录和可选状态仍属于本次发布时执行回滚。"""
 
     _, state_path = _ownership_paths(skills_root)
     if _lexists(state_path):
-        if _is_link_like(state_path) or not state_path.is_file():
-            raise LocalSkillError(
-                "rollback_failed",
-                "ownership record changed before rollback",
-            )
-        try:
-            state_stat = state_path.lstat()
-            if (
-                not stat.S_ISREG(state_stat.st_mode)
-                or state_stat.st_size > OWNERSHIP_MAX_BYTES
-            ):
-                raise LocalSkillError(
-                    "rollback_failed",
-                    "ownership record is unsafe to read during rollback",
-                )
-            state_bytes = state_path.read_bytes()
-            if len(state_bytes) > OWNERSHIP_MAX_BYTES:
-                raise LocalSkillError(
-                    "rollback_failed",
-                    "ownership record changed size during rollback",
-                )
-            state_fingerprint = hashlib.sha256(state_bytes).hexdigest()
-        except OSError as exc:
-            raise LocalSkillError(
-                "rollback_failed",
-                "ownership record could not be verified for rollback",
-            ) from exc
+        state_fingerprint = _read_rollback_ownership_fingerprint(state_path)
         if state_fingerprint != expected_state_fingerprint:
             raise LocalSkillError(
                 "rollback_failed",
@@ -1163,6 +1173,14 @@ def _rollback_published_install_checked(
                 "rollback_failed",
                 "published target reappeared before ownership rollback",
             )
+        current_state_fingerprint = _read_rollback_ownership_fingerprint(
+            state_path
+        )
+        if current_state_fingerprint != expected_state_fingerprint:
+            raise LocalSkillError(
+                "rollback_failed",
+                "ownership record changed before rollback",
+            )
         try:
             state_path.unlink()
         except OSError as exc:
@@ -1178,7 +1196,7 @@ def _rollback_published_install(
     target: Path,
     *,
     expected_revision: str,
-    expected_state_fingerprint: str,
+    expected_state_fingerprint: str | None,
 ) -> None:
     """将任何无法安全完成的回滚统一报告为 rollback_failed。"""
 
@@ -1291,7 +1309,7 @@ def install(skills_dir: str | None) -> dict:
                     ) from exc
                 staging = None
 
-                state_fingerprint = ""
+                persisted_state_fingerprint: str | None = None
                 failure_type = "publish_failed"
                 try:
                     installed_snapshot = _snapshot_installed_package(target)
@@ -1308,7 +1326,7 @@ def install(skills_dir: str | None) -> dict:
                         source_snapshot,
                         installed_snapshot,
                     )
-                    state_fingerprint = hashlib.sha256(
+                    payload_fingerprint = hashlib.sha256(
                         ownership_payload.encode("utf-8")
                     ).hexdigest()
                     failure_type = "state_write_failed"
@@ -1317,7 +1335,18 @@ def install(skills_dir: str | None) -> dict:
                         target,
                         ownership_payload,
                     )
-                    if written_state.fingerprint != state_fingerprint:
+                    persisted_state_fingerprint = written_state.fingerprint
+                    if not written_state.valid:
+                        raise LocalSkillError(
+                            "state_write_failed",
+                            "ownership record could not be verified after writing",
+                        )
+                    if persisted_state_fingerprint is None:
+                        raise LocalSkillError(
+                            "state_write_failed",
+                            "ownership record fingerprint is unavailable after writing",
+                        )
+                    if persisted_state_fingerprint != payload_fingerprint:
                         raise LocalSkillError(
                             "state_write_failed",
                             "ownership record fingerprint mismatch",
@@ -1328,7 +1357,9 @@ def install(skills_dir: str | None) -> dict:
                             locked_root,
                             target,
                             expected_revision=staged_snapshot.package_revision,
-                            expected_state_fingerprint=state_fingerprint,
+                            expected_state_fingerprint=(
+                                persisted_state_fingerprint
+                            ),
                         )
                     except LocalSkillError as rollback_error:
                         raise rollback_error from exc

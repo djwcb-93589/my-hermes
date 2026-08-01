@@ -65,3 +65,16 @@ computer_use_tests/
 tests_docx/
 tests_process/
 tests_dashboard
+
+# ===== 测试任务约定：隔离测试文件与测试产物不提交仓库 =====
+# 所有测试任务（独立验收、静态协议、监督模拟等）的测试代码、
+# fixtures、结果产物与测试报告一律加入忽略，不进入版本库。
+development/skills/claude-code/tests/
+development/skills/claude-code/results/
+development/skills/claude-code/ccs_p1_test_report.md
+
+recovery/
+
+# ===== T3 验收测试：Claude Code Skill 发现与选择（隔离目录，不提交） =====
+tests_claude_code/
+T3_CLAUDE_CODE_SKILL_DISCOVERY_SELECTION_REPORT.md
