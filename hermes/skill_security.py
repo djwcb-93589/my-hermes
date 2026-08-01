@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from hermes._io_utils import atomic_write_text, file_lock
+from hermes._io_utils import atomic_write_text
 from hermes.config import HERMES_HOME
+from hermes.skill_trust import acquire_trust_store_lock, load_trust_records
 
 
 TRUSTED_SKILLS_FILE = HERMES_HOME / "trusted_skills.json"
@@ -366,16 +367,7 @@ def compute_skill_content_hash(text: str) -> str:
 
 
 def _load_trust_records(file_path: Path | None = None) -> dict[str, dict]:
-    file_path = file_path or TRUSTED_SKILLS_FILE
-    if not file_path.exists():
-        return {}
-    try:
-        data = json.loads(file_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {name: record for name, record in data.items() if isinstance(record, dict)}
+    return load_trust_records(file_path or TRUSTED_SKILLS_FILE)
 
 
 def _atomic_write_records(file_path: Path, records: dict[str, dict]) -> None:
@@ -408,8 +400,7 @@ def trust_skill_content(name: str, content: str) -> dict[str, str]:
         "content_hash": compute_skill_content_hash(content),
         "trusted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    TRUSTED_SKILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(TRUSTED_SKILLS_FILE):
+    with acquire_trust_store_lock(TRUSTED_SKILLS_FILE):
         records = _load_trust_records()
         records[name] = record
         _atomic_write_records(TRUSTED_SKILLS_FILE, records)

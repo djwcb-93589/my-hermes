@@ -69,7 +69,6 @@ INSTALLER_STATE_DIR = ".installer-state"
 INSTALLER_ID = "myhermes-claude-code-local-skill"
 OWNERSHIP_SCHEMA_VERSION = 1
 OWNERSHIP_MAX_BYTES = 64 * 1024
-TRUST_RECORDS_MAX_BYTES = 4 * 1024 * 1024
 GOVERNANCE_FILE = ".myhermes.json"
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\((?P<target>[^)\n]+)\)")
 WINDOWS_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -79,10 +78,17 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 class LocalSkillError(Exception):
     """表示可稳定报告给调用者的本地 Skill 操作错误。"""
 
-    def __init__(self, error_type: str, message: str):
+    def __init__(
+        self,
+        error_type: str,
+        message: str,
+        *,
+        details: dict[str, object] | None = None,
+    ):
         super().__init__(message)
         self.error_type = error_type
         self.message = message
+        self.details = dict(details or {})
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,10 @@ LockTimeout = io_utils.LockTimeout
 acquire_skill_lock = importlib.import_module(
     "hermes.skill_locking"
 ).acquire_skill_lock
+trust_store = importlib.import_module("hermes.skill_trust")
+acquire_trust_store_lock = trust_store.acquire_trust_store_lock
+inspect_skill_trust_state = trust_store.inspect_skill_trust_state
+SkillTrustStoreState = trust_store.SkillTrustStoreState
 
 
 BUNDLED_SKILLS_ROOT = (
@@ -551,8 +561,8 @@ def _skills_root(value: str | None) -> Path:
     return root
 
 
-def _target_path(skills_root: Path) -> Path:
-    """构造并验证固定的直接子目录目标。"""
+def _direct_target_path(skills_root: Path) -> Path:
+    """构造固定的直接子目录目标，不解析现有路径。"""
 
     target = skills_root / SKILL_NAME
     if target == skills_root or target.name != SKILL_NAME or target.parent != skills_root:
@@ -560,6 +570,13 @@ def _target_path(skills_root: Path) -> Path:
             "unsafe_target",
             "target must be the claude-code direct child of skills root",
         )
+    return target
+
+
+def _target_path(skills_root: Path) -> Path:
+    """构造并验证固定的直接子目录目标。"""
+
+    target = _direct_target_path(skills_root)
     try:
         target_resolved = target.resolve(strict=False)
         source_resolved = SOURCE_DIR.resolve(strict=True)
@@ -874,44 +891,50 @@ def _cleanup_empty_state_dir(skills_root: Path) -> None:
     if not state_dir.exists():
         return
     try:
+        if next(state_dir.iterdir(), None) is not None:
+            return
         state_dir.rmdir()
-    except OSError:
-        pass
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        try:
+            if state_dir.is_dir() and next(state_dir.iterdir(), None) is not None:
+                return
+        except OSError:
+            pass
+        raise LocalSkillError(
+            "state_cleanup_failed",
+            "empty installer state directory could not be removed",
+            details={"ownership_removed": True},
+        ) from exc
 
 
-def _trusted_skills_file() -> Path:
-    """返回现有 Skill 信任记录的规范路径。"""
-
-    return (hermes_home() / "trusted_skills.json").resolve(strict=False)
-
-
-def _management_reason(target: Path) -> str | None:
-    """保守识别治理 sidecar 或现有信任记录，不复制授权规则。"""
+def _governance_reason(target: Path) -> str | None:
+    """保守识别现有治理 sidecar，不复制治理授权规则。"""
 
     governance_path = target / GOVERNANCE_FILE
     if _lexists(governance_path):
         return "skill_managed"
+    return None
 
-    try:
-        trusted_file = _trusted_skills_file()
-    except (OSError, RuntimeError):
+
+def _trust_block_reason(trust_state: SkillTrustStoreState) -> str | None:
+    """把通用 trust 只读状态映射为安装器的保守阻塞原因。"""
+
+    if not trust_state.reliable:
+        return trust_state.error_type or "trust_state_unknown"
+    if trust_state.record_present:
         return "skill_managed"
-    if not _lexists(trusted_file):
-        return None
-    try:
-        if _is_link_like(trusted_file) or not trusted_file.is_file():
-            return "skill_managed"
-        if trusted_file.lstat().st_size > TRUST_RECORDS_MAX_BYTES:
-            return "skill_managed"
-        trusted_bytes = trusted_file.read_bytes()
-        if len(trusted_bytes) > TRUST_RECORDS_MAX_BYTES:
-            return "skill_managed"
-        records = json.loads(trusted_bytes.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return "skill_managed"
-    if not isinstance(records, dict):
-        return "skill_managed"
-    return "skill_managed" if SKILL_NAME in records else None
+    return None
+
+
+def _management_block_reason(target: Path) -> str | None:
+    """组合治理 sidecar 与通用 trust 状态，不读取存储格式。"""
+
+    governance_reason = _governance_reason(target) if installed else None
+    if governance_reason is not None:
+        return governance_reason
+    return _trust_block_reason(inspect_skill_trust_state(SKILL_NAME))
 
 
 def _copy_runtime_files(snapshot: PackageSnapshot, staging: Path) -> None:
@@ -1073,7 +1096,7 @@ def _rollback_published_install_checked(
                 "rollback_failed",
                 "published target is no longer a plain directory",
             )
-        if _management_reason(target) is not None:
+        if _management_block_reason(target) is not None:
             raise LocalSkillError(
                 "rollback_failed",
                 "published target entered managed state before rollback",
@@ -1183,9 +1206,10 @@ def install(skills_dir: str | None) -> dict:
                     ownership.error
                     or "ownership record already exists for an absent target",
                 )
-            if _management_reason(target) is not None:
+            management_reason = _management_block_reason(target)
+            if management_reason is not None:
                 raise LocalSkillError(
-                    "skill_managed",
+                    management_reason,
                     "existing Skill management state must be resolved before install",
                 )
 
@@ -1222,9 +1246,10 @@ def install(skills_dir: str | None) -> dict:
                         current_ownership.error
                         or "ownership record appeared during installation",
                     )
-                if _management_reason(target) is not None:
+                management_reason = _management_block_reason(target)
+                if management_reason is not None:
                     raise LocalSkillError(
-                        "skill_managed",
+                        management_reason,
                         "Skill management state changed during installation",
                     )
                 try:
@@ -1327,13 +1352,21 @@ def _snapshot_status(
 
 
 def _status_observation(skills_root: Path, target: Path) -> dict:
-    """生成一次不写文件的安装目录与所有权一致性观察。"""
+    """生成一次不写文件的安装、治理与 trust 一致性观察。"""
 
     target_present = _lexists(target)
     ownership = _read_ownership_state(skills_root, target)
+    installed = False
     installed_snapshot: PackageSnapshot | None = None
     installed_error: dict | None = None
-    if target_present:
+    try:
+        _target_path(skills_root)
+    except LocalSkillError as exc:
+        installed_error = {
+            "error_type": exc.error_type,
+            "error": exc.message,
+        }
+    if target_present and installed_error is None:
         if _is_link_like(target):
             installed_error = {
                 "error_type": "unsafe_target",
@@ -1345,13 +1378,20 @@ def _status_observation(skills_root: Path, target: Path) -> dict:
                 "error": "installed target must be a directory",
             }
         else:
+            installed = True
             installed_snapshot, installed_error = _snapshot_status(
                 target,
                 installed=True,
             )
-    management_reason = _management_reason(target)
-    signature = (
+    governance_reason = _governance_reason(target)
+    trust_state = inspect_skill_trust_state(SKILL_NAME)
+    managed = bool(
+        governance_reason is not None
+        or (trust_state.reliable and trust_state.record_present)
+    )
+    readiness_signature = (
         target_present,
+        installed,
         (
             installed_snapshot.skill_revision,
             installed_snapshot.package_revision,
@@ -1363,67 +1403,111 @@ def _status_observation(skills_root: Path, target: Path) -> dict:
         ownership.valid,
         ownership.fingerprint,
         ownership.error_type,
-        management_reason,
+    )
+    signature = (
+        readiness_signature,
+        governance_reason,
+        trust_state.reliable,
+        trust_state.record_present,
+        trust_state.fingerprint,
+        trust_state.error_type,
     )
     return {
         "target_present": target_present,
+        "installed": installed,
         "ownership": ownership,
         "installed_snapshot": installed_snapshot,
         "installed_error": installed_error,
-        "management_reason": management_reason,
+        "governance_reason": governance_reason,
+        "trust_state": trust_state,
+        "managed": managed,
+        "readiness_signature": readiness_signature,
         "signature": signature,
     }
 
 
-def _status_reason(observation: dict, *, concurrent_change: bool) -> str | None:
-    """按安全优先级给出未就绪的结构化原因。"""
+def _readiness_reason(observation: dict, *, concurrent_change: bool) -> str | None:
+    """只按安装完整性给出未就绪原因，不混入治理或版本同步状态。"""
 
     if concurrent_change:
         return "concurrent_change"
     ownership: OwnershipState = observation["ownership"]
     installed_error = observation["installed_error"]
-    if installed_error is not None:
-        return installed_error.get("error_type") or "target_changed"
-    if not ownership.exists:
+    if (
+        installed_error is not None
+        and installed_error.get("error_type") == "unsafe_target"
+    ):
+        return "unsafe_target"
+    if not observation["target_present"]:
+        return "not_installed"
+    if not observation["installed"]:
         return (
-            "ownership_record_missing"
-            if observation["target_present"]
-            else "target_missing"
+            installed_error.get("error_type")
+            if installed_error is not None
+            else "unsafe_target"
         )
+    if not ownership.exists:
+        return "ownership_record_missing"
     if not ownership.valid:
         return ownership.error_type or "ownership_record_invalid"
-    if not observation["target_present"]:
-        return "target_missing"
+    if installed_error is not None:
+        error_type = installed_error.get("error_type")
+        if error_type in {"unsafe_target", "target_changed"}:
+            return error_type
+        return "installed_content_invalid"
     installed_snapshot: PackageSnapshot | None = observation["installed_snapshot"]
     if installed_snapshot is None:
-        return "target_changed"
+        return "installed_content_invalid"
     if (
         installed_snapshot.package_revision
         != ownership.record["installed_revision"]
     ):
         return "target_changed"
-    if observation["management_reason"] is not None:
-        return observation["management_reason"]
     return None
+
+
+def _uninstall_block_reason(
+    observation: dict,
+    *,
+    concurrent_change: bool,
+) -> str | None:
+    """独立判断安装器是否仍有权执行自动卸载。"""
+
+    readiness_reason = _readiness_reason(
+        observation,
+        concurrent_change=concurrent_change,
+    )
+    if readiness_reason is not None:
+        return readiness_reason
+    if observation["governance_reason"] is not None:
+        return observation["governance_reason"]
+    return _trust_block_reason(observation["trust_state"])
 
 
 def status(skills_dir: str | None) -> dict:
     """只读报告 package、所有权与就绪状态。"""
 
     skills_root = _skills_root(skills_dir)
-    target = _target_path(skills_root)
+    target = _direct_target_path(skills_root)
     source_exists = _lexists(SOURCE_DIR / "SKILL.md")
     source_snapshot, source_error = (
         _snapshot_status(SOURCE_DIR) if source_exists else (None, None)
     )
     first = _status_observation(skills_root, target)
     observation = _status_observation(skills_root, target)
-    concurrent_change = first["signature"] != observation["signature"]
+    readiness_changed = (
+        first["readiness_signature"] != observation["readiness_signature"]
+    )
+    uninstall_state_changed = first["signature"] != observation["signature"]
     installed_snapshot: PackageSnapshot | None = observation["installed_snapshot"]
     ownership: OwnershipState = observation["ownership"]
-    reason = _status_reason(
+    reason = _readiness_reason(
         observation,
-        concurrent_change=concurrent_change,
+        concurrent_change=readiness_changed,
+    )
+    uninstall_block_reason = _uninstall_block_reason(
+        observation,
+        concurrent_change=uninstall_state_changed,
     )
 
     result = {
@@ -1431,11 +1515,14 @@ def status(skills_dir: str | None) -> dict:
         "action": "status",
         "source_exists": source_exists,
         "target_present": observation["target_present"],
-        "installed": installed_snapshot is not None,
+        "installed": observation["installed"],
         "managed_by_installer": ownership.managed_by_installer,
         "ownership_valid": ownership.valid,
         "ready": reason is None,
         "reason": reason,
+        "managed": observation["managed"],
+        "uninstall_allowed": uninstall_block_reason is None,
+        "uninstall_block_reason": uninstall_block_reason,
         "source_revision": (
             source_snapshot.skill_revision if source_snapshot is not None else None
         ),
@@ -1519,13 +1606,38 @@ def _delete_owned_state_record(
         raise LocalSkillError(
             "state_write_failed",
             "ownership record could not be removed",
+            details={"ownership_removed": False},
         ) from exc
     if _lexists(state_path):
         raise LocalSkillError(
             "state_write_failed",
             "ownership record still exists after deletion",
+            details={"ownership_removed": False},
         )
     _cleanup_empty_state_dir(skills_root)
+
+
+def _partial_state_cleanup_error(
+    cause: Exception,
+    *,
+    message: str,
+    target: Path,
+) -> LocalSkillError:
+    """报告目标已删除但安装器状态尚未完整清理。"""
+
+    ownership_removed = bool(
+        isinstance(cause, LocalSkillError)
+        and cause.details.get("ownership_removed", False)
+    )
+    return LocalSkillError(
+        "state_cleanup_failed",
+        message,
+        details={
+            "partial": True,
+            "target_removed": not _lexists(target),
+            "ownership_removed": ownership_removed,
+        },
+    )
 
 
 def _validate_uninstall_target(skills_root: Path, target: Path) -> Path:
@@ -1586,11 +1698,20 @@ def uninstall(skills_dir: str | None) -> dict:
                         ownership.error_type or "ownership_record_invalid",
                         ownership.error or "ownership record is invalid",
                     )
-                _delete_owned_state_record(
-                    locked_root,
-                    target,
-                    expected_fingerprint=ownership.fingerprint,
-                )
+                try:
+                    _delete_owned_state_record(
+                        locked_root,
+                        target,
+                        expected_fingerprint=ownership.fingerprint,
+                    )
+                except LocalSkillError as exc:
+                    raise _partial_state_cleanup_error(
+                        exc,
+                        message=(
+                            "target was already absent but ownership state cleanup failed"
+                        ),
+                        target=target,
+                    ) from exc
                 return {
                     "ok": True,
                     "action": "uninstall",
@@ -1611,14 +1732,14 @@ def uninstall(skills_dir: str | None) -> dict:
                     ownership.error_type or "ownership_record_invalid",
                     ownership.error or "ownership record is invalid",
                 )
-            if _management_reason(target_resolved) is not None:
+            if _governance_reason(target_resolved) is not None:
                 raise LocalSkillError(
                     "skill_managed",
-                    "uninstall refuses a governed, pinned, adopted, or trusted Skill",
+                    "uninstall refuses a governed, pinned, or adopted Skill",
                 )
             try:
                 installed_snapshot = _snapshot_installed_package(target_resolved)
-            except LocalSkillError as exc:
+            except (LocalSkillError, OSError, RuntimeError) as exc:
                 raise LocalSkillError(
                     "target_changed",
                     "installed target layout or content cannot be verified",
@@ -1633,53 +1754,103 @@ def uninstall(skills_dir: str | None) -> dict:
                 )
             _assert_no_links_recursive(target_resolved)
 
-            confirmed_ownership = _read_ownership_state(locked_root, target)
-            if (
-                not confirmed_ownership.valid
-                or confirmed_ownership.fingerprint != ownership.fingerprint
-            ):
-                raise LocalSkillError(
-                    "ownership_mismatch",
-                    "ownership record changed during uninstall validation",
-                )
-            if _management_reason(target_resolved) is not None:
-                raise LocalSkillError(
-                    "skill_managed",
-                    "Skill management state changed during uninstall validation",
-                )
+            target_removed = False
             try:
-                confirmed_snapshot = _snapshot_installed_package(target_resolved)
-            except LocalSkillError as exc:
+                # 固定顺序：外层已持有 Skill 锁，随后才取得 trust store 锁。
+                with acquire_trust_store_lock():
+                    trust_state = inspect_skill_trust_state(SKILL_NAME)
+                    trust_reason = _trust_block_reason(trust_state)
+                    if trust_reason is not None:
+                        raise LocalSkillError(
+                            trust_reason,
+                            "uninstall refuses a trusted or uncertain Skill state",
+                        )
+                    if _governance_reason(target_resolved) is not None:
+                        raise LocalSkillError(
+                            "skill_managed",
+                            "Skill governance state changed during uninstall validation",
+                        )
+                    confirmed_target = _validate_uninstall_target(
+                        locked_root,
+                        target,
+                    )
+                    if confirmed_target != target_resolved:
+                        raise LocalSkillError(
+                            "unsafe_target",
+                            "uninstall target identity changed during validation",
+                        )
+                    confirmed_ownership = _read_ownership_state(locked_root, target)
+                    if (
+                        not confirmed_ownership.valid
+                        or confirmed_ownership.fingerprint != ownership.fingerprint
+                    ):
+                        raise LocalSkillError(
+                            "ownership_mismatch",
+                            "ownership record changed during uninstall validation",
+                        )
+                    try:
+                        confirmed_snapshot = _snapshot_installed_package(
+                            target_resolved
+                        )
+                    except (LocalSkillError, OSError, RuntimeError) as exc:
+                        raise LocalSkillError(
+                            "target_changed",
+                            "installed target changed during uninstall validation",
+                        ) from exc
+                    if (
+                        confirmed_snapshot.package_revision
+                        != ownership.record["installed_revision"]
+                    ):
+                        raise LocalSkillError(
+                            "target_changed",
+                            "installed target changed during uninstall validation",
+                        )
+                    _assert_no_links_recursive(target_resolved)
+                    try:
+                        shutil.rmtree(target_resolved)
+                    except OSError as exc:
+                        raise LocalSkillError(
+                            "delete_failed",
+                            "installed target could not be removed completely",
+                        ) from exc
+                    if _lexists(target_resolved):
+                        raise LocalSkillError(
+                            "delete_failed",
+                            "installed target still exists after deletion",
+                        )
+                    target_removed = True
+            except LockTimeout as exc:
                 raise LocalSkillError(
-                    "target_changed",
-                    "installed target changed during uninstall validation",
+                    "trust_lock_timeout",
+                    "could not acquire trust store lock",
                 ) from exc
-            if (
-                confirmed_snapshot.package_revision
-                != ownership.record["installed_revision"]
-            ):
-                raise LocalSkillError(
-                    "target_changed",
-                    "installed target changed during uninstall validation",
-                )
-
-            try:
-                shutil.rmtree(target_resolved)
             except OSError as exc:
+                if target_removed:
+                    raise _partial_state_cleanup_error(
+                        exc,
+                        message=(
+                            "target was removed but the trust lock could not be released"
+                        ),
+                        target=target,
+                    ) from exc
                 raise LocalSkillError(
-                    "delete_failed",
-                    "installed target could not be removed completely",
+                    "trust_store_unavailable",
+                    "trust store lock could not be used reliably",
                 ) from exc
-            if _lexists(target_resolved):
-                raise LocalSkillError(
-                    "delete_failed",
-                    "installed target still exists after deletion",
+            try:
+                _delete_owned_state_record(
+                    locked_root,
+                    target,
+                    expected_fingerprint=ownership.fingerprint,
                 )
-            _delete_owned_state_record(
-                locked_root,
-                target,
-                expected_fingerprint=ownership.fingerprint,
-            )
+            except LocalSkillError as exc:
+                raise _partial_state_cleanup_error(
+                    exc,
+                    message=(
+                        "target was removed but ownership state cleanup failed"
+                    ),
+                    target=target,
+                ) from exc
             return {
                 "ok": True,
                 "action": "uninstall",
@@ -1730,7 +1901,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result = uninstall(args.skills_dir)
     except LocalSkillError as exc:
-        _print_result(
+        failure = dict(exc.details)
+        failure.update(
             {
                 "ok": False,
                 "action": args.action,
@@ -1738,6 +1910,7 @@ def main(argv: list[str] | None = None) -> int:
                 "error": exc.message,
             }
         )
+        _print_result(failure)
         return 1
     except OSError:
         _print_result(
