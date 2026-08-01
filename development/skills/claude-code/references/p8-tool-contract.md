@@ -35,6 +35,17 @@ PTY 只受 `LocalBackend` 支持。可信运行时上下文已公开给出 Backe
 - `submit`：写入文本并按当前 transport 提交 Enter；所有普通指示都使用它。
 - `close`：只为普通 pipe stdin 发送真实 EOF；PTY 不支持。
 
+## 输入大小
+
+当前 Process `write`/`submit` 的单次 stdin 上限是 64 KiB（65,536 bytes），按 `data` 的 UTF-8 编码字节数校验；`submit` 的 transport Enter 也由 Process Tool 计入。不要使用 Python 字符数、显示字符数或 Markdown 行数代替字节数。
+
+Skill 在发送前负责避免明显超限，Process Tool 仍是最终权威校验，预检查不能替代运行时验证。规则如下：
+
+- one-shot 必须把单次完整 prompt 作为一次 `write`，成功后才 `close`。完整 prompt 超限时在启动前停止，不 `write`、不直接 `close`、不改用 shell 拼接，也不自动拆成多个 write。
+- supervised 初始任务和每条 `submit`/`write` 独立遵守上限。指示保持简短，只发送新增目标、具体偏差、硬约束和下一步动作；不发送巨大日志、完整文件或重复全部历史。
+- 第一版不实现自动分块。多次 write 的边界、delivery unknown、重发和 EOF 需要独立事务协议，不能在本 Skill 中猜测。
+- 运行时仍返回输入过大错误时，不重试、不切换 shell 传输、不自动分块；报告任务未送达，且不回显完整输入。
+
 ## Pipe one-shot
 
 one-shot 的 command 固定为 `claude -p`，完整任务不得出现在 command 中。输入和生命周期 action 为：
@@ -50,6 +61,8 @@ kill
 `poll` 可用于公开状态检查。标准顺序是：
 
 ```text
+完整任务 UTF-8 编码大小 ≤ 当前 64 KiB 上限
+→
 terminal(command="claude -p", background=true, pty=false)
 → status=running
 → process write：data 为完整多行任务

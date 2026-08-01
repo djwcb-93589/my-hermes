@@ -12,18 +12,32 @@
    ```text
    command -v claude
    claude --version
-   claude --help
    ```
 
-   `command -v` 失败表示命令不可用；version 或 help 失败时按其公开结果报告。不要自动安装、升级、降级或改写 PATH。
+   `command -v` 失败表示命令不可用；`claude --version` 只用于诊断、报告和辅助识别明显过旧版本，不以固定版本字符串作为唯一能力依据。`claude --help` 可以辅助诊断：出现 flag 是支持信号，未出现不能判定不支持。不要自动安装、升级、降级或改写 PATH。
 5. **PTY 必要性**：根据任务是否需要交互、纠偏或持续监督选择模式。print 模式足够时使用 one-shot。
 
 ## 模式能力检查
 
-- **one-shot**：从当前 `claude --help` 的公开输出单独确认 `-p` 能力，并通过 Terminal 的公开结果判断普通后台 pipe。不要因为 PTY 不支持而判定 one-shot 不可用。
-- **supervised PTY**：从当前 `claude --help` 的公开输出确认存在 `--ax-screen-reader`，不要把可能过时的固定版本号作为唯一依据。参数存在时才允许进入 supervised PTY。
-- 帮助输出不支持 `--ax-screen-reader` 时，报告“supervised PTY prerequisites 不满足”；不要误报为 Claude Code 未安装，不要自动升级，也不要静默删除该参数后启动复杂 TUI。
-- Terminal Tool 返回 `pty_unsupported` 时，不回退 pipe 交互模式、不切换 Backend、不访问私有状态；报告当前环境不支持 supervised PTY，并在任务确实适合时建议独立评估 one-shot pipe。
+- **one-shot**：单独确认 `claude` 命令存在，并通过实际 Terminal/Process 公开结果判断 `claude -p` 与普通后台 pipe stdin。screen-reader probe 的结果不能代表 one-shot 可用性。
+- **supervised PTY**：命令存在且任务确实需要监督时，先执行安全、非交互、不会启动开发会话的 flag probe：
+
+  ```text
+  claude --ax-screen-reader --version
+  ```
+
+  - probe 成功退出：参数被当前 CLI 接受，screen-reader prerequisite 满足。
+  - stdout/stderr 明确出现 `unknown option`、`unrecognized option`、`unexpected argument` 或当前 CLI 的等价参数错误：判定当前版本不支持 supervised PTY 所需的 screen-reader 模式，但不要误报 Claude Code 未安装。
+  - 认证问题、配置错误、安装损坏、环境异常、依赖加载失败或其他未知非零退出：不得判定 flag 不支持；报告 `Claude Code capability probe failed`，并停止 supervised PTY 自动启动。
+
+probe 报告不得泄漏 token、API key、用户目录、配置文件正文或完整环境变量。不要自动升级，也不要静默删除参数后启动复杂 TUI。probe 成功后仍需通过公开 Terminal 结果确认 PTY；返回 `pty_unsupported` 时，不回退 pipe 交互模式、不切换 Backend、不访问私有状态，并单独评估 one-shot。
+
+## 输入大小预检查
+
+- 当前 Process `write`/`submit` 的单次 stdin 上限为 64 KiB。依据必须是完整 `data` UTF-8 编码后的字节数，不是 Python 字符数、显示字符数或 Markdown 行数；中文和 emoji 可能占多个字节。
+- one-shot 在启动 `claude -p` 前确认完整 prompt 符合上限。超限或无法可靠确认时，不启动、不 `write`、不 `close`，也不改用命令行参数、heredoc、echo pipe、临时 shell 变量或多次 write；报告 `The Claude Code task exceeds the current process input limit and was not sent.`，且不回显完整任务。
+- 第一版不实现 prompt 分块。Process Tool 仍是最终权威校验；运行时拒绝输入时不重试、不切换 shell 传输、不自动分块，并报告任务未送达。
+- supervised 初始任务和每条后续 `submit`/`write` 也独立遵守上限。保持指示简短，只发送新增目标、具体偏差、硬约束和下一步动作；不要发送巨大日志、完整文件或重复全部历史。超限时停止并报告，不自动拆分。
 
 ## 任务约束清单
 
@@ -55,4 +69,4 @@
 
 ## 启动决定
 
-只有公开 Tool、cwd、所选模式的 CLI/transport 能力和用户约束均已确认，且任务提示不含凭证时，才进入 `STARTING`。不要为能力判断访问私有状态、另建状态字段或持久化 registry。
+只有公开 Tool、cwd、所选模式的 CLI/transport 能力、输入大小和用户约束均已确认，且任务提示不含凭证时，才进入 `STARTING`。不要为能力判断访问私有状态、另建状态字段或持久化 registry。

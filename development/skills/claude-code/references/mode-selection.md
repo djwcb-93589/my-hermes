@@ -10,7 +10,10 @@
 - 启动后不需要补充要求或中途纠偏；
 - 不预期权限确认、选择题或追问；
 - 只需要最终输出与自然退出状态；
-- Claude Code 的 print 模式能够完成工作。
+- Claude Code 的 print 模式能够完成工作；
+- 完整任务的 UTF-8 编码大小不超过当前 Process stdin 的 64 KiB 上限。
+
+先按 UTF-8 字节数检查完整任务。超限或无法可靠确认符合上限时，不启动 Claude Code、不调用 `write` 或 `close`，不使用 shell 拼接，也不自动拆成多个 write；停止 one-shot 自动执行并报告输入过大，不回显完整任务。
 
 启动形态：
 
@@ -49,7 +52,14 @@ process(
 
 ## Supervised PTY 模式
 
-当前 CLI 的公开帮助确认支持 `--ax-screen-reader`，并且存在以下任一具体需要时使用：
+同时满足以下能力条件，并且存在具体监督需要时使用：
+
+- `claude` 命令可用；
+- 安全、非交互的 `claude --ax-screen-reader --version` probe 成功；
+- Terminal Tool 的公开结果确认 `LocalBackend` PTY 可用；
+- 用户任务确实需要主动监督，而不是仅为绕过 one-shot stdin 协议。
+
+监督需要包括：
 
 - 用户明确要求监控进度；
 - 需要在运行中纠偏或传递用户新增要求；
@@ -79,11 +89,16 @@ process(
 
 `--ax-screen-reader` 只减少装饰边框和动画，不会把 PTY 输出变成结构化事件。输出仍可能包含 ANSI、`\r`、输入 echo、spinner 和重复重绘，且只是追加流，不是屏幕快照。不要承诺完整支持 `vim`、`top` 或其他复杂全屏 TUI。
 
+不要仅凭 `claude --help` 缺少 flag 判定不支持。probe 明确返回 unknown/unrecognized/unexpected argument 类参数错误时，报告当前版本不支持所需 screen-reader 模式；其他非零退出报告 `Claude Code capability probe failed`，不得推断 flag 不支持。两种情况都不静默删除参数或启动普通复杂 TUI；可以建议 one-shot，但不能私自改变用户要求的监督模式。
+
+每次 `submit`/`write` 都独立遵守 Process stdin 的 UTF-8 64 KiB 上限，并应远小于边界。只发送简短目标、具体偏差、硬约束和下一步动作；补充要求只发送增量，不发送巨大日志、完整文件或全部历史。超限时停止并报告，不自动拆分。
+
 如果公开启动调用返回 `pty_unsupported`，不要删除 `--ax-screen-reader` 后静默启动复杂 TUI，不要回退到 pipe 交互、切换 Backend 或访问私有运行时状态；报告 supervised PTY 当前不可用。one-shot pipe 能力必须单独判断，不能因 PTY 不支持而一并判定不可用。
 
 ## 选择原则
 
 - 用完成任务所需的最小交互能力；可 one-shot 时不启用 PTY。
+- one-shot 可用性与 screen-reader probe、PTY 支持分开判断；supervised prerequisites 不满足不等于 Claude Code 整体不可用。
 - 不要为了规避 pipe stdin 协议而默认把所有任务改成 PTY；简单任务仍优先 one-shot。
 - “任务耗时长”本身不等于需要 PTY；“必须持续监督或可能交互”才是 PTY 理由。
 - 模式属于当前 `process_id` 的启动属性，运行中不能原地切换。

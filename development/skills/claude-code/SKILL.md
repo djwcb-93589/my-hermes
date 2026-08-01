@@ -51,6 +51,8 @@ metadata:
 
 用于目标清晰、无需中途补充要求、无需交互确认且只需要最终结果的任务。
 
+启动前确认完整任务的 UTF-8 编码大小不超过当前 Process stdin 的 64 KiB 上限。超限或无法可靠确认符合上限时停止并报告；不要启动进程、自动分块或改用 shell 拼接。
+
 ```text
 terminal(
     command="claude -p",
@@ -68,7 +70,7 @@ terminal(
 
 ### Supervised PTY
 
-用于用户明确要求监控、需要中途纠偏、可能出现权限或问题提示、需要多轮交互，或需要长时间持续监督的任务。启动前必须通过当前 CLI 的公开帮助确认支持 `--ax-screen-reader`。
+用于用户明确要求监控、需要中途纠偏、可能出现权限或问题提示、需要多轮交互，或需要长时间持续监督的任务。启动前使用安全、非交互的 `claude --ax-screen-reader --version` probe 确认参数被接受；`claude --help` 只作辅助，缺少 flag 不能单独判定不支持。
 
 ```text
 terminal(
@@ -86,8 +88,8 @@ terminal(
 ## 核心工作流
 
 1. 明确目标工作目录，完整提取用户目标、验收标准和硬约束。
-2. 执行前置检查并选择最小充分模式；检查失败时不要启动。
-3. 使用任务模板生成初始任务，删除所有凭证，并明确允许与禁止的范围。
+2. 执行前置检查并分别判断 one-shot 与 supervised PTY 能力；候选模式为 supervised PTY 时执行安全 flag probe，检查失败时不要启动。
+3. 使用任务模板生成初始任务，删除所有凭证，明确允许与禁止的范围，并按 UTF-8 字节数检查本次 Process 输入不超过 64 KiB。
 4. 通过 Terminal Tool 启动一次 Claude Code，保存 `process_id` 并检查返回的真实 ProcessStatus；不要仅凭取得标识就假定进程正在等待输入。
 5. 仅在当前 Agent 上下文保存协议允许的最小监督状态；不要复制完整日志。
 6. one-shot 模式仅在 `status=running` 时用 `write` 原样发送完整任务，成功后用 `close` 发送 EOF，再用 `log`/`wait` 收集结果；supervised PTY 模式先确认 `status=running`，再用 `submit` 发送行式初始任务并进入监督循环。
@@ -118,6 +120,8 @@ terminal(
 - one-shot `write` 返回 `process_input_delivery_unknown` 后不得重发任务、不得调用 `close`；先用 `poll`/`log` 检查，仍无法确认时停止自动输入并报告，必要时用 `process kill` 避免执行不完整提示。
 - `close` 只用于 one-shot pipe，且只在 `write` 明确成功后调用；close 重试不得伴随第二次 `write`。supervised PTY 不使用 `close`。
 - supervised 输入出现 `process_input_delivery_unknown` 时同样不得自动重发，也不得假设成功或失败；先读新增日志，仍无法确认时停止自动输入并报告。
+- Process `write`/`submit` 的单次输入受 UTF-8 64 KiB 上限约束，Process Tool 是最终校验权威。one-shot 超限时不启动、不发送、不 close、不改用 shell，也不自动分块。
+- supervised 的初始任务和每条后续指示都必须保持在输入上限内；只发送简短目标、具体偏差、硬约束和下一步动作，不重复完整任务、历史、巨大日志或完整文件，超限时停止并报告。
 - `next_cursor` 只能采用 Process Tool 返回值。ANSI 清理、脱敏和文本理解不得改变 cursor。
 - 不自动使用 `--dangerously-skip-permissions`、`bypassPermissions` 或其他权限绕过方式。
 - 不自动批准高风险、范围不明、涉及凭证、工作区外路径、危险 Bash、Git push、发布或部署的操作。
