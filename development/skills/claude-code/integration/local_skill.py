@@ -428,7 +428,7 @@ def _validate_markdown_links(
     package_root: Path,
     runtime_files: tuple[Path, ...],
 ) -> None:
-    """确认本地 Markdown 引用不逃逸且指向运行时清单。"""
+    """按规范目标确认本地 Markdown 引用留在运行时清单内。"""
 
     root_resolved = package_root.resolve(strict=True)
     manifest_paths = {
@@ -468,13 +468,43 @@ def _validate_markdown_links(
             local_path = unquote(parsed.path).replace("\\", "/")
             if not local_path:
                 continue
+            if (
+                local_path.startswith("/")
+                or WINDOWS_ABSOLUTE_RE.match(local_path)
+            ):
+                raise LocalSkillError(
+                    "absolute_reference_path",
+                    f"absolute Markdown path is not allowed: {document.name}",
+                )
             relative = PurePosixPath(local_path)
-            if relative.is_absolute() or ".." in relative.parts:
+            if relative.is_absolute():
+                raise LocalSkillError(
+                    "absolute_reference_path",
+                    f"absolute Markdown path is not allowed: {document.name}",
+                )
+
+            # 允许包内 ``..``，但拒绝原始解析路径经过任何链接或重解析点。
+            current = document.parent
+            for part in relative.parts:
+                if part == "..":
+                    current = current.parent
+                    continue
+                current = current / part
+                if _lexists(current) and _is_link_like(current):
+                    raise LocalSkillError(
+                        "reference_path_escape",
+                        f"Markdown link traverses a linked path: {document.name}",
+                    )
+
+            try:
+                candidate = (
+                    document.parent / Path(*relative.parts)
+                ).resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
                 raise LocalSkillError(
                     "reference_path_escape",
-                    f"Markdown link contains an unsafe path: {document.name}",
-                )
-            candidate = (document.parent / Path(*relative.parts)).resolve(strict=False)
+                    f"Markdown link could not be resolved safely: {document.name}",
+                ) from exc
             try:
                 candidate_relative = candidate.relative_to(root_resolved)
             except ValueError as exc:

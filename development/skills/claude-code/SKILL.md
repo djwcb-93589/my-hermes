@@ -1,13 +1,12 @@
 ---
 name: claude-code
 description: >-
-  Use for repository-scale analysis, coordinated multi-file changes, or
-  long-running coding work that may need progress monitoring and follow-up
-  instructions. Select and read this Skill when task scope, cwd, and user
-  authorization are clear; then run the required installation-state,
-  authentication, tool, PTY, and active-session preflight before launch. If
-  preflight fails, do not launch. Prefer normal File or Terminal operations for
-  small, direct tasks.
+  Use only when the user explicitly asks to use Claude Code/CC, or explicitly
+  asks to continue, steer, stop, or otherwise control an existing Claude Code
+  session. Do not select, recommend, or launch Claude Code based only on task
+  size or complexity. Without an explicit user request, use normal myHermes
+  tools. After explicit activation, read this Skill and complete the required
+  preflight before launch or session control.
 version: 0.3.0
 platforms:
   - windows
@@ -23,37 +22,32 @@ metadata:
 
 # Claude Code 主动监督
 
-## 选择与启动边界
+## 显式启用与启动边界
 
-先根据任务本身判断是否匹配，不要在读取本 Skill 前调用 Terminal 或 Process 检查 Claude Code。任务范围、cwd 和用户授权明确，并且具备下列任一特征时，先调用 `skill_view(name="claude-code")`：
+只有当前用户请求明确要求使用 Claude Code/CC，或明确要求继续、补充指示、停止或控制已有 Claude Code 会话时，才选择本 Skill 并调用 `skill_view(name="claude-code")`。
 
-适用场景：
+不得用以下情况代替用户的明确要求：
 
-- 仓库级代码分析或需要理解较大代码库；
-- 跨多个文件的协调修改；
-- 需要持续运行、增量观察和阶段判断的编码任务；
-- 需要多轮补充要求或中途纠偏；
-- 需要 Claude Code 长时间处理代码库，并由上层 Agent 主动监督。
+- 任务复杂、涉及整个仓库、修改多个文件或运行时间较长；
+- Agent 判断 Claude Code 更合适，或用户让 Agent 自行选择工具；
+- Claude Code 已安装、已认证，或用户以前使用过 Claude Code。
 
-以下任务不应选择本 Skill：
+用户没有明确要求 Claude Code/CC 时：
 
-- 一条普通 shell 命令，或简单 File/Terminal 操作；
-- 单文件极小修改，或只读取少量文件的任务；
-- cwd 不明确，或修改任务缺少用户授权；
-- myHermes 自身工具可以直接、可靠完成的任务；
-- 既不需要仓库级或多文件处理，也不需要长期监控或多轮控制的任务。
-
-不要仅因任务提到“代码”就选择本 Skill。先使用完成任务所需的最小能力；简单任务继续优先使用现有 File 或 Terminal Tool。
+- 不选择或读取本 Skill；
+- 不主动推荐 Claude Code，也不询问是否启用；
+- 不执行 Claude Code preflight，不启动或控制 Claude Code；
+- 使用正常的 myHermes File、Terminal、Process 等现有能力完成任务。
 
 ```text
-任务适配判断
+用户明确要求 Claude Code / CC
 → skill_view
 → 阅读正文及当前任务需要的 references
-→ 执行启动 preflight
-→ 全部通过后才启动 Claude Code
+→ 执行安装、认证、cwd、工具、所选 transport 和活跃会话 preflight
+→ 全部通过后才进入后续启动或控制流程
 ```
 
-读取后，按 [prerequisites.md](references/prerequisites.md) 检查 Claude Code 安装与认证、Terminal/Process、所选模式需要的 PTY 或 pipe、cwd 会话互斥和授权风险。任一检查失败只表示当前不能启动：保留“本 Skill 已正确选择和读取”的事实，停止启动并报告具体阻断原因；不要自动安装、认证、终止已有会话或放宽权限。
+用户明确启用只授权选择并读取本 Skill，不会扩大任务范围、文件权限或危险操作授权。读取后，按 [prerequisites.md](references/prerequisites.md) 完成 preflight；任一检查失败时停止后续操作并报告具体阻断原因。不要自动安装、认证、输入凭据、终止已有会话、放宽权限、commit 或 push。
 
 ## 职责边界
 

@@ -1,6 +1,6 @@
 # 启动前检查
 
-本文件只在 Agent 已根据任务规模、cwd 和用户授权选择本 Skill，并通过 `skill_view` 读取正文后使用。它只决定当前能否启动 Claude Code，不是调用 `skill_view` 前的选择门禁。
+本文件只在用户已明确要求使用或控制 Claude Code/CC，且 Agent 已通过 `skill_view` 读取正文后使用。它只决定当前能否启动或控制 Claude Code，不是调用 `skill_view` 前的选择门禁。
 
 在启动任何 Claude Code 进程前逐项检查。任一必要条件不满足时，保留 Skill 已正确选择和读取的事实，停止启动并报告具体原因。不要自动安装或认证 Claude Code，不要输入凭证，不要终止同一 cwd 的已有会话，也不要通过换后端、绕过 Terminal/Process/PTY 或放宽权限自行修复。
 
