@@ -197,7 +197,7 @@ a:focus-visible {
 
 .primary-button,
 .secondary-button,
-.text-button
+.text-button,
 .danger-button {
   min-height: 2.5rem;
   border-radius: 0.65rem;

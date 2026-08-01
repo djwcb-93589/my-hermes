@@ -69,6 +69,11 @@ _SOURCES = (
         toolsets=("delegate",),
     ),
     ToolsetDeclarationSource(
+        name="orchestration",
+        module_name="hermes.tool_declarations.orchestration",
+        toolsets=("orchestration",),
+    ),
+    ToolsetDeclarationSource(
         name="messaging",
         module_name="hermes.tool_declarations.messaging",
         toolsets=("messaging",),
