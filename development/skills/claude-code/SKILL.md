@@ -1,15 +1,17 @@
 ---
 name: claude-code
-description: Supervise Claude Code through the existing Terminal and Process tools, monitor progress, detect blocking states, and send controlled corrective instructions.
-version: 0.1.0
+description: Use when the user asks my-hermes to delegate coding work to Claude Code, monitor Claude Code progress, or steer an active Claude Code session. Prefer one-shot mode for non-interactive tasks and supervised PTY only when mid-task intervention is required.
+version: 0.2.0
 platforms:
   - windows
   - linux
   - darwin
 metadata:
-  development_stage: isolated
-  requires_terminal_pty: true
-  agent_integration: false
+  development_stage: local_user_preview
+  agent_integration: local_user
+  supports_one_shot: true
+  supports_supervised_pty: true
+  requires_process_input: true
 ---
 
 # Claude Code 主动监督
