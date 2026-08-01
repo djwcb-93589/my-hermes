@@ -53,12 +53,12 @@ last_progress_signature
 
 - 状态长期不明且满足停滞条件：填充并发送 [progress-request.md](../templates/progress-request.md)，只发送一次，然后等待文字状态或其他有效变化。
 - 目标、范围或硬约束偏离：填充并发送 [corrective-instruction.md](../templates/corrective-instruction.md)。
-- 用户取消、风险升级或需要结束：发送 [safe-stop.md](../templates/safe-stop.md)，观察最小操作完成后再决定是否中断或 `kill`。
+- 用户取消、风险升级或需要结束：在输入安全且可用时发送一次 [safe-stop.md](../templates/safe-stop.md)，按恢复协议进行有界观察；仍需终止时调用 `process kill`。
 - 明确问题需要用户决定：不要替用户猜测；停止自动输入并把问题、选项与影响报告给用户。
 
 ## 输入步骤
 
-每次发送前：
+以下步骤只用于 supervised PTY 的行式指示；one-shot 完整任务必须遵循 pipe `write`/`close` 协议。每次发送前：
 
 1. 用最新 Process Tool 响应确认 `status=running`。
 2. 确认内容不含密码、token、API key 或其他凭证。
@@ -67,3 +67,5 @@ last_progress_signature
 5. 发送后进入观察，不因日志未立即 echo 而重发。
 
 若返回 `process_input_delivery_unknown`，本次干预结果保持未知：不要重发，不要增加新的自动输入；先读取新增日志，无法确认时报告并停止自动干预。
+
+不要通过 `process write` 自行发送控制字符。正在执行高风险或越权操作、用户要求立即终止、进程失控、继续输入可能产生不可控副作用，或之前输入 delivery unknown 时，跳过 safe-stop 并直接调用 `process kill`。

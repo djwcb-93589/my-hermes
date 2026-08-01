@@ -1,6 +1,6 @@
 # 监督循环
 
-仅在 supervised PTY 模式执行主动监督循环。one-shot 只观察日志与自然退出，不发送常规进度追问。
+仅在 supervised PTY 模式执行主动监督循环。one-shot 按 pipe 协议在 `status=running` 后 `write` 完整任务，并仅在 write 明确成功后 `close` stdin；此后只观察日志与自然退出，不发送常规进度追问。
 
 ## 初始化
 

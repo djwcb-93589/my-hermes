@@ -37,12 +37,11 @@ metadata:
 - [permissions-and-safety.md](references/permissions-and-safety.md)：权限、凭证和危险操作边界。
 - [claude-code-cli.md](references/claude-code-cli.md)：本 Skill 使用的 CLI 能力。
 
-使用 supervised PTY 时还要读取：
+启动后出现输入失败、取消、停滞或终止需要时，读取 [recovery-and-cleanup.md](references/recovery-and-cleanup.md)。使用 supervised PTY 时还要读取：
 
 - [supervision-loop.md](references/supervision-loop.md)：增量监督循环。
 - [progress-state-model.md](references/progress-state-model.md)：逻辑状态与有效进展。
 - [intervention-policy.md](references/intervention-policy.md)：干预条件和去重。
-- [recovery-and-cleanup.md](references/recovery-and-cleanup.md)：失败、停滞、取消与清理。
 
 构造初始输入时，按任务类型使用 [implementation-task.md](templates/implementation-task.md) 或 [review-task.md](templates/review-task.md)。仅在相应条件成立时使用 [progress-request.md](templates/progress-request.md)、[corrective-instruction.md](templates/corrective-instruction.md) 或 [safe-stop.md](templates/safe-stop.md)。提交前替换全部占位符。
 
@@ -54,19 +53,22 @@ metadata:
 
 ```text
 terminal(
-    command="claude -p \"<task>\"",
+    command="claude -p",
     background=true,
     pty=false
 )
 → 保存 process_id
+→ 检查 Terminal 返回的真实 status
+→ status=running 时 process write 完整任务文本
+→ write 明确成功后 process close
 → process log / wait
 ```
 
-只要 `claude -p` 能满足任务，就不要无理由启用 PTY。one-shot 进程出现交互阻塞时，不要盲目输入或自动换模式重启；先报告实际状态。
+完整任务只通过 Process Tool 的 `data` 原样写入 pipe stdin，可以包含多行和 Git Bash 元字符；不要把任务拼入 `command`，不要手工构造 Bash 转义，也不要把任务写入 logger 或输入历史。`close` 为普通 pipe 发送真实 EOF，只能在 `write` 明确成功后调用。只要该流程能满足任务，就不要无理由启用 PTY。
 
 ### Supervised PTY
 
-用于用户明确要求监控、需要中途纠偏、可能出现权限或问题提示、需要多轮交互，或需要长时间持续监督的任务。
+用于用户明确要求监控、需要中途纠偏、可能出现权限或问题提示、需要多轮交互，或需要长时间持续监督的任务。启动前必须通过当前 CLI 的公开帮助确认支持 `--ax-screen-reader`。
 
 ```text
 terminal(
@@ -86,9 +88,9 @@ terminal(
 1. 明确目标工作目录，完整提取用户目标、验收标准和硬约束。
 2. 执行前置检查并选择最小充分模式；检查失败时不要启动。
 3. 使用任务模板生成初始任务，删除所有凭证，并明确允许与禁止的范围。
-4. 通过 Terminal Tool 启动一次 Claude Code，立即保存 `process_id`。
+4. 通过 Terminal Tool 启动一次 Claude Code，保存 `process_id` 并检查返回的真实 ProcessStatus；不要仅凭取得标识就假定进程正在等待输入。
 5. 仅在当前 Agent 上下文保存协议允许的最小监督状态；不要复制完整日志。
-6. one-shot 模式使用 `log`/`wait` 收集结果；supervised PTY 模式先确认 `status=running`，再用 `submit` 发送行式初始任务并进入监督循环。
+6. one-shot 模式仅在 `status=running` 时用 `write` 原样发送完整任务，成功后用 `close` 发送 EOF，再用 `log`/`wait` 收集结果；supervised PTY 模式先确认 `status=running`，再用 `submit` 发送行式初始任务并进入监督循环。
 7. 每轮只读取 `next_cursor` 之后的新增输出，分别判断 ProcessStatus、Claude Code 逻辑状态和有效进展。
 8. 只有干预条件成立且未命中去重规则时，发送一次最小必要指示；否则继续观察。
 9. 按完成判定或恢复策略收尾，不把总结、短暂无输出或单个子任务完成误判为整体完成。
@@ -112,13 +114,16 @@ terminal(
 
 ## 不可违反的运行规则
 
-- 发送任何输入前确认 Process Tool 报告 `status=running`；普通行式指示使用 `process(action="submit")`。
-- `process_input_delivery_unknown` 后不得自动重发，也不得假设成功或失败；先读新增日志，仍无法确认时停止自动输入并报告。
+- 发送任何输入前确认公开返回值报告 `status=running`。one-shot 完整任务使用一次 `process(action="write")`；supervised PTY 的普通行式指示使用 `process(action="submit")`。
+- one-shot `write` 返回 `process_input_delivery_unknown` 后不得重发任务、不得调用 `close`；先用 `poll`/`log` 检查，仍无法确认时停止自动输入并报告，必要时用 `process kill` 避免执行不完整提示。
+- `close` 只用于 one-shot pipe，且只在 `write` 明确成功后调用；close 重试不得伴随第二次 `write`。supervised PTY 不使用 `close`。
+- supervised 输入出现 `process_input_delivery_unknown` 时同样不得自动重发，也不得假设成功或失败；先读新增日志，仍无法确认时停止自动输入并报告。
 - `next_cursor` 只能采用 Process Tool 返回值。ANSI 清理、脱敏和文本理解不得改变 cursor。
 - 不自动使用 `--dangerously-skip-permissions`、`bypassPermissions` 或其他权限绕过方式。
 - 不自动批准高风险、范围不明、涉及凭证、工作区外路径、危险 Bash、Git push、发布或部署的操作。
 - 不因思考、读文件、允许的耗时命令、短暂无输出、spinner 或暂时 `UNKNOWN` 而频繁打断。
 - 相同干预原因只发送一次；发送后至少等待一次有效状态变化，才允许相关的下一次干预。
+- 终止时不要通过 `write` 自行发送控制字符；在输入安全且可用时先 `submit` 一次 safe-stop，有限观察后仍需终止则调用 `process kill`，由 ProcessManager 负责中断与强制终止。
 
 ## 完成与汇报
 
