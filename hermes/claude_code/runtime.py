@@ -1,0 +1,436 @@
+"""Claude Code 受管会话的最小启动与生命周期工作流。"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import replace
+
+from hermes.claude_code.contracts import (
+    ClaudeCodeProcessPort,
+    ClaudeCodeProcessSnapshot,
+    ClaudeCodeReadResult,
+    ClaudeCodeRuntimeError,
+    ClaudeCodeSessionRef,
+)
+
+
+class ClaudeCodeRuntime:
+    """只保存 SessionRef；进程、输出与 cleanup 继续由 ProcessManager 拥有。"""
+
+    def __init__(
+        self,
+        process_port: ClaudeCodeProcessPort,
+        *,
+        executable: str = "claude",
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        required = (
+            "preflight_start",
+            "start",
+            "read",
+            "write",
+            "submit",
+            "status",
+            "wait",
+            "interrupt",
+            "kill",
+        )
+        if any(
+            not callable(getattr(process_port, name, None))
+            for name in required
+        ):
+            raise TypeError("process_port does not implement the required interface")
+        if not isinstance(executable, str) or not executable.strip():
+            raise ValueError("executable must be a non-empty string")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self._port = process_port
+        self._executable = executable
+        self._clock = clock
+        self._lock = threading.RLock()
+        # 这里只保存受管 CC 引用，不复制 Handle、日志或 ProcessManager registry。
+        self._sessions: dict[str, ClaudeCodeSessionRef] = {}
+        self._active_cwds: dict[str, str] = {}
+
+    def start(
+        self,
+        *,
+        user_requested: bool,
+        session_owner: str,
+        cwd: str,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> ClaudeCodeSessionRef:
+        """仅在用户明确指定 CC 后启动一个受管后台 PTY。"""
+
+        if user_requested is not True:
+            raise ClaudeCodeRuntimeError(
+                "explicit_user_request_required",
+                "Claude Code requires an explicit current user request",
+            )
+        self._require_owner(session_owner)
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise ClaudeCodeRuntimeError(
+                "cwd_required",
+                "Claude Code requires an explicit working directory",
+            )
+        normalized_cwd = self._port.preflight_start(
+            session_owner=session_owner,
+            cwd=cwd,
+            executable=self._executable,
+        )
+
+        with self._lock:
+            self._assert_cwd_available_locked(normalized_cwd)
+            snapshot = self._port.start(
+                session_owner=session_owner,
+                cwd=normalized_cwd,
+                executable=self._executable,
+                cancel_checker=cancel_checker,
+            )
+            try:
+                now = float(self._clock())
+                if snapshot.process_id in self._sessions:
+                    raise RuntimeError("duplicate Claude Code process id")
+                if snapshot.cwd != normalized_cwd:
+                    raise RuntimeError("Claude Code cwd changed before registration")
+                session = ClaudeCodeSessionRef(
+                    process_id=snapshot.process_id,
+                    session_owner=session_owner,
+                    cwd=normalized_cwd,
+                    cursor=0,
+                    started_at=snapshot.started_at,
+                    last_activity_at=now,
+                )
+                self._sessions[session.process_id] = session
+                if snapshot.active:
+                    self._active_cwds[session.cwd] = session.process_id
+                return session
+            except Exception as registration_error:
+                self._discard_session_locked(
+                    session_owner=session_owner,
+                    process_id=snapshot.process_id,
+                )
+                try:
+                    cleanup_snapshot = self._port.kill(
+                        session_owner=session_owner,
+                        process_id=snapshot.process_id,
+                        grace_seconds=0.0,
+                    )
+                    if cleanup_snapshot.active:
+                        raise ClaudeCodeRuntimeError(
+                            "session_registration_failed",
+                            "Claude Code registration cleanup remained active",
+                        )
+                except ClaudeCodeRuntimeError as cleanup_error:
+                    raise ClaudeCodeRuntimeError(
+                        "session_registration_failed",
+                        "Claude Code session registration and cleanup failed",
+                    ) from cleanup_error
+                raise ClaudeCodeRuntimeError(
+                    "session_registration_failed",
+                    "Claude Code session registration failed and was rolled back",
+                ) from registration_error
+
+    def read(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        limit: int = 20_000,
+    ) -> ClaudeCodeReadResult:
+        """只读取已保存 cursor 后的新输出，并原样采用 next_cursor。"""
+
+        with self._lock:
+            session = self._require_session_locked(session_owner, process_id)
+            page = self._invoke(
+                session,
+                lambda: self._port.read(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                    cursor=session.cursor,
+                    limit=limit,
+                ),
+            )
+            updated = replace(
+                session,
+                cursor=page.next_cursor,
+                last_activity_at=float(self._clock()),
+            )
+            self._sessions[process_id] = updated
+            self._release_cwd_if_terminal_locked(updated, page.status)
+            return ClaudeCodeReadResult(
+                session=updated,
+                status=page.status,
+                output=page.output,
+                requested_cursor=page.requested_cursor,
+                available_from_cursor=page.available_from_cursor,
+                next_cursor=page.next_cursor,
+                output_truncated=page.output_truncated,
+                exit_code=page.exit_code,
+            )
+
+    def write(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        data: str,
+    ) -> int:
+        """原样写入，不追加 Enter，也不保存输入。"""
+
+        session = self._require_session(session_owner, process_id)
+        result = self._invoke(
+            session,
+            lambda: self._port.write(
+                session_owner=session_owner,
+                process_id=process_id,
+                data=data,
+            ),
+        )
+        self._touch(session)
+        return result
+
+    def submit(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        data: str,
+    ) -> int:
+        """提交文本和一次 transport Enter，不保存输入。"""
+
+        session = self._require_session(session_owner, process_id)
+        result = self._invoke(
+            session,
+            lambda: self._port.submit(
+                session_owner=session_owner,
+                process_id=process_id,
+                data=data,
+            ),
+        )
+        self._touch(session)
+        return result
+
+    def status(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+    ) -> ClaudeCodeProcessSnapshot:
+        """返回 ProcessStatus，不推断 Claude Code 语义状态。"""
+
+        session = self._require_session(session_owner, process_id)
+        snapshot = self._invoke(
+            session,
+            lambda: self._port.status(
+                session_owner=session_owner,
+                process_id=process_id,
+            ),
+        )
+        self._touch(session, process_status=snapshot.status)
+        return snapshot
+
+    def wait(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        timeout: float = 30.0,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> ClaudeCodeProcessSnapshot:
+        """执行一次有界等待；超时不终止进程。"""
+
+        session = self._require_session(session_owner, process_id)
+        snapshot = self._invoke(
+            session,
+            lambda: self._port.wait(
+                session_owner=session_owner,
+                process_id=process_id,
+                timeout=timeout,
+                cancel_checker=cancel_checker,
+            ),
+        )
+        self._touch(session, process_status=snapshot.status)
+        return snapshot
+
+    def interrupt(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+    ) -> int:
+        """请求协作式 Ctrl+C；不承担强制终止。"""
+
+        session = self._require_session(session_owner, process_id)
+        result = self._invoke(
+            session,
+            lambda: self._port.interrupt(
+                session_owner=session_owner,
+                process_id=process_id,
+            ),
+        )
+        self._touch(session)
+        return result
+
+    def kill(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        grace_seconds: float = 2.0,
+    ) -> ClaudeCodeProcessSnapshot:
+        """请求 ProcessManager 协作式中断并按需强制清理进程树。"""
+
+        session = self._require_session(session_owner, process_id)
+        snapshot = self._invoke(
+            session,
+            lambda: self._port.kill(
+                session_owner=session_owner,
+                process_id=process_id,
+                grace_seconds=grace_seconds,
+            ),
+        )
+        self._touch(session, process_status=snapshot.status)
+        return snapshot
+
+    def _assert_cwd_available_locked(self, cwd: str) -> None:
+        """拒绝同一 runtime 内同 cwd 的第二个活跃 CC。"""
+
+        process_id = self._active_cwds.get(cwd)
+        if process_id is None:
+            return
+        session = self._sessions.get(process_id)
+        if session is None:
+            self._active_cwds.pop(cwd, None)
+            return
+        try:
+            snapshot = self._port.status(
+                session_owner=session.session_owner,
+                process_id=session.process_id,
+            )
+        except ClaudeCodeRuntimeError as error:
+            if error.error_type == "session_not_found":
+                self._discard_session_locked(
+                    session_owner=session.session_owner,
+                    process_id=session.process_id,
+                )
+                return
+            raise ClaudeCodeRuntimeError(
+                "cwd_session_active",
+                "An existing managed Claude Code session could not be cleared",
+            ) from error
+        if snapshot.active:
+            raise ClaudeCodeRuntimeError(
+                "cwd_session_active",
+                "A managed Claude Code session is already active for this cwd",
+            )
+        self._active_cwds.pop(cwd, None)
+
+    def _require_session(
+        self,
+        session_owner: str,
+        process_id: str,
+    ) -> ClaudeCodeSessionRef:
+        """验证调用 owner、SessionRef 与 process id 的一致性。"""
+
+        with self._lock:
+            return self._require_session_locked(session_owner, process_id)
+
+    def _require_session_locked(
+        self,
+        session_owner: str,
+        process_id: str,
+    ) -> ClaudeCodeSessionRef:
+        """在 runtime 锁内读取最小引用，不查询系统 PID。"""
+
+        self._require_owner(session_owner)
+        if not isinstance(process_id, str) or not process_id.strip():
+            raise ClaudeCodeRuntimeError(
+                "session_not_found",
+                "Claude Code session was not found",
+            )
+        session = self._sessions.get(process_id)
+        if session is None:
+            raise ClaudeCodeRuntimeError(
+                "session_not_found",
+                "Claude Code session was not found",
+            )
+        if session.session_owner != session_owner:
+            raise ClaudeCodeRuntimeError(
+                "session_owner_mismatch",
+                "Claude Code session belongs to a different owner",
+            )
+        return session
+
+    @staticmethod
+    def _require_owner(session_owner: str) -> None:
+        """拒绝缺失的调用 session owner。"""
+
+        if not isinstance(session_owner, str) or not session_owner.strip():
+            raise ClaudeCodeRuntimeError(
+                "session_owner_mismatch",
+                "Claude Code requires a valid owning session",
+            )
+
+    def _invoke(self, session: ClaudeCodeSessionRef, operation: Callable):
+        """在 Manager 记录消失时同步丢弃对应的非资源引用。"""
+
+        try:
+            return operation()
+        except ClaudeCodeRuntimeError as error:
+            if error.error_type == "session_not_found":
+                with self._lock:
+                    self._discard_session_locked(
+                        session_owner=session.session_owner,
+                        process_id=session.process_id,
+                    )
+            raise
+
+    def _touch(
+        self,
+        session: ClaudeCodeSessionRef,
+        *,
+        process_status: str | None = None,
+    ) -> None:
+        """只更新时间和 cwd 占用，不保存输入或输出。"""
+
+        with self._lock:
+            current = self._sessions.get(session.process_id)
+            if current is None or current.session_owner != session.session_owner:
+                return
+            updated = replace(current, last_activity_at=float(self._clock()))
+            self._sessions[session.process_id] = updated
+            if process_status is not None:
+                self._release_cwd_if_terminal_locked(updated, process_status)
+
+    def _release_cwd_if_terminal_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+        process_status: str,
+    ) -> None:
+        """终态只释放并发占用；ProcessManager 仍保留生命周期记录。"""
+
+        if process_status in {"starting", "running"}:
+            return
+        if self._active_cwds.get(session.cwd) == session.process_id:
+            self._active_cwds.pop(session.cwd, None)
+
+    def _discard_session_locked(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+    ) -> None:
+        """只丢弃 SessionRef；不执行任何进程或 Backend cleanup。"""
+
+        session = self._sessions.get(process_id)
+        if session is None or session.session_owner != session_owner:
+            return
+        self._sessions.pop(process_id, None)
+        if self._active_cwds.get(session.cwd) == process_id:
+            self._active_cwds.pop(session.cwd, None)
+
+
+__all__ = ["ClaudeCodeRuntime"]
