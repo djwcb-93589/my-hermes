@@ -21,6 +21,12 @@ from hermes.orchestration.models import (
     freeze_json_object,
     plain_json_object,
 )
+from hermes.orchestration.roles import (
+    AgentRoleDefinition,
+    AgentRoleSpec,
+    RoleResolver,
+    RoleResolverFactory,
+)
 from hermes.orchestration.service import OrchestrationService
 from hermes.orchestration.workflow_execution import (
     WorkflowExecutionKind,
@@ -30,6 +36,8 @@ from hermes.orchestration.workflow_execution import (
 
 
 _MAX_APPLICATION_CONCURRENCY = 16
+_MAX_AGENT_DEFINITIONS = 32
+_MAX_TOTAL_AGENT_INSTRUCTIONS_CHARS = 1_000_000
 
 
 def _copy_workflow_spec(spec: WorkflowCreateSpec) -> WorkflowCreateSpec:
@@ -44,7 +52,11 @@ def _copy_workflow_spec(spec: WorkflowCreateSpec) -> WorkflowCreateSpec:
             key=task.key,
             title=task.title,
             prompt=task.prompt,
-            role=task.role,
+            role=(
+                task.role.strip()
+                if type(task.role) is str
+                else task.role
+            ),
             depends_on=tuple(task.depends_on),
             priority=task.priority,
             max_attempts=task.max_attempts,
@@ -66,16 +78,82 @@ def _copy_workflow_spec(spec: WorkflowCreateSpec) -> WorkflowCreateSpec:
     )
 
 
+def _copy_agent_definitions(
+    definitions: object,
+) -> tuple[AgentRoleDefinition, ...]:
+    """复制并校验单次调用的动态职责目录。"""
+
+    if not isinstance(definitions, (list, tuple)):
+        raise OrchestrationValidationError(
+            "agents must be a sequence of AgentRoleDefinition values"
+        )
+    if not 1 <= len(definitions) <= _MAX_AGENT_DEFINITIONS:
+        raise OrchestrationValidationError(
+            "agent definition count exceeds its limit"
+        )
+    copied: list[AgentRoleDefinition] = []
+    for definition in definitions:
+        if not isinstance(definition, AgentRoleDefinition):
+            raise OrchestrationValidationError(
+                "agents must contain AgentRoleDefinition values"
+            )
+        try:
+            copied.append(AgentRoleDefinition(
+                name=definition.name,
+                instructions=definition.instructions,
+            ))
+        except (TypeError, ValueError) as exc:
+            raise OrchestrationValidationError(
+                "agent definition is invalid"
+            ) from exc
+    names = tuple(definition.name for definition in copied)
+    if len(names) != len(set(names)):
+        raise OrchestrationValidationError(
+            "agent definition names must be unique"
+        )
+    if sum(len(definition.instructions) for definition in copied) > (
+        _MAX_TOTAL_AGENT_INSTRUCTIONS_CHARS
+    ):
+        raise OrchestrationValidationError(
+            "agent instructions exceed the total size limit"
+        )
+    return tuple(copied)
+
+
 @dataclass(frozen=True, slots=True)
 class OrchestrationRunRequest:
     """一次创建并运行固定 DAG 的不可变应用请求。"""
 
     workflow: WorkflowCreateSpec
+    agents: tuple[AgentRoleDefinition, ...]
     result_task_key: str | None
     max_concurrency: int
 
     def __post_init__(self) -> None:
         copied_workflow = _copy_workflow_spec(self.workflow)
+        copied_agents = _copy_agent_definitions(self.agents)
+        agent_names = frozenset(
+            definition.name for definition in copied_agents
+        )
+        used_agent_names: set[str] = set()
+        for task in copied_workflow.tasks:
+            if not isinstance(task, TaskCreateSpec):
+                raise OrchestrationValidationError(
+                    "workflow tasks must be TaskCreateSpec values"
+                )
+            if type(task.role) is not str or not task.role:
+                raise OrchestrationValidationError(
+                    "task role must be a non-empty string"
+                )
+            if task.role not in agent_names:
+                raise OrchestrationValidationError(
+                    "task role must reference a defined agent"
+                )
+            used_agent_names.add(task.role)
+        if used_agent_names != agent_names:
+            raise OrchestrationValidationError(
+                "every agent definition must be referenced by a task"
+            )
         result_task_key = self.result_task_key
         if result_task_key is not None and (
             type(result_task_key) is not str or not result_task_key.strip()
@@ -98,6 +176,7 @@ class OrchestrationRunRequest:
                     "result_task_key must identify one workflow task"
                 )
         object.__setattr__(self, "workflow", copied_workflow)
+        object.__setattr__(self, "agents", copied_agents)
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,24 +307,37 @@ class OrchestrationRunReport:
 class WorkflowRunnerFactory(Protocol):
     """为每次应用调用创建独立 WorkflowRunner 的端口。"""
 
-    def create(self, *, max_concurrency: int) -> WorkflowRunner:
+    def create(
+        self,
+        *,
+        max_concurrency: int,
+        role_resolver: RoleResolver,
+    ) -> WorkflowRunner:
         """返回不共享 runner_id、线程池或活动任务的新 Runner。"""
 
 
 class OrchestrationApplication:
     """只通过领域 Service 和 Runner Factory 完成编排应用用例。"""
 
-    __slots__ = ("_max_supported_concurrency", "_runner_factory", "_service")
+    __slots__ = (
+        "_max_supported_concurrency",
+        "_role_resolver_factory",
+        "_runner_factory",
+        "_service",
+    )
 
     def __init__(
         self,
         *,
         service: OrchestrationService,
+        role_resolver_factory: RoleResolverFactory,
         runner_factory: WorkflowRunnerFactory,
         max_supported_concurrency: int,
     ) -> None:
         if not isinstance(service, OrchestrationService):
             raise TypeError("service must be an OrchestrationService")
+        if not callable(getattr(role_resolver_factory, "create", None)):
+            raise TypeError("role_resolver_factory must provide create()")
         if not callable(getattr(runner_factory, "create", None)):
             raise TypeError("runner_factory must provide create()")
         if (
@@ -258,6 +350,7 @@ class OrchestrationApplication:
                 "max_supported_concurrency must be within its limit"
             )
         self._service = service
+        self._role_resolver_factory = role_resolver_factory
         self._runner_factory = runner_factory
         self._max_supported_concurrency = max_supported_concurrency
 
@@ -290,11 +383,13 @@ class OrchestrationApplication:
             )
 
         result_task_key = self._resolve_result_task_key(request)
+        role_resolver = self._create_role_resolver(request.agents)
         workflow = self._service.create_workflow(request.workflow)
         workflow_id = workflow.workflow_id
         try:
             runner = self._runner_factory.create(
-                max_concurrency=request.max_concurrency
+                max_concurrency=request.max_concurrency,
+                role_resolver=role_resolver,
             )
             if not callable(getattr(runner, "run", None)):
                 raise WorkflowRunnerError(
@@ -400,6 +495,35 @@ class OrchestrationApplication:
                     result.kind
                     is WorkflowExecutionKind.PERSISTENCE_UNKNOWN
                 ),
+            ) from exc
+
+    def _create_role_resolver(
+        self,
+        definitions: tuple[AgentRoleDefinition, ...],
+    ) -> RoleResolver:
+        """在写库前构造并核验本次 Workflow 的独立职责目录。"""
+
+        try:
+            resolver = self._role_resolver_factory.create(definitions)
+            resolve = getattr(resolver, "resolve", None)
+            if not callable(resolve):
+                raise TypeError("role resolver must provide resolve()")
+            for definition in definitions:
+                role = resolve(definition.name)
+                if (
+                    not isinstance(role, AgentRoleSpec)
+                    or role.name != definition.name
+                    or role.system_prompt != definition.instructions
+                ):
+                    raise TypeError(
+                        "role resolver returned an invalid role plan"
+                    )
+            return resolver
+        except OrchestrationValidationError:
+            raise
+        except Exception as exc:
+            raise OrchestrationValidationError(
+                "agent role definitions could not be resolved"
             ) from exc
 
     @staticmethod

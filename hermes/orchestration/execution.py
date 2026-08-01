@@ -13,7 +13,7 @@ from hermes.orchestration.models import TaskClaim
 
 
 if TYPE_CHECKING:
-    from hermes.orchestration.roles import AgentRoleSpec
+    from hermes.orchestration.roles import AgentRoleSpec, RoleResolver
 
 
 class TaskExecutionOutcomeKind(StrEnum):
@@ -214,8 +214,20 @@ class ClaimedTaskExecutor(Protocol):
         """执行一次 Claim；调用方负责在执行期间维持租约。"""
 
 
+class ClaimedTaskExecutorFactory(Protocol):
+    """用单次 Workflow 的 RoleResolver 创建独立 Task Executor。"""
+
+    def create(
+        self,
+        *,
+        role_resolver: RoleResolver,
+    ) -> ClaimedTaskExecutor:
+        """只组装执行器，不创建 Workflow、线程或持久化角色。"""
+
+
 __all__ = [
     "ClaimedTaskExecutor",
+    "ClaimedTaskExecutorFactory",
     "ResolvedAgentTools",
     "TaskExecutionOutcome",
     "TaskExecutionOutcomeKind",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -85,9 +86,48 @@ def _require_text(value: object, field_name: str, maximum: int) -> str:
     return value
 
 
+def _normalize_definition_name(value: object) -> str:
+    """规范化动态职责名称，同时拒绝不可见控制字符。"""
+
+    if type(value) is not str or not value.strip():
+        raise ValueError("role definition name must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "role definition name must contain valid Unicode"
+        ) from exc
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError(
+            "role definition name must not contain control characters"
+        )
+    normalized = value.strip()
+    if len(normalized) > _MAX_ROLE_NAME_LENGTH:
+        raise ValueError("role definition name exceeds its length limit")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRoleDefinition:
+    """主 Agent 为单次 Workflow 声明的不可变业务职责。"""
+
+    name: str
+    instructions: str
+
+    def __post_init__(self) -> None:
+        normalized_name = _normalize_definition_name(self.name)
+        instructions = _require_text(
+            self.instructions,
+            "role definition instructions",
+            _MAX_ROLE_PROMPT_LENGTH,
+        )
+        object.__setattr__(self, "name", normalized_name)
+        object.__setattr__(self, "instructions", instructions)
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRoleSpec:
-    """调用方显式注入的不可变单 Agent 执行角色。"""
+    """Worker Runtime 使用的完整、不可变单 Agent 执行计划。"""
 
     name: str
     system_prompt: str
@@ -138,6 +178,16 @@ class RoleResolver(Protocol):
         """解析角色；未知名称必须抛出 UnknownAgentRoleError。"""
 
 
+class RoleResolverFactory(Protocol):
+    """为单次 Workflow 的动态职责创建独立 RoleResolver。"""
+
+    def create(
+        self,
+        definitions: tuple[AgentRoleDefinition, ...],
+    ) -> RoleResolver:
+        """补齐固定执行能力，但不运行 Agent 或修改全局状态。"""
+
+
 class StaticRoleRegistry:
     """构造后不可修改、无全局实例的最小内存 RoleResolver。"""
 
@@ -168,7 +218,9 @@ class StaticRoleRegistry:
 
 
 __all__ = [
+    "AgentRoleDefinition",
     "AgentRoleSpec",
     "RoleResolver",
+    "RoleResolverFactory",
     "StaticRoleRegistry",
 ]

@@ -11,21 +11,24 @@ TOOL_DECLARATIONS = (
             "name": "orchestration_run",
             "description": (
                 "Synchronously create and run one fixed, persistent task DAG "
-                "with a small set of isolated worker roles. Tasks may form a "
-                "pipeline, fan-out/fan-in, or mixed DAG. The call waits until "
-                "the workflow completes, fails, blocks, is cancelled, or "
-                "reaches a safe runner stop. This first version has no "
-                "background manager, automatic restart recovery, public "
-                "resume/unblock operation, dynamic task creation, workdir, "
-                "or autonomous worker claiming. The call is not retry-safe: "
-                "a crash may leave a persisted workflow that must not be "
-                "blindly submitted again. Prefer a final synthesizer task and "
-                "select it with result_task_key when the DAG has multiple "
-                "sinks. Worker toolsets, models, leases, and internal IDs are "
-                "fixed by the application and cannot be supplied here. The "
-                "bundled roles currently receive only low-risk skill_read "
-                "tools; they cannot use Terminal, File, Delegate, Cron, or "
-                "memory-writing tools."
+                "with isolated workers. Define agents first; every agent has "
+                "only a name and clear, non-overlapping responsibility "
+                "instructions, and every task role must exactly reference a "
+                "defined agent name. One definition may be used by multiple "
+                "tasks, but every task run still has an independent session "
+                "and no shared conversation memory. Agent definitions are "
+                "per-call responsibility templates, not persistent profiles, "
+                "and are not automatically recoverable after restart. "
+                "Workers cannot create agents, call Delegate or "
+                "orchestration_run, claim tasks, or modify workflow state. "
+                "Worker tools, models, iterations, approval policy, and other "
+                "execution settings are fixed by the application and cannot "
+                "be configured here; current workers receive only low-risk "
+                "skill_read tools. Tasks may form a pipeline, fan-out/fan-in, "
+                "or mixed DAG. A final aggregation task should depend on every "
+                "upstream result it must combine. Use result_task_key when the "
+                "DAG has multiple sinks. The call waits for a stable stop and "
+                "is not retry-safe after an unknown crash outcome."
             ),
             "parameters": {
                 "type": "object",
@@ -40,6 +43,28 @@ TOOL_DECLARATIONS = (
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 100_000,
+                    },
+                    "agents": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 128,
+                                },
+                                "instructions": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 100_000,
+                                },
+                            },
+                            "required": ["name", "instructions"],
+                        },
                     },
                     "tasks": {
                         "type": "array",
@@ -68,12 +93,6 @@ TOOL_DECLARATIONS = (
                                     "type": "string",
                                     "minLength": 1,
                                     "maxLength": 128,
-                                    "enum": [
-                                        "researcher",
-                                        "engineer",
-                                        "reviewer",
-                                        "synthesizer",
-                                    ],
                                 },
                                 "depends_on": {
                                     "type": "array",
@@ -119,7 +138,7 @@ TOOL_DECLARATIONS = (
                         "maximum": 8,
                     },
                 },
-                "required": ["title", "goal", "tasks"],
+                "required": ["title", "goal", "agents", "tasks"],
             },
         },
         execution_environments=("cli", "gateway"),

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from hermes.orchestration.agent_worker import (
@@ -18,8 +18,16 @@ from hermes.orchestration.errors import (
     WorkflowRunnerError,
     WorkflowRunnerValidationError,
 )
-from hermes.orchestration.execution import ClaimedTaskExecutor
-from hermes.orchestration.roles import AgentRoleSpec, StaticRoleRegistry
+from hermes.orchestration.execution import (
+    ClaimedTaskExecutor,
+    ClaimedTaskExecutorFactory,
+)
+from hermes.orchestration.roles import (
+    AgentRoleDefinition,
+    AgentRoleSpec,
+    RoleResolver,
+    StaticRoleRegistry,
+)
 from hermes.orchestration.service import OrchestrationService
 from hermes.orchestration.threaded_execution import (
     ThreadedWorkflowTaskExecutionPoolFactory,
@@ -43,31 +51,6 @@ _HARD_MAX_POLL_SECONDS = 60.0
 _MAX_RUNNER_ID_COMPONENT_LENGTH = 128
 _SAFE_RUNNER_ID_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _DEFAULT_ROLE_TOOLSETS = ("skill_read",)
-
-_DEFAULT_ROLE_PROMPTS = {
-    "researcher": (
-        "Collect relevant facts and documentary evidence for the assigned "
-        "task. Separate observations from inference, identify uncertainty, "
-        "and hand off a concise structured summary. Do not make the final "
-        "workflow decision."
-    ),
-    "engineer": (
-        "Perform the assigned technical implementation analysis. Be precise "
-        "about code-level constraints and clearly state when the available "
-        "read-only capabilities are insufficient. Do not claim edits or "
-        "commands that were not actually performed."
-    ),
-    "reviewer": (
-        "Independently review the direct upstream work. Identify errors, "
-        "omissions, unsafe assumptions, compatibility risks, and missing "
-        "evidence. Do not accept upstream conclusions by default."
-    ),
-    "synthesizer": (
-        "Synthesize only the persisted direct-upstream results into one "
-        "coherent final answer. Preserve material uncertainty, do not invent "
-        "missing work, and do not create or delegate to another agent."
-    ),
-}
 
 
 def _positive_finite_number(
@@ -168,6 +151,125 @@ class OrchestrationRuntimeSettings:
         )
 
 
+class FixedCapabilityRoleResolverFactory:
+    """把单次动态职责补齐为固定权限和模型的不可变执行计划。"""
+
+    __slots__ = (
+        "_max_iterations",
+        "_model",
+        "_model_kwargs",
+        "_toolsets",
+    )
+
+    def __init__(
+        self,
+        *,
+        toolsets: tuple[str, ...],
+        model: str,
+        max_iterations: int,
+        model_kwargs: Mapping[str, object],
+    ) -> None:
+        # 仅借助完整执行计划契约冻结固定能力，不形成可用业务角色。
+        template = AgentRoleSpec(
+            name="__fixed_capability_template__",
+            system_prompt="Internal fixed capability validation template.",
+            toolsets=toolsets,
+            model=model,
+            max_iterations=max_iterations,
+            model_kwargs=model_kwargs,
+        )
+        self._toolsets = template.toolsets
+        self._model = template.model
+        self._max_iterations = template.max_iterations
+        self._model_kwargs = template.model_kwargs
+
+    def create(
+        self,
+        definitions: tuple[AgentRoleDefinition, ...],
+    ) -> RoleResolver:
+        if not isinstance(definitions, (list, tuple)) or not definitions:
+            raise TypeError(
+                "definitions must be a non-empty sequence"
+            )
+        roles: dict[str, AgentRoleSpec] = {}
+        for definition in definitions:
+            if not isinstance(definition, AgentRoleDefinition):
+                raise TypeError(
+                    "definitions must contain AgentRoleDefinition values"
+                )
+            if definition.name in roles:
+                raise ValueError("agent definition names must be unique")
+            roles[definition.name] = AgentRoleSpec(
+                name=definition.name,
+                system_prompt=definition.instructions,
+                toolsets=self._toolsets,
+                model=self._model,
+                max_iterations=self._max_iterations,
+                model_kwargs=self._model_kwargs,
+            )
+        return StaticRoleRegistry(roles)
+
+
+class IsolatedAgentTaskExecutorFactory:
+    """复用正式基础设施，为单次 Workflow 创建独立 Task Executor。"""
+
+    __slots__ = (
+        "_isolated_agent_executor",
+        "_max_goal_chars",
+        "_service",
+        "_tool_resolver",
+    )
+
+    def __init__(
+        self,
+        *,
+        service: OrchestrationService,
+        tool_resolver: RegistryTaskToolResolver,
+        isolated_agent_executor: IsolatedAgentExecutor,
+        max_goal_chars: int,
+    ) -> None:
+        if not isinstance(service, OrchestrationService):
+            raise TypeError("service must be an OrchestrationService")
+        if not callable(getattr(tool_resolver, "resolve", None)):
+            raise TypeError("tool_resolver must provide resolve()")
+        if not callable(getattr(isolated_agent_executor, "execute", None)):
+            raise TypeError("isolated_agent_executor must provide execute()")
+        resolver_registry = getattr(tool_resolver, "registry_identity", None)
+        executor_registry = getattr(isolated_agent_executor, "registry", None)
+        if (
+            resolver_registry is None
+            or executor_registry is None
+            or resolver_registry is not executor_registry
+        ):
+            raise ValueError(
+                "tool resolver and isolated executor must share one registry"
+            )
+        if (
+            type(max_goal_chars) is not int
+            or not 1 <= max_goal_chars <= _HARD_MAX_GOAL_CHARS
+        ):
+            raise ValueError("max_goal_chars must be within its hard limit")
+        self._service = service
+        self._tool_resolver = tool_resolver
+        self._isolated_agent_executor = isolated_agent_executor
+        self._max_goal_chars = max_goal_chars
+
+    def create(
+        self,
+        *,
+        role_resolver: RoleResolver,
+    ) -> ClaimedTaskExecutor:
+        if not callable(getattr(role_resolver, "resolve", None)):
+            raise TypeError("role_resolver must provide resolve()")
+        return IsolatedAgentTaskExecutor(
+            service=self._service,
+            role_resolver=role_resolver,
+            tool_resolver=self._tool_resolver,
+            isolated_agent_executor=self._isolated_agent_executor,
+            max_goal_chars=self._max_goal_chars,
+        )
+
+
 class CentralWorkflowRunnerFactory:
     """为每次应用调用创建全新中央 Runner 的具体 Factory。"""
 
@@ -176,22 +278,22 @@ class CentralWorkflowRunnerFactory:
         "_runner_id_factory",
         "_service",
         "_settings",
-        "_task_executor",
+        "_task_executor_factory",
     )
 
     def __init__(
         self,
         *,
         service: OrchestrationService,
-        task_executor: ClaimedTaskExecutor,
+        task_executor_factory: ClaimedTaskExecutorFactory,
         pool_factory: WorkflowTaskExecutionPoolFactory,
         settings: OrchestrationRuntimeSettings,
         runner_id_factory: Callable[[], object] = uuid.uuid4,
     ) -> None:
         if not isinstance(service, OrchestrationService):
             raise TypeError("service must be an OrchestrationService")
-        if not callable(getattr(task_executor, "execute_claim", None)):
-            raise TypeError("task_executor must provide execute_claim()")
+        if not callable(getattr(task_executor_factory, "create", None)):
+            raise TypeError("task_executor_factory must provide create()")
         if not callable(getattr(pool_factory, "create", None)):
             raise TypeError("pool_factory must provide create()")
         if not isinstance(settings, OrchestrationRuntimeSettings):
@@ -199,12 +301,17 @@ class CentralWorkflowRunnerFactory:
         if not callable(runner_id_factory):
             raise TypeError("runner_id_factory must be callable")
         self._service = service
-        self._task_executor = task_executor
+        self._task_executor_factory = task_executor_factory
         self._pool_factory = pool_factory
         self._settings = settings
         self._runner_id_factory = runner_id_factory
 
-    def create(self, *, max_concurrency: int) -> WorkflowRunner:
+    def create(
+        self,
+        *,
+        max_concurrency: int,
+        role_resolver: RoleResolver,
+    ) -> WorkflowRunner:
         if (
             type(max_concurrency) is not int
             or not 1
@@ -214,10 +321,22 @@ class CentralWorkflowRunnerFactory:
             raise WorkflowRunnerValidationError(
                 "max_concurrency exceeds the configured limit"
             )
+        if not callable(getattr(role_resolver, "resolve", None)):
+            raise WorkflowRunnerValidationError(
+                "role_resolver must provide resolve()"
+            )
+        task_executor = self._task_executor_factory.create(
+            role_resolver=role_resolver
+        )
+        if not callable(getattr(task_executor, "execute_claim", None)):
+            raise WorkflowRunnerError(
+                "task_executor_factory returned an invalid executor",
+                persistence_unknown=False,
+            )
         runner_id = self._new_runner_id()
         return CentralWorkflowRunner(
             service=self._service,
-            task_executor=self._task_executor,
+            task_executor=task_executor,
             pool_factory=self._pool_factory,
             runner_id=runner_id,
             max_concurrency=max_concurrency,
@@ -241,28 +360,6 @@ class CentralWorkflowRunnerFactory:
                 "runner_id factory returned an invalid identifier"
             )
         return f"runner_{component}"
-
-
-def _build_default_role_registry(
-    *,
-    model: str,
-    max_output_tokens: int,
-    max_child_iterations: int,
-) -> StaticRoleRegistry:
-    """组装不含 Delegate、写入或审批能力的四个静态角色。"""
-
-    roles = {
-        name: AgentRoleSpec(
-            name=name,
-            system_prompt=prompt,
-            toolsets=_DEFAULT_ROLE_TOOLSETS,
-            model=model,
-            max_iterations=max_child_iterations,
-            model_kwargs={"max_tokens": max_output_tokens},
-        )
-        for name, prompt in _DEFAULT_ROLE_PROMPTS.items()
-    }
-    return StaticRoleRegistry(roles)
 
 
 def build_orchestration_application(
@@ -311,10 +408,11 @@ def build_orchestration_application(
 
     store = SQLiteOrchestrationStore(db_path)
     service = OrchestrationService(store)
-    role_registry = _build_default_role_registry(
+    role_resolver_factory = FixedCapabilityRoleResolverFactory(
+        toolsets=_DEFAULT_ROLE_TOOLSETS,
         model=model,
-        max_output_tokens=max_output_tokens,
-        max_child_iterations=max_child_iterations,
+        max_iterations=max_child_iterations,
+        model_kwargs={"max_tokens": max_output_tokens},
     )
     tool_resolver = RegistryTaskToolResolver(
         registry=execution_registry,
@@ -331,16 +429,25 @@ def build_orchestration_application(
         max_risk_level=ToolRiskLevel.LOW,
     )
     # staging 只在注册期验证声明；真正 Worker 始终使用正式 execution Registry。
-    for role_name in _DEFAULT_ROLE_PROMPTS:
-        validation_resolver.resolve(role_registry.resolve(role_name))
+    capability_validation_definition = AgentRoleDefinition(
+        name="__capability_validation__",
+        instructions="Validate fixed orchestration worker capabilities.",
+    )
+    capability_validation_roles = role_resolver_factory.create(
+        (capability_validation_definition,)
+    )
+    validation_resolver.resolve(
+        capability_validation_roles.resolve(
+            capability_validation_definition.name
+        )
+    )
     isolated_executor = IsolatedAgentExecutor(
         registry=execution_registry,
         client=model_client,
         process_manager=process_manager,
     )
-    task_executor = IsolatedAgentTaskExecutor(
+    task_executor_factory = IsolatedAgentTaskExecutorFactory(
         service=service,
-        role_resolver=role_registry,
         tool_resolver=tool_resolver,
         isolated_agent_executor=isolated_executor,
         max_goal_chars=active_settings.max_goal_chars,
@@ -348,12 +455,13 @@ def build_orchestration_application(
     pool_factory = ThreadedWorkflowTaskExecutionPoolFactory()
     runner_factory = CentralWorkflowRunnerFactory(
         service=service,
-        task_executor=task_executor,
+        task_executor_factory=task_executor_factory,
         pool_factory=pool_factory,
         settings=active_settings,
     )
     return OrchestrationApplication(
         service=service,
+        role_resolver_factory=role_resolver_factory,
         runner_factory=runner_factory,
         max_supported_concurrency=(
             active_settings.maximum_max_concurrency
@@ -363,6 +471,8 @@ def build_orchestration_application(
 
 __all__ = [
     "CentralWorkflowRunnerFactory",
+    "FixedCapabilityRoleResolverFactory",
+    "IsolatedAgentTaskExecutorFactory",
     "OrchestrationRuntimeSettings",
     "build_orchestration_application",
 ]

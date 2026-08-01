@@ -29,6 +29,7 @@ from hermes.orchestration.errors import (
 )
 from hermes.orchestration.execution import (
     ClaimedTaskExecutor,
+    ClaimedTaskExecutorFactory,
     ResolvedAgentTools,
     TaskExecutionOutcome,
     TaskExecutionOutcomeKind,
@@ -49,8 +50,10 @@ from hermes.orchestration.models import (
 )
 from hermes.orchestration.service import OrchestrationService
 from hermes.orchestration.roles import (
+    AgentRoleDefinition,
     AgentRoleSpec,
     RoleResolver,
+    RoleResolverFactory,
     StaticRoleRegistry,
 )
 from hermes.orchestration.store import OrchestrationStore
@@ -66,8 +69,10 @@ from hermes.orchestration.workflow_execution import (
 
 
 __all__ = [
+    "AgentRoleDefinition",
     "AgentRoleSpec",
     "ClaimedTaskExecutor",
+    "ClaimedTaskExecutorFactory",
     "InvalidTaskTransitionError",
     "OrchestrationApplication",
     "OrchestrationConflictError",
@@ -84,6 +89,7 @@ __all__ = [
     "OrchestrationValidationError",
     "ResolvedAgentTools",
     "RoleResolver",
+    "RoleResolverFactory",
     "StaticRoleRegistry",
     "TaskClaim",
     "TaskClaimLostError",

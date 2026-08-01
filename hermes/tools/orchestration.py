@@ -28,6 +28,7 @@ from hermes.orchestration.models import (
     WorkflowCreateSpec,
     plain_json_object,
 )
+from hermes.orchestration.roles import AgentRoleDefinition
 from hermes.tool_declarations.orchestration import TOOL_DECLARATIONS
 from hermes.tools import ToolRegistry, register_declared_handlers
 
@@ -43,19 +44,17 @@ _MAX_ATTEMPTS = 100
 _MAX_PRIORITY_ABS = 1_000_000
 _MAX_METADATA_PROPERTIES = 256
 _MAX_OUTPUT_CHARS = 8_000_000
-_ALLOWED_ROLES = frozenset({
-    "researcher",
-    "engineer",
-    "reviewer",
-    "synthesizer",
-})
+_MAX_AGENT_DEFINITIONS = 32
+_MAX_TOTAL_AGENT_INSTRUCTIONS_CHARS = 1_000_000
 _TOP_LEVEL_KEYS = frozenset({
     "title",
     "goal",
+    "agents",
     "tasks",
     "result_task_key",
     "max_concurrency",
 })
+_AGENT_KEYS = frozenset({"name", "instructions"})
 _TASK_KEYS = frozenset({
     "key",
     "title",
@@ -67,20 +66,35 @@ _TASK_KEYS = frozenset({
     "input_metadata",
 })
 _RUNTIME_OVERRIDE_KEYS = frozenset({
+    "allowed_tool_names",
+    "allowed_tools",
     "application",
+    "capabilities",
     "client",
     "database_path",
     "db_path",
     "execution_registry",
     "executor",
     "isolated_agent_executor",
+    "max_child_iterations",
+    "max_iterations",
+    "max_tokens",
+    "model",
     "model_client",
+    "model_kwargs",
+    "permissions",
     "process_manager",
+    "provider",
     "registry",
+    "role_resolver",
+    "role_resolver_factory",
     "runner_factory",
     "service",
     "settings",
     "task_executor",
+    "task_executor_factory",
+    "tools",
+    "toolsets",
 })
 
 
@@ -107,9 +121,60 @@ def _required_text(
     return value
 
 
+def _parse_agents(value: object) -> tuple[AgentRoleDefinition, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise OrchestrationValidationError("agents must be an array")
+    if not 1 <= len(value) <= _MAX_AGENT_DEFINITIONS:
+        raise OrchestrationValidationError(
+            "agent definition count exceeds its limit"
+        )
+    definitions: list[AgentRoleDefinition] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise OrchestrationValidationError(
+                "agents must contain JSON objects"
+            )
+        if set(item) - _AGENT_KEYS:
+            raise OrchestrationValidationError(
+                "agent definition contains unsupported fields"
+            )
+        try:
+            definitions.append(AgentRoleDefinition(
+                name=_required_text(
+                    item.get("name"),
+                    "agent name",
+                    maximum=_MAX_ROLE_LENGTH,
+                ),
+                instructions=_required_text(
+                    item.get("instructions"),
+                    "agent instructions",
+                    maximum=_MAX_TEXT_LENGTH,
+                ),
+            ))
+        except OrchestrationValidationError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise OrchestrationValidationError(
+                "agent definition is invalid"
+            ) from exc
+    names = tuple(definition.name for definition in definitions)
+    if len(names) != len(set(names)):
+        raise OrchestrationValidationError(
+            "agent definition names must be unique"
+        )
+    if sum(len(definition.instructions) for definition in definitions) > (
+        _MAX_TOTAL_AGENT_INSTRUCTIONS_CHARS
+    ):
+        raise OrchestrationValidationError(
+            "agent instructions exceed the total size limit"
+        )
+    return tuple(definitions)
+
+
 def _parse_task(
     value: object,
     *,
+    agent_names: frozenset[str],
     maximum_dependencies: int,
 ) -> TaskCreateSpec:
     if not isinstance(value, Mapping):
@@ -123,9 +188,11 @@ def _parse_task(
         value.get("role"),
         "task role",
         maximum=_MAX_ROLE_LENGTH,
-    )
-    if role not in _ALLOWED_ROLES:
-        raise OrchestrationValidationError("task role is not supported")
+    ).strip()
+    if role not in agent_names:
+        raise OrchestrationValidationError(
+            "task role must reference a defined agent"
+        )
 
     depends_on = value.get("depends_on", ())
     if not isinstance(depends_on, (list, tuple)):
@@ -213,6 +280,8 @@ def _parse_request(
         raise OrchestrationValidationError(
             "arguments contain unsupported fields"
         )
+    agents = _parse_agents(args.get("agents"))
+    agent_names = frozenset(definition.name for definition in agents)
     tasks_value = args.get("tasks")
     if not isinstance(tasks_value, (list, tuple)):
         raise OrchestrationValidationError("tasks must be an array")
@@ -223,10 +292,15 @@ def _parse_request(
     tasks = tuple(
         _parse_task(
             task,
+            agent_names=agent_names,
             maximum_dependencies=settings.max_tasks_per_workflow,
         )
         for task in tasks_value
     )
+    if frozenset(task.role for task in tasks) != agent_names:
+        raise OrchestrationValidationError(
+            "every agent definition must be referenced by a task"
+        )
     result_task_key_value = args.get("result_task_key")
     result_task_key = (
         None
@@ -264,6 +338,7 @@ def _parse_request(
     )
     return OrchestrationRunRequest(
         workflow=workflow,
+        agents=agents,
         result_task_key=result_task_key,
         max_concurrency=max_concurrency,
     )
