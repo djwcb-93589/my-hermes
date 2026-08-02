@@ -229,6 +229,11 @@ class ClaudeCodeOutputDetector:
 
         self._action_required = None
         self._last_action_fingerprint = None
+        if self._state in {
+            ClaudeCodeState.WAITING_INPUT,
+            ClaudeCodeState.WAITING_APPROVAL,
+        }:
+            self._state = ClaudeCodeState.UNKNOWN
 
     def record_outbound_input(
         self,
