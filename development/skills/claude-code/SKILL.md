@@ -7,17 +7,18 @@ description: >-
   size or complexity. Without an explicit user request, use normal myHermes
   tools. After explicit activation, read this Skill and complete the required
   preflight before launch or session control.
-version: 0.5.0
+version: 0.6.0
 platforms:
   - windows
   - linux
   - darwin
 metadata:
-  development_stage: output_observation
+  development_stage: workflow_controller
   agent_integration: discovery_and_selection
   managed_runtime: true
   output_normalization: true
   state_detection: true
+  workflow_controller: true
   supports_one_shot: true
   supports_supervised_pty: true
   requires_process_input: true
@@ -54,14 +55,14 @@ metadata:
 
 ## 职责边界
 
-通过现有 Terminal Tool 和 Process Tool 启动、观察、纠偏和结束 Claude Code。受管运行模块封装同一条 ProcessManager 公共调用链；P5 只在该链路之上提供有界输出解释和单次状态观察。它们都不是新 Tool，也不拥有进程、PTY、日志或 cleanup 基础设施。
+通过现有 Terminal Tool 和 Process Tool 启动、观察、纠偏和结束 Claude Code。受管 Runtime 封装同一条 ProcessManager 公共调用链，P5 提供有界输出解释和单次状态观察，P6 Controller 只在 Runtime 公共接口之上提供有界工作流编排。它们都不是新 Tool，也不拥有进程、PTY、日志或 cleanup 基础设施；Controller 尚未接入 AgentLoop。
 
 必须遵守以下边界：
 
 - 只通过 Terminal Tool 启动进程，只通过 Process Tool 管理已注册进程。
 - 保存 Terminal Tool 返回的 `process_id`；不要保存 Handle，不要按 PID 操作系统进程，不要访问 `ProcessManager` 私有字段。
 - 使用 Process Tool 返回的 `next_cursor` 继续读取；不要计算、修正或另建 cursor。
-- 生命周期引用只保存 `process_id`、`session_owner`、`cwd`、cursor 和时间戳；P5 另按 [output-observation.md](references/output-observation.md) 保存有硬上限的解析缓冲与 fingerprint。ProcessManager process id 仍是唯一运行身份。
+- 生命周期引用只保存 `process_id`、`session_owner`、`cwd`、cursor 和时间戳；P5 另按 [output-observation.md](references/output-observation.md) 保存有硬上限的解析缓冲与 fingerprint，P6 只增加有界计数、deadline 和最新 Snapshot。ProcessManager process id 仍是唯一运行身份。
 - 不建立完整日志副本、第二套分页器、进程 registry、reader、cleanup 或后台监控服务。
 - 只管理由当前 myHermes runtime、当前 ProcessManager 和当前 owner 启动的会话；不扫描、接管、恢复、终止或清理外部终端中的 Claude Code。
 - 不创建 Claude Code 专用 Tool、Agent 唤醒机制或 Claude hooks。
@@ -76,6 +77,7 @@ metadata:
 - [p8-tool-contract.md](references/p8-tool-contract.md)：Terminal/Process 的公开契约。
 - [managed-runtime.md](references/managed-runtime.md)：P4 真实后台 PTY、SessionRef、owner/cwd 互斥和基础生命周期边界。
 - [output-observation.md](references/output-observation.md)：P5 增量规范化、Event/ActionRequired/Snapshot、状态证据和安全降级。
+- [workflow-controller.md](references/workflow-controller.md)：P6 有界 poll/wait、ActionRequired 暂停、deadline、中断、终止和 final drain。
 - [permissions-and-safety.md](references/permissions-and-safety.md)：权限、凭证和危险操作边界。
 - [claude-code-cli.md](references/claude-code-cli.md)：本 Skill 使用的 CLI 能力。
 

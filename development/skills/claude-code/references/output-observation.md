@@ -75,4 +75,4 @@ UNKNOWN
 + ActionRequired(kind="unknown_prompt")
 ```
 
-连续轮询、deadline、sleep、停滞计时、自动响应、审批决策、终态 drain/retry 和干预策略编排属于 P6 Controller。
+连续轮询、deadline、停滞计数、终态 drain/retry 和工作流收敛由独立的 P6 [workflow-controller.md](workflow-controller.md) 承担；Detector 与 `observe` 仍不循环、不自动响应，也不执行审批决策。

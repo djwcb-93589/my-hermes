@@ -86,7 +86,7 @@ Runtime 先检查 SessionRef；Adapter 再把同一 owner 传给 ProcessManager�
 - `interrupt`：通过 owner-scoped 输入路径发送一次 Ctrl+C，只请求协作式中断；delivery unknown 时不自动重发。
 - `kill`：调用 ProcessManager `kill`，由其负责协作式中断、grace period、必要的强制终止和进程树清理。
 
-P4 的 `read`、`status` 等基础接口仍不推断语义。P5 只通过 `observe` 提供有界规范化和多证据状态识别，详见 [output-observation.md](output-observation.md)；自动轮询、回复、批准和完整 Controller 仍不在本阶段。
+P4 的 `read`、`status` 等基础接口仍不推断语义。P5 只通过 `observe` 提供有界规范化和多证据状态识别，详见 [output-observation.md](output-observation.md)。P6 在独立 [workflow-controller.md](workflow-controller.md) 中串联这些公开接口；Runtime 本身仍不自动轮询、回复、批准或终止。
 
 ## cleanup 与外部会话
 
