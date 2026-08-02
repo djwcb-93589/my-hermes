@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
+import secrets
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from hermes.claude_code.contracts import (
     ClaudeCodeActionKind,
@@ -24,6 +26,13 @@ MAX_EVENT_TEXT_CHARS = 2_048
 MAX_DETECTION_CONTEXT_CHARS = 8_192
 MAX_RECENT_EVENT_FINGERPRINTS = 128
 MAX_ACTION_OPTIONS = 8
+MAX_OUTBOUND_INPUT_EVIDENCE = 16
+OUTBOUND_INPUT_TTL_SECONDS = 30.0
+OUTBOUND_INPUT_OBSERVATION_BUDGET = 4
+OUTBOUND_INPUT_PREFIX_CHARS = 16
+RECENT_MATCHED_ECHO_TTL_SECONDS = 10.0
+RECENT_MATCHED_ECHO_MATCH_BUDGET = 2
+MAX_ECHO_MATCH_LINES = 16
 _EVENT_TRUNCATION_MARKER = "\n[… event text truncated …]\n"
 
 _TERMINAL_PROCESS_STATUSES = frozenset(
@@ -102,6 +111,44 @@ _INLINE_OPTION_RE = re.compile(
 _LINE_OPTION_RE = re.compile(
     r"(?m)^\s*(?:\d{1,2}[.)]|[-*]|\[[ xX]?\])\s+(.{1,160})\s*$"
 )
+_ECHO_PROMPT_PREFIX_RE = re.compile(
+    r"(?i)^\s*(?:[│┃|]\s*)?"
+    r"(?:(?:you|human|user)\s*:\s*|[>❯›»$#]+\s*)"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboundInputEvidence:
+    """不含明文的短生命周期 outbound input 证据。"""
+
+    fingerprint: str
+    normalized_length: int
+    prefix_fingerprints: tuple[str, ...]
+    input_kind: str
+    sent_at: float
+    cursor_before: int
+    cursor_after: int
+    remaining_observations: int
+    line_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchedEchoEvidence:
+    """短暂吸收同一 PTY echo 的有限重复重绘。"""
+
+    fingerprint: str
+    normalized_length: int
+    prefix_fingerprints: tuple[str, ...]
+    expires_at: float
+    remaining_matches: int
+
+
+@dataclass(frozen=True, slots=True)
+class _EchoIsolationResult:
+    """保留完整输出，同时只把非 echo 文本交给语义检测。"""
+
+    semantic_text: str
+    metadata: dict[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +158,7 @@ class DetectionResult:
     state: ClaudeCodeState
     events: tuple[ClaudeCodeEvent, ...]
     action_required: ClaudeCodeActionRequired | None
+    activity_detected: bool = False
 
 
 class ClaudeCodeOutputDetector:
@@ -128,6 +176,25 @@ class ClaudeCodeOutputDetector:
         self._ready_seen = False
         self._last_process_status: str | None = None
         self._context_complete = True
+        self._semantic_context = ""
+        self._last_semantic_context_fingerprint = ""
+        self._outbound_response_pending = False
+        self._input_fingerprint_key = secrets.token_bytes(32)
+        self._outbound_inputs: deque[_OutboundInputEvidence] = deque(
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE
+        )
+        self._matched_echoes: deque[_MatchedEchoEvidence] = deque(
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE
+        )
+        self._pending_input_hasher = self._new_input_hasher()
+        self._pending_input_prefix_hasher = self._new_input_hasher()
+        self._pending_input_prefix_fingerprints: list[str] = []
+        self._next_input_line_id = 1
+        self._pending_input_line_id = self._next_input_line_id
+        self._pending_input_length = 0
+        self._pending_input_cursor_before = 0
+        self._pending_input_last_sent_at = 0.0
+        self._pending_input_previous_was_cr = False
 
     def begin_task(self) -> None:
         """记录首个任务已送达，不保存任务文本。"""
@@ -140,6 +207,8 @@ class ClaudeCodeOutputDetector:
         self._progress_seen = False
         self._ready_seen = False
         self._context_complete = True
+        self._outbound_response_pending = False
+        self._clear_semantic_context()
         self._clear_recent_event_fingerprints()
 
     def acknowledge_input(self) -> None:
@@ -149,8 +218,467 @@ class ClaudeCodeOutputDetector:
         self._last_action_fingerprint = None
         self._completion_seen = False
         self._failure_seen = False
+        self._progress_seen = False
+        self._ready_seen = False
         self._state = ClaudeCodeState.STARTING
+        self._clear_semantic_context()
         self._clear_recent_event_fingerprints()
+
+    def record_outbound_input(
+        self,
+        data: str,
+        *,
+        input_kind: str,
+        sent_at: float,
+        cursor_before: int,
+        cursor_after: int,
+    ) -> None:
+        """只保存脱敏规范化 HMAC，不保留 outbound input 明文。"""
+
+        if not isinstance(data, str):
+            raise TypeError("outbound input must be text")
+        if input_kind not in {"write", "submit"}:
+            raise ValueError("input_kind must be write or submit")
+        if cursor_before < 0 or cursor_after < cursor_before:
+            raise ValueError("outbound input cursor range is invalid")
+        if self._action_required is not None and (
+            input_kind == "submit" or "\r" in data or "\n" in data
+        ):
+            self._outbound_response_pending = True
+
+        if (
+            self._pending_input_length
+            and sent_at - self._pending_input_last_sent_at
+            > OUTBOUND_INPUT_TTL_SECONDS
+        ):
+            self._reset_pending_input()
+
+        safe_data = redact_claude_code_output(data)
+        for character in safe_data:
+            if character == "\n":
+                if self._pending_input_previous_was_cr:
+                    self._pending_input_previous_was_cr = False
+                    continue
+                self._capture_pending_input(
+                    input_kind=input_kind,
+                    sent_at=sent_at,
+                    cursor_after=cursor_after,
+                )
+                self._reset_pending_input()
+                continue
+            if character == "\r":
+                self._capture_pending_input(
+                    input_kind=input_kind,
+                    sent_at=sent_at,
+                    cursor_after=cursor_after,
+                )
+                self._reset_pending_input()
+                self._pending_input_previous_was_cr = True
+                continue
+
+            self._pending_input_previous_was_cr = False
+            if character.isspace():
+                continue
+            if self._pending_input_length == 0:
+                self._pending_input_cursor_before = cursor_before
+            encoded = character.encode("utf-8", errors="replace")
+            self._pending_input_hasher.update(encoded)
+            self._pending_input_length += 1
+            if (
+                len(self._pending_input_prefix_fingerprints)
+                < OUTBOUND_INPUT_PREFIX_CHARS
+            ):
+                self._pending_input_prefix_hasher.update(encoded)
+                self._pending_input_prefix_fingerprints.append(
+                    self._pending_input_prefix_hasher.copy().hexdigest()
+                )
+
+        if self._pending_input_length:
+            self._pending_input_last_sent_at = sent_at
+            self._capture_pending_input(
+                input_kind=input_kind,
+                sent_at=sent_at,
+                cursor_after=cursor_after,
+            )
+        if input_kind == "submit":
+            self._reset_pending_input()
+
+    def _capture_pending_input(
+        self,
+        *,
+        input_kind: str,
+        sent_at: float,
+        cursor_after: int,
+    ) -> None:
+        if self._pending_input_length == 0:
+            return
+        evidence = _OutboundInputEvidence(
+            fingerprint=self._pending_input_hasher.copy().hexdigest(),
+            normalized_length=self._pending_input_length,
+            prefix_fingerprints=tuple(
+                self._pending_input_prefix_fingerprints
+            ),
+            input_kind=input_kind,
+            sent_at=sent_at,
+            cursor_before=self._pending_input_cursor_before,
+            cursor_after=cursor_after,
+            remaining_observations=OUTBOUND_INPUT_OBSERVATION_BUDGET,
+            line_id=self._pending_input_line_id,
+        )
+        self._outbound_inputs = deque(
+            (
+                existing
+                for existing in self._outbound_inputs
+                if existing.line_id != evidence.line_id
+            ),
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE,
+        )
+        self._outbound_inputs.append(evidence)
+
+    def _reset_pending_input(self) -> None:
+        self._pending_input_hasher = self._new_input_hasher()
+        self._pending_input_prefix_hasher = self._new_input_hasher()
+        self._pending_input_prefix_fingerprints = []
+        self._next_input_line_id += 1
+        self._pending_input_line_id = self._next_input_line_id
+        self._pending_input_length = 0
+        self._pending_input_cursor_before = 0
+        self._pending_input_last_sent_at = 0.0
+        self._pending_input_previous_was_cr = False
+
+    def _new_input_hasher(self) -> hmac.HMAC:
+        return hmac.new(
+            self._input_fingerprint_key,
+            digestmod=hashlib.sha256,
+        )
+
+    def _clear_outbound_input_evidence(self) -> None:
+        self._outbound_inputs.clear()
+        self._matched_echoes.clear()
+        self._outbound_response_pending = False
+        self._reset_pending_input()
+
+    def _isolate_input_echo(
+        self,
+        candidate: str,
+        *,
+        cursor_start: int,
+        cursor_end: int,
+        timestamp: float,
+        enabled: bool,
+    ) -> _EchoIsolationResult:
+        self._prune_outbound_input_evidence(timestamp)
+        if not candidate or not enabled:
+            return _EchoIsolationResult(candidate, {})
+
+        eligible = tuple(
+            evidence
+            for evidence in self._outbound_inputs
+            if cursor_end > max(evidence.cursor_after, cursor_start)
+        )
+        lines = candidate.splitlines()
+        matched_lines: set[int] = set()
+        matched_keys: set[tuple[str, int]] = set()
+        matched_prefixes: dict[tuple[str, int], tuple[str, ...]] = {}
+        matched_line_ids: set[int] = set()
+        matched_recent: set[tuple[str, int]] = set()
+        suspected_lines: set[int] = set()
+        suspected_line_ids: set[int] = set()
+
+        for evidence in reversed(eligible):
+            key = (evidence.fingerprint, evidence.normalized_length)
+            if key in matched_keys or evidence.line_id in matched_line_ids:
+                continue
+            line_indexes = self._find_echo_lines(
+                lines,
+                fingerprint=evidence.fingerprint,
+                normalized_length=evidence.normalized_length,
+                claimed=matched_lines,
+            )
+            if line_indexes:
+                matched_lines.update(line_indexes)
+                matched_keys.add(key)
+                matched_prefixes[key] = evidence.prefix_fingerprints
+                matched_line_ids.add(evidence.line_id)
+
+        for evidence in tuple(self._matched_echoes):
+            key = (evidence.fingerprint, evidence.normalized_length)
+            line_indexes = self._find_echo_lines(
+                lines,
+                fingerprint=evidence.fingerprint,
+                normalized_length=evidence.normalized_length,
+                claimed=matched_lines,
+            )
+            if line_indexes:
+                matched_lines.update(line_indexes)
+                matched_recent.add(key)
+
+        for evidence in reversed(eligible):
+            if evidence.line_id in matched_line_ids:
+                continue
+            line_indexes = self._find_echo_prefix_lines(
+                lines,
+                fingerprints=evidence.prefix_fingerprints,
+                claimed=matched_lines | suspected_lines,
+            )
+            if line_indexes:
+                suspected_lines.update(line_indexes)
+                suspected_line_ids.add(evidence.line_id)
+        for evidence in tuple(self._matched_echoes):
+            line_indexes = self._find_echo_prefix_lines(
+                lines,
+                fingerprints=evidence.prefix_fingerprints,
+                claimed=matched_lines | suspected_lines,
+            )
+            if line_indexes:
+                suspected_lines.update(line_indexes)
+
+        self._advance_outbound_input_evidence(
+            eligible=eligible,
+            matched_keys=matched_keys,
+            matched_prefixes=matched_prefixes,
+            matched_line_ids=matched_line_ids,
+            matched_recent=matched_recent,
+            preserved_line_ids=suspected_line_ids,
+            timestamp=timestamp,
+        )
+        if matched_lines:
+            semantic_text = self._without_lines(
+                lines,
+                matched_lines | suspected_lines,
+            )
+            metadata: dict[str, object] = {
+                "source": "input_echo" if not semantic_text else "mixed",
+                "input_echo_lines": len(matched_lines),
+            }
+            if suspected_lines:
+                metadata["input_echo_unconfirmed"] = True
+            if semantic_text:
+                metadata["contains_input_echo"] = True
+            return _EchoIsolationResult(semantic_text, metadata)
+
+        if suspected_lines:
+            semantic_text = self._without_lines(lines, suspected_lines)
+            metadata = {
+                "source": (
+                    "unconfirmed_after_input"
+                    if not semantic_text
+                    else "mixed"
+                ),
+                "input_echo_unconfirmed": True,
+            }
+            return _EchoIsolationResult(semantic_text, metadata)
+
+        return _EchoIsolationResult(candidate, {})
+
+    def _prune_outbound_input_evidence(self, timestamp: float) -> None:
+        self._outbound_inputs = deque(
+            (
+                evidence
+                for evidence in self._outbound_inputs
+                if evidence.remaining_observations > 0
+                and max(0.0, timestamp - evidence.sent_at)
+                <= OUTBOUND_INPUT_TTL_SECONDS
+            ),
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE,
+        )
+        self._matched_echoes = deque(
+            (
+                evidence
+                for evidence in self._matched_echoes
+                if evidence.remaining_matches > 0
+                and timestamp <= evidence.expires_at
+            ),
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE,
+        )
+
+    def _advance_outbound_input_evidence(
+        self,
+        *,
+        eligible: tuple[_OutboundInputEvidence, ...],
+        matched_keys: set[tuple[str, int]],
+        matched_prefixes: dict[tuple[str, int], tuple[str, ...]],
+        matched_line_ids: set[int],
+        matched_recent: set[tuple[str, int]],
+        preserved_line_ids: set[int],
+        timestamp: float,
+    ) -> None:
+        eligible_ids = {id(evidence) for evidence in eligible}
+        remaining_inputs: deque[_OutboundInputEvidence] = deque(
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE
+        )
+        for evidence in self._outbound_inputs:
+            key = (evidence.fingerprint, evidence.normalized_length)
+            if key in matched_keys or evidence.line_id in matched_line_ids:
+                continue
+            if evidence.line_id in preserved_line_ids:
+                remaining_inputs.append(evidence)
+                continue
+            if id(evidence) not in eligible_ids:
+                remaining_inputs.append(evidence)
+                continue
+            remaining = evidence.remaining_observations - 1
+            if remaining > 0:
+                remaining_inputs.append(
+                    replace(evidence, remaining_observations=remaining)
+                )
+        self._outbound_inputs = remaining_inputs
+
+        recent: deque[_MatchedEchoEvidence] = deque(
+            maxlen=MAX_OUTBOUND_INPUT_EVIDENCE
+        )
+        for evidence in self._matched_echoes:
+            key = (evidence.fingerprint, evidence.normalized_length)
+            if key in matched_keys:
+                continue
+            remaining = evidence.remaining_matches
+            if key in matched_recent:
+                remaining -= 1
+            if remaining > 0:
+                recent.append(
+                    replace(evidence, remaining_matches=remaining)
+                )
+        for fingerprint, normalized_length in matched_keys:
+            recent.append(
+                _MatchedEchoEvidence(
+                    fingerprint=fingerprint,
+                    normalized_length=normalized_length,
+                    prefix_fingerprints=matched_prefixes[
+                        (fingerprint, normalized_length)
+                    ],
+                    expires_at=(
+                        timestamp + RECENT_MATCHED_ECHO_TTL_SECONDS
+                    ),
+                    remaining_matches=RECENT_MATCHED_ECHO_MATCH_BUDGET,
+                )
+            )
+        self._matched_echoes = recent
+
+    def _find_echo_lines(
+        self,
+        lines: list[str],
+        *,
+        fingerprint: str,
+        normalized_length: int,
+        claimed: set[int],
+    ) -> set[int]:
+        scan_limit = min(len(lines), MAX_ECHO_MATCH_LINES)
+        for start in range(scan_limit):
+            if start in claimed:
+                continue
+            variants = (lines[start],)
+            without_prefix = _ECHO_PROMPT_PREFIX_RE.sub(
+                "",
+                lines[start],
+                count=1,
+            )
+            if without_prefix != lines[start]:
+                variants += (without_prefix,)
+            for first_line in variants:
+                hasher = self._new_input_hasher()
+                length = self._update_echo_hasher(hasher, first_line)
+                for end in range(start, scan_limit):
+                    if end in claimed:
+                        break
+                    if end > start:
+                        length += self._update_echo_hasher(
+                            hasher,
+                            lines[end],
+                        )
+                    if length > normalized_length:
+                        break
+                    if length == normalized_length and hmac.compare_digest(
+                        hasher.copy().hexdigest(),
+                        fingerprint,
+                    ):
+                        return set(range(start, end + 1))
+        return set()
+
+    def _find_echo_prefix_lines(
+        self,
+        lines: list[str],
+        *,
+        fingerprints: tuple[str, ...],
+        claimed: set[int],
+    ) -> set[int]:
+        if not fingerprints:
+            return set()
+        normalized_length = len(fingerprints)
+        scan_limit = min(len(lines), MAX_ECHO_MATCH_LINES)
+        for start in range(scan_limit):
+            if start in claimed:
+                continue
+            variants = (lines[start],)
+            without_prefix = _ECHO_PROMPT_PREFIX_RE.sub(
+                "",
+                lines[start],
+                count=1,
+            )
+            if without_prefix != lines[start]:
+                variants += (without_prefix,)
+            for first_line in variants:
+                hasher = self._new_input_hasher()
+                length = 0
+                matched_end: int | None = None
+                for end in range(start, scan_limit):
+                    if end in claimed:
+                        break
+                    line = first_line if end == start else lines[end]
+                    for character in redact_claude_code_output(line):
+                        if character.isspace():
+                            continue
+                        if length == normalized_length:
+                            break
+                        hasher.update(
+                            character.encode("utf-8", errors="replace")
+                        )
+                        length += 1
+                    if length and hmac.compare_digest(
+                        hasher.copy().hexdigest(),
+                        fingerprints[length - 1],
+                    ):
+                        matched_end = end
+                    elif matched_end is not None:
+                        break
+                    if length == normalized_length:
+                        break
+                if matched_end is not None:
+                    return set(range(start, matched_end + 1))
+        return set()
+
+    @staticmethod
+    def _update_echo_hasher(hasher: hmac.HMAC, text: str) -> int:
+        length = 0
+        safe_text = redact_claude_code_output(text)
+        for character in safe_text:
+            if character.isspace():
+                continue
+            hasher.update(character.encode("utf-8", errors="replace"))
+            length += 1
+        return length
+
+    @staticmethod
+    def _without_lines(lines: list[str], excluded: set[int]) -> str:
+        return "\n".join(
+            line for index, line in enumerate(lines) if index not in excluded
+        ).strip()
+
+    def _clear_semantic_context(self) -> None:
+        self._semantic_context = ""
+        self._last_semantic_context_fingerprint = ""
+
+    def _append_semantic_context(self, text: str) -> None:
+        safe_text = redact_claude_code_output(text).strip()
+        if not safe_text:
+            return
+        fingerprint = hashlib.sha256(
+            " ".join(safe_text.split()).casefold().encode("utf-8")
+        ).hexdigest()
+        if fingerprint == self._last_semantic_context_fingerprint:
+            return
+        combined = f"{self._semantic_context}\n{safe_text}".strip()
+        self._semantic_context = combined[-MAX_DETECTION_CONTEXT_CHARS:]
+        self._last_semantic_context_fingerprint = fingerprint
 
     def detect(
         self,
@@ -168,8 +696,8 @@ class ClaudeCodeOutputDetector:
         """生成本轮新事件；不轮询、不输入，也不执行任何审批。"""
 
         events: list[ClaudeCodeEvent] = []
-        candidate = redact_claude_code_output(delta.text).strip()
-        context = delta.normalized_output[-MAX_DETECTION_CONTEXT_CHARS:]
+        previous_action_fingerprint = self._last_action_fingerprint
+        output_candidate = redact_claude_code_output(delta.text).strip()
 
         if delta.cursor_gap:
             self._context_complete = False
@@ -179,6 +707,8 @@ class ClaudeCodeOutputDetector:
             self._failure_seen = False
             self._progress_seen = False
             self._ready_seen = False
+            self._clear_semantic_context()
+            self._clear_outbound_input_evidence()
             self._clear_recent_event_fingerprints()
             self._append_event(
                 events,
@@ -217,8 +747,16 @@ class ClaudeCodeOutputDetector:
             self._action_required = None
             self._last_action_fingerprint = None
 
-        if candidate:
-            output_metadata: dict[str, object] = {}
+        isolation = self._isolate_input_echo(
+            output_candidate,
+            cursor_start=delta.cursor_start,
+            cursor_end=delta.cursor_end,
+            timestamp=timestamp,
+            enabled=not delta.cursor_gap,
+        )
+        candidate = isolation.semantic_text.strip()
+        if output_candidate:
+            output_metadata = dict(isolation.metadata)
             if delta.limits_hit:
                 output_metadata["limits_hit"] = delta.limits_hit
             self._append_event(
@@ -228,7 +766,7 @@ class ClaudeCodeOutputDetector:
                 cursor_start=delta.cursor_start,
                 cursor_end=delta.cursor_end,
                 timestamp=timestamp,
-                text=candidate,
+                text=output_candidate,
                 metadata=output_metadata,
             )
         elif delta.limits_hit:
@@ -243,6 +781,9 @@ class ClaudeCodeOutputDetector:
                 metadata={"limits_hit": delta.limits_hit},
             )
 
+        if candidate and not delta.cursor_gap:
+            self._append_semantic_context(candidate)
+        context = self._semantic_context[-MAX_DETECTION_CONTEXT_CHARS:]
         prompt_structure = bool(
             candidate and self._looks_like_prompt(candidate)
         )
@@ -255,6 +796,16 @@ class ClaudeCodeOutputDetector:
         )
         failure_signal = bool(candidate and _FAILURE_RE.search(candidate))
         ready_signal = bool(candidate and _READY_RE.search(candidate))
+        resumed_after_input = bool(
+            candidate
+            and self._outbound_response_pending
+            and not prompt_structure
+        )
+        if resumed_after_input:
+            self._outbound_response_pending = False
+            self._action_required = None
+            self._last_action_fingerprint = None
+            self._progress_seen = True
 
         if not delta.cursor_gap:
             if progress_signal:
@@ -327,6 +878,7 @@ class ClaudeCodeOutputDetector:
             ):
                 action = None
             if action is not None:
+                self._outbound_response_pending = False
                 self._record_action(
                     events,
                     action=action,
@@ -344,24 +896,6 @@ class ClaudeCodeOutputDetector:
             ):
                 self._action_required = None
                 self._last_action_fingerprint = None
-        elif prompt_structure:
-            action = self._action(
-                ClaudeCodeActionKind.UNKNOWN_PROMPT,
-                "Claude Code emitted a prompt in a cursor-gap page",
-                candidate,
-                self._extract_options(candidate),
-                "unknown",
-                delta.cursor_end,
-            )
-            self._record_action(
-                events,
-                action=action,
-                source_text=candidate,
-                process_id=process_id,
-                cursor_start=delta.cursor_start,
-                cursor_end=delta.cursor_end,
-                timestamp=timestamp,
-            )
 
         if self._process_just_exited(process_status):
             self._append_event(
@@ -395,11 +929,26 @@ class ClaudeCodeOutputDetector:
             failure_signal=failure_signal,
             ready_signal=ready_signal,
         )
+        if lost or process_status in _TERMINAL_PROCESS_STATUSES:
+            self._action_required = None
+            self._last_action_fingerprint = None
+            self._clear_outbound_input_evidence()
+        elif self._state == ClaudeCodeState.WORKING:
+            self._action_required = None
+            self._last_action_fingerprint = None
+
+        action_changed = (
+            previous_action_fingerprint != self._last_action_fingerprint
+        )
+        activity_detected = action_changed or any(
+            self._event_counts_as_activity(event) for event in events
+        )
         self._last_process_status = process_status
         return DetectionResult(
             state=self._state,
             events=tuple(events),
             action_required=self._action_required,
+            activity_detected=activity_detected,
         )
 
     def _resolve_state(
@@ -692,6 +1241,15 @@ class ClaudeCodeOutputDetector:
         self._recent_fingerprints.clear()
         self._recent_fingerprint_set.clear()
 
+    @staticmethod
+    def _event_counts_as_activity(event: ClaudeCodeEvent) -> bool:
+        if event.event_type != ClaudeCodeEventType.OUTPUT:
+            return True
+        return event.metadata.get("source") not in {
+            "input_echo",
+            "unconfirmed_after_input",
+        }
+
     def _append_event(
         self,
         events: list[ClaudeCodeEvent],
@@ -703,7 +1261,7 @@ class ClaudeCodeOutputDetector:
         timestamp: float,
         text: str,
         metadata: dict[str, object] | None = None,
-    ) -> None:
+    ) -> bool:
         full_safe_text = redact_claude_code_output(text)
         safe_text = self._bounded_text(full_safe_text)
         safe_metadata = dict(metadata or {})
@@ -717,7 +1275,7 @@ class ClaudeCodeOutputDetector:
             cursor_end,
         )
         if fingerprint in self._recent_fingerprint_set:
-            return
+            return False
         self._recent_fingerprints.append(fingerprint)
         self._recent_fingerprint_set.add(fingerprint)
         while len(self._recent_fingerprints) > MAX_RECENT_EVENT_FINGERPRINTS:
@@ -734,6 +1292,7 @@ class ClaudeCodeOutputDetector:
                 metadata=safe_metadata,
             )
         )
+        return True
 
     @staticmethod
     def _bounded_text(text: str) -> str:
@@ -797,8 +1356,15 @@ class ClaudeCodeOutputDetector:
 __all__ = [
     "MAX_ACTION_OPTIONS",
     "MAX_DETECTION_CONTEXT_CHARS",
+    "MAX_ECHO_MATCH_LINES",
     "MAX_EVENT_TEXT_CHARS",
+    "MAX_OUTBOUND_INPUT_EVIDENCE",
     "MAX_RECENT_EVENT_FINGERPRINTS",
+    "OUTBOUND_INPUT_OBSERVATION_BUDGET",
+    "OUTBOUND_INPUT_PREFIX_CHARS",
+    "OUTBOUND_INPUT_TTL_SECONDS",
+    "RECENT_MATCHED_ECHO_MATCH_BUDGET",
+    "RECENT_MATCHED_ECHO_TTL_SECONDS",
     "ClaudeCodeOutputDetector",
     "DetectionResult",
 ]

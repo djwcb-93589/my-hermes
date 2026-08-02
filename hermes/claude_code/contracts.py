@@ -304,6 +304,7 @@ class ClaudeCodeSnapshot:
     process_status: str | None
     exit_code: int | None
     last_activity_at: float
+    last_observed_at: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_ref, ClaudeCodeSessionRef):
@@ -335,6 +336,8 @@ class ClaudeCodeSnapshot:
         ):
             raise ValueError("exit_code must be an integer or None")
         _require_timestamp("last_activity_at", self.last_activity_at)
+        if self.last_observed_at is not None:
+            _require_timestamp("last_observed_at", self.last_observed_at)
 
 
 class ClaudeCodeProcessPort(Protocol):

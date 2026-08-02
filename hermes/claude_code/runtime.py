@@ -107,7 +107,8 @@ class ClaudeCodeRuntime:
                     last_activity_at=now,
                 )
                 observation = ClaudeCodeObservationState(
-                    initial_cursor=session.cursor
+                    initial_cursor=session.cursor,
+                    initial_process_status=snapshot.status,
                 )
                 self._sessions[session.process_id] = session
                 self._observations[session.process_id] = observation
@@ -151,6 +152,7 @@ class ClaudeCodeRuntime:
 
         with self._lock:
             session = self._require_session_locked(session_owner, process_id)
+            observation = self._observation_locked(session)
             page = self._invoke(
                 session,
                 lambda: self._port.read(
@@ -160,10 +162,17 @@ class ClaudeCodeRuntime:
                     limit=limit,
                 ),
             )
+            status_changed = observation.note_process_status(page.status)
+            has_new_output = (
+                page.next_cursor > session.cursor and bool(page.output)
+            )
+            last_activity_at = session.last_activity_at
+            if status_changed or has_new_output:
+                last_activity_at = float(self._clock())
             updated = replace(
                 session,
                 cursor=page.next_cursor,
-                last_activity_at=float(self._clock()),
+                last_activity_at=last_activity_at,
             )
             self._sessions[process_id] = updated
             self._release_cwd_if_terminal_locked(updated, page.status)
@@ -213,11 +222,7 @@ class ClaudeCodeRuntime:
                 session = replace(
                     session,
                     cursor=page.next_cursor,
-                    last_activity_at=timestamp,
                 )
-                self._sessions[process_id] = session
-            else:
-                session = replace(session, last_activity_at=timestamp)
                 self._sessions[process_id] = session
 
             if not lost:
@@ -246,7 +251,7 @@ class ClaudeCodeRuntime:
                     observable_status,
                 )
 
-            return observation.build(
+            observation_result = observation.build_result(
                 session_ref=session,
                 page=page,
                 process_snapshot=process_snapshot,
@@ -254,6 +259,16 @@ class ClaudeCodeRuntime:
                 lost=lost,
                 observation_errors=tuple(observation_errors),
             )
+            snapshot = observation_result.snapshot
+            if observation_result.activity_detected:
+                session = replace(session, last_activity_at=timestamp)
+                self._sessions[process_id] = session
+                snapshot = replace(
+                    snapshot,
+                    session_ref=session,
+                    last_activity_at=timestamp,
+                )
+            return snapshot
 
     def write(
         self,
@@ -264,17 +279,26 @@ class ClaudeCodeRuntime:
     ) -> int:
         """原样写入，不追加 Enter，也不保存输入。"""
 
-        session = self._require_session(session_owner, process_id)
-        result = self._invoke(
-            session,
-            lambda: self._port.write(
-                session_owner=session_owner,
-                process_id=process_id,
+        with self._lock:
+            session = self._require_session_locked(
+                session_owner,
+                process_id,
+            )
+            result = self._invoke(
+                session,
+                lambda: self._port.write(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                    data=data,
+                ),
+            )
+            self._record_outbound_input_locked(
+                session,
                 data=data,
-            ),
-        )
-        self._touch(session)
-        return result
+                input_kind="write",
+                submitted=False,
+            )
+            return result
 
     def submit(
         self,
@@ -285,18 +309,26 @@ class ClaudeCodeRuntime:
     ) -> int:
         """提交文本和一次 transport Enter，不保存输入。"""
 
-        session = self._require_session(session_owner, process_id)
-        result = self._invoke(
-            session,
-            lambda: self._port.submit(
-                session_owner=session_owner,
-                process_id=process_id,
+        with self._lock:
+            session = self._require_session_locked(
+                session_owner,
+                process_id,
+            )
+            result = self._invoke(
+                session,
+                lambda: self._port.submit(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                    data=data,
+                ),
+            )
+            self._record_outbound_input_locked(
+                session,
                 data=data,
-            ),
-        )
-        self._mark_input_submitted(session)
-        self._touch(session)
-        return result
+                input_kind="submit",
+                submitted=True,
+            )
+            return result
 
     def status(
         self,
@@ -348,17 +380,20 @@ class ClaudeCodeRuntime:
     ) -> int:
         """请求协作式 Ctrl+C；不承担强制终止。"""
 
-        session = self._require_session(session_owner, process_id)
-        result = self._invoke(
-            session,
-            lambda: self._port.interrupt(
-                session_owner=session_owner,
-                process_id=process_id,
-            ),
-        )
-        self._mark_interrupt_requested(session)
-        self._touch(session)
-        return result
+        with self._lock:
+            session = self._require_session_locked(
+                session_owner,
+                process_id,
+            )
+            result = self._invoke(
+                session,
+                lambda: self._port.interrupt(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                ),
+            )
+            self._mark_interrupt_requested_locked(session)
+            return result
 
     def kill(
         self,
@@ -494,34 +529,70 @@ class ClaudeCodeRuntime:
         *,
         process_status: str | None = None,
     ) -> None:
-        """只更新时间和 cwd 占用，不保存输入或输出。"""
+        """只有 ProcessStatus 实质变化时才更新时间。"""
 
         with self._lock:
             current = self._sessions.get(session.process_id)
             if current is None or current.session_owner != session.session_owner:
                 return
-            updated = replace(current, last_activity_at=float(self._clock()))
-            self._sessions[session.process_id] = updated
+            updated = current
+            if (
+                process_status is not None
+                and self._observation_locked(current).note_process_status(
+                    process_status
+                )
+            ):
+                updated = replace(
+                    current,
+                    last_activity_at=float(self._clock()),
+                )
+                self._sessions[session.process_id] = updated
             if process_status is not None:
                 self._release_cwd_if_terminal_locked(updated, process_status)
 
-    def _mark_input_submitted(self, session: ClaudeCodeSessionRef) -> None:
-        """仅记录行式 submit 成功事实；不得保存 data。"""
+    def _record_outbound_input_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+        *,
+        data: str,
+        input_kind: str,
+        submitted: bool,
+    ) -> None:
+        """原子记录安全 input evidence，并把成功输入计为活动。"""
 
-        with self._lock:
-            current = self._sessions.get(session.process_id)
-            if current is None or current.session_owner != session.session_owner:
-                return
-            self._observation_locked(current).mark_input_submitted()
+        current = self._sessions.get(session.process_id)
+        if current is None or current.session_owner != session.session_owner:
+            return
+        timestamp = float(self._clock())
+        observation = self._observation_locked(current)
+        observation.record_outbound_input(
+            data,
+            input_kind=input_kind,
+            sent_at=timestamp,
+            cursor_before=session.cursor,
+            cursor_after=current.cursor,
+        )
+        if submitted:
+            observation.mark_input_submitted()
+        self._sessions[session.process_id] = replace(
+            current,
+            last_activity_at=timestamp,
+        )
 
-    def _mark_interrupt_requested(self, session: ClaudeCodeSessionRef) -> None:
-        """仅在 interrupt 明确送达后记录事实。"""
+    def _mark_interrupt_requested_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+    ) -> None:
+        """原子记录明确送达的 interrupt，并更新活动时间。"""
 
-        with self._lock:
-            current = self._sessions.get(session.process_id)
-            if current is None or current.session_owner != session.session_owner:
-                return
-            self._observation_locked(current).mark_interrupt_requested()
+        current = self._sessions.get(session.process_id)
+        if current is None or current.session_owner != session.session_owner:
+            return
+        self._observation_locked(current).mark_interrupt_requested()
+        self._sessions[session.process_id] = replace(
+            current,
+            last_activity_at=float(self._clock()),
+        )
 
     def _release_cwd_if_terminal_locked(
         self,
