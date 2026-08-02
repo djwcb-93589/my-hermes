@@ -60,11 +60,11 @@ recent event fingerprints: 128
 action options: 8
 ```
 
-命中上限时截断旧内容并在输出或事件 metadata 中标记；不得无限保存历史。重复 spinner、相同重绘、相同事件和相同 ActionRequired 通过最近规范化签名、事件 fingerprint 与 ActionRequired fingerprint 去重。Prompt、选项、错误原因、完成信号和进程退出发生实质变化时仍生成新事件。
+命中上限时截断旧内容并在输出或事件 metadata 中标记；不得无限保存历史。此类滚动淘汰只移除当前视图中已经处理的最早内容，后续新输出仍持续增量读取和分析，不会因累计输出量停止会话。重复 spinner、相同重绘、相同事件和相同 ActionRequired 通过最近规范化签名、事件 fingerprint 与 ActionRequired fingerprint 去重。Prompt、选项、错误原因、完成信号和进程退出发生实质变化时仍生成新事件。
 
 ## gap、错误与安全降级
 
-原始 cursor 始终只采用 ProcessManager 返回值，规范化字符位置从不写回。`output_truncated`、可用起点前移，或原始 `read` 绕过了分析上下文时，`observe` 生成 `CURSOR_GAP`、保留新的合法 cursor、清除不完整语义证据并返回 `UNKNOWN`；在新的明确任务边界前，不得猜补缺失内容或据此分类审批、认证与完成。
+原始 cursor 始终只采用 ProcessManager 返回值，规范化字符位置从不写回。只有请求 cursor 已落后于 ProcessManager 当前可用窗口、`output_truncated` 表明未读取的原始区间丢失，或原始 `read` 绕过了分析上下文时，`observe` 才生成 `CURSOR_GAP`、保留新的合法 cursor、清除不完整语义证据并返回 `UNKNOWN`；规范化和 Detector 的正常滚动淘汰不构成 cursor gap。在新的明确任务边界前，不得猜补缺失内容或据此分类审批、认证与完成。
 
 读取或状态查询失败生成 `READ_ERROR`，保留 SessionRef，并根据仍可确认的生命周期事实返回 `UNKNOWN`、`LOST` 或 `FAILED`；P5 不自动重试或 kill。终态观察只分析本次可读剩余页并生成 `PROCESS_EXIT`，不执行 final-drain 循环。
 

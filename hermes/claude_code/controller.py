@@ -48,7 +48,6 @@ class ClaudeCodeControllerOutcome(str, Enum):
     DEADLINE_EXCEEDED = "deadline_exceeded"
     CANCELLED = "cancelled"
     OBSERVATION_LIMIT_REACHED = "observation_limit_reached"
-    OUTPUT_BUDGET_EXCEEDED = "output_budget_exceeded"
     STALLED = "stalled"
 
 
@@ -64,8 +63,8 @@ class ClaudeCodeControllerResult:
     outcome: ClaudeCodeControllerOutcome
     observation_count: int
     consecutive_empty_reads: int
+    # 仅统计本任务已观察到的原始 cursor 增量，不是输出预算。
     output_used: int
-    output_budget: int
     deadline_remaining: float
     limits_hit: tuple[str, ...] = ()
 
@@ -78,12 +77,9 @@ class ClaudeCodeControllerResult:
             ("observation_count", self.observation_count),
             ("consecutive_empty_reads", self.consecutive_empty_reads),
             ("output_used", self.output_used),
-            ("output_budget", self.output_budget),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        if self.output_budget < 1:
-            raise ValueError("output_budget must be positive")
         if (
             isinstance(self.deadline_remaining, bool)
             or not isinstance(self.deadline_remaining, (int, float))
@@ -108,11 +104,6 @@ class ClaudeCodeControllerResult:
     @property
     def terminal(self) -> bool:
         return _snapshot_is_terminal(self.snapshot)
-
-    @property
-    def output_truncated(self) -> bool:
-        return "output_budget_exceeded" in self.limits_hit
-
 
 @dataclass(slots=True)
 class _ControllerTask:
@@ -839,16 +830,11 @@ class ClaudeCodeController:
                 "Claude Code observation is blocked by a Controller limit",
                 details={"process_id": task.process_id},
             )
-        remaining_budget = self._policy.output_budget - task.output_used
-        limit = min(
-            self._policy.observation_read_limit,
-            max(1, remaining_budget),
-        )
         try:
             snapshot = self._runtime.observe(
                 session_owner=task.session_owner,
                 process_id=task.process_id,
-                limit=limit,
+                limit=self._policy.observation_read_limit,
             )
         except ClaudeCodeRuntimeError as runtime_error:
             raise self._wrap_runtime_error(
@@ -911,8 +897,6 @@ class ClaudeCodeController:
         else:
             task.consecutive_empty_reads = 0
         task.last_snapshot = snapshot
-        if task.output_used >= self._policy.output_budget:
-            task.limits_hit.add("output_budget_exceeded")
         if task.observation_count >= self._policy.max_observation_count:
             task.limits_hit.add("observation_limit_reached")
 
@@ -1190,18 +1174,12 @@ class ClaudeCodeController:
         if task.observation_count >= self._policy.max_observation_count:
             task.limits_hit.add("observation_limit_reached")
             return False
-        if task.output_used >= self._policy.output_budget:
-            task.limits_hit.add("output_budget_exceeded")
-            return False
         return True
 
     def _limit_outcome_locked(
         self,
         task: _ControllerTask,
     ) -> ClaudeCodeControllerOutcome | None:
-        if task.output_used >= self._policy.output_budget:
-            task.limits_hit.add("output_budget_exceeded")
-            return ClaudeCodeControllerOutcome.OUTPUT_BUDGET_EXCEEDED
         if task.observation_count >= self._policy.max_observation_count:
             task.limits_hit.add("observation_limit_reached")
             return ClaudeCodeControllerOutcome.OBSERVATION_LIMIT_REACHED
@@ -1247,7 +1225,6 @@ class ClaudeCodeController:
             observation_count=task.observation_count,
             consecutive_empty_reads=task.consecutive_empty_reads,
             output_used=task.output_used,
-            output_budget=self._policy.output_budget,
             deadline_remaining=max(0.0, task.deadline - self._now()),
             limits_hit=tuple(sorted(task.limits_hit)),
         )

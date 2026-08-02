@@ -15,7 +15,6 @@ class ClaudeCodeControllerPolicy:
     single_wait_limit: float = 5.0
     max_consecutive_empty_reads: int = 6
     max_observation_count: int = 1_000
-    output_budget: int = 1_000_000
     interrupt_observation_attempts: int = 3
     final_drain_attempts: int = 3
     cleanup_attempts: int = 3
@@ -50,12 +49,6 @@ class ClaudeCodeControllerPolicy:
             self.max_observation_count,
             1,
             100_000,
-        )
-        self._require_count(
-            "output_budget",
-            self.output_budget,
-            1,
-            100_000_000,
         )
         self._require_count(
             "interrupt_observation_attempts",
