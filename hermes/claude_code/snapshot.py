@@ -77,6 +77,7 @@ class ClaudeCodeObservationState:
         """记录一次明确送达的受管 interrupt。"""
 
         self._interrupt_requested = True
+        self._detector.acknowledge_interrupt()
 
     def note_process_status(self, process_status: str | None) -> bool:
         """只在 ProcessStatus 确实变化时报告活动。"""

@@ -224,6 +224,12 @@ class ClaudeCodeOutputDetector:
         self._clear_semantic_context()
         self._clear_recent_event_fingerprints()
 
+    def acknowledge_interrupt(self) -> None:
+        """中断明确送达后使当前待处理动作失效，保留观察历史。"""
+
+        self._action_required = None
+        self._last_action_fingerprint = None
+
     def record_outbound_input(
         self,
         data: str,
