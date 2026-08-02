@@ -19,6 +19,8 @@ from hermes.backends import (
     get_backend,
 )
 from hermes.claude_code.contracts import (
+    CLAUDE_CODE_ACTIVE_PROCESS_STATUSES,
+    CLAUDE_CODE_PROCESS_STATUSES,
     ClaudeCodeProcessLog,
     ClaudeCodeProcessSnapshot,
     ClaudeCodeRuntimeError,
@@ -97,7 +99,6 @@ class ProcessManagerClaudeCodePort:
             cwd=cwd,
             executable=executable,
         )
-        backend.cwd = normalized_cwd
         starter_failure: str | None = None
 
         def starter():
@@ -109,6 +110,7 @@ class ProcessManagerClaudeCodePort:
                     command,
                     cancel_checker=cancel_checker,
                     pty=True,
+                    cwd=normalized_cwd,
                 )
             except (
                 BackgroundPtyDependencyUnavailableError,
@@ -159,41 +161,53 @@ class ProcessManagerClaudeCodePort:
                 "Claude Code background PTY could not be registered",
             ) from exc
 
-        converted = self._convert_snapshot(
-            snapshot,
-            error_type="process_start_failed",
-        )
-        if converted.status in {"killed", "lost", "failed_start"}:
-            raise ClaudeCodeRuntimeError(
-                "process_start_failed",
-                "Claude Code did not enter a usable managed process state",
-            )
-        if converted.terminal_mode != "pty":
-            self._cleanup_invalid_start(session_owner, converted.process_id)
-            raise ClaudeCodeRuntimeError(
-                "pty_unavailable",
-                "Claude Code did not start with a PTY",
-            )
-
-        path_policy = getattr(backend, "path_policy", ALLOW_ALL_PATH_POLICY)
+        process_id = self._registered_process_id(snapshot)
         try:
-            actual_cwd = path_policy.normalize_path(
-                converted.cwd,
-                cwd=normalized_cwd,
+            converted = self._convert_snapshot(
+                snapshot,
+                error_type="process_start_failed",
             )
-        except (OSError, RuntimeError, ValueError) as exc:
-            self._cleanup_invalid_start(session_owner, converted.process_id)
+            if converted.status in {"killed", "lost", "failed_start"}:
+                raise ClaudeCodeRuntimeError(
+                    "process_start_failed",
+                    "Claude Code did not enter a usable managed process state",
+                )
+            if converted.terminal_mode != "pty":
+                raise ClaudeCodeRuntimeError(
+                    "pty_unavailable",
+                    "Claude Code did not start with a PTY",
+                )
+
+            path_policy = getattr(
+                backend,
+                "path_policy",
+                ALLOW_ALL_PATH_POLICY,
+            )
+            try:
+                actual_cwd = path_policy.normalize_path(
+                    converted.cwd,
+                    cwd=normalized_cwd,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ClaudeCodeRuntimeError(
+                    "process_start_failed",
+                    "Claude Code start directory could not be confirmed",
+                ) from exc
+            if actual_cwd != normalized_cwd:
+                raise ClaudeCodeRuntimeError(
+                    "process_start_failed",
+                    "Claude Code started outside the requested directory",
+                )
+            return replace(converted, cwd=normalized_cwd)
+        except ClaudeCodeRuntimeError:
+            self._cleanup_post_spawn_failure(session_owner, process_id)
+            raise
+        except Exception as exc:
+            self._cleanup_post_spawn_failure(session_owner, process_id)
             raise ClaudeCodeRuntimeError(
                 "process_start_failed",
-                "Claude Code start directory could not be confirmed",
+                "Claude Code post-start validation failed",
             ) from exc
-        if actual_cwd != normalized_cwd:
-            self._cleanup_invalid_start(session_owner, converted.process_id)
-            raise ClaudeCodeRuntimeError(
-                "process_start_failed",
-                "Claude Code started outside the requested directory",
-            )
-        return replace(converted, cwd=normalized_cwd)
 
     def read(
         self,
@@ -570,29 +584,69 @@ class ProcessManagerClaudeCodePort:
                 "Claude Code input failed",
             ) from exc
 
-    def _cleanup_invalid_start(self, session_owner: str, process_id: str) -> None:
-        """启动后校验失败时仍由 ProcessManager 收敛已登记进程。"""
+    @staticmethod
+    def _registered_process_id(snapshot) -> str:
+        """在完整快照转换前保存 ProcessManager 分配的唯一身份。"""
 
         try:
-            snapshot = self._process_manager.kill(
+            process_id = snapshot.process_id
+        except Exception as exc:
+            raise ClaudeCodeRuntimeError(
+                "session_registration_failed",
+                "Claude Code registered process identity is unavailable",
+            ) from exc
+        if not isinstance(process_id, str) or not process_id.strip():
+            raise ClaudeCodeRuntimeError(
+                "session_registration_failed",
+                "Claude Code registered process identity is unavailable",
+            )
+        return process_id
+
+    def _cleanup_post_spawn_failure(
+        self,
+        session_owner: str,
+        process_id: str,
+    ) -> None:
+        """只收敛本次登记进程，并确认其不再处于 active 状态。"""
+
+        try:
+            current = self._process_manager.poll(session_owner, process_id)
+            current_status = self._known_process_status(current)
+        except Exception:
+            # 无法确认状态时仍尝试按唯一 process id 终止，不扩大到整个 session。
+            current_status = None
+        if (
+            current_status is not None
+            and current_status not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+        ):
+            return
+
+        try:
+            stopped = self._process_manager.kill(
                 session_owner,
                 process_id,
                 grace_seconds=0.0,
             )
+            stopped_status = self._known_process_status(stopped)
         except Exception as exc:
             raise ClaudeCodeRuntimeError(
                 "session_registration_failed",
-                "Claude Code invalid start cleanup could not be confirmed",
+                "Claude Code post-start cleanup could not be confirmed",
             ) from exc
-        converted = self._convert_snapshot(
-            snapshot,
-            error_type="session_registration_failed",
-        )
-        if converted.active:
+        if stopped_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES:
             raise ClaudeCodeRuntimeError(
                 "session_registration_failed",
-                "Claude Code invalid start cleanup did not reach a terminal state",
+                "Claude Code post-start cleanup remained active",
             )
+
+    @staticmethod
+    def _known_process_status(snapshot) -> str:
+        """只读取清理确认所需的稳定 ProcessStatus。"""
+
+        status = ProcessManagerClaudeCodePort._status_value(snapshot.status)
+        if status not in CLAUDE_CODE_PROCESS_STATUSES:
+            raise ValueError("process status is unsupported")
+        return status
 
     @staticmethod
     def _convert_snapshot(snapshot, *, error_type: str) -> ClaudeCodeProcessSnapshot:

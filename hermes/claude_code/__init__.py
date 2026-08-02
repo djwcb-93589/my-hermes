@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 from hermes.claude_code.contracts import (
@@ -15,13 +16,17 @@ from hermes.claude_code.contracts import (
 from hermes.claude_code.runtime import ClaudeCodeRuntime
 
 
+_DEFAULT_RUNTIME_LOCK = threading.Lock()
+_default_runtime: ClaudeCodeRuntime | None = None
+
+
 def create_claude_code_runtime(
     *,
     process_manager=None,
     backend_provider: Callable[[str], object] | None = None,
     executable: str = "claude",
 ) -> ClaudeCodeRuntime:
-    """显式组合一个 runtime；调用方负责复用实例和现有 session cleanup。"""
+    """为显式隔离或依赖注入创建 runtime，不作为逐任务生产入口。"""
 
     if process_manager is None:
         from hermes.processes import process_manager as default_process_manager
@@ -36,6 +41,16 @@ def create_claude_code_runtime(
     return ClaudeCodeRuntime(port, executable=executable)
 
 
+def get_claude_code_runtime() -> ClaudeCodeRuntime:
+    """惰性返回绑定全局 ProcessManager 的进程级默认 runtime。"""
+
+    global _default_runtime
+    with _DEFAULT_RUNTIME_LOCK:
+        if _default_runtime is None:
+            _default_runtime = create_claude_code_runtime()
+        return _default_runtime
+
+
 __all__ = [
     "ClaudeCodeProcessLog",
     "ClaudeCodeProcessPort",
@@ -45,4 +60,5 @@ __all__ = [
     "ClaudeCodeRuntimeError",
     "ClaudeCodeSessionRef",
     "create_claude_code_runtime",
+    "get_claude_code_runtime",
 ]

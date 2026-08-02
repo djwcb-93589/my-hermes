@@ -1869,8 +1869,9 @@ class LocalBackend(BaseExecutionEnvironment):
         *,
         cancel_checker: Callable[[], bool] | None = None,
         pty: bool = False,
+        cwd: str | None = None,
     ) -> BackgroundProcessHandle:
-        """按显式传输模式分流，保持既有 pipe 启动路径不变。"""
+        """按显式传输模式分流，可为本次启动指定独立 cwd。"""
 
         if not isinstance(pty, bool):
             raise ValueError("pty must be a boolean")
@@ -1878,10 +1879,12 @@ class LocalBackend(BaseExecutionEnvironment):
             return self._spawn_background_pty(
                 command,
                 cancel_checker=cancel_checker,
+                cwd=cwd,
             )
         return self._spawn_background_pipe(
             command,
             cancel_checker=cancel_checker,
+            cwd=cwd,
         )
 
     def _spawn_background_pty(
@@ -1889,6 +1892,7 @@ class LocalBackend(BaseExecutionEnvironment):
         command: str,
         *,
         cancel_checker: Callable[[], bool] | None = None,
+        cwd: str | None = None,
     ) -> BackgroundProcessHandle:
         """冻结 Local 会话启动状态，再把 PTY 资源交给独立适配层。"""
 
@@ -1912,7 +1916,7 @@ class LocalBackend(BaseExecutionEnvironment):
             with self._execute_lock:
                 if not self._snapshot_ready:
                     self.init_session()
-                started_cwd = self.cwd
+                started_cwd = self._background_started_cwd_locked(cwd)
                 snapshot_copy = self._copy_background_snapshot_locked()
                 cwd_shell = self._cwd_to_shell(started_cwd)
                 env = filter_local_subprocess_environment(
@@ -1963,6 +1967,7 @@ class LocalBackend(BaseExecutionEnvironment):
         command: str,
         *,
         cancel_checker: Callable[[], bool] | None = None,
+        cwd: str | None = None,
     ) -> BackgroundProcessHandle:
         """启动不占用前台执行锁的本地后台进程。"""
 
@@ -1984,7 +1989,7 @@ class LocalBackend(BaseExecutionEnvironment):
             with self._execute_lock:
                 if not self._snapshot_ready:
                     self.init_session()
-                started_cwd = self.cwd
+                started_cwd = self._background_started_cwd_locked(cwd)
                 snapshot_copy = self._copy_background_snapshot_locked()
                 cwd_shell = self._cwd_to_shell(started_cwd)
                 env = filter_local_subprocess_environment(
@@ -2116,6 +2121,19 @@ class LocalBackend(BaseExecutionEnvironment):
                     )
                 )
             raise
+
+    def _background_started_cwd_locked(self, cwd: str | None) -> str:
+        """在前台锁内解析单次 cwd，不改写共享 Backend 状态。"""
+
+        if cwd is None:
+            return self.cwd
+        started_cwd = self.path_policy.require_allowed(
+            cwd,
+            cwd=self.cwd,
+        )
+        if not os.path.isdir(started_cwd):
+            raise ValueError("cwd must be an accessible directory")
+        return started_cwd
 
     def _copy_background_snapshot_locked(self) -> Path:
         """在前台锁保护下复制当前 session 的环境快照。"""
