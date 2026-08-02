@@ -377,6 +377,7 @@ class ClaudeCodeController:
                     runtime_error,
                     process_id,
                 ) from runtime_error
+            task.interrupt_requested = False
             task.consecutive_empty_reads = 0
             if action is not None:
                 task.last_snapshot = replace(
@@ -433,6 +434,7 @@ class ClaudeCodeController:
                     runtime_error,
                     process_id,
                 ) from runtime_error
+            task.interrupt_requested = False
             task.consecutive_empty_reads = 0
             task.last_snapshot = replace(
                 snapshot,
@@ -515,12 +517,14 @@ class ClaudeCodeController:
                 except ClaudeCodeRuntimeError as runtime_error:
                     if runtime_error.delivery_unknown:
                         task.interrupt_requested = True
+                        self._clear_interrupt_action_locked(task)
                     raise self._wrap_runtime_error(
                         "interrupt_failed",
                         "Claude Code interrupt could not be confirmed",
                         runtime_error,
                         process_id,
                     ) from runtime_error
+            self._clear_interrupt_action_locked(task)
 
             operation_deadline = self._operation_deadline(
                 self._policy.interrupt_observation_attempts
@@ -549,11 +553,10 @@ class ClaudeCodeController:
                         task,
                         limit_outcome,
                     )
-                result = self._observe_and_resolve_locked(
+                result = self._observe_interrupt_locked(
                     task,
-                    error_type="interrupt_failed",
                 )
-                if result.outcome != ClaudeCodeControllerOutcome.RUNNING:
+                if result is not None:
                     return result
                 if (
                     attempt + 1
@@ -774,6 +777,56 @@ class ClaudeCodeController:
             ClaudeCodeControllerOutcome.RUNNING,
         )
 
+    def _observe_interrupt_locked(
+        self,
+        task: _ControllerTask,
+    ) -> ClaudeCodeControllerResult | None:
+        """只按真实终态收敛一次 interrupt 观察，不让旧动作提前结束。"""
+
+        snapshot = self._observe_once_locked(
+            task,
+            error_type="interrupt_failed",
+        )
+        if _snapshot_is_terminal(snapshot):
+            cleared_snapshot = self._clear_interrupt_action_locked(
+                task,
+                snapshot=snapshot,
+            )
+            assert cleared_snapshot is not None
+            return self._finalize_terminal_locked(
+                task,
+                cleared_snapshot,
+                outcome=ClaudeCodeControllerOutcome.TERMINAL,
+                suppress_actions=True,
+            )
+        self._clear_interrupt_action_locked(task, snapshot=snapshot)
+        return None
+
+    def _clear_interrupt_action_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        snapshot: ClaudeCodeSnapshot | None = None,
+    ) -> ClaudeCodeSnapshot | None:
+        """使中断前提示只保留为历史输出，不再作为当前可执行动作。"""
+
+        current = snapshot if snapshot is not None else task.last_snapshot
+        if current is None or current.action_required is None:
+            return current
+        state = current.state
+        if state in {
+            ClaudeCodeState.WAITING_INPUT,
+            ClaudeCodeState.WAITING_APPROVAL,
+        }:
+            state = ClaudeCodeState.UNKNOWN
+        cleared = replace(
+            current,
+            state=state,
+            action_required=None,
+        )
+        task.last_snapshot = cleared
+        return cleared
+
     def _observe_once_locked(
         self,
         task: _ControllerTask,
@@ -869,6 +922,7 @@ class ClaudeCodeController:
         snapshot: ClaudeCodeSnapshot,
         *,
         outcome: ClaudeCodeControllerOutcome,
+        suppress_actions: bool = False,
     ) -> ClaudeCodeControllerResult:
         if task.archived:
             return self._archived_result(task)
@@ -890,6 +944,13 @@ class ClaudeCodeController:
                 task,
                 error_type="final_drain_failed",
             )
+            if suppress_actions:
+                cleared_current = self._clear_interrupt_action_locked(
+                    task,
+                    snapshot=current,
+                )
+                assert cleared_current is not None
+                current = cleared_current
             if not _snapshot_is_terminal(current):
                 raise ClaudeCodeControllerError(
                     "final_drain_failed",

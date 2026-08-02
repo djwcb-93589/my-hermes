@@ -78,3 +78,4 @@ recovery/
 # ===== T3 验收测试：Claude Code Skill 发现与选择（隔离目录，不提交） =====
 tests_claude_code/
 T3_CLAUDE_CODE_SKILL_DISCOVERY_SELECTION_REPORT.md
+T4_CLAUDE_CODE_MANAGED_RUNTIME_REPORT.md
