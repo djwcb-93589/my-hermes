@@ -13,11 +13,13 @@ from hermes.claude_code.contracts import (
     ClaudeCodeReadResult,
     ClaudeCodeRuntimeError,
     ClaudeCodeSessionRef,
+    ClaudeCodeSnapshot,
 )
+from hermes.claude_code.snapshot import ClaudeCodeObservationState
 
 
 class ClaudeCodeRuntime:
-    """只保存 SessionRef；进程、输出与 cleanup 继续由 ProcessManager 拥有。"""
+    """保存 SessionRef 与有界解释状态；进程和 cleanup 仍由 Manager 拥有。"""
 
     def __init__(
         self,
@@ -50,9 +52,10 @@ class ClaudeCodeRuntime:
         self._executable = executable
         self._clock = clock
         self._lock = threading.RLock()
-        # 这里只保存受管 CC 引用，不复制 Handle、日志或 ProcessManager registry。
+        # 不复制 Handle、完整日志或 ProcessManager registry；解释缓冲均有硬上限。
         self._sessions: dict[str, ClaudeCodeSessionRef] = {}
         self._active_cwds: dict[str, str] = {}
+        self._observations: dict[str, ClaudeCodeObservationState] = {}
 
     def start(
         self,
@@ -103,7 +106,11 @@ class ClaudeCodeRuntime:
                     started_at=snapshot.started_at,
                     last_activity_at=now,
                 )
+                observation = ClaudeCodeObservationState(
+                    initial_cursor=session.cursor
+                )
                 self._sessions[session.process_id] = session
+                self._observations[session.process_id] = observation
                 if snapshot.active:
                     self._active_cwds[session.cwd] = session.process_id
                 return session
@@ -171,6 +178,83 @@ class ClaudeCodeRuntime:
                 exit_code=page.exit_code,
             )
 
+    def observe(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        limit: int = 20_000,
+    ) -> ClaudeCodeSnapshot:
+        """执行一次读取、规范化和状态识别，不循环、不输入也不终止。"""
+
+        with self._lock:
+            session = self._require_session_locked(session_owner, process_id)
+            observation = self._observation_locked(session)
+            timestamp = float(self._clock())
+            page = None
+            process_snapshot = None
+            lost = False
+            observation_errors: list[tuple[str, str, str]] = []
+
+            try:
+                page = self._port.read(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                    cursor=session.cursor,
+                    limit=limit,
+                )
+            except ClaudeCodeRuntimeError as error:
+                observation_errors.append(
+                    ("read", error.error_type, error.safe_message)
+                )
+                lost = error.error_type == "session_not_found"
+
+            if page is not None:
+                session = replace(
+                    session,
+                    cursor=page.next_cursor,
+                    last_activity_at=timestamp,
+                )
+                self._sessions[process_id] = session
+            else:
+                session = replace(session, last_activity_at=timestamp)
+                self._sessions[process_id] = session
+
+            if not lost:
+                try:
+                    process_snapshot = self._port.status(
+                        session_owner=session_owner,
+                        process_id=process_id,
+                    )
+                except ClaudeCodeRuntimeError as error:
+                    observation_errors.append(
+                        ("status", error.error_type, error.safe_message)
+                    )
+                    lost = (
+                        error.error_type == "session_not_found"
+                        or page is None
+                    )
+
+            observable_status = (
+                process_snapshot.status
+                if process_snapshot is not None
+                else page.status if page is not None and not lost else None
+            )
+            if observable_status is not None:
+                self._release_cwd_if_terminal_locked(
+                    session,
+                    observable_status,
+                )
+
+            return observation.build(
+                session_ref=session,
+                page=page,
+                process_snapshot=process_snapshot,
+                timestamp=timestamp,
+                lost=lost,
+                observation_errors=tuple(observation_errors),
+            )
+
     def write(
         self,
         *,
@@ -210,6 +294,7 @@ class ClaudeCodeRuntime:
                 data=data,
             ),
         )
+        self._mark_input_submitted(session)
         self._touch(session)
         return result
 
@@ -271,6 +356,7 @@ class ClaudeCodeRuntime:
                 process_id=process_id,
             ),
         )
+        self._mark_interrupt_requested(session)
         self._touch(session)
         return result
 
@@ -364,6 +450,20 @@ class ClaudeCodeRuntime:
             )
         return session
 
+    def _observation_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+    ) -> ClaudeCodeObservationState:
+        """读取当前会话的有界解释状态，不复制 ProcessManager 日志。"""
+
+        observation = self._observations.get(session.process_id)
+        if observation is None:
+            observation = ClaudeCodeObservationState(
+                initial_cursor=session.cursor
+            )
+            self._observations[session.process_id] = observation
+        return observation
+
     @staticmethod
     def _require_owner(session_owner: str) -> None:
         """拒绝缺失的调用 session owner。"""
@@ -405,6 +505,24 @@ class ClaudeCodeRuntime:
             if process_status is not None:
                 self._release_cwd_if_terminal_locked(updated, process_status)
 
+    def _mark_input_submitted(self, session: ClaudeCodeSessionRef) -> None:
+        """仅记录行式 submit 成功事实；不得保存 data。"""
+
+        with self._lock:
+            current = self._sessions.get(session.process_id)
+            if current is None or current.session_owner != session.session_owner:
+                return
+            self._observation_locked(current).mark_input_submitted()
+
+    def _mark_interrupt_requested(self, session: ClaudeCodeSessionRef) -> None:
+        """仅在 interrupt 明确送达后记录事实。"""
+
+        with self._lock:
+            current = self._sessions.get(session.process_id)
+            if current is None or current.session_owner != session.session_owner:
+                return
+            self._observation_locked(current).mark_interrupt_requested()
+
     def _release_cwd_if_terminal_locked(
         self,
         session: ClaudeCodeSessionRef,
@@ -429,6 +547,7 @@ class ClaudeCodeRuntime:
         if session is None or session.session_owner != session_owner:
             return
         self._sessions.pop(process_id, None)
+        self._observations.pop(process_id, None)
         if self._active_cwds.get(session.cwd) == process_id:
             self._active_cwds.pop(session.cwd, None)
 

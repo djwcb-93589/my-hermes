@@ -1,4 +1,4 @@
-"""Claude Code 受管启动与基础生命周期公共接口。"""
+"""Claude Code 受管生命周期、输出解释与单次观察公共接口。"""
 
 from __future__ import annotations
 
@@ -6,12 +6,26 @@ import threading
 from collections.abc import Callable
 
 from hermes.claude_code.contracts import (
+    ClaudeCodeActionKind,
+    ClaudeCodeActionRequired,
+    ClaudeCodeEvent,
+    ClaudeCodeEventType,
     ClaudeCodeProcessLog,
     ClaudeCodeProcessPort,
     ClaudeCodeProcessSnapshot,
     ClaudeCodeReadResult,
     ClaudeCodeRuntimeError,
     ClaudeCodeSessionRef,
+    ClaudeCodeSnapshot,
+    ClaudeCodeState,
+)
+from hermes.claude_code.detector import (
+    ClaudeCodeOutputDetector,
+    DetectionResult,
+)
+from hermes.claude_code.normalizer import (
+    ClaudeCodeOutputNormalizer,
+    NormalizedOutputDelta,
 )
 from hermes.claude_code.runtime import ClaudeCodeRuntime
 
@@ -52,6 +66,12 @@ def get_claude_code_runtime() -> ClaudeCodeRuntime:
 
 
 __all__ = [
+    "ClaudeCodeActionKind",
+    "ClaudeCodeActionRequired",
+    "ClaudeCodeEvent",
+    "ClaudeCodeEventType",
+    "ClaudeCodeOutputDetector",
+    "ClaudeCodeOutputNormalizer",
     "ClaudeCodeProcessLog",
     "ClaudeCodeProcessPort",
     "ClaudeCodeProcessSnapshot",
@@ -59,6 +79,10 @@ __all__ = [
     "ClaudeCodeRuntime",
     "ClaudeCodeRuntimeError",
     "ClaudeCodeSessionRef",
+    "ClaudeCodeSnapshot",
+    "ClaudeCodeState",
+    "DetectionResult",
+    "NormalizedOutputDelta",
     "create_claude_code_runtime",
     "get_claude_code_runtime",
 ]

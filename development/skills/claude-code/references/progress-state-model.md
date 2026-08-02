@@ -2,6 +2,8 @@
 
 这些状态是 Skill 在当前 Agent 上下文中的逻辑判断，用于解释 Claude Code 的活动。它们不写入 ProcessManager，也不替代 ProcessStatus：`starting`、`running`、`exited`、`killed`、`lost`、`failed_start`。
 
+P5 `ClaudeCodeSnapshot.state` 使用较粗的运行时集合：`STARTING`、`READY`、`WORKING`、`WAITING_INPUT`、`WAITING_APPROVAL`、`COMPLETED`、`FAILED`、`INTERRUPTED`、`LOST`、`UNKNOWN`。其中 `WORKING` 可以由上层监督根据新增事件细分为下表的 `PLANNING`、`INSPECTING`、`EDITING`、`RUNNING_COMMAND` 或 `RUNNING_TESTS`；`WAITING_INPUT` 对应 `WAITING_USER`，`WAITING_APPROVAL` 对应 `WAITING_PERMISSION`。不要把上层细分写回 ProcessManager 或伪装成 P5 检测器已确认的事实。
+
 ## 逻辑状态
 
 | 状态 | 判定含义 |

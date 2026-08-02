@@ -77,7 +77,8 @@ Runtime 先检查 SessionRef；Adapter 再把同一 owner 传给 ProcessManager�
 ## 基础操作
 
 - `start`：通过 LocalBackend 后台 PTY 与 ProcessManager 启动 `claude --ax-screen-reader`，返回 cursor 为 0 的 SessionRef。
-- `read`：把 SessionRef 保存的绝对 cursor 原样传给 ProcessManager，只采用其返回的 `next_cursor`；除沿用现有基础设施凭证脱敏外，保留 ANSI、`\r`、echo、spinner 和重绘等 PTY 追加文本，不做状态识别。
+- `read`：把 SessionRef 保存的绝对 cursor 原样传给 ProcessManager，只采用其返回的 `next_cursor`；该原始兼容入口继续返回含 ANSI、`\r`、echo、spinner 和重绘的脱敏 PTY 追加文本。
+- `observe`：在同一次有界调用中读取一页新增输出、规范化、生成事件、复核 ProcessStatus 并返回 P5 Snapshot；不循环、不等待、不输入也不终止。
 - `write`：调用 `write_stdin` 原样发送文本，不附加 Enter，不保存输入。
 - `submit`：调用 `submit_stdin`，由当前 PTY transport 提交 Enter，不保存输入。
 - `status`：只返回 `starting`、`running`、`exited`、`killed`、`lost` 或 `failed_start` 等 ProcessStatus 事实。
@@ -85,7 +86,7 @@ Runtime 先检查 SessionRef；Adapter 再把同一 owner 传给 ProcessManager�
 - `interrupt`：通过 owner-scoped 输入路径发送一次 Ctrl+C，只请求协作式中断；delivery unknown 时不自动重发。
 - `kill`：调用 ProcessManager `kill`，由其负责协作式中断、grace period、必要的强制终止和进程树清理。
 
-P4 不根据输出推断 `READY`、`WAITING_INPUT`、`WAITING_APPROVAL`、`COMPLETED` 或 `FAILED`，也不自动轮询、回复或批准。ANSI 规范化、跨 chunk 识别、完整 Controller 和审批状态机属于后续阶段。
+P4 的 `read`、`status` 等基础接口仍不推断语义。P5 只通过 `observe` 提供有界规范化和多证据状态识别，详见 [output-observation.md](output-observation.md)；自动轮询、回复、批准和完整 Controller 仍不在本阶段。
 
 ## cleanup 与外部会话
 

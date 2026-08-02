@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Protocol
 
@@ -20,6 +21,49 @@ CLAUDE_CODE_PROCESS_STATUSES = frozenset(
         "failed_start",
     }
 )
+
+
+class ClaudeCodeState(str, Enum):
+    """只描述 Claude Code 可观察语义，不替代 ProcessStatus。"""
+
+    STARTING = "STARTING"
+    READY = "READY"
+    WORKING = "WORKING"
+    WAITING_INPUT = "WAITING_INPUT"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    INTERRUPTED = "INTERRUPTED"
+    LOST = "LOST"
+    UNKNOWN = "UNKNOWN"
+
+
+class ClaudeCodeEventType(str, Enum):
+    """一次观察可以产生的稳定事件类型。"""
+
+    OUTPUT = "OUTPUT"
+    PROGRESS = "PROGRESS"
+    QUESTION = "QUESTION"
+    APPROVAL_REQUEST = "APPROVAL_REQUEST"
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    COMPLETION_SIGNAL = "COMPLETION_SIGNAL"
+    FAILURE_SIGNAL = "FAILURE_SIGNAL"
+    PROCESS_EXIT = "PROCESS_EXIT"
+    READ_ERROR = "READ_ERROR"
+    CURSOR_GAP = "CURSOR_GAP"
+    UNKNOWN_PROMPT = "UNKNOWN_PROMPT"
+
+
+class ClaudeCodeActionKind(str, Enum):
+    """需要上层决定但 P5 不会自动执行的动作类别。"""
+
+    CLARIFICATION = "clarification"
+    APPROVAL = "approval"
+    AUTHENTICATION = "authentication"
+    DESTRUCTIVE_ACTION = "destructive_action"
+    EXTERNAL_ACCESS = "external_access"
+    UNKNOWN_PROMPT = "unknown_prompt"
+    STALLED = "stalled"
 
 
 class ClaudeCodeRuntimeError(RuntimeError):
@@ -189,6 +233,110 @@ class ClaudeCodeReadResult:
     exit_code: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeEvent:
+    """绑定 ProcessManager 原始 cursor 区间的脱敏增量事件。"""
+
+    event_type: ClaudeCodeEventType
+    process_id: str
+    cursor_start: int
+    cursor_end: int
+    timestamp: float
+    text: str
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event_type, ClaudeCodeEventType):
+            raise ValueError("event_type must be a ClaudeCodeEventType")
+        _require_nonempty_text("process_id", self.process_id)
+        _require_nonnegative_int("cursor_start", self.cursor_start)
+        _require_nonnegative_int("cursor_end", self.cursor_end)
+        if self.cursor_end < self.cursor_start:
+            raise ValueError("cursor_end must not precede cursor_start")
+        _require_timestamp("timestamp", self.timestamp)
+        if not isinstance(self.text, str):
+            raise ValueError("event text must be text")
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("event metadata must be a mapping")
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(dict(self.metadata)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeActionRequired:
+    """只报告待决策内容，不包含回答、批准或认证数据。"""
+
+    kind: ClaudeCodeActionKind
+    summary: str
+    prompt_text: str
+    options: tuple[str, ...]
+    risk: str
+    cursor: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ClaudeCodeActionKind):
+            raise ValueError("kind must be a ClaudeCodeActionKind")
+        _require_nonempty_text("summary", self.summary)
+        if not isinstance(self.prompt_text, str):
+            raise ValueError("prompt_text must be text")
+        if not isinstance(self.options, tuple) or any(
+            not isinstance(option, str) or not option.strip()
+            for option in self.options
+        ):
+            raise ValueError("options must contain non-empty text")
+        _require_nonempty_text("risk", self.risk)
+        _require_nonnegative_int("cursor", self.cursor)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeSnapshot:
+    """单次观察的有界、脱敏且不触发交互的结构化结果。"""
+
+    session_ref: ClaudeCodeSessionRef
+    state: ClaudeCodeState
+    events: tuple[ClaudeCodeEvent, ...]
+    action_required: ClaudeCodeActionRequired | None
+    raw_cursor: int
+    normalized_output: str
+    process_status: str | None
+    exit_code: int | None
+    last_activity_at: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_ref, ClaudeCodeSessionRef):
+            raise ValueError("session_ref must be a ClaudeCodeSessionRef")
+        if not isinstance(self.state, ClaudeCodeState):
+            raise ValueError("state must be a ClaudeCodeState")
+        if not isinstance(self.events, tuple) or any(
+            not isinstance(event, ClaudeCodeEvent) for event in self.events
+        ):
+            raise ValueError("events must contain ClaudeCodeEvent values")
+        if self.action_required is not None and not isinstance(
+            self.action_required,
+            ClaudeCodeActionRequired,
+        ):
+            raise ValueError(
+                "action_required must be ClaudeCodeActionRequired or None"
+            )
+        _require_nonnegative_int("raw_cursor", self.raw_cursor)
+        if not isinstance(self.normalized_output, str):
+            raise ValueError("normalized_output must be text")
+        if (
+            self.process_status is not None
+            and self.process_status not in CLAUDE_CODE_PROCESS_STATUSES
+        ):
+            raise ValueError("process_status is not supported")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool)
+            or not isinstance(self.exit_code, int)
+        ):
+            raise ValueError("exit_code must be an integer or None")
+        _require_timestamp("last_activity_at", self.last_activity_at)
+
+
 class ClaudeCodeProcessPort(Protocol):
     """Claude Code runtime 使用的最小进程端口。"""
 
@@ -278,10 +426,16 @@ class ClaudeCodeProcessPort(Protocol):
 __all__ = [
     "CLAUDE_CODE_ACTIVE_PROCESS_STATUSES",
     "CLAUDE_CODE_PROCESS_STATUSES",
+    "ClaudeCodeActionKind",
+    "ClaudeCodeActionRequired",
+    "ClaudeCodeEvent",
+    "ClaudeCodeEventType",
     "ClaudeCodeProcessLog",
     "ClaudeCodeProcessPort",
     "ClaudeCodeProcessSnapshot",
     "ClaudeCodeReadResult",
     "ClaudeCodeRuntimeError",
     "ClaudeCodeSessionRef",
+    "ClaudeCodeSnapshot",
+    "ClaudeCodeState",
 ]
