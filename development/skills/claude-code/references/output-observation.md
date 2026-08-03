@@ -40,7 +40,7 @@ COMPLETION_SIGNAL FAILURE_SIGNAL PROCESS_EXIT READ_ERROR
 CURSOR_GAP UNKNOWN_PROMPT
 ```
 
-`ClaudeCodeActionRequired` 包含 `kind`、安全摘要、脱敏 prompt、有限 options、risk 和原始 cursor。`kind` 支持 `clarification`、`approval`、`authentication`、`destructive_action`、`external_access`、`unknown_prompt` 和 `stalled`；P5 只报告，不执行。
+真实 Claude Code `ActionRequired` 包含不含 Prompt 明文的稳定 `action_id`、`process_id`、`session_owner`、`kind`、脱敏 prompt、原样 options、risk、原始 cursor 范围和创建时间。相同重绘沿用同一 action id；Prompt 或 options 实质变化才生成新身份。`kind` 支持 `clarification`、`approval`、`authentication`、`destructive_action`、`external_access`、`unknown_prompt` 和 `stalled`；其中 `stalled` 是 P6 Controller 合成状态，不是原生 Claude Code Prompt。
 
 `ClaudeCodeSnapshot` 包含更新后的 SessionRef、状态、本轮新事件、当前 ActionRequired、原始 cursor、有界规范化输出、ProcessStatus、exit code 和最近活动时间。它不包含输入历史、凭据、Handle、PID 或完整原始日志。
 
@@ -57,18 +57,18 @@ current line: 4096 chars
 single event text: 2048 chars
 pending escape: 256 chars
 recent event fingerprints: 128
-action options: 8
+current action prompt/options: bounded by the current normalized input view
 ```
 
-命中上限时截断旧内容并在输出或事件 metadata 中标记；不得无限保存历史。此类滚动淘汰只移除当前视图中已经处理的最早内容，后续新输出仍持续增量读取和分析，不会因累计输出量停止会话。重复 spinner、相同重绘、相同事件和相同 ActionRequired 通过最近规范化签名、事件 fingerprint 与 ActionRequired fingerprint 去重。Prompt、选项、错误原因、完成信号和进程退出发生实质变化时仍生成新事件。
+命中上限时截断旧内容并在输出或事件 metadata 中标记；不得无限保存历史。此类滚动淘汰只移除当前视图中已经处理的最早内容，后续新输出仍持续增量读取和分析，不会因累计输出量停止会话。当前 ActionRequired 的 Prompt 和 options 来自这份有界视图，保留其中可见选项的原文、顺序和重复项，不另设选项数量、文本改写或审批过滤。重复 spinner、相同重绘、相同事件和相同 ActionRequired 通过最近规范化签名、事件 fingerprint 与 ActionRequired fingerprint 去重。Prompt、选项、错误原因、完成信号和进程退出发生实质变化时仍生成新事件。
 
 ## gap、错误与安全降级
 
-原始 cursor 始终只采用 ProcessManager 返回值，规范化字符位置从不写回。只有请求 cursor 已落后于 ProcessManager 当前可用窗口、`output_truncated` 表明未读取的原始区间丢失，或原始 `read` 绕过了分析上下文时，`observe` 才生成 `CURSOR_GAP`、保留新的合法 cursor、清除不完整语义证据并返回 `UNKNOWN`；规范化和 Detector 的正常滚动淘汰不构成 cursor gap。在新的明确任务边界前，不得猜补缺失内容或据此分类审批、认证与完成。
+原始 cursor 始终只采用 ProcessManager 返回值，规范化字符位置从不写回。只有请求 cursor 已落后于 ProcessManager 当前可用窗口、`output_truncated` 表明未读取的原始区间丢失，或原始 `read` 绕过了分析上下文时，`observe` 才生成 `CURSOR_GAP`、保留新的合法 cursor、清除不完整语义证据并返回 `UNKNOWN`；该页对外输出可以使用固定占位而不暴露无法确认的 PTY 文本。规范化和 Detector 的正常滚动淘汰不构成 cursor gap。在新的明确任务边界前，不得猜补缺失内容或据此分类审批、认证与完成。
 
 读取或状态查询失败生成 `READ_ERROR`，保留 SessionRef，并根据仍可确认的生命周期事实返回 `UNKNOWN`、`LOST` 或 `FAILED`；P5 不自动重试或 kill。终态观察只分析本次可读剩余页并生成 `PROCESS_EXIT`，不执行 final-drain 循环。
 
-所有输出在 Process Port 和 P5 组合上下文再次脱敏。Event、Snapshot、ActionRequired 与 fingerprint 不保存 Token、password、Authorization header、OAuth/verification/device code 或用户输入凭据。认证提示只能产生 `authentication`，不能自动填写或批准。任何无法可靠分类的交互提示必须返回：
+所有输出在 Process Port 和 P5 组合上下文再次脱敏。Event、Snapshot、ActionRequired 与 fingerprint 不保存 Token、password、Authorization header、OAuth/verification/device code 或用户输入凭据。已匹配的 PTY 输入 echo 不作为语义证据，也不对外暴露输入正文；其 Event 和 Snapshot 仅使用固定占位标记。认证提示产生 `authentication`，但不会自动填写或批准；用户明确提供的认证回复只在 P7 Controller 的单次提交调用中短暂存在。任何无法可靠分类的交互提示必须返回：
 
 ```text
 UNKNOWN

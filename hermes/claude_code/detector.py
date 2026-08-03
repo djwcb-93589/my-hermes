@@ -15,6 +15,7 @@ from hermes.claude_code.contracts import (
     ClaudeCodeEvent,
     ClaudeCodeEventType,
     ClaudeCodeState,
+    build_claude_code_action_id,
 )
 from hermes.claude_code.normalizer import (
     NormalizedOutputDelta,
@@ -25,8 +26,8 @@ from hermes.claude_code.normalizer import (
 MAX_EVENT_TEXT_CHARS = 2_048
 MAX_DETECTION_CONTEXT_CHARS = 8_192
 MAX_RECENT_EVENT_FINGERPRINTS = 128
-MAX_ACTION_OPTIONS = 8
 MAX_OUTBOUND_INPUT_EVIDENCE = 16
+MAX_SUPPRESSED_ACTION_FINGERPRINTS = 128
 OUTBOUND_INPUT_TTL_SECONDS = 30.0
 OUTBOUND_INPUT_OBSERVATION_BUDGET = 4
 OUTBOUND_INPUT_PREFIX_CHARS = 16
@@ -34,6 +35,8 @@ RECENT_MATCHED_ECHO_TTL_SECONDS = 10.0
 RECENT_MATCHED_ECHO_MATCH_BUDGET = 2
 MAX_ECHO_MATCH_LINES = 16
 _EVENT_TRUNCATION_MARKER = "\n[… event text truncated …]\n"
+_INPUT_ECHO_OMITTED_TEXT = "[input echo omitted]"
+_CURSOR_GAP_OUTPUT_OMITTED_TEXT = "[output omitted after cursor gap]"
 
 _TERMINAL_PROCESS_STATUSES = frozenset(
     {"exited", "killed", "lost", "failed_start"}
@@ -109,7 +112,7 @@ _INLINE_OPTION_RE = re.compile(
     r"\byes\s*/\s*no\b|\ballow\s*/\s*deny\b)"
 )
 _LINE_OPTION_RE = re.compile(
-    r"(?m)^\s*(?:\d{1,2}[.)]|[-*]|\[[ xX]?\])\s+(.{1,160})\s*$"
+    r"(?m)^\s*(?:\d+[.)]|[-*]|\[[ xX]?\])\s+.+\s*$"
 )
 _ECHO_PROMPT_PREFIX_RE = re.compile(
     r"(?i)^\s*(?:[│┃|]\s*)?"
@@ -145,9 +148,8 @@ class _MatchedEchoEvidence:
 
 @dataclass(frozen=True, slots=True)
 class _EchoIsolationResult:
-    """保留完整输出，同时只把非 echo 文本交给语义检测。"""
-
     semantic_text: str
+    display_text: str
     metadata: dict[str, object]
 
 
@@ -159,6 +161,7 @@ class DetectionResult:
     events: tuple[ClaudeCodeEvent, ...]
     action_required: ClaudeCodeActionRequired | None
     activity_detected: bool = False
+    display_output: str = ""
 
 
 class ClaudeCodeOutputDetector:
@@ -168,6 +171,8 @@ class ClaudeCodeOutputDetector:
         self._state = ClaudeCodeState.STARTING
         self._action_required: ClaudeCodeActionRequired | None = None
         self._last_action_fingerprint: str | None = None
+        self._suppressed_action_fingerprints: deque[str] = deque()
+        self._suppressed_action_fingerprint_set: set[str] = set()
         self._recent_fingerprints: deque[str] = deque()
         self._recent_fingerprint_set: set[str] = set()
         self._completion_seen = False
@@ -202,6 +207,7 @@ class ClaudeCodeOutputDetector:
         self._state = ClaudeCodeState.STARTING
         self._action_required = None
         self._last_action_fingerprint = None
+        self._clear_suppressed_action_fingerprints()
         self._completion_seen = False
         self._failure_seen = False
         self._progress_seen = False
@@ -214,8 +220,8 @@ class ClaudeCodeOutputDetector:
     def acknowledge_input(self) -> None:
         """输入明确送达后清除旧提示，但不保存回答内容。"""
 
-        self._action_required = None
-        self._last_action_fingerprint = None
+        self.invalidate_current_action()
+        self._clear_suppressed_action_fingerprints()
         self._completion_seen = False
         self._failure_seen = False
         self._progress_seen = False
@@ -224,9 +230,17 @@ class ClaudeCodeOutputDetector:
         self._clear_semantic_context()
         self._clear_recent_event_fingerprints()
 
-    def acknowledge_interrupt(self) -> None:
-        """中断明确送达后使当前待处理动作失效，保留观察历史。"""
+    def invalidate_current_action(
+        self,
+        *,
+        suppress_reappearance: bool = False,
+    ) -> None:
+        """使当前原生提示失效，但保留输出、cursor 和历史事件。"""
 
+        if suppress_reappearance and self._action_required is not None:
+            self._remember_suppressed_action_fingerprint(
+                self._action_fingerprint(self._action_required)
+            )
         self._action_required = None
         self._last_action_fingerprint = None
         if self._state in {
@@ -234,6 +248,16 @@ class ClaudeCodeOutputDetector:
             ClaudeCodeState.WAITING_APPROVAL,
         }:
             self._state = ClaudeCodeState.UNKNOWN
+
+    def acknowledge_interrupt(self) -> None:
+        """中断明确送达后使当前待处理动作失效，保留观察历史。"""
+
+        self.invalidate_current_action(suppress_reappearance=True)
+
+    def acknowledge_input_delivery_unknown(self) -> None:
+        """送达未知时抑制旧提示的单纯重绘，不推断输入是否成功。"""
+
+        self.invalidate_current_action(suppress_reappearance=True)
 
     def record_outbound_input(
         self,
@@ -380,7 +404,7 @@ class ClaudeCodeOutputDetector:
     ) -> _EchoIsolationResult:
         self._prune_outbound_input_evidence(timestamp)
         if not candidate or not enabled:
-            return _EchoIsolationResult(candidate, {})
+            return _EchoIsolationResult(candidate, candidate, {})
 
         eligible = tuple(
             evidence
@@ -466,7 +490,11 @@ class ClaudeCodeOutputDetector:
                 metadata["input_echo_unconfirmed"] = True
             if semantic_text:
                 metadata["contains_input_echo"] = True
-            return _EchoIsolationResult(semantic_text, metadata)
+            return _EchoIsolationResult(
+                semantic_text,
+                semantic_text,
+                metadata,
+            )
 
         if suspected_lines:
             semantic_text = self._without_lines(lines, suspected_lines)
@@ -478,9 +506,13 @@ class ClaudeCodeOutputDetector:
                 ),
                 "input_echo_unconfirmed": True,
             }
-            return _EchoIsolationResult(semantic_text, metadata)
+            return _EchoIsolationResult(
+                semantic_text,
+                semantic_text,
+                metadata,
+            )
 
-        return _EchoIsolationResult(candidate, {})
+        return _EchoIsolationResult(candidate, candidate, {})
 
     def _prune_outbound_input_evidence(self, timestamp: float) -> None:
         self._outbound_inputs = deque(
@@ -695,6 +727,7 @@ class ClaudeCodeOutputDetector:
         self,
         *,
         process_id: str,
+        session_owner: str,
         delta: NormalizedOutputDelta,
         process_status: str | None,
         exit_code: int | None,
@@ -719,7 +752,7 @@ class ClaudeCodeOutputDetector:
             self._progress_seen = False
             self._ready_seen = False
             self._clear_semantic_context()
-            self._clear_outbound_input_evidence()
+            self._outbound_response_pending = False
             self._clear_recent_event_fingerprints()
             self._append_event(
                 events,
@@ -758,14 +791,24 @@ class ClaudeCodeOutputDetector:
             self._action_required = None
             self._last_action_fingerprint = None
 
+        outbound_evidence_present = bool(
+            self._outbound_inputs or self._matched_echoes
+        )
         isolation = self._isolate_input_echo(
             output_candidate,
             cursor_start=delta.cursor_start,
             cursor_end=delta.cursor_end,
             timestamp=timestamp,
-            enabled=not delta.cursor_gap,
+            enabled=True,
         )
         candidate = isolation.semantic_text.strip()
+        display_output = isolation.display_text.strip()
+        if delta.cursor_gap:
+            candidate = ""
+            display_output = _CURSOR_GAP_OUTPUT_OMITTED_TEXT
+            isolation.metadata["source"] = "cursor_gap"
+            if outbound_evidence_present:
+                isolation.metadata["input_echo_unconfirmed"] = True
         if output_candidate:
             output_metadata = dict(isolation.metadata)
             if delta.limits_hit:
@@ -777,7 +820,7 @@ class ClaudeCodeOutputDetector:
                 cursor_start=delta.cursor_start,
                 cursor_end=delta.cursor_end,
                 timestamp=timestamp,
-                text=output_candidate,
+                text=display_output or _INPUT_ECHO_OMITTED_TEXT,
                 metadata=output_metadata,
             )
         elif delta.limits_hit:
@@ -817,6 +860,15 @@ class ClaudeCodeOutputDetector:
             self._action_required = None
             self._last_action_fingerprint = None
             self._progress_seen = True
+            self._clear_suppressed_action_fingerprints()
+
+        if candidate and not prompt_structure and (
+            progress_signal
+            or completion_signal
+            or failure_signal
+            or ready_signal
+        ):
+            self._clear_suppressed_action_fingerprints()
 
         if not delta.cursor_gap:
             if progress_signal:
@@ -863,16 +915,23 @@ class ClaudeCodeOutputDetector:
             if self._context_complete:
                 action = self._classify_action(
                     action_source,
-                    delta.cursor_end,
+                    process_id=process_id,
+                    session_owner=session_owner,
+                    cursor_start=delta.cursor_start,
+                    cursor_end=delta.cursor_end,
+                    timestamp=timestamp,
                 )
             elif self._looks_like_prompt(candidate):
                 action = self._action(
                     ClaudeCodeActionKind.UNKNOWN_PROMPT,
                     "Claude Code emitted a prompt after an output gap",
                     candidate,
-                    self._extract_options(candidate),
                     "unknown",
-                    delta.cursor_end,
+                    process_id=process_id,
+                    session_owner=session_owner,
+                    cursor_start=delta.cursor_start,
+                    cursor_end=delta.cursor_end,
+                    timestamp=timestamp,
                 )
                 action_source = candidate
             else:
@@ -893,7 +952,6 @@ class ClaudeCodeOutputDetector:
                 self._record_action(
                     events,
                     action=action,
-                    source_text=action_source,
                     process_id=process_id,
                     cursor_start=delta.cursor_start,
                     cursor_end=delta.cursor_end,
@@ -960,6 +1018,11 @@ class ClaudeCodeOutputDetector:
             events=tuple(events),
             action_required=self._action_required,
             activity_detected=activity_detected,
+            display_output=(
+                display_output
+                if display_output
+                else _INPUT_ECHO_OMITTED_TEXT if output_candidate else ""
+            ),
         )
 
     def _resolve_state(
@@ -1058,7 +1121,12 @@ class ClaudeCodeOutputDetector:
     def _classify_action(
         self,
         candidate: str,
-        cursor: int,
+        *,
+        process_id: str,
+        session_owner: str,
+        cursor_start: int,
+        cursor_end: int,
+        timestamp: float,
     ) -> ClaudeCodeActionRequired | None:
         if not candidate:
             return None
@@ -1069,7 +1137,6 @@ class ClaudeCodeOutputDetector:
         approval = bool(_APPROVAL_RE.search(candidate))
         clarification = bool(_CLARIFICATION_RE.search(candidate))
         options = self._extract_options(candidate)
-
         if auth and (
             prompt_like
             or approval
@@ -1080,86 +1147,131 @@ class ClaudeCodeOutputDetector:
                 ClaudeCodeActionKind.AUTHENTICATION,
                 "Claude Code requires authentication",
                 candidate,
-                options,
                 "high",
-                cursor,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
             )
         if destructive and prompt_like and (approval or options):
             return self._action(
                 ClaudeCodeActionKind.DESTRUCTIVE_ACTION,
                 "Claude Code requests confirmation for a destructive action",
                 candidate,
-                options,
                 "critical",
-                cursor,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
             )
         if external and prompt_like and (approval or options):
             return self._action(
                 ClaudeCodeActionKind.EXTERNAL_ACCESS,
                 "Claude Code requests external access",
                 candidate,
-                options,
                 "high",
-                cursor,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
             )
         if approval and prompt_like:
             return self._action(
                 ClaudeCodeActionKind.APPROVAL,
                 "Claude Code requests permission or confirmation",
                 candidate,
-                options,
                 "medium",
-                cursor,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
             )
         if clarification and prompt_like:
             return self._action(
                 ClaudeCodeActionKind.CLARIFICATION,
                 "Claude Code requests additional information",
                 candidate,
-                options,
                 "low",
-                cursor,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
             )
         if prompt_like:
             return self._action(
                 ClaudeCodeActionKind.UNKNOWN_PROMPT,
                 "Claude Code emitted an unclassified interactive prompt",
                 candidate,
-                options,
                 "unknown",
-                cursor,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
             )
         return None
 
     @staticmethod
     def _action_source(candidate: str, context: str) -> str:
-        """提示或选项跨页出现时补入有界上下文。"""
+        """保留最新 Prompt 块，避免无关历史输出改变其语义身份。"""
 
-        if (
+        if not (
             ClaudeCodeOutputDetector._looks_like_prompt(candidate)
             or _LINE_OPTION_RE.search(candidate)
         ):
-            contextual = redact_claude_code_output(context).strip()
-            if contextual:
-                return contextual[-MAX_DETECTION_CONTEXT_CHARS:]
-        return candidate
+            return candidate
+        contextual = redact_claude_code_output(context).strip()
+        if not contextual:
+            return candidate
+        lines = [line for line in contextual.splitlines() if line.strip()]
+        for index in range(len(lines) - 1, -1, -1):
+            if ClaudeCodeOutputDetector._looks_like_prompt(lines[index]):
+                return "\n".join(lines[index:])[
+                    -MAX_DETECTION_CONTEXT_CHARS:
+                ]
+        return contextual[-MAX_DETECTION_CONTEXT_CHARS:]
 
     @staticmethod
     def _action(
         kind: ClaudeCodeActionKind,
         summary: str,
         prompt_text: str,
-        options: tuple[str, ...],
         risk: str,
-        cursor: int,
+        *,
+        process_id: str,
+        session_owner: str,
+        cursor_start: int,
+        cursor_end: int,
+        timestamp: float,
     ) -> ClaudeCodeActionRequired:
+        safe_prompt_text = redact_claude_code_output(prompt_text).strip()
+        options = ClaudeCodeOutputDetector._extract_options(safe_prompt_text)
         return ClaudeCodeActionRequired(
             kind=kind,
             summary=summary,
-            prompt_text=ClaudeCodeOutputDetector._bounded_text(prompt_text),
+            prompt_text=safe_prompt_text,
             options=options,
             risk=risk,
-            cursor=cursor,
+            cursor=cursor_end,
+            action_id=build_claude_code_action_id(
+                process_id=process_id,
+                session_owner=session_owner,
+                kind=kind,
+                prompt_text=safe_prompt_text,
+                options=options,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+            ),
+            process_id=process_id,
+            session_owner=session_owner,
+            cursor_start=cursor_start,
+            cursor_end=cursor_end,
+            created_at=timestamp,
         )
 
     @staticmethod
@@ -1176,23 +1288,23 @@ class ClaudeCodeOutputDetector:
 
     @staticmethod
     def _extract_options(text: str) -> tuple[str, ...]:
-        options: list[str] = []
-        inline = _INLINE_OPTION_RE.search(text)
-        if inline:
-            lowered = inline.group(0).casefold()
-            options.extend(
-                ("allow", "deny")
-                if "allow" in lowered
-                else ("yes", "no")
-            )
-        for match in _LINE_OPTION_RE.finditer(text):
-            option = redact_claude_code_output(match.group(1)).strip()
-            option = option[:160]
-            if option and option not in options:
-                options.append(option)
-            if len(options) >= MAX_ACTION_OPTIONS:
-                break
-        return tuple(options[:MAX_ACTION_OPTIONS])
+        options_with_positions: list[tuple[int, str]] = []
+        line_matches = tuple(_LINE_OPTION_RE.finditer(text))
+        for inline in _INLINE_OPTION_RE.finditer(text):
+            if any(
+                match.start() <= inline.start() < match.end()
+                for match in line_matches
+            ):
+                continue
+            option = redact_claude_code_output(inline.group(0)).strip()
+            if option:
+                options_with_positions.append((inline.start(), option))
+        for match in line_matches:
+            option = redact_claude_code_output(match.group(0)).strip()
+            if option:
+                options_with_positions.append((match.start(), option))
+        options_with_positions.sort(key=lambda item: item[0])
+        return tuple(option for _, option in options_with_positions)
 
     @staticmethod
     def _action_event_type(
@@ -1211,7 +1323,6 @@ class ClaudeCodeOutputDetector:
         events: list[ClaudeCodeEvent],
         *,
         action: ClaudeCodeActionRequired,
-        source_text: str,
         process_id: str,
         cursor_start: int,
         cursor_end: int,
@@ -1219,7 +1330,11 @@ class ClaudeCodeOutputDetector:
     ) -> None:
         """仅在动作内容实质变化时保存待决动作并生成事件。"""
 
-        action_fingerprint = self._action_fingerprint(action, source_text)
+        action_fingerprint = self._action_fingerprint(action)
+        if action_fingerprint in self._suppressed_action_fingerprint_set:
+            self._action_required = None
+            self._last_action_fingerprint = None
+            return
         if action_fingerprint == self._last_action_fingerprint:
             return
         self._action_required = action
@@ -1235,7 +1350,7 @@ class ClaudeCodeOutputDetector:
             metadata={
                 "kind": action.kind.value,
                 "risk": action.risk,
-                "options": action.options,
+                "action_id": action.action_id,
                 "prompt_fingerprint": action_fingerprint,
             },
         )
@@ -1251,6 +1366,26 @@ class ClaudeCodeOutputDetector:
 
         self._recent_fingerprints.clear()
         self._recent_fingerprint_set.clear()
+
+    def _remember_suppressed_action_fingerprint(self, fingerprint: str) -> None:
+        """在有确定输入边界后，有界地抑制旧提示的纯重绘。"""
+
+        if fingerprint in self._suppressed_action_fingerprint_set:
+            return
+        self._suppressed_action_fingerprints.append(fingerprint)
+        self._suppressed_action_fingerprint_set.add(fingerprint)
+        while (
+            len(self._suppressed_action_fingerprints)
+            > MAX_SUPPRESSED_ACTION_FINGERPRINTS
+        ):
+            removed = self._suppressed_action_fingerprints.popleft()
+            self._suppressed_action_fingerprint_set.discard(removed)
+
+    def _clear_suppressed_action_fingerprints(self) -> None:
+        """仅在用户明确开始新输入边界时清除过期的重绘抑制。"""
+
+        self._suppressed_action_fingerprints.clear()
+        self._suppressed_action_fingerprint_set.clear()
 
     @staticmethod
     def _event_counts_as_activity(event: ClaudeCodeEvent) -> bool:
@@ -1350,22 +1485,17 @@ class ClaudeCodeOutputDetector:
     @staticmethod
     def _action_fingerprint(
         action: ClaudeCodeActionRequired,
-        source_text: str,
     ) -> str:
         payload = (
             action.kind.value,
             " ".join(action.prompt_text.split()).casefold(),
             tuple(" ".join(option.split()).casefold() for option in action.options),
             action.risk,
-            " ".join(
-                redact_claude_code_output(source_text).split()
-            ).casefold(),
         )
         return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
 __all__ = [
-    "MAX_ACTION_OPTIONS",
     "MAX_DETECTION_CONTEXT_CHARS",
     "MAX_ECHO_MATCH_LINES",
     "MAX_EVENT_TEXT_CHARS",

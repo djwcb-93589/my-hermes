@@ -14,12 +14,15 @@ from hermes.claude_code.contracts import (
     CLAUDE_CODE_ACTIVE_PROCESS_STATUSES,
     ClaudeCodeActionKind,
     ClaudeCodeActionRequired,
+    ClaudeCodeCurrentInteraction,
     ClaudeCodeEvent,
     ClaudeCodeEventType,
+    ClaudeCodeInteractionResponse,
     ClaudeCodeProcessSnapshot,
     ClaudeCodeRuntimeError,
     ClaudeCodeSnapshot,
     ClaudeCodeState,
+    build_claude_code_action_id,
 )
 from hermes.claude_code.controller_policy import (
     ClaudeCodeControllerPolicy,
@@ -35,6 +38,7 @@ _TERMINAL_STATES = frozenset(
         ClaudeCodeState.LOST,
     }
 )
+_MAX_RETAINED_INTERACTION_IDS = 128
 
 
 class ClaudeCodeControllerOutcome(str, Enum):
@@ -123,6 +127,15 @@ class _ControllerTask:
     terminal_events: tuple[ClaudeCodeEvent, ...] = ()
     cancelled: bool = False
     interrupt_requested: bool = False
+    interaction_in_progress_id: str | None = None
+    resolved_interaction_ids: OrderedDict[str, None] = field(
+        default_factory=OrderedDict,
+        repr=False,
+    )
+    invalidated_interaction_ids: OrderedDict[str, None] = field(
+        default_factory=OrderedDict,
+        repr=False,
+    )
     archived: bool = False
     limits_hit: set[str] = field(default_factory=set)
     lock: threading.RLock = field(
@@ -381,61 +394,166 @@ class ClaudeCodeController:
                 error_type="poll_failed",
             )
 
-    def answer_question(
+    def current_interaction(
         self,
         *,
         session_owner: str,
         process_id: str,
-        answer: str,
-    ) -> ClaudeCodeControllerResult:
-        """只回答当前 clarification；审批、认证和未知提示一律拒绝。"""
+    ) -> ClaudeCodeCurrentInteraction | None:
+        """返回最新已观察到的原生提示，不读取历史事件也不发送输入。"""
 
-        if not isinstance(answer, str) or not answer.strip():
-            raise ClaudeCodeControllerError(
-                "invalid_action_response",
-                "Claude Code clarification answer must be non-empty",
-            )
         task, terminal = self._resolve_task(session_owner, process_id)
         if terminal is not None:
-            raise self._terminal_error(process_id)
+            return None
+        assert task is not None
+        with task.lock:
+            if task.archived:
+                return None
+            snapshot = self._current_snapshot_locked(task)
+            if _snapshot_is_terminal(snapshot):
+                return None
+            action = snapshot.action_required
+            if not self._is_native_interaction(action):
+                return None
+            assert action is not None
+            self._assert_interaction_belongs_to_task_locked(task, action)
+            if (
+                action.action_id in task.resolved_interaction_ids
+                or action.action_id in task.invalidated_interaction_ids
+                or task.interaction_in_progress_id == action.action_id
+            ):
+                return None
+            return ClaudeCodeCurrentInteraction(
+                state=snapshot.state,
+                action=action,
+            )
+
+    def reply_to_interaction(
+        self,
+        *,
+        response: ClaudeCodeInteractionResponse,
+    ) -> ClaudeCodeControllerResult:
+        """原样提交用户明确提供的当前原生交互回复。"""
+
+        if not isinstance(response, ClaudeCodeInteractionResponse):
+            raise TypeError("response must be a ClaudeCodeInteractionResponse")
+        if response.user_confirmed is not True:
+            raise ClaudeCodeControllerError(
+                "explicit_user_confirmation_required",
+                "Claude Code interaction reply requires explicit user confirmation",
+                details={"process_id": response.process_id},
+            )
+        if not response.response:
+            raise ClaudeCodeControllerError(
+                "interaction_response_required",
+                "Claude Code interaction reply must be non-empty",
+                details={"process_id": response.process_id},
+            )
+
+        task, terminal = self._resolve_task(
+            response.session_owner,
+            response.process_id,
+        )
+        if terminal is not None:
+            raise self._terminal_error(response.process_id)
         assert task is not None
         with task.lock:
             self._guard_input_locked(task)
-            snapshot = self._current_snapshot_locked(task)
-            action = snapshot.action_required
-            if (
-                action is None
-                or action.kind != ClaudeCodeActionKind.CLARIFICATION
-            ):
-                raise ClaudeCodeControllerError(
-                    "invalid_action_response",
-                    "Only a current Claude Code clarification can be answered",
-                    details={"process_id": process_id},
+            snapshot = self._observe_once_locked(
+                task,
+                error_type="interaction_response_failed",
+            )
+            if _snapshot_is_terminal(snapshot):
+                self._finalize_terminal_locked(
+                    task,
+                    snapshot,
+                    outcome=ClaudeCodeControllerOutcome.TERMINAL,
                 )
+                raise self._terminal_error(response.process_id)
+            if snapshot.process_status not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES:
+                raise ClaudeCodeControllerError(
+                    "interaction_expired",
+                    "Claude Code interaction is no longer active",
+                    details={"process_id": response.process_id},
+                )
+
+            action = snapshot.action_required
+            if not self._is_native_interaction(action):
+                raise self._interaction_absent_error_locked(task, response)
+            assert action is not None
+            self._assert_interaction_belongs_to_task_locked(task, action)
+            if action.action_id != response.action_id:
+                raise self._interaction_id_error_locked(task, response)
+            if action.action_id in task.resolved_interaction_ids:
+                raise ClaudeCodeControllerError(
+                    "interaction_already_resolved",
+                    "Claude Code interaction was already resolved",
+                    details={"process_id": response.process_id},
+                )
+            if action.action_id in task.invalidated_interaction_ids:
+                raise ClaudeCodeControllerError(
+                    "interaction_expired",
+                    "Claude Code interaction is no longer current",
+                    details={"process_id": response.process_id},
+                )
+            if task.interaction_in_progress_id == action.action_id:
+                raise ClaudeCodeControllerError(
+                    "interaction_in_progress",
+                    "Claude Code interaction reply is already being submitted",
+                    details={"process_id": response.process_id},
+                )
+
+            task.interaction_in_progress_id = action.action_id
             try:
                 self._runtime.submit(
-                    session_owner=session_owner,
-                    process_id=process_id,
-                    data=answer,
+                    session_owner=response.session_owner,
+                    process_id=response.process_id,
+                    data=response.response,
                 )
             except ClaudeCodeRuntimeError as runtime_error:
+                if runtime_error.delivery_unknown:
+                    self._remember_interaction_id_locked(
+                        task.invalidated_interaction_ids,
+                        action.action_id,
+                    )
+                    self._clear_current_interaction_locked(
+                        task,
+                        snapshot=snapshot,
+                    )
+                    raise ClaudeCodeControllerError(
+                        "interaction_delivery_unknown",
+                        "Claude Code interaction reply delivery could not be confirmed",
+                        delivery_unknown=True,
+                        details={
+                            "process_id": response.process_id,
+                            "cause_error_type": runtime_error.error_type,
+                        },
+                    ) from runtime_error
                 raise self._wrap_runtime_error(
-                    "instruction_failed",
-                    "Claude Code clarification answer submission failed",
+                    "interaction_response_failed",
+                    "Claude Code interaction reply submission failed",
                     runtime_error,
-                    process_id,
+                    response.process_id,
                 ) from runtime_error
-            task.interrupt_requested = False
-            task.consecutive_empty_reads = 0
-            task.last_snapshot = replace(
-                snapshot,
-                state=ClaudeCodeState.UNKNOWN,
-                action_required=None,
-            )
-            return self._observe_and_resolve_locked(
-                task,
-                error_type="poll_failed",
-            )
+            else:
+                self._remember_interaction_id_locked(
+                    task.resolved_interaction_ids,
+                    action.action_id,
+                )
+                task.interrupt_requested = False
+                task.consecutive_empty_reads = 0
+                self._clear_current_interaction_locked(
+                    task,
+                    snapshot=snapshot,
+                    invalidate=False,
+                )
+                return self._observe_and_resolve_locked(
+                    task,
+                    error_type="interaction_response_failed",
+                )
+            finally:
+                if task.interaction_in_progress_id == action.action_id:
+                    task.interaction_in_progress_id = None
 
     def wait_for_action(
         self,
@@ -499,6 +617,7 @@ class ClaudeCodeController:
         assert task is not None
         with task.lock:
             if not task.interrupt_requested:
+                interrupted_snapshot = task.last_snapshot
                 try:
                     self._runtime.interrupt(
                         session_owner=session_owner,
@@ -515,7 +634,10 @@ class ClaudeCodeController:
                         runtime_error,
                         process_id,
                     ) from runtime_error
-            self._clear_interrupt_action_locked(task)
+                self._clear_interrupt_action_locked(
+                    task,
+                    snapshot=interrupted_snapshot,
+                )
 
             operation_deadline = self._operation_deadline(
                 self._policy.interrupt_observation_attempts
@@ -592,6 +714,7 @@ class ClaudeCodeController:
         with task.lock:
             if task.archived:
                 return self._archived_result(task)
+            self._clear_current_interaction_locked(task)
             confirmed = self._kill_until_inactive(
                 session_owner=session_owner,
                 process_id=process_id,
@@ -743,6 +866,24 @@ class ClaudeCodeController:
                 options=(),
                 risk="low",
                 cursor=snapshot.raw_cursor,
+                action_id=build_claude_code_action_id(
+                    process_id=task.process_id,
+                    session_owner=task.session_owner,
+                    kind=ClaudeCodeActionKind.STALLED,
+                    prompt_text="",
+                    options=(),
+                    cursor_start=snapshot.raw_cursor,
+                    cursor_end=snapshot.raw_cursor,
+                ),
+                process_id=task.process_id,
+                session_owner=task.session_owner,
+                cursor_start=snapshot.raw_cursor,
+                cursor_end=snapshot.raw_cursor,
+                created_at=(
+                    snapshot.last_observed_at
+                    if snapshot.last_observed_at is not None
+                    else self._now()
+                ),
             )
             snapshot = replace(
                 snapshot,
@@ -779,18 +920,12 @@ class ClaudeCodeController:
             error_type="interrupt_failed",
         )
         if _snapshot_is_terminal(snapshot):
-            cleared_snapshot = self._clear_interrupt_action_locked(
-                task,
-                snapshot=snapshot,
-            )
-            assert cleared_snapshot is not None
             return self._finalize_terminal_locked(
                 task,
-                cleared_snapshot,
+                snapshot,
                 outcome=ClaudeCodeControllerOutcome.TERMINAL,
                 suppress_actions=True,
             )
-        self._clear_interrupt_action_locked(task, snapshot=snapshot)
         return None
 
     def _clear_interrupt_action_locked(
@@ -799,11 +934,32 @@ class ClaudeCodeController:
         *,
         snapshot: ClaudeCodeSnapshot | None = None,
     ) -> ClaudeCodeSnapshot | None:
-        """使中断前提示只保留为历史输出，不再作为当前可执行动作。"""
+        """只使已确认送达 interrupt 时的旧提示失效。"""
+
+        return self._clear_current_interaction_locked(
+            task,
+            snapshot=snapshot,
+        )
+
+    def _clear_current_interaction_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        snapshot: ClaudeCodeSnapshot | None = None,
+        invalidate: bool = True,
+    ) -> ClaudeCodeSnapshot | None:
+        """清理当前提示缓存，并按需使其身份不可再次提交。"""
 
         current = snapshot if snapshot is not None else task.last_snapshot
         if current is None or current.action_required is None:
             return current
+        action = current.action_required
+        if invalidate and self._is_native_interaction(action):
+            assert action is not None
+            self._remember_interaction_id_locked(
+                task.invalidated_interaction_ids,
+                action.action_id,
+            )
         state = current.state
         if state in {
             ClaudeCodeState.WAITING_INPUT,
@@ -896,6 +1052,11 @@ class ClaudeCodeController:
             task.consecutive_empty_reads += 1
         else:
             task.consecutive_empty_reads = 0
+        self._invalidate_replaced_interaction_locked(
+            task,
+            previous=previous,
+            current=snapshot,
+        )
         task.last_snapshot = snapshot
         if task.observation_count >= self._policy.max_observation_count:
             task.limits_hit.add("observation_limit_reached")
@@ -1318,6 +1479,133 @@ class ClaudeCodeController:
         with self._tasks_guard:
             if self._tasks.get(task.process_id) is task:
                 self._tasks.pop(task.process_id, None)
+
+    @staticmethod
+    def _is_native_interaction(
+        action: ClaudeCodeActionRequired | None,
+    ) -> bool:
+        """只把带完整身份的真实 CC Prompt 作为可回复交互。"""
+
+        return bool(
+            action is not None
+            and action.kind != ClaudeCodeActionKind.STALLED
+            and action.action_id
+            and action.process_id
+            and action.session_owner
+            and action.cursor_start is not None
+            and action.cursor_end is not None
+            and action.created_at is not None
+        )
+
+    def _assert_interaction_belongs_to_task_locked(
+        self,
+        task: _ControllerTask,
+        action: ClaudeCodeActionRequired,
+    ) -> None:
+        """拒绝动作身份与当前受管 task 不一致的内部状态。"""
+
+        if action.session_owner != task.session_owner:
+            raise ClaudeCodeControllerError(
+                "controller_owner_mismatch",
+                "Claude Code interaction belongs to another owner",
+                details={"process_id": task.process_id},
+            )
+        if action.process_id != task.process_id:
+            raise ClaudeCodeControllerError(
+                "interaction_id_mismatch",
+                "Claude Code interaction belongs to another process",
+                details={"process_id": task.process_id},
+            )
+
+    @staticmethod
+    def _remember_interaction_id_locked(
+        entries: OrderedDict[str, None],
+        action_id: str,
+    ) -> None:
+        """只保留有界的 opaque 动作身份，不保存任何用户回复。"""
+
+        if not action_id:
+            return
+        entries[action_id] = None
+        entries.move_to_end(action_id)
+        while len(entries) > _MAX_RETAINED_INTERACTION_IDS:
+            entries.popitem(last=False)
+
+    def _invalidate_replaced_interaction_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        previous: ClaudeCodeSnapshot | None,
+        current: ClaudeCodeSnapshot,
+    ) -> None:
+        """新提示、恢复工作或终态出现时使旧提示身份不可复用。"""
+
+        if previous is None:
+            return
+        previous_action = previous.action_required
+        if not self._is_native_interaction(previous_action):
+            return
+        assert previous_action is not None
+        current_action = current.action_required
+        if (
+            not self._is_native_interaction(current_action)
+            or current_action is None
+            or current_action.action_id != previous_action.action_id
+        ):
+            self._remember_interaction_id_locked(
+                task.invalidated_interaction_ids,
+                previous_action.action_id,
+            )
+
+    def _interaction_absent_error_locked(
+        self,
+        task: _ControllerTask,
+        response: ClaudeCodeInteractionResponse,
+    ) -> ClaudeCodeControllerError:
+        """将已消费和已失效的提示与从未存在的提示区分开。"""
+
+        if response.action_id in task.resolved_interaction_ids:
+            return ClaudeCodeControllerError(
+                "interaction_already_resolved",
+                "Claude Code interaction was already resolved",
+                details={"process_id": response.process_id},
+            )
+        if response.action_id in task.invalidated_interaction_ids:
+            return ClaudeCodeControllerError(
+                "interaction_expired",
+                "Claude Code interaction is no longer current",
+                details={"process_id": response.process_id},
+            )
+        return ClaudeCodeControllerError(
+            "interaction_not_found",
+            "Claude Code has no current native interaction",
+            details={"process_id": response.process_id},
+        )
+
+    def _interaction_id_error_locked(
+        self,
+        task: _ControllerTask,
+        response: ClaudeCodeInteractionResponse,
+    ) -> ClaudeCodeControllerError:
+        """拒绝已被替换、已消费或不属于当前提示的回复。"""
+
+        if response.action_id in task.resolved_interaction_ids:
+            return ClaudeCodeControllerError(
+                "interaction_already_resolved",
+                "Claude Code interaction was already resolved",
+                details={"process_id": response.process_id},
+            )
+        if response.action_id in task.invalidated_interaction_ids:
+            return ClaudeCodeControllerError(
+                "interaction_expired",
+                "Claude Code interaction is no longer current",
+                details={"process_id": response.process_id},
+            )
+        return ClaudeCodeControllerError(
+            "interaction_id_mismatch",
+            "Claude Code interaction does not match the current prompt",
+            details={"process_id": response.process_id},
+        )
 
     @staticmethod
     def _current_snapshot_locked(task: _ControllerTask) -> ClaudeCodeSnapshot:

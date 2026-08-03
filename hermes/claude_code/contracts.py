@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -124,6 +125,49 @@ def _require_timestamp(field_name: str, value: float) -> None:
         or value < 0
     ):
         raise ValueError(f"{field_name} must be a non-negative timestamp")
+
+
+def build_claude_code_action_id(
+    *,
+    process_id: str,
+    session_owner: str,
+    kind: ClaudeCodeActionKind,
+    prompt_text: str,
+    options: tuple[str, ...],
+    cursor_start: int,
+    cursor_end: int,
+) -> str:
+    """基于脱敏后的可观察提示生成不含正文的稳定动作身份。"""
+
+    _require_nonempty_text("process_id", process_id)
+    _require_nonempty_text("session_owner", session_owner)
+    if not isinstance(kind, ClaudeCodeActionKind):
+        raise ValueError("kind must be a ClaudeCodeActionKind")
+    if not isinstance(prompt_text, str):
+        raise ValueError("prompt_text must be text")
+    if not isinstance(options, tuple) or any(
+        not isinstance(option, str) or not option.strip()
+        for option in options
+    ):
+        raise ValueError("options must contain non-empty text")
+    _require_nonnegative_int("cursor_start", cursor_start)
+    _require_nonnegative_int("cursor_end", cursor_end)
+    if cursor_end < cursor_start:
+        raise ValueError("cursor_end must not precede cursor_start")
+
+    payload = (
+        "claude-code-action-v1",
+        process_id,
+        session_owner,
+        kind.value,
+        cursor_start,
+        cursor_end,
+        " ".join(prompt_text.split()).casefold(),
+        tuple(" ".join(option.split()).casefold() for option in options),
+    )
+    return "ccact_" + hashlib.sha256(
+        repr(payload).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +319,12 @@ class ClaudeCodeActionRequired:
     options: tuple[str, ...]
     risk: str
     cursor: int
+    action_id: str = ""
+    process_id: str = ""
+    session_owner: str = ""
+    cursor_start: int | None = None
+    cursor_end: int | None = None
+    created_at: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ClaudeCodeActionKind):
@@ -289,6 +339,110 @@ class ClaudeCodeActionRequired:
             raise ValueError("options must contain non-empty text")
         _require_nonempty_text("risk", self.risk)
         _require_nonnegative_int("cursor", self.cursor)
+        identity_present = any(
+            (
+                self.action_id,
+                self.process_id,
+                self.session_owner,
+                self.cursor_start is not None,
+                self.cursor_end is not None,
+                self.created_at is not None,
+            )
+        )
+        if not identity_present:
+            return
+        _require_nonempty_text("action_id", self.action_id)
+        _require_nonempty_text("process_id", self.process_id)
+        _require_nonempty_text("session_owner", self.session_owner)
+        if self.cursor_start is None or self.cursor_end is None:
+            raise ValueError("action cursor range must be complete")
+        _require_nonnegative_int("cursor_start", self.cursor_start)
+        _require_nonnegative_int("cursor_end", self.cursor_end)
+        if self.cursor_end < self.cursor_start:
+            raise ValueError("cursor_end must not precede cursor_start")
+        if self.cursor != self.cursor_end:
+            raise ValueError("cursor must equal cursor_end for an identified action")
+        if self.created_at is None:
+            raise ValueError("created_at is required for an identified action")
+        _require_timestamp("created_at", self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeCurrentInteraction:
+    """只包含当前有效原生提示的透明展示视图。"""
+
+    state: ClaudeCodeState
+    action: ClaudeCodeActionRequired
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, ClaudeCodeState):
+            raise ValueError("state must be a ClaudeCodeState")
+        if not isinstance(self.action, ClaudeCodeActionRequired):
+            raise ValueError("action must be a ClaudeCodeActionRequired")
+        _require_nonempty_text("action_id", self.action.action_id)
+        _require_nonempty_text("process_id", self.action.process_id)
+        _require_nonempty_text("session_owner", self.action.session_owner)
+
+    @property
+    def action_id(self) -> str:
+        return self.action.action_id
+
+    @property
+    def process_id(self) -> str:
+        return self.action.process_id
+
+    @property
+    def session_owner(self) -> str:
+        return self.action.session_owner
+
+    @property
+    def kind(self) -> ClaudeCodeActionKind:
+        return self.action.kind
+
+    @property
+    def prompt_text(self) -> str:
+        return self.action.prompt_text
+
+    @property
+    def options(self) -> tuple[str, ...]:
+        return self.action.options
+
+    @property
+    def cursor_start(self) -> int:
+        assert self.action.cursor_start is not None
+        return self.action.cursor_start
+
+    @property
+    def cursor_end(self) -> int:
+        assert self.action.cursor_end is not None
+        return self.action.cursor_end
+
+    @property
+    def created_at(self) -> float:
+        assert self.action.created_at is not None
+        return self.action.created_at
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeInteractionResponse:
+    """仅在提交调用栈中短暂携带用户明确提供的原样回复。"""
+
+    action_id: str
+    process_id: str
+    session_owner: str
+    response: str = field(repr=False)
+    user_confirmed: bool
+    created_at: float
+
+    def __post_init__(self) -> None:
+        _require_nonempty_text("action_id", self.action_id)
+        _require_nonempty_text("process_id", self.process_id)
+        _require_nonempty_text("session_owner", self.session_owner)
+        if not isinstance(self.response, str):
+            raise ValueError("response must be text")
+        if not isinstance(self.user_confirmed, bool):
+            raise ValueError("user_confirmed must be a boolean")
+        _require_timestamp("created_at", self.created_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,8 +585,10 @@ __all__ = [
     "CLAUDE_CODE_PROCESS_STATUSES",
     "ClaudeCodeActionKind",
     "ClaudeCodeActionRequired",
+    "ClaudeCodeCurrentInteraction",
     "ClaudeCodeEvent",
     "ClaudeCodeEventType",
+    "ClaudeCodeInteractionResponse",
     "ClaudeCodeProcessLog",
     "ClaudeCodeProcessPort",
     "ClaudeCodeProcessSnapshot",
@@ -441,4 +597,5 @@ __all__ = [
     "ClaudeCodeSessionRef",
     "ClaudeCodeSnapshot",
     "ClaudeCodeState",
+    "build_claude_code_action_id",
 ]

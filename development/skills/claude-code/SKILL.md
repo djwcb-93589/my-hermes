@@ -7,18 +7,19 @@ description: >-
   size or complexity. Without an explicit user request, use normal myHermes
   tools. After explicit activation, read this Skill and complete the required
   preflight before launch or session control.
-version: 0.6.0
+version: 0.7.0
 platforms:
   - windows
   - linux
   - darwin
 metadata:
-  development_stage: workflow_controller
+  development_stage: native_interaction_bubbling
   agent_integration: discovery_and_selection
   managed_runtime: true
   output_normalization: true
   state_detection: true
   workflow_controller: true
+  native_interaction_bubbling: true
   supports_one_shot: true
   supports_supervised_pty: true
   requires_process_input: true
@@ -55,7 +56,7 @@ metadata:
 
 ## 职责边界
 
-通过现有 Terminal Tool 和 Process Tool 启动、观察、纠偏和结束 Claude Code。受管 Runtime 封装同一条 ProcessManager 公共调用链，P5 提供有界输出解释和单次状态观察，P6 Controller 只在 Runtime 公共接口之上提供有界工作流编排。它们都不是新 Tool，也不拥有进程、PTY、日志或 cleanup 基础设施；Controller 尚未接入 AgentLoop。
+通过现有 Terminal Tool 和 Process Tool 启动、观察、纠偏和结束 Claude Code。受管 Runtime 封装同一条 ProcessManager 公共调用链，P5 提供有界输出解释和单次状态观察，P6/P7 Controller 在 Runtime 公共接口之上提供有界工作流编排和原生交互透明冒泡。它们都不是新 Tool，也不拥有进程、PTY、日志或 cleanup 基础设施；Controller 尚未接入 AgentLoop。
 
 必须遵守以下边界：
 
@@ -78,6 +79,7 @@ metadata:
 - [managed-runtime.md](references/managed-runtime.md)：P4 真实后台 PTY、SessionRef、owner/cwd 互斥和基础生命周期边界。
 - [output-observation.md](references/output-observation.md)：P5 增量规范化、Event/ActionRequired/Snapshot、状态证据和安全降级。
 - [workflow-controller.md](references/workflow-controller.md)：P6 有界 poll/wait、ActionRequired 暂停、deadline、中断、终止和 final drain。
+- [approvals.md](references/approvals.md)：P7 原生 Prompt、可见选项、稳定 action_id 与统一原样回复。
 - [permissions-and-safety.md](references/permissions-and-safety.md)：权限、凭证和危险操作边界。
 - [claude-code-cli.md](references/claude-code-cli.md)：本 Skill 使用的 CLI 能力。
 
@@ -139,8 +141,9 @@ terminal(
 6. one-shot 模式仅在 `status=running` 时用 `write` 原样发送完整任务，成功后用 `close` 发送 EOF，再用 `log`/`wait` 收集结果；supervised PTY 模式先确认 `status=running`，再用 `submit` 发送行式初始任务并进入监督循环。
 7. 每轮只读取 `next_cursor` 之后的新增输出，分别判断 ProcessStatus、Claude Code 逻辑状态和有效进展。
 8. 只有干预条件成立且未命中去重规则时，发送一次最小必要指示；否则继续观察。
-9. 按完成判定或恢复策略收尾，不把总结、短暂无输出或单个子任务完成误判为整体完成。
-10. 最终使用 `wait` 或确认终态，读取最后一段日志，核对报告的修改和仓库状态，再向用户汇总。
+9. Claude Code 输出原生交互 Prompt 时，原样展示当前 Prompt 与全部可见选项；只有用户明确提供确切回复后，才按当前 `action_id`、process_id 和 owner 原样转发一次。
+10. 按完成判定或恢复策略收尾，不把总结、短暂无输出或单个子任务完成误判为整体完成。
+11. 最终使用 `wait` 或确认终态，读取最后一段日志，核对报告的修改和仓库状态，再向用户汇总。
 
 ## 任务约束传播
 
@@ -169,6 +172,8 @@ terminal(
 - `next_cursor` 只能采用 Process Tool 返回值。ANSI 清理、脱敏和文本理解不得改变 cursor。
 - 不自动使用 `--dangerously-skip-permissions`、`bypassPermissions` 或其他权限绕过方式。
 - 不自动批准高风险、范围不明、涉及凭证、工作区外路径、危险 Bash、Git push、发布或部署的操作。
+- Claude Code 的原生 Prompt、选项、`Always allow`、`Don't ask again`、`Remember this choice`、密码、Token 和认证码都不得由 Agent 自动选择、改写、过滤或推荐；用户明确提供的确切回复才可通过统一交互接口原样提交。
+- 用户回复正文不得写入普通日志、Event、Snapshot、Controller 长期状态、错误 details 或持久文件；输入送达未知时不得自动重发。
 - 不因思考、读文件、允许的耗时命令、短暂无输出、spinner 或暂时 `UNKNOWN` 而频繁打断。
 - 相同干预原因只发送一次；发送后至少等待一次有效状态变化，才允许相关的下一次干预。
 - 终止时不要通过 `write` 自行发送控制字符；在输入安全且可用时先 `submit` 一次 safe-stop，有限观察后仍需终止则调用 `process kill`，由 ProcessManager 负责中断与强制终止。

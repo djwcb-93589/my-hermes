@@ -314,14 +314,22 @@ class ClaudeCodeRuntime:
                 session_owner,
                 process_id,
             )
-            result = self._invoke(
-                session,
-                lambda: self._port.submit(
-                    session_owner=session_owner,
-                    process_id=process_id,
-                    data=data,
-                ),
-            )
+            try:
+                result = self._invoke(
+                    session,
+                    lambda: self._port.submit(
+                        session_owner=session_owner,
+                        process_id=process_id,
+                        data=data,
+                    ),
+                )
+            except ClaudeCodeRuntimeError as error:
+                if error.delivery_unknown:
+                    self._record_uncertain_submit_locked(
+                        session,
+                        data=data,
+                    )
+                raise
             self._record_outbound_input_locked(
                 session,
                 data=data,
@@ -385,13 +393,18 @@ class ClaudeCodeRuntime:
                 session_owner,
                 process_id,
             )
-            result = self._invoke(
-                session,
-                lambda: self._port.interrupt(
-                    session_owner=session_owner,
-                    process_id=process_id,
-                ),
-            )
+            try:
+                result = self._invoke(
+                    session,
+                    lambda: self._port.interrupt(
+                        session_owner=session_owner,
+                        process_id=process_id,
+                    ),
+                )
+            except ClaudeCodeRuntimeError as error:
+                if error.delivery_unknown:
+                    self._mark_interrupt_delivery_unknown_locked(session)
+                raise
             self._mark_interrupt_requested_locked(session)
             return result
 
@@ -579,6 +592,27 @@ class ClaudeCodeRuntime:
             last_activity_at=timestamp,
         )
 
+    def _record_uncertain_submit_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+        *,
+        data: str,
+    ) -> None:
+        """未知送达只保留短期 echo 指纹，并使当前提示在事实源失效。"""
+
+        current = self._sessions.get(session.process_id)
+        if current is None or current.session_owner != session.session_owner:
+            return
+        observation = self._observation_locked(current)
+        observation.record_outbound_input(
+            data,
+            input_kind="submit",
+            sent_at=float(self._clock()),
+            cursor_before=session.cursor,
+            cursor_after=current.cursor,
+        )
+        observation.mark_input_delivery_unknown()
+
     def _mark_interrupt_requested_locked(
         self,
         session: ClaudeCodeSessionRef,
@@ -593,6 +627,17 @@ class ClaudeCodeRuntime:
             current,
             last_activity_at=float(self._clock()),
         )
+
+    def _mark_interrupt_delivery_unknown_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+    ) -> None:
+        """中断未能确认送达时只清除旧提示，不伪造活动时间。"""
+
+        current = self._sessions.get(session.process_id)
+        if current is None or current.session_owner != session.session_owner:
+            return
+        self._observation_locked(current).mark_interrupt_delivery_unknown()
 
     def _release_cwd_if_terminal_locked(
         self,

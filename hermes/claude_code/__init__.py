@@ -9,8 +9,10 @@ from collections.abc import Callable
 from hermes.claude_code.contracts import (
     ClaudeCodeActionKind,
     ClaudeCodeActionRequired,
+    ClaudeCodeCurrentInteraction,
     ClaudeCodeEvent,
     ClaudeCodeEventType,
+    ClaudeCodeInteractionResponse,
     ClaudeCodeProcessLog,
     ClaudeCodeProcessPort,
     ClaudeCodeProcessSnapshot,
@@ -19,6 +21,7 @@ from hermes.claude_code.contracts import (
     ClaudeCodeSessionRef,
     ClaudeCodeSnapshot,
     ClaudeCodeState,
+    build_claude_code_action_id,
 )
 from hermes.claude_code.controller import (
     ClaudeCodeController,
@@ -112,6 +115,7 @@ def get_claude_code_controller() -> ClaudeCodeController:
 __all__ = [
     "ClaudeCodeActionKind",
     "ClaudeCodeActionRequired",
+    "ClaudeCodeCurrentInteraction",
     "ClaudeCodeController",
     "ClaudeCodeControllerError",
     "ClaudeCodeControllerOutcome",
@@ -119,6 +123,7 @@ __all__ = [
     "ClaudeCodeControllerResult",
     "ClaudeCodeEvent",
     "ClaudeCodeEventType",
+    "ClaudeCodeInteractionResponse",
     "ClaudeCodeOutputDetector",
     "ClaudeCodeOutputNormalizer",
     "ClaudeCodeProcessLog",
@@ -136,4 +141,5 @@ __all__ = [
     "create_claude_code_runtime",
     "get_claude_code_controller",
     "get_claude_code_runtime",
+    "build_claude_code_action_id",
 ]

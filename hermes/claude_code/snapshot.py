@@ -13,10 +13,14 @@ from hermes.claude_code.contracts import (
 )
 from hermes.claude_code.detector import ClaudeCodeOutputDetector
 from hermes.claude_code.normalizer import (
+    MAX_NORMALIZED_TEXT_CHARS,
     ClaudeCodeOutputNormalizer,
     NormalizedOutputDelta,
     redact_claude_code_output,
 )
+
+
+_DISPLAY_CURSOR_GAP_MARKER = "[ProcessManager cursor gap]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,7 @@ class ClaudeCodeObservationState:
         self._last_process_status = initial_process_status
         self._task_submitted = False
         self._interrupt_requested = False
+        self._display_output = ""
 
     def record_outbound_input(
         self,
@@ -73,8 +78,20 @@ class ClaudeCodeObservationState:
         else:
             self._detector.acknowledge_input()
 
+    def mark_input_delivery_unknown(self) -> None:
+        """未知送达时使当前提示失效，避免旧动作被自动重复消费。"""
+
+        self._interrupt_requested = False
+        self._detector.acknowledge_input_delivery_unknown()
+
     def mark_interrupt_requested(self) -> None:
         """记录一次明确送达的受管 interrupt。"""
+
+        self._interrupt_requested = True
+        self._detector.acknowledge_interrupt()
+
+    def mark_interrupt_delivery_unknown(self) -> None:
+        """中断送达未知时保留请求事实，并使旧提示失效。"""
 
         self._interrupt_requested = True
         self._detector.acknowledge_interrupt()
@@ -147,6 +164,7 @@ class ClaudeCodeObservationState:
         )
         detection = self._detector.detect(
             process_id=session_ref.process_id,
+            session_owner=session_ref.session_owner,
             delta=delta,
             process_status=process_status,
             exit_code=exit_code,
@@ -156,6 +174,10 @@ class ClaudeCodeObservationState:
             lost=lost,
             observation_errors=observation_errors,
         )
+        display_output = self._update_display_output(
+            delta=delta,
+            latest_output=detection.display_output,
+        )
         return _ClaudeCodeObservationResult(
             snapshot=ClaudeCodeSnapshot(
                 session_ref=session_ref,
@@ -163,9 +185,7 @@ class ClaudeCodeObservationState:
                 events=detection.events,
                 action_required=detection.action_required,
                 raw_cursor=session_ref.cursor,
-                normalized_output=redact_claude_code_output(
-                    delta.normalized_output
-                ),
+                normalized_output=display_output,
                 process_status=process_status,
                 exit_code=exit_code,
                 last_activity_at=session_ref.last_activity_at,
@@ -175,6 +195,30 @@ class ClaudeCodeObservationState:
                 status_changed or detection.activity_detected
             ),
         )
+
+    def _update_display_output(
+        self,
+        *,
+        delta: NormalizedOutputDelta,
+        latest_output: str,
+    ) -> str:
+        """为对外 Snapshot 保留不含输入 echo 的固定滚动视图。"""
+
+        if delta.cursor_gap:
+            self._display_output = _DISPLAY_CURSOR_GAP_MARKER
+        safe_latest_output = redact_claude_code_output(latest_output).strip()
+        if safe_latest_output:
+            if self._display_output:
+                self._display_output = (
+                    f"{self._display_output}\n{safe_latest_output}"
+                )
+            else:
+                self._display_output = safe_latest_output
+        if len(self._display_output) > MAX_NORMALIZED_TEXT_CHARS:
+            self._display_output = self._display_output[
+                -MAX_NORMALIZED_TEXT_CHARS:
+            ]
+        return self._display_output
 
     def _normalize_page(
         self,
