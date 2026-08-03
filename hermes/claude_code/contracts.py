@@ -22,6 +22,8 @@ CLAUDE_CODE_PROCESS_STATUSES = frozenset(
         "failed_start",
     }
 )
+MAX_NATIVE_INTERACTION_PROMPT_CHARS = 8_192
+MAX_NATIVE_INTERACTION_OPTIONS = 64
 
 
 class ClaudeCodeState(str, Enum):
@@ -325,6 +327,15 @@ class ClaudeCodeActionRequired:
     cursor_start: int | None = None
     cursor_end: int | None = None
     created_at: float | None = None
+    raw_prompt_text: str | None = field(default=None, repr=False)
+    raw_options: tuple[str, ...] | None = field(
+        default=None,
+        repr=False,
+    )
+    native_prompt_fingerprint: str | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ClaudeCodeActionKind):
@@ -337,6 +348,31 @@ class ClaudeCodeActionRequired:
             for option in self.options
         ):
             raise ValueError("options must contain non-empty text")
+        if self.raw_prompt_text is not None:
+            if not isinstance(self.raw_prompt_text, str):
+                raise ValueError("raw_prompt_text must be text or None")
+            if len(self.raw_prompt_text) > MAX_NATIVE_INTERACTION_PROMPT_CHARS:
+                raise ValueError("raw_prompt_text exceeds the interaction limit")
+        if self.raw_options is not None:
+            if not isinstance(self.raw_options, tuple) or any(
+                not isinstance(option, str) or not option.strip()
+                for option in self.raw_options
+            ):
+                raise ValueError(
+                    "raw_options must contain non-empty text or be None"
+                )
+            if len(self.raw_options) > MAX_NATIVE_INTERACTION_OPTIONS:
+                raise ValueError("raw_options exceeds the interaction limit")
+        if self.native_prompt_fingerprint is not None:
+            if not isinstance(self.native_prompt_fingerprint, str):
+                raise ValueError(
+                    "native_prompt_fingerprint must be text or None"
+                )
+            if len(self.native_prompt_fingerprint) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in self.native_prompt_fingerprint
+            ):
+                raise ValueError("native_prompt_fingerprint is invalid")
         _require_nonempty_text("risk", self.risk)
         _require_nonnegative_int("cursor", self.cursor)
         identity_present = any(
@@ -382,6 +418,13 @@ class ClaudeCodeCurrentInteraction:
         _require_nonempty_text("action_id", self.action.action_id)
         _require_nonempty_text("process_id", self.action.process_id)
         _require_nonempty_text("session_owner", self.action.session_owner)
+        if (
+            self.action.raw_prompt_text is None
+            or self.action.raw_options is None
+        ):
+            raise ValueError(
+                "current interaction requires a native prompt view"
+            )
 
     @property
     def action_id(self) -> str:
@@ -401,11 +444,13 @@ class ClaudeCodeCurrentInteraction:
 
     @property
     def prompt_text(self) -> str:
-        return self.action.prompt_text
+        assert self.action.raw_prompt_text is not None
+        return self.action.raw_prompt_text
 
     @property
     def options(self) -> tuple[str, ...]:
-        return self.action.options
+        assert self.action.raw_options is not None
+        return self.action.raw_options
 
     @property
     def cursor_start(self) -> int:
@@ -583,6 +628,8 @@ class ClaudeCodeProcessPort(Protocol):
 __all__ = [
     "CLAUDE_CODE_ACTIVE_PROCESS_STATUSES",
     "CLAUDE_CODE_PROCESS_STATUSES",
+    "MAX_NATIVE_INTERACTION_OPTIONS",
+    "MAX_NATIVE_INTERACTION_PROMPT_CHARS",
     "ClaudeCodeActionKind",
     "ClaudeCodeActionRequired",
     "ClaudeCodeCurrentInteraction",

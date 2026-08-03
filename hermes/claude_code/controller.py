@@ -174,6 +174,7 @@ class ClaudeCodeController:
         required = (
             "start",
             "observe",
+            "current_interaction",
             "submit",
             "status",
             "wait",
@@ -423,9 +424,27 @@ class ClaudeCodeController:
                 or task.interaction_in_progress_id == action.action_id
             ):
                 return None
+            try:
+                interaction_action = self._runtime.current_interaction(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                )
+            except ClaudeCodeRuntimeError as runtime_error:
+                raise self._wrap_runtime_error(
+                    "poll_failed",
+                    "Claude Code current interaction could not be read",
+                    runtime_error,
+                    process_id,
+                ) from runtime_error
+            if not self._matches_current_interaction(
+                action,
+                interaction_action,
+            ):
+                return None
+            assert interaction_action is not None
             return ClaudeCodeCurrentInteraction(
                 state=snapshot.state,
-                action=action,
+                action=interaction_action,
             )
 
     def reply_to_interaction(
@@ -436,20 +455,16 @@ class ClaudeCodeController:
         """原样提交用户明确提供的当前原生交互回复。"""
 
         if not isinstance(response, ClaudeCodeInteractionResponse):
-            raise TypeError("response must be a ClaudeCodeInteractionResponse")
+            raise ClaudeCodeControllerError(
+                "interaction_response_required",
+                "Claude Code interaction reply is invalid",
+            )
         if response.user_confirmed is not True:
             raise ClaudeCodeControllerError(
                 "explicit_user_confirmation_required",
                 "Claude Code interaction reply requires explicit user confirmation",
                 details={"process_id": response.process_id},
             )
-        if not response.response:
-            raise ClaudeCodeControllerError(
-                "interaction_response_required",
-                "Claude Code interaction reply must be non-empty",
-                details={"process_id": response.process_id},
-            )
-
         task, terminal = self._resolve_task(
             response.session_owner,
             response.process_id,
@@ -502,6 +517,28 @@ class ClaudeCodeController:
                     "Claude Code interaction reply is already being submitted",
                     details={"process_id": response.process_id},
                 )
+
+            try:
+                interaction_action = self._runtime.current_interaction(
+                    session_owner=response.session_owner,
+                    process_id=response.process_id,
+                )
+            except ClaudeCodeRuntimeError as runtime_error:
+                raise self._wrap_runtime_error(
+                    "interaction_response_failed",
+                    "Claude Code current interaction could not be read",
+                    runtime_error,
+                    response.process_id,
+                ) from runtime_error
+            if not self._matches_current_interaction(
+                action,
+                interaction_action,
+            ):
+                self._clear_current_interaction_locked(
+                    task,
+                    snapshot=snapshot,
+                )
+                raise self._interaction_absent_error_locked(task, response)
 
             task.interaction_in_progress_id = action.action_id
             try:
@@ -1495,6 +1532,36 @@ class ClaudeCodeController:
             and action.cursor_start is not None
             and action.cursor_end is not None
             and action.created_at is not None
+        )
+
+    @classmethod
+    def _matches_current_interaction(
+        cls,
+        safe_action: ClaudeCodeActionRequired,
+        interaction_action: ClaudeCodeActionRequired | None,
+    ) -> bool:
+        """只接受与最新安全 Snapshot 同一身份的短暂原生视图。"""
+
+        if not cls._is_native_interaction(interaction_action):
+            return False
+        assert interaction_action is not None
+        if (
+            interaction_action.raw_prompt_text is None
+            or interaction_action.raw_options is None
+        ):
+            return False
+        return (
+            interaction_action.action_id == safe_action.action_id
+            and interaction_action.process_id == safe_action.process_id
+            and interaction_action.session_owner == safe_action.session_owner
+            and interaction_action.cursor_start == safe_action.cursor_start
+            and interaction_action.cursor_end == safe_action.cursor_end
+            and interaction_action.created_at == safe_action.created_at
+            and interaction_action.kind == safe_action.kind
+            and interaction_action.summary == safe_action.summary
+            and interaction_action.prompt_text == safe_action.prompt_text
+            and interaction_action.options == safe_action.options
+            and interaction_action.risk == safe_action.risk
         )
 
     def _assert_interaction_belongs_to_task_locked(

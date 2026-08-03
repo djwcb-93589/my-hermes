@@ -50,11 +50,11 @@ stalled
 
 `send_instruction` 只通过 Runtime `submit` 发送用户明确给出的普通指令。它可以清除已由该指令处理的 stalled，但不得覆盖其他未解决 ActionRequired。
 
-P7 的 `current_interaction` 返回当前有效的真实 Claude Code Prompt、全部可见选项、`action_id`、`process_id`、owner、状态和 cursor 范围；它不返回历史 Event、已回复 Prompt、interrupt 前提示、终态提示或 Controller 自身的 `stalled`。
+P7.1 的 `current_interaction` 返回当前有效的真实 Claude Code Prompt、最多 64 项可见选项、`action_id`、`process_id`、owner、状态和 cursor 范围。Prompt/options 来自 Runtime 保留的有界临时原生视图：它已按终端语义规范化，但不替换密钥值；公开 Snapshot、Event、日志和归档结果仍只保留脱敏视图。安全/原生视图无法可靠映射或原生视图缺失时，它返回无交互，不从历史 PTY 拼接或回退。它不返回历史 Event、已回复 Prompt、interrupt 前提示、终态提示或 Controller 自身的 `stalled`。
 
-`reply_to_interaction` 是所有真实 Prompt 的唯一回复入口。调用方必须传入 `user_confirmed=True`、当前 `action_id`、匹配的 `process_id`/owner 和用户明确给出的确切字符串。Controller 在同一任务锁内先做一次有界 observe，再校验进程仍 active、Prompt 仍当前且未消费，随后将回复原样 `Runtime.submit`。它不解释或映射 `y/n`、编号、选项、密码或 Token，也不按 `clarification`、`approval`、`authentication`、`destructive_action`、`external_access` 或 `unknown_prompt` 采取不同发送策略。
+`reply_to_interaction` 是所有真实 Prompt 的唯一回复入口。调用方必须传入 `user_confirmed=True`、当前 `action_id`、匹配的 `process_id`/owner 和用户明确给出的确切字符串；空字符串 `response=""` 表示一次明确的 Enter，并由 `Runtime.submit(data="")` 原样提交。`response` 缺失、为 `None` 或不是字符串仍是无效请求，不等同于空字符串 Enter。Controller 在同一任务锁内先做一次有界 observe，再校验进程仍 active、Prompt 仍当前且未消费，随后将回复原样 `Runtime.submit`。它不解释或映射 `y/n`、编号、选项、密码或 Token，也不按 `clarification`、`approval`、`authentication`、`destructive_action`、`external_access` 或 `unknown_prompt` 采取不同发送策略。
 
-成功提交后旧 action id 失效并观察真实输出；新 Prompt 产生新身份。送达未知时不自动重发，旧动作不恢复为可自动消费状态。用户回复正文不写入 Event、Snapshot、Controller 长期状态、日志、错误 details 或持久文件。详细透明冒泡边界见 [approvals.md](approvals.md)。
+成功提交、任何新的 write 输入或送达未知后，旧 action id 与临时原生视图失效并观察真实输出；新 Prompt 替换为新视图和新身份。送达未知时不自动重发，旧动作不恢复为可自动消费状态。用户回复正文不写入 Event、Snapshot、Controller 长期状态、日志、错误 details 或持久文件。详细透明冒泡边界见 [approvals.md](approvals.md)。
 
 ## 中断、终止与终态
 

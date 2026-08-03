@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from hermes.claude_code.contracts import (
+    ClaudeCodeActionRequired,
+    ClaudeCodeProcessLog,
     ClaudeCodeProcessPort,
     ClaudeCodeProcessSnapshot,
     ClaudeCodeReadResult,
@@ -176,6 +178,10 @@ class ClaudeCodeRuntime:
             )
             self._sessions[process_id] = updated
             self._release_cwd_if_terminal_locked(updated, page.status)
+            self._clear_interaction_if_terminal_locked(
+                updated,
+                page.status,
+            )
             return ClaudeCodeReadResult(
                 session=updated,
                 status=page.status,
@@ -201,16 +207,20 @@ class ClaudeCodeRuntime:
             observation = self._observation_locked(session)
             timestamp = float(self._clock())
             page = None
+            interaction_output: str | None = None
             process_snapshot = None
             lost = False
             observation_errors: list[tuple[str, str, str]] = []
 
             try:
-                page = self._port.read(
-                    session_owner=session_owner,
-                    process_id=process_id,
-                    cursor=session.cursor,
-                    limit=limit,
+                page, interaction_output = self._invoke(
+                    session,
+                    lambda: self._read_for_observation(
+                        session_owner=session_owner,
+                        process_id=process_id,
+                        cursor=session.cursor,
+                        limit=limit,
+                    ),
                 )
             except ClaudeCodeRuntimeError as error:
                 observation_errors.append(
@@ -256,6 +266,7 @@ class ClaudeCodeRuntime:
                 page=page,
                 process_snapshot=process_snapshot,
                 timestamp=timestamp,
+                interaction_output=interaction_output,
                 lost=lost,
                 observation_errors=tuple(observation_errors),
             )
@@ -269,6 +280,28 @@ class ClaudeCodeRuntime:
                     last_activity_at=timestamp,
                 )
             return snapshot
+
+    def current_interaction(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+    ) -> ClaudeCodeActionRequired | None:
+        """确认进程仍 active 后读取当前短暂原生交互视图，不读取日志。"""
+
+        snapshot = self.status(
+            session_owner=session_owner,
+            process_id=process_id,
+        )
+        if not snapshot.active:
+            return None
+
+        with self._lock:
+            session = self._require_session_locked(
+                session_owner,
+                process_id,
+            )
+            return self._observation_locked(session).current_interaction()
 
     def write(
         self,
@@ -284,14 +317,23 @@ class ClaudeCodeRuntime:
                 session_owner,
                 process_id,
             )
-            result = self._invoke(
-                session,
-                lambda: self._port.write(
-                    session_owner=session_owner,
-                    process_id=process_id,
-                    data=data,
-                ),
-            )
+            try:
+                result = self._invoke(
+                    session,
+                    lambda: self._port.write(
+                        session_owner=session_owner,
+                        process_id=process_id,
+                        data=data,
+                    ),
+                )
+            except ClaudeCodeRuntimeError as error:
+                if error.delivery_unknown:
+                    self._record_uncertain_input_locked(
+                        session,
+                        data=data,
+                        input_kind="write",
+                    )
+                raise
             self._record_outbound_input_locked(
                 session,
                 data=data,
@@ -325,9 +367,10 @@ class ClaudeCodeRuntime:
                 )
             except ClaudeCodeRuntimeError as error:
                 if error.delivery_unknown:
-                    self._record_uncertain_submit_locked(
+                    self._record_uncertain_input_locked(
                         session,
                         data=data,
+                        input_kind="submit",
                     )
                 raise
             self._record_outbound_input_locked(
@@ -512,6 +555,45 @@ class ClaudeCodeRuntime:
             self._observations[session.process_id] = observation
         return observation
 
+    def _read_for_observation(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        cursor: int,
+        limit: int,
+    ) -> tuple[ClaudeCodeProcessLog, str | None]:
+        """仅在 observe 调用栈内取得原生临时文本，不扩展公开 Port 日志。"""
+
+        reader = getattr(self._port, "_read_for_observation", None)
+        if not callable(reader):
+            return (
+                self._port.read(
+                    session_owner=session_owner,
+                    process_id=process_id,
+                    cursor=cursor,
+                    limit=limit,
+                ),
+                None,
+            )
+        result = reader(
+            session_owner=session_owner,
+            process_id=process_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], ClaudeCodeProcessLog)
+            or not isinstance(result[1], str)
+        ):
+            raise ClaudeCodeRuntimeError(
+                "read_failed",
+                "Claude Code observation output is invalid",
+            )
+        return result
+
     @staticmethod
     def _require_owner(session_owner: str) -> None:
         """拒绝缺失的调用 session owner。"""
@@ -549,11 +631,10 @@ class ClaudeCodeRuntime:
             if current is None or current.session_owner != session.session_owner:
                 return
             updated = current
+            observation = self._observation_locked(current)
             if (
                 process_status is not None
-                and self._observation_locked(current).note_process_status(
-                    process_status
-                )
+                and observation.note_process_status(process_status)
             ):
                 updated = replace(
                     current,
@@ -561,7 +642,22 @@ class ClaudeCodeRuntime:
                 )
                 self._sessions[session.process_id] = updated
             if process_status is not None:
+                self._clear_interaction_if_terminal_locked(
+                    updated,
+                    process_status,
+                )
                 self._release_cwd_if_terminal_locked(updated, process_status)
+
+    def _clear_interaction_if_terminal_locked(
+        self,
+        session: ClaudeCodeSessionRef,
+        process_status: str,
+    ) -> None:
+        """终态无需等待下一次 observe 才释放原生交互视图。"""
+
+        if process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES:
+            return
+        self._observation_locked(session).mark_terminal()
 
     def _record_outbound_input_locked(
         self,
@@ -587,16 +683,19 @@ class ClaudeCodeRuntime:
         )
         if submitted:
             observation.mark_input_submitted()
+        elif data:
+            observation.mark_input_started()
         self._sessions[session.process_id] = replace(
             current,
             last_activity_at=timestamp,
         )
 
-    def _record_uncertain_submit_locked(
+    def _record_uncertain_input_locked(
         self,
         session: ClaudeCodeSessionRef,
         *,
         data: str,
+        input_kind: str,
     ) -> None:
         """未知送达只保留短期 echo 指纹，并使当前提示在事实源失效。"""
 
@@ -606,7 +705,7 @@ class ClaudeCodeRuntime:
         observation = self._observation_locked(current)
         observation.record_outbound_input(
             data,
-            input_kind="submit",
+            input_kind=input_kind,
             sent_at=float(self._clock()),
             cursor_before=session.cursor,
             cursor_after=current.cursor,

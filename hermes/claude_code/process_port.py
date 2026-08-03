@@ -217,7 +217,42 @@ class ProcessManagerClaudeCodePort:
         cursor: int,
         limit: int,
     ) -> ClaudeCodeProcessLog:
-        """读取一页日志；只脱敏响应副本，不改写绝对 cursor。"""
+        """读取一页公开脱敏日志，不改写绝对 cursor。"""
+
+        page, _ = self._read_page(
+            session_owner=session_owner,
+            process_id=process_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        return page
+
+    def _read_for_observation(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        cursor: int,
+        limit: int,
+    ) -> tuple[ClaudeCodeProcessLog, str]:
+        """只供 Runtime 单次观察使用的原生临时副本，不进入公开日志契约。"""
+
+        return self._read_page(
+            session_owner=session_owner,
+            process_id=process_id,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def _read_page(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        cursor: int,
+        limit: int,
+    ) -> tuple[ClaudeCodeProcessLog, str]:
+        """从同一次 Manager 读取构造公开副本与观察期临时文本。"""
 
         if (
             isinstance(limit, bool)
@@ -248,20 +283,26 @@ class ProcessManagerClaudeCodePort:
 
         try:
             status = self._status_value(getattr(result, "status", None))
+            interaction_output = getattr(result, "output", "")
+            if not isinstance(interaction_output, str):
+                raise TypeError("process output must be text")
             output = redact_terminal_output(
-                getattr(result, "output", ""),
+                interaction_output,
                 getattr(snapshot, "command", ""),
                 infrastructure_env_names=INFRASTRUCTURE_CREDENTIAL_ENV_VARS,
             )
-            return ClaudeCodeProcessLog(
-                process_id=result.process_id,
-                status=status,
-                output=output,
-                requested_cursor=result.requested_cursor,
-                available_from_cursor=result.available_from_cursor,
-                next_cursor=result.next_cursor,
-                output_truncated=result.output_truncated,
-                exit_code=result.exit_code,
+            return (
+                ClaudeCodeProcessLog(
+                    process_id=result.process_id,
+                    status=status,
+                    output=output,
+                    requested_cursor=result.requested_cursor,
+                    available_from_cursor=result.available_from_cursor,
+                    next_cursor=result.next_cursor,
+                    output_truncated=result.output_truncated,
+                    exit_code=result.exit_code,
+                ),
+                interaction_output,
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise ClaudeCodeRuntimeError(

@@ -7,9 +7,11 @@ import hmac
 import re
 import secrets
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from hermes.claude_code.contracts import (
+    MAX_NATIVE_INTERACTION_OPTIONS,
+    MAX_NATIVE_INTERACTION_PROMPT_CHARS,
     ClaudeCodeActionKind,
     ClaudeCodeActionRequired,
     ClaudeCodeEvent,
@@ -28,6 +30,7 @@ MAX_DETECTION_CONTEXT_CHARS = 8_192
 MAX_RECENT_EVENT_FINGERPRINTS = 128
 MAX_OUTBOUND_INPUT_EVIDENCE = 16
 MAX_SUPPRESSED_ACTION_FINGERPRINTS = 128
+MAX_PENDING_INTERACTION_OBSERVATIONS = 4
 OUTBOUND_INPUT_TTL_SECONDS = 30.0
 OUTBOUND_INPUT_OBSERVATION_BUDGET = 4
 OUTBOUND_INPUT_PREFIX_CHARS = 16
@@ -151,6 +154,7 @@ class _EchoIsolationResult:
     semantic_text: str
     display_text: str
     metadata: dict[str, object]
+    excluded_lines: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +166,10 @@ class DetectionResult:
     action_required: ClaudeCodeActionRequired | None
     activity_detected: bool = False
     display_output: str = ""
+    discard_interaction_view: bool = field(
+        default=False,
+        repr=False,
+    )
 
 
 class ClaudeCodeOutputDetector:
@@ -183,8 +191,11 @@ class ClaudeCodeOutputDetector:
         self._context_complete = True
         self._semantic_context = ""
         self._last_semantic_context_fingerprint = ""
+        self._interaction_context = ""
+        self._pending_interaction_observations = 0
         self._outbound_response_pending = False
         self._input_fingerprint_key = secrets.token_bytes(32)
+        self._native_action_key = secrets.token_bytes(32)
         self._outbound_inputs: deque[_OutboundInputEvidence] = deque(
             maxlen=MAX_OUTBOUND_INPUT_EVIDENCE
         )
@@ -215,6 +226,7 @@ class ClaudeCodeOutputDetector:
         self._context_complete = True
         self._outbound_response_pending = False
         self._clear_semantic_context()
+        self._clear_interaction_context()
         self._clear_recent_event_fingerprints()
 
     def acknowledge_input(self) -> None:
@@ -243,6 +255,7 @@ class ClaudeCodeOutputDetector:
             )
         self._action_required = None
         self._last_action_fingerprint = None
+        self._clear_interaction_context()
         if self._state in {
             ClaudeCodeState.WAITING_INPUT,
             ClaudeCodeState.WAITING_APPROVAL,
@@ -258,6 +271,28 @@ class ClaudeCodeOutputDetector:
         """送达未知时抑制旧提示的单纯重绘，不推断输入是否成功。"""
 
         self.invalidate_current_action(suppress_reappearance=True)
+
+    def clear_native_interaction_view(self) -> None:
+        """删除当前动作中的原生副本，但保留安全状态事实。"""
+
+        if self._action_required is not None:
+            self._action_required = replace(
+                self._action_required,
+                raw_prompt_text=None,
+                raw_options=None,
+                native_prompt_fingerprint=None,
+            )
+            self._last_action_fingerprint = self._action_fingerprint(
+                self._action_required
+            )
+        self._clear_interaction_context()
+
+    def _current_native_interaction(
+        self,
+    ) -> ClaudeCodeActionRequired | None:
+        """仅供 ObservationState 读取当前原生动作，不属于检测结果。"""
+
+        return self._action_required
 
     def record_outbound_input(
         self,
@@ -478,9 +513,10 @@ class ClaudeCodeOutputDetector:
             timestamp=timestamp,
         )
         if matched_lines:
+            excluded_lines = matched_lines | suspected_lines
             semantic_text = self._without_lines(
                 lines,
-                matched_lines | suspected_lines,
+                excluded_lines,
             )
             metadata: dict[str, object] = {
                 "source": "input_echo" if not semantic_text else "mixed",
@@ -494,6 +530,7 @@ class ClaudeCodeOutputDetector:
                 semantic_text,
                 semantic_text,
                 metadata,
+                frozenset(excluded_lines),
             )
 
         if suspected_lines:
@@ -510,6 +547,7 @@ class ClaudeCodeOutputDetector:
                 semantic_text,
                 semantic_text,
                 metadata,
+                frozenset(suspected_lines),
             )
 
         return _EchoIsolationResult(candidate, candidate, {})
@@ -723,12 +761,210 @@ class ClaudeCodeOutputDetector:
         self._semantic_context = combined[-MAX_DETECTION_CONTEXT_CHARS:]
         self._last_semantic_context_fingerprint = fingerprint
 
+    def _clear_interaction_context(self) -> None:
+        """清理仅供当前原生 Prompt 提取的短暂文本视图。"""
+
+        self._interaction_context = ""
+        self._pending_interaction_observations = 0
+
+    def _append_interaction_context(self, text: str) -> None:
+        """只保留已按 echo 掩码过滤的有界原生终端文本。"""
+
+        interaction_text = text.strip()
+        if not interaction_text:
+            return
+        combined = f"{self._interaction_context}\n{interaction_text}".strip()
+        self._interaction_context = combined[-MAX_NATIVE_INTERACTION_PROMPT_CHARS:]
+        self._pending_interaction_observations = (
+            MAX_PENDING_INTERACTION_OBSERVATIONS
+        )
+
+    def _expire_pending_interaction_context(self) -> bool:
+        """限制未形成动作的原生解析上下文跨观察保留时间。"""
+
+        if not self._interaction_context:
+            return False
+        self._pending_interaction_observations -= 1
+        if self._pending_interaction_observations > 0:
+            return False
+        self._clear_interaction_context()
+        return True
+
+    @staticmethod
+    def _interaction_candidate(
+        *,
+        safe_output: str,
+        interaction_delta: NormalizedOutputDelta,
+        excluded_lines: frozenset[int],
+    ) -> str:
+        """将安全视图的 echo 行掩码同步应用到并行原生视图。"""
+
+        interaction_output = interaction_delta.text
+        if not interaction_output:
+            return ""
+        if (
+            redact_claude_code_output(interaction_output).strip()
+            != safe_output
+        ):
+            return ""
+        safe_lines = safe_output.splitlines()
+        interaction_lines = interaction_output.splitlines()
+        if len(safe_lines) != len(interaction_lines):
+            return ""
+        return ClaudeCodeOutputDetector._without_lines(
+            interaction_lines,
+            set(excluded_lines),
+        )
+
+    def _native_action_view(
+        self,
+        action: ClaudeCodeActionRequired,
+        *,
+        interaction_candidate: str,
+        process_id: str,
+        session_owner: str,
+        cursor_start: int,
+        cursor_end: int,
+        timestamp: float,
+    ) -> tuple[ClaudeCodeActionRequired, bool]:
+        """只在已有安全 Action 后附加短暂原生 Prompt 视图。"""
+
+        if not interaction_candidate:
+            return action, False
+        interaction_source = self._native_action_source(
+            action,
+            process_id=process_id,
+            session_owner=session_owner,
+            cursor_start=cursor_start,
+            cursor_end=cursor_end,
+            timestamp=timestamp,
+        )
+        if not interaction_source:
+            return action, True
+        raw_options = self._extract_options(
+            interaction_source,
+            redact_output=False,
+        )[:MAX_NATIVE_INTERACTION_OPTIONS]
+        native_prompt_fingerprint = self._native_prompt_fingerprint(
+            interaction_source,
+            raw_options,
+        )
+        return replace(
+            action,
+            action_id=self._native_action_id(
+                action,
+                native_prompt_fingerprint,
+            ),
+            raw_prompt_text=interaction_source,
+            raw_options=raw_options,
+            native_prompt_fingerprint=native_prompt_fingerprint,
+        ), False
+
+    def _clear_native_view_for_safe_action(
+        self,
+        action: ClaudeCodeActionRequired,
+    ) -> None:
+        """原生增量无法安全映射时仅撤销临时视图，不改变安全动作。"""
+
+        current = self._action_required
+        if (
+            current is None
+            or self._safe_action_fingerprint(current)
+            != self._safe_action_fingerprint(action)
+            or (
+                current.raw_prompt_text is None
+                and current.raw_options is None
+                and current.native_prompt_fingerprint is None
+            )
+        ):
+            return
+        self._action_required = replace(
+            current,
+            raw_prompt_text=None,
+            raw_options=None,
+            native_prompt_fingerprint=None,
+        )
+        self._last_action_fingerprint = self._action_fingerprint(
+            self._action_required
+        )
+
+    def _native_action_source(
+        self,
+        action: ClaudeCodeActionRequired,
+        *,
+        process_id: str,
+        session_owner: str,
+        cursor_start: int,
+        cursor_end: int,
+        timestamp: float,
+    ) -> str:
+        """仅接受可映射回当前安全动作的原生 Prompt 后缀。"""
+
+        context = self._interaction_context
+        lines = [line for line in context.splitlines() if line.strip()]
+        for start in range(len(lines) - 1, -1, -1):
+            source = "\n".join(lines[start:])[
+                -MAX_NATIVE_INTERACTION_PROMPT_CHARS:
+            ]
+            equivalent_action = self._classify_action(
+                redact_claude_code_output(source).strip(),
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
+            )
+            if (
+                equivalent_action is not None
+                and self._safe_action_fingerprint(equivalent_action)
+                == self._safe_action_fingerprint(action)
+            ):
+                return source
+        return ""
+
+    def _native_prompt_fingerprint(
+        self,
+        prompt_text: str,
+        options: tuple[str, ...],
+    ) -> str:
+        """用每个 Detector 私有 HMAC 标识原生内容，不保留其明文身份。"""
+
+        payload = (
+            "claude-code-native-prompt-v1",
+            " ".join(prompt_text.split()),
+            tuple(" ".join(option.split()) for option in options),
+        )
+        return hmac.new(
+            self._native_action_key,
+            repr(payload).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _native_action_id(
+        self,
+        action: ClaudeCodeActionRequired,
+        native_prompt_fingerprint: str,
+    ) -> str:
+        """把临时原生内容的不可逆身份并入不透明 action id。"""
+
+        payload = (
+            "claude-code-native-action-v1",
+            action.action_id,
+            native_prompt_fingerprint,
+        )
+        return "ccact_" + hmac.new(
+            self._native_action_key,
+            repr(payload).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
     def detect(
         self,
         *,
         process_id: str,
         session_owner: str,
         delta: NormalizedOutputDelta,
+        interaction_delta: NormalizedOutputDelta,
         process_status: str | None,
         exit_code: int | None,
         timestamp: float,
@@ -742,6 +978,13 @@ class ClaudeCodeOutputDetector:
         events: list[ClaudeCodeEvent] = []
         previous_action_fingerprint = self._last_action_fingerprint
         output_candidate = redact_claude_code_output(delta.text).strip()
+        interaction_safe_candidate = redact_claude_code_output(
+            interaction_delta.text
+        ).strip()
+        # 原生视图中的秘密值变化可能在安全视图中折叠为同一个
+        # <secret>。此时仍需用同一安全投影确认并刷新当前原生提示，
+        # 但不把该重复内容写入公开输出或事件。
+        semantic_output = output_candidate or interaction_safe_candidate
 
         if delta.cursor_gap:
             self._context_complete = False
@@ -752,6 +995,7 @@ class ClaudeCodeOutputDetector:
             self._progress_seen = False
             self._ready_seen = False
             self._clear_semantic_context()
+            self._clear_interaction_context()
             self._outbound_response_pending = False
             self._clear_recent_event_fingerprints()
             self._append_event(
@@ -790,12 +1034,13 @@ class ClaudeCodeOutputDetector:
         if observation_errors:
             self._action_required = None
             self._last_action_fingerprint = None
+            self._clear_interaction_context()
 
         outbound_evidence_present = bool(
             self._outbound_inputs or self._matched_echoes
         )
         isolation = self._isolate_input_echo(
-            output_candidate,
+            semantic_output,
             cursor_start=delta.cursor_start,
             cursor_end=delta.cursor_end,
             timestamp=timestamp,
@@ -803,8 +1048,14 @@ class ClaudeCodeOutputDetector:
         )
         candidate = isolation.semantic_text.strip()
         display_output = isolation.display_text.strip()
+        interaction_candidate = self._interaction_candidate(
+            safe_output=semantic_output,
+            interaction_delta=interaction_delta,
+            excluded_lines=isolation.excluded_lines,
+        )
         if delta.cursor_gap:
             candidate = ""
+            interaction_candidate = ""
             display_output = _CURSOR_GAP_OUTPUT_OMITTED_TEXT
             isolation.metadata["source"] = "cursor_gap"
             if outbound_evidence_present:
@@ -835,8 +1086,18 @@ class ClaudeCodeOutputDetector:
                 metadata={"limits_hit": delta.limits_hit},
             )
 
+        pending_interaction_expired = False
         if candidate and not delta.cursor_gap:
             self._append_semantic_context(candidate)
+        if interaction_candidate and not delta.cursor_gap:
+            self._append_interaction_context(interaction_candidate)
+        elif isolation.excluded_lines and not candidate:
+            self._clear_interaction_context()
+            pending_interaction_expired = True
+        elif not delta.cursor_gap:
+            pending_interaction_expired = (
+                self._expire_pending_interaction_context()
+            )
         context = self._semantic_context[-MAX_DETECTION_CONTEXT_CHARS:]
         prompt_structure = bool(
             candidate and self._looks_like_prompt(candidate)
@@ -948,6 +1209,17 @@ class ClaudeCodeOutputDetector:
             ):
                 action = None
             if action is not None:
+                action, native_view_unavailable = self._native_action_view(
+                    action,
+                    interaction_candidate=interaction_candidate,
+                    process_id=process_id,
+                    session_owner=session_owner,
+                    cursor_start=delta.cursor_start,
+                    cursor_end=delta.cursor_end,
+                    timestamp=timestamp,
+                )
+                if native_view_unavailable:
+                    self._clear_native_view_for_safe_action(action)
                 self._outbound_response_pending = False
                 self._record_action(
                     events,
@@ -965,6 +1237,7 @@ class ClaudeCodeOutputDetector:
             ):
                 self._action_required = None
                 self._last_action_fingerprint = None
+                self._clear_interaction_context()
 
         if self._process_just_exited(process_status):
             self._append_event(
@@ -1001,10 +1274,12 @@ class ClaudeCodeOutputDetector:
         if lost or process_status in _TERMINAL_PROCESS_STATUSES:
             self._action_required = None
             self._last_action_fingerprint = None
+            self._clear_interaction_context()
             self._clear_outbound_input_evidence()
         elif self._state == ClaudeCodeState.WORKING:
             self._action_required = None
             self._last_action_fingerprint = None
+            self._clear_interaction_context()
 
         action_changed = (
             previous_action_fingerprint != self._last_action_fingerprint
@@ -1016,12 +1291,16 @@ class ClaudeCodeOutputDetector:
         return DetectionResult(
             state=self._state,
             events=tuple(events),
-            action_required=self._action_required,
+            action_required=self._safe_action(self._action_required),
             activity_detected=activity_detected,
             display_output=(
                 display_output
                 if display_output
                 else _INPUT_ECHO_OMITTED_TEXT if output_candidate else ""
+            ),
+            discard_interaction_view=bool(
+                (isolation.excluded_lines and not candidate)
+                or pending_interaction_expired
             ),
         )
 
@@ -1217,7 +1496,12 @@ class ClaudeCodeOutputDetector:
         return None
 
     @staticmethod
-    def _action_source(candidate: str, context: str) -> str:
+    def _action_source(
+        candidate: str,
+        context: str,
+        *,
+        redact_context: bool = True,
+    ) -> str:
         """保留最新 Prompt 块，避免无关历史输出改变其语义身份。"""
 
         if not (
@@ -1225,7 +1509,11 @@ class ClaudeCodeOutputDetector:
             or _LINE_OPTION_RE.search(candidate)
         ):
             return candidate
-        contextual = redact_claude_code_output(context).strip()
+        contextual = (
+            redact_claude_code_output(context).strip()
+            if redact_context
+            else context.strip()
+        )
         if not contextual:
             return candidate
         lines = [line for line in contextual.splitlines() if line.strip()]
@@ -1275,6 +1563,23 @@ class ClaudeCodeOutputDetector:
         )
 
     @staticmethod
+    def _safe_action(
+        action: ClaudeCodeActionRequired | None,
+    ) -> ClaudeCodeActionRequired | None:
+        """移除只供当前交互使用的原生视图后再写入公开 Snapshot。"""
+
+        if action is None:
+            return None
+        if action.raw_prompt_text is None and action.raw_options is None:
+            return action
+        return replace(
+            action,
+            raw_prompt_text=None,
+            raw_options=None,
+            native_prompt_fingerprint=None,
+        )
+
+    @staticmethod
     def _looks_like_prompt(text: str) -> bool:
         tail = text.rstrip()[-2_048:]
         lines = [line.strip() for line in tail.splitlines() if line.strip()]
@@ -1287,7 +1592,11 @@ class ClaudeCodeOutputDetector:
         return question or prompt_verb or options
 
     @staticmethod
-    def _extract_options(text: str) -> tuple[str, ...]:
+    def _extract_options(
+        text: str,
+        *,
+        redact_output: bool = True,
+    ) -> tuple[str, ...]:
         options_with_positions: list[tuple[int, str]] = []
         line_matches = tuple(_LINE_OPTION_RE.finditer(text))
         for inline in _INLINE_OPTION_RE.finditer(text):
@@ -1296,11 +1605,19 @@ class ClaudeCodeOutputDetector:
                 for match in line_matches
             ):
                 continue
-            option = redact_claude_code_output(inline.group(0)).strip()
+            option = (
+                redact_claude_code_output(inline.group(0)).strip()
+                if redact_output
+                else inline.group(0).strip()
+            )
             if option:
                 options_with_positions.append((inline.start(), option))
         for match in line_matches:
-            option = redact_claude_code_output(match.group(0)).strip()
+            option = (
+                redact_claude_code_output(match.group(0)).strip()
+                if redact_output
+                else match.group(0).strip()
+            )
             if option:
                 options_with_positions.append((match.start(), option))
         options_with_positions.sort(key=lambda item: item[0])
@@ -1334,8 +1651,20 @@ class ClaudeCodeOutputDetector:
         if action_fingerprint in self._suppressed_action_fingerprint_set:
             self._action_required = None
             self._last_action_fingerprint = None
+            self._clear_interaction_context()
             return
         if action_fingerprint == self._last_action_fingerprint:
+            if (
+                self._action_required is not None
+                and action.raw_prompt_text is not None
+                and action.raw_options is not None
+            ):
+                self._action_required = replace(
+                    self._action_required,
+                    raw_prompt_text=action.raw_prompt_text,
+                    raw_options=action.raw_options,
+                )
+            self._clear_interaction_context()
             return
         self._action_required = action
         self._last_action_fingerprint = action_fingerprint
@@ -1354,6 +1683,7 @@ class ClaudeCodeOutputDetector:
                 "prompt_fingerprint": action_fingerprint,
             },
         )
+        self._clear_interaction_context()
 
     def _process_just_exited(self, process_status: str | None) -> bool:
         return (
@@ -1483,7 +1813,7 @@ class ClaudeCodeOutputDetector:
         return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _action_fingerprint(
+    def _safe_action_fingerprint(
         action: ClaudeCodeActionRequired,
     ) -> str:
         payload = (
@@ -1494,12 +1824,24 @@ class ClaudeCodeOutputDetector:
         )
         return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
+    @classmethod
+    def _action_fingerprint(
+        cls,
+        action: ClaudeCodeActionRequired,
+    ) -> str:
+        payload = (
+            cls._safe_action_fingerprint(action),
+            action.native_prompt_fingerprint or "",
+        )
+        return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
 
 __all__ = [
     "MAX_DETECTION_CONTEXT_CHARS",
     "MAX_ECHO_MATCH_LINES",
     "MAX_EVENT_TEXT_CHARS",
     "MAX_OUTBOUND_INPUT_EVIDENCE",
+    "MAX_PENDING_INTERACTION_OBSERVATIONS",
     "MAX_RECENT_EVENT_FINGERPRINTS",
     "OUTBOUND_INPUT_OBSERVATION_BUDGET",
     "OUTBOUND_INPUT_PREFIX_CHARS",

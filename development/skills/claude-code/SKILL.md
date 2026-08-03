@@ -7,7 +7,7 @@ description: >-
   size or complexity. Without an explicit user request, use normal myHermes
   tools. After explicit activation, read this Skill and complete the required
   preflight before launch or session control.
-version: 0.7.0
+version: 0.7.1
 platforms:
   - windows
   - linux
@@ -77,9 +77,9 @@ metadata:
 - [mode-selection.md](references/mode-selection.md)：one-shot 与 supervised PTY 的选择。
 - [p8-tool-contract.md](references/p8-tool-contract.md)：Terminal/Process 的公开契约。
 - [managed-runtime.md](references/managed-runtime.md)：P4 真实后台 PTY、SessionRef、owner/cwd 互斥和基础生命周期边界。
-- [output-observation.md](references/output-observation.md)：P5 增量规范化、Event/ActionRequired/Snapshot、状态证据和安全降级。
-- [workflow-controller.md](references/workflow-controller.md)：P6 有界 poll/wait、ActionRequired 暂停、deadline、中断、终止和 final drain。
-- [approvals.md](references/approvals.md)：P7 原生 Prompt、可见选项、稳定 action_id 与统一原样回复。
+- [output-observation.md](references/output-observation.md)：P5/P7.1 增量规范化、双视图、Event/ActionRequired/Snapshot、状态证据和安全降级。
+- [workflow-controller.md](references/workflow-controller.md)：P6/P7.1 有界 poll/wait、ActionRequired 暂停、临时原生交互、中断、终止和 final drain。
+- [approvals.md](references/approvals.md)：P7/P7.1 原生 Prompt、可见选项、稳定 action_id、空 Enter 与统一原样回复。
 - [permissions-and-safety.md](references/permissions-and-safety.md)：权限、凭证和危险操作边界。
 - [claude-code-cli.md](references/claude-code-cli.md)：本 Skill 使用的 CLI 能力。
 
@@ -141,7 +141,7 @@ terminal(
 6. one-shot 模式仅在 `status=running` 时用 `write` 原样发送完整任务，成功后用 `close` 发送 EOF，再用 `log`/`wait` 收集结果；supervised PTY 模式先确认 `status=running`，再用 `submit` 发送行式初始任务并进入监督循环。
 7. 每轮只读取 `next_cursor` 之后的新增输出，分别判断 ProcessStatus、Claude Code 逻辑状态和有效进展。
 8. 只有干预条件成立且未命中去重规则时，发送一次最小必要指示；否则继续观察。
-9. Claude Code 输出原生交互 Prompt 时，原样展示当前 Prompt 与全部可见选项；只有用户明确提供确切回复后，才按当前 `action_id`、process_id 和 owner 原样转发一次。
+9. Claude Code 输出原生交互 Prompt 时，只通过当前临时交互视图展示终端规范化后的 Prompt 与可见选项；它不替代脱敏日志、Event 或 Snapshot。只有用户明确提供确切回复（包括明确选择的空字符串 Enter）后，才按当前 `action_id`、process_id 和 owner 原样转发一次。
 10. 按完成判定或恢复策略收尾，不把总结、短暂无输出或单个子任务完成误判为整体完成。
 11. 最终使用 `wait` 或确认终态，读取最后一段日志，核对报告的修改和仓库状态，再向用户汇总。
 
@@ -174,6 +174,7 @@ terminal(
 - 不自动批准高风险、范围不明、涉及凭证、工作区外路径、危险 Bash、Git push、发布或部署的操作。
 - Claude Code 的原生 Prompt、选项、`Always allow`、`Don't ask again`、`Remember this choice`、密码、Token 和认证码都不得由 Agent 自动选择、改写、过滤或推荐；用户明确提供的确切回复才可通过统一交互接口原样提交。
 - 用户回复正文不得写入普通日志、Event、Snapshot、Controller 长期状态、错误 details 或持久文件；输入送达未知时不得自动重发。
+- 当前原生交互视图只在有效 Prompt 存在时短暂保留；回复、任何新输入、送达未知、interrupt、新 Prompt 或终态都会使旧视图失效。安全/原生视图无法可靠映射时返回无交互，绝不回退或拼接历史原始 PTY；匹配或可疑的 PTY 输入 echo 不得重新作为 Claude Code Prompt 冒泡。
 - 不因思考、读文件、允许的耗时命令、短暂无输出、spinner 或暂时 `UNKNOWN` 而频繁打断。
 - 相同干预原因只发送一次；发送后至少等待一次有效状态变化，才允许相关的下一次干预。
 - 终止时不要通过 `write` 自行发送控制字符；在输入安全且可用时先 `submit` 一次 safe-stop，有限观察后仍需终止则调用 `process kill`，由 ProcessManager 负责中断与强制终止。

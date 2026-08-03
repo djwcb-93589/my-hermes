@@ -100,6 +100,7 @@ class ClaudeCodeOutputNormalizer:
         max_current_line: int = MAX_CURRENT_LINE_CHARS,
         max_pending_escape: int = MAX_PENDING_ESCAPE_CHARS,
         initial_cursor: int = 0,
+        redact_output: bool = True,
     ) -> None:
         for name, value in (
             ("max_raw_buffer", max_raw_buffer),
@@ -115,11 +116,14 @@ class ClaudeCodeOutputNormalizer:
             or initial_cursor < 0
         ):
             raise ValueError("initial_cursor must be a non-negative integer")
+        if not isinstance(redact_output, bool):
+            raise TypeError("redact_output must be a boolean")
 
         self._max_raw_buffer = max_raw_buffer
         self._max_normalized_text = max_normalized_text
         self._max_current_line = max_current_line
         self._max_pending_escape = max_pending_escape
+        self._redact_output = redact_output
         self._expected_cursor = initial_cursor
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._raw_tail = ""
@@ -136,9 +140,25 @@ class ClaudeCodeOutputNormalizer:
 
     @property
     def normalized_output(self) -> str:
-        """返回有界脱敏文本；它从不参与原始 cursor 计算。"""
+        """返回有界终端规范化文本；它从不参与原始 cursor 计算。"""
 
         return self._bounded_normalized_output()
+
+    def clear_view(self) -> None:
+        """清空当前规范化视图，但保留 ProcessManager 的绝对 cursor。"""
+
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._raw_tail = ""
+        self._history = ""
+        self._line = []
+        self._column = 0
+        self._saved_column = 0
+        self._pending_escape = ""
+        self._history_truncated = False
+        self._last_committed_signature = ""
+        self._last_dynamic_signature = ""
+        self._changed_fragments = []
+        self._limits_hit = set()
 
     def feed(
         self,
@@ -193,9 +213,7 @@ class ClaudeCodeOutputNormalizer:
             and current_signature
             and current_signature != self._last_dynamic_signature
         ):
-            self._changed_fragments.append(
-                redact_claude_code_output(current_line)
-            )
+            self._changed_fragments.append(self._present_text(current_line))
             self._last_dynamic_signature = current_signature
 
         changed_text = self._bounded_changed_text(self._changed_fragments)
@@ -246,11 +264,11 @@ class ClaudeCodeOutputNormalizer:
         if len(combined) > self._max_raw_buffer:
             combined = combined[-self._max_raw_buffer :]
             self._limits_hit.add("raw_buffer")
-        safe_tail = redact_claude_code_output(combined)
-        if len(safe_tail) > self._max_raw_buffer:
-            safe_tail = safe_tail[-self._max_raw_buffer :]
+        view_tail = self._present_text(combined)
+        if len(view_tail) > self._max_raw_buffer:
+            view_tail = view_tail[-self._max_raw_buffer :]
             self._limits_hit.add("raw_buffer")
-        self._raw_tail = safe_tail
+        self._raw_tail = view_tail
 
     def _reset_after_cursor_gap(self) -> None:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -431,7 +449,7 @@ class ClaudeCodeOutputNormalizer:
             self._limits_hit.add("current_line")
 
     def _commit_line(self) -> None:
-        line = redact_claude_code_output(self._line_text())
+        line = self._present_text(self._line_text())
         signature = self._semantic_signature(line)
         if not signature or signature == self._last_committed_signature:
             return
@@ -441,10 +459,10 @@ class ClaudeCodeOutputNormalizer:
         self._last_dynamic_signature = signature
 
     def _append_history(self, text: str) -> None:
-        safe_text = redact_claude_code_output(text).rstrip()
-        if not safe_text:
+        view_text = self._present_text(text).rstrip()
+        if not view_text:
             return
-        addition = f"{safe_text}\n"
+        addition = f"{view_text}\n"
         self._history += addition
         if len(self._history) > self._max_normalized_text:
             self._history = self._history[-self._max_normalized_text :]
@@ -455,7 +473,7 @@ class ClaudeCodeOutputNormalizer:
         return "".join(self._line).rstrip()
 
     def _bounded_normalized_output(self) -> str:
-        current = redact_claude_code_output(self._line_text())
+        current = self._present_text(self._line_text())
         output = f"{self._history}{current}".rstrip()
         if self._history_truncated or len(output) > self._max_normalized_text:
             budget = max(
@@ -471,22 +489,26 @@ class ClaudeCodeOutputNormalizer:
                     : self._max_normalized_text
                 ]
             )
-        return redact_claude_code_output(
-            output[-self._max_normalized_text :]
-        )
+        return self._present_text(output[-self._max_normalized_text :])
 
     def _bounded_changed_text(self, fragments: list[str]) -> str:
         unique: list[str] = []
         for fragment in fragments:
-            safe_fragment = redact_claude_code_output(fragment).strip()
-            if safe_fragment and (not unique or unique[-1] != safe_fragment):
-                unique.append(safe_fragment)
+            view_fragment = self._present_text(fragment).strip()
+            if view_fragment and (
+                not unique or unique[-1] != view_fragment
+            ):
+                unique.append(view_fragment)
         return "\n".join(unique)[-self._max_normalized_text :]
 
-    @staticmethod
-    def _semantic_signature(text: str) -> str:
-        safe_text = redact_claude_code_output(text)
-        without_spinner = _SPINNER_CHARS_RE.sub("", safe_text)
+    def _present_text(self, text: str) -> str:
+        if self._redact_output:
+            return redact_claude_code_output(text)
+        return text
+
+    def _semantic_signature(self, text: str) -> str:
+        view_text = self._present_text(text)
+        without_spinner = _SPINNER_CHARS_RE.sub("", view_text)
         semantic_text = " ".join(without_spinner.split()).casefold()
         if not semantic_text:
             return ""
