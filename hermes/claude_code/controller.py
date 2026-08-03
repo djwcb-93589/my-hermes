@@ -447,18 +447,12 @@ class ClaudeCodeController:
     @classmethod
     def _deferred_initial_submission_ready(
         cls,
-        task: _ControllerTask,
+        _task: _ControllerTask,
         snapshot: ClaudeCodeSnapshot,
     ) -> bool:
-        """自动首投仍要求 READY；已解决启动交互后只放行显式首条任务。"""
+        """延后首投只依据当前 READY，旧交互标记不能替代状态事实。"""
 
-        if cls._initial_submission_ready(snapshot):
-            return True
-        return (
-            task.startup_interaction_resolved
-            and snapshot.action_required is None
-            and snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
-        )
+        return cls._initial_submission_ready(snapshot)
 
     def poll(
         self,
@@ -751,14 +745,10 @@ class ClaudeCodeController:
                     task,
                     error_type="interaction_response_failed",
                 )
-                if (
-                    not task.initial_instruction_submitted
-                    and result.outcome == ClaudeCodeControllerOutcome.RUNNING
-                    and result.snapshot.action_required is None
-                    and result.snapshot.process_status
-                    in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
-                ):
-                    task.startup_interaction_resolved = True
+                if not task.initial_instruction_submitted:
+                    task.startup_interaction_resolved = (
+                        self._initial_submission_ready(result.snapshot)
+                    )
                 return result
             finally:
                 if task.interaction_in_progress_id == action.action_id:

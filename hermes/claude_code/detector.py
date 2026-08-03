@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 
 from hermes.claude_code.contracts import (
+    CLAUDE_CODE_ACTIVE_PROCESS_STATUSES,
     MAX_NATIVE_INTERACTION_OPTIONS,
     MAX_NATIVE_INTERACTION_PROMPT_CHARS,
     ClaudeCodeActionKind,
@@ -47,10 +48,26 @@ _TERMINAL_PROCESS_STATUSES = frozenset(
 _EXIT_PROCESS_STATUSES = frozenset({"exited", "killed", "failed_start"})
 _INTERRUPT_EXIT_CODES = frozenset({-15, -2, 130})
 
-_READY_RE = re.compile(
-    r"(?i)(?:welcome\s+to\s+claude|how\s+can\s+i\s+help|"
-    r"what\s+would\s+you\s+like|enter\s+(?:a\s+)?(?:task|prompt)|"
-    r"ready\s+(?:for|to\s+accept)|可以开始|请输入任务)"
+_READY_WELCOME_RE = re.compile(
+    r"(?i)\bwelcome\s+(?:back|to\s+claude(?:\s+code)?)\b"
+)
+_READY_MANUAL_MODE_RE = re.compile(
+    r"(?i)\bmanual\s+mode\s*(?:(?::|\bis\b)\s*)?(?:on|enabled)\b"
+)
+_READY_TASK_INPUT_RE = re.compile(
+    r"(?im)(?:\bhow\s+can\s+i\s+help\b|"
+    r"\bwhat\s+would\s+you\s+like(?:\s+to\s+do)?\b|"
+    r"\benter\s+(?:a\s+)?(?:task|prompt)\b|"
+    r"\bready\s+(?:for|to\s+accept)\b|"
+    r"^\s*(?:[>❯›»])\s*$|可以开始|请输入任务)"
+)
+_FOLDER_TRUST_RE = re.compile(
+    r"(?i)\bdo\s+you\s+trust\s+(?:the\s+)?files?\s+in\s+"
+    r"(?:this|the)\s+(?:folder|directory)\b"
+)
+_FOLDER_TRUST_RESPONSE_RE = re.compile(
+    r"(?im)\b(?:enter|select|choose)\s+"
+    r"(?:y(?:es)?\s*/\s*n(?:o)?|a(?:lways)?)\s*:\s*$"
 )
 _PROGRESS_RE = re.compile(
     r"(?i)\b(?:analys(?:e|ing)|inspect(?:ing)?|read(?:ing)?|"
@@ -115,7 +132,7 @@ _INLINE_OPTION_RE = re.compile(
     r"\byes\s*/\s*no\b|\ballow\s*/\s*deny\b)"
 )
 _LINE_OPTION_RE = re.compile(
-    r"(?m)^\s*(?:\d+[.)]|[-*]|\[[ xX]?\])\s+.+\s*$"
+    r"(?m)^\s*(?:(?:\d+|[A-Za-z])[.)]|[-*]|\[[ xX]?\])\s+.+\s*$"
 )
 _ECHO_PROMPT_PREFIX_RE = re.compile(
     r"(?i)^\s*(?:[│┃|]\s*)?"
@@ -1110,7 +1127,11 @@ class ClaudeCodeOutputDetector:
             and not prompt_structure
         )
         failure_signal = bool(candidate and _FAILURE_RE.search(candidate))
-        ready_signal = bool(candidate and _READY_RE.search(candidate))
+        ready_signal = bool(
+            candidate
+            and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+            and self._is_verified_ready_signal(candidate, context)
+        )
         resumed_after_input = bool(
             candidate
             and self._outbound_response_pending
@@ -1198,8 +1219,7 @@ class ClaudeCodeOutputDetector:
             else:
                 action = None
             if (
-                not task_submitted
-                and ready_signal
+                ready_signal
                 and action is not None
                 and action.kind
                 in {
@@ -1368,15 +1388,7 @@ class ClaudeCodeOutputDetector:
                 return ClaudeCodeState.UNKNOWN
             return ClaudeCodeState.WAITING_APPROVAL
 
-        if not task_submitted and (
-            ready_signal or self._ready_seen or _READY_RE.search(context)
-        ):
-            return ClaudeCodeState.READY
-        if (
-            task_submitted
-            and completion_signal
-            and ready_signal
-        ):
+        if ready_signal or self._ready_seen:
             return ClaudeCodeState.READY
         if task_submitted and (
             progress_signal
@@ -1397,6 +1409,58 @@ class ClaudeCodeOutputDetector:
             return self._state
         return ClaudeCodeState.STARTING
 
+    def _is_verified_ready_signal(
+        self,
+        candidate: str,
+        context: str,
+    ) -> bool:
+        """仅在本轮新增文本补齐多条就绪证据时确认 READY。"""
+
+        if self._action_required is not None:
+            return False
+        if (
+            self._has_startup_interaction_semantics(candidate)
+            or self._has_startup_interaction_semantics(context)
+        ):
+            return False
+        candidate_evidence = self._ready_evidence(candidate)
+        if not candidate_evidence:
+            return False
+        return len(self._ready_evidence(context)) >= 2
+
+    @staticmethod
+    def _ready_evidence(text: str) -> frozenset[str]:
+        """将欢迎、模式与输入提示分成独立 READY 证据。"""
+
+        evidence: set[str] = set()
+        if _READY_WELCOME_RE.search(text):
+            evidence.add("welcome")
+        if _READY_MANUAL_MODE_RE.search(text):
+            evidence.add("manual_mode")
+        if _READY_TASK_INPUT_RE.search(text):
+            evidence.add("task_input")
+        return frozenset(evidence)
+
+    @classmethod
+    def _has_startup_interaction_semantics(cls, text: str) -> bool:
+        """避免欢迎页历史掩盖本轮新的启动交互。"""
+
+        if not text:
+            return False
+        if (
+            _FOLDER_TRUST_RE.search(text)
+            or _AUTH_RE.search(text)
+            or _APPROVAL_RE.search(text)
+        ):
+            return True
+        if _INLINE_OPTION_RE.search(text) or len(
+            _LINE_OPTION_RE.findall(text)
+        ) >= 2:
+            return True
+        return cls._looks_like_prompt(text) and not bool(
+            _READY_TASK_INPUT_RE.search(text)
+        )
+
     def _classify_action(
         self,
         candidate: str,
@@ -1416,6 +1480,7 @@ class ClaudeCodeOutputDetector:
         approval = bool(_APPROVAL_RE.search(candidate))
         clarification = bool(_CLARIFICATION_RE.search(candidate))
         options = self._extract_options(candidate)
+        folder_trust = bool(_FOLDER_TRUST_RE.search(candidate))
         if auth and (
             prompt_like
             or approval
@@ -1427,6 +1492,23 @@ class ClaudeCodeOutputDetector:
                 "Claude Code requires authentication",
                 candidate,
                 "high",
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
+            )
+        if folder_trust:
+            if not (
+                prompt_like
+                and self._folder_trust_prompt_complete(candidate, options)
+            ):
+                return None
+            return self._action(
+                ClaudeCodeActionKind.APPROVAL,
+                "Claude Code requests folder trust confirmation",
+                candidate,
+                "medium",
                 process_id=process_id,
                 session_owner=session_owner,
                 cursor_start=cursor_start,
@@ -1496,6 +1578,19 @@ class ClaudeCodeOutputDetector:
         return None
 
     @staticmethod
+    def _folder_trust_prompt_complete(
+        text: str,
+        options: tuple[str, ...],
+    ) -> bool:
+        """只在目录信任 Prompt 的可选项已完整出现后创建动作。"""
+
+        return bool(
+            len(options) >= 2
+            or _INLINE_OPTION_RE.search(text)
+            or _FOLDER_TRUST_RESPONSE_RE.search(text)
+        )
+
+    @staticmethod
     def _action_source(
         candidate: str,
         context: str,
@@ -1516,6 +1611,15 @@ class ClaudeCodeOutputDetector:
         )
         if not contextual:
             return candidate
+        folder_trust_source = (
+            ClaudeCodeOutputDetector._folder_trust_action_source(contextual)
+        )
+        if folder_trust_source and (
+            _FOLDER_TRUST_RE.search(candidate)
+            or _FOLDER_TRUST_RESPONSE_RE.search(candidate)
+            or len(_LINE_OPTION_RE.findall(candidate)) >= 2
+        ):
+            return folder_trust_source
         lines = [line for line in contextual.splitlines() if line.strip()]
         for index in range(len(lines) - 1, -1, -1):
             if ClaudeCodeOutputDetector._looks_like_prompt(lines[index]):
@@ -1523,6 +1627,17 @@ class ClaudeCodeOutputDetector:
                     -MAX_DETECTION_CONTEXT_CHARS:
                 ]
         return contextual[-MAX_DETECTION_CONTEXT_CHARS:]
+
+    @staticmethod
+    def _folder_trust_action_source(context: str) -> str:
+        """从最后一个目录信任问题开始保留有界交互块。"""
+
+        matches = tuple(_FOLDER_TRUST_RE.finditer(context))
+        if not matches:
+            return ""
+        return context[matches[-1].start() :][
+            -MAX_DETECTION_CONTEXT_CHARS:
+        ]
 
     @staticmethod
     def _action(
@@ -1621,7 +1736,11 @@ class ClaudeCodeOutputDetector:
             if option:
                 options_with_positions.append((match.start(), option))
         options_with_positions.sort(key=lambda item: item[0])
-        return tuple(option for _, option in options_with_positions)
+        return tuple(
+            option for _, option in options_with_positions[
+                :MAX_NATIVE_INTERACTION_OPTIONS
+            ]
+        )
 
     @staticmethod
     def _action_event_type(
