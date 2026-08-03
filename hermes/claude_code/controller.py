@@ -45,6 +45,7 @@ class ClaudeCodeControllerOutcome(str, Enum):
     """说明一次 Controller 调用为何返回，不替代 Runtime 状态。"""
 
     RUNNING = "running"
+    STARTUP_NOT_READY = "startup_not_ready"
     ACTION_REQUIRED = "action_required"
     TERMINAL = "terminal"
     TERMINATED = "terminated"
@@ -71,6 +72,8 @@ class ClaudeCodeControllerResult:
     output_used: int
     deadline_remaining: float
     limits_hit: tuple[str, ...] = ()
+    # 只说明本会话首条任务是否成功提交，不保存任务正文。
+    initial_instruction_submitted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ClaudeCodeSnapshot):
@@ -96,6 +99,8 @@ class ClaudeCodeControllerResult:
             for item in self.limits_hit
         ):
             raise ValueError("limits_hit must contain non-empty strings")
+        if not isinstance(self.initial_instruction_submitted, bool):
+            raise ValueError("initial_instruction_submitted must be a boolean")
 
     @property
     def process_id(self) -> str:
@@ -121,6 +126,8 @@ class _ControllerTask:
     initial_cursor: int
     observation_count: int = 0
     terminal_observation_count: int = 0
+    initial_instruction_submitted: bool = False
+    startup_interaction_resolved: bool = False
     consecutive_empty_reads: int = 0
     output_used: int = 0
     last_snapshot: ClaudeCodeSnapshot | None = None
@@ -214,7 +221,7 @@ class ClaudeCodeController:
         task: str,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> ClaudeCodeControllerResult:
-        """启动、登记并提交一次明确授权的受管 Claude Code 任务。"""
+        """启动、登记并仅在 READY 后提交一次明确授权的初始任务。"""
 
         if user_requested is not True:
             raise ClaudeCodeControllerError(
@@ -270,56 +277,188 @@ class ClaudeCodeController:
                 details={"process_id": session.process_id},
             ) from registration_error
 
-        pre_submit_error: ClaudeCodeControllerError | None = None
-        if self._call_cancel_checker(cancel_checker, "poll_failed"):
-            controller_task.cancelled = True
-            pre_submit_error = ClaudeCodeControllerError(
-                "cancelled",
-                "Claude Code task start was cancelled before submission",
-                details={"process_id": session.process_id},
+        with controller_task.lock:
+            startup_result = self._await_startup_ready_locked(
+                controller_task,
+                cancel_checker=cancel_checker,
             )
-        elif self._now() >= controller_task.deadline:
-            pre_submit_error = ClaudeCodeControllerError(
-                "deadline_exceeded",
-                "Claude Code task deadline was reached before submission",
-                details={"process_id": session.process_id},
+            if startup_result is not None:
+                return startup_result
+            return self._submit_initial_task_locked(
+                controller_task,
+                initial_task=task,
+                cancel_checker=cancel_checker,
             )
-        if pre_submit_error is not None:
-            raise pre_submit_error
 
+    def _await_startup_ready_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        cancel_checker: Callable[[], bool] | None,
+    ) -> ClaudeCodeControllerResult | None:
+        """有界等待首个可信 READY，绝不保存或自动重放初始任务。"""
+
+        terminal_observation = False
+        for attempt in range(self._policy.startup_observation_attempts):
+            use_terminal_observation = terminal_observation
+            terminal_observation = False
+            result = self._observe_and_resolve_locked(
+                task,
+                error_type="poll_failed",
+                terminal_observation=use_terminal_observation,
+            )
+            snapshot = result.snapshot
+            if (
+                result.terminal
+                or result.action_required is not None
+                or result.outcome != ClaudeCodeControllerOutcome.RUNNING
+            ):
+                return result
+            if task.cancelled or self._call_cancel_checker(
+                cancel_checker,
+                "poll_failed",
+            ):
+                task.cancelled = True
+                return self._make_result_locked(
+                    task,
+                    ClaudeCodeControllerOutcome.CANCELLED,
+                )
+            if self._now() >= task.deadline:
+                return self._make_result_locked(
+                    task,
+                    ClaudeCodeControllerOutcome.DEADLINE_EXCEEDED,
+                )
+            if self._initial_submission_ready(snapshot):
+                return None
+            if attempt + 1 >= self._policy.startup_observation_attempts:
+                break
+            remaining = task.deadline - self._now()
+            if remaining <= 0:
+                return self._make_result_locked(
+                    task,
+                    ClaudeCodeControllerOutcome.DEADLINE_EXCEEDED,
+                )
+            waited = self._wait_runtime_locked(
+                task,
+                timeout=min(
+                    self._policy.poll_interval,
+                    self._policy.single_wait_limit,
+                    remaining,
+                ),
+                error_type="poll_failed",
+                cancel_checker=cancel_checker,
+            )
+            if waited is None:
+                return self._make_result_locked(
+                    task,
+                    ClaudeCodeControllerOutcome.CANCELLED,
+                )
+            terminal_observation = not waited.active
+
+        task.limits_hit.add("startup_observation_attempts")
+        return self._make_result_locked(
+            task,
+            ClaudeCodeControllerOutcome.STARTUP_NOT_READY,
+        )
+
+    def _submit_initial_task_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        initial_task: str,
+        cancel_checker: Callable[[], bool] | None,
+    ) -> ClaudeCodeControllerResult:
+        """只在已观察到 READY 后提交一次初始任务，并保留既有失败清理。"""
+
+        snapshot = self._current_snapshot_locked(task)
+        if not self._initial_submission_ready(snapshot):
+            return self._make_result_locked(
+                task,
+                ClaudeCodeControllerOutcome.STARTUP_NOT_READY,
+            )
+        if task.initial_instruction_submitted:
+            raise ClaudeCodeControllerError(
+                "instruction_failed",
+                "Claude Code initial task was already submitted",
+                details={"process_id": task.process_id},
+            )
+        if task.cancelled or self._call_cancel_checker(
+            cancel_checker,
+            "poll_failed",
+        ):
+            task.cancelled = True
+            return self._make_result_locked(
+                task,
+                ClaudeCodeControllerOutcome.CANCELLED,
+            )
+        if self._now() >= task.deadline:
+            return self._make_result_locked(
+                task,
+                ClaudeCodeControllerOutcome.DEADLINE_EXCEEDED,
+            )
+        limit_outcome = self._limit_outcome_locked(task)
+        if limit_outcome is not None:
+            return self._make_result_locked(task, limit_outcome)
         try:
             self._runtime.submit(
-                session_owner=session_owner,
-                process_id=session.process_id,
-                data=task,
+                session_owner=task.session_owner,
+                process_id=task.process_id,
+                data=initial_task,
             )
         except Exception as submit_error:
             try:
                 self._kill_until_inactive(
-                    session_owner=session_owner,
-                    process_id=session.process_id,
+                    session_owner=task.session_owner,
+                    process_id=task.process_id,
                 )
             except ClaudeCodeControllerError as cleanup_error:
                 raise cleanup_error from submit_error
-            self._remove_active_task(controller_task)
+            self._remove_active_task(task)
             if isinstance(submit_error, ClaudeCodeRuntimeError):
                 raise self._wrap_runtime_error(
                     "instruction_failed",
                     "Claude Code initial task submission failed",
                     submit_error,
-                    session.process_id,
+                    task.process_id,
                 ) from submit_error
             raise ClaudeCodeControllerError(
                 "instruction_failed",
                 "Claude Code initial task submission failed",
-                details={"process_id": session.process_id},
+                details={"process_id": task.process_id},
             ) from submit_error
 
-        with controller_task.lock:
-            return self._observe_and_resolve_locked(
-                controller_task,
-                error_type="poll_failed",
-            )
+        task.initial_instruction_submitted = True
+        task.consecutive_empty_reads = 0
+        return self._observe_and_resolve_locked(
+            task,
+            error_type="poll_failed",
+        )
+
+    @staticmethod
+    def _initial_submission_ready(snapshot: ClaudeCodeSnapshot) -> bool:
+        """初始任务只能在无待处理交互的活跃 READY 会话中提交。"""
+
+        return (
+            snapshot.state == ClaudeCodeState.READY
+            and snapshot.action_required is None
+            and snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+        )
+
+    @classmethod
+    def _deferred_initial_submission_ready(
+        cls,
+        task: _ControllerTask,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> bool:
+        """自动首投仍要求 READY；已解决启动交互后只放行显式首条任务。"""
+
+        if cls._initial_submission_ready(snapshot):
+            return True
+        return (
+            task.startup_interaction_resolved
+            and snapshot.action_required is None
+            and snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+        )
 
     def poll(
         self,
@@ -358,7 +497,7 @@ class ClaudeCodeController:
         process_id: str,
         instruction: str,
     ) -> ClaudeCodeControllerResult:
-        """提交用户明确给出的普通补充指令，不处理待审批动作。"""
+        """提交用户明确给出的补充或延后初始指令，不处理待审批动作。"""
 
         if not isinstance(instruction, str) or not instruction.strip():
             raise ClaudeCodeControllerError(
@@ -371,7 +510,8 @@ class ClaudeCodeController:
         assert task is not None
         with task.lock:
             self._guard_input_locked(task)
-            action = self._current_snapshot_locked(task).action_required
+            snapshot = self._current_snapshot_locked(task)
+            action = snapshot.action_required
             if action is not None and action.kind != ClaudeCodeActionKind.STALLED:
                 raise ClaudeCodeControllerError(
                     "action_required",
@@ -380,6 +520,15 @@ class ClaudeCodeController:
                         "process_id": process_id,
                         "action_kind": action.kind.value,
                     },
+                )
+            initial_submission = not task.initial_instruction_submitted
+            if initial_submission and not self._deferred_initial_submission_ready(
+                task,
+                snapshot,
+            ):
+                return self._make_result_locked(
+                    task,
+                    ClaudeCodeControllerOutcome.STARTUP_NOT_READY,
                 )
             try:
                 self._runtime.submit(
@@ -394,6 +543,8 @@ class ClaudeCodeController:
                     runtime_error,
                     process_id,
                 ) from runtime_error
+            if initial_submission:
+                task.initial_instruction_submitted = True
             task.interrupt_requested = False
             task.consecutive_empty_reads = 0
             if action is not None:
@@ -596,10 +747,19 @@ class ClaudeCodeController:
                     snapshot=snapshot,
                     invalidate=False,
                 )
-                return self._observe_and_resolve_locked(
+                result = self._observe_and_resolve_locked(
                     task,
                     error_type="interaction_response_failed",
                 )
+                if (
+                    not task.initial_instruction_submitted
+                    and result.outcome == ClaudeCodeControllerOutcome.RUNNING
+                    and result.snapshot.action_required is None
+                    and result.snapshot.process_status
+                    in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+                ):
+                    task.startup_interaction_resolved = True
+                return result
             finally:
                 if task.interaction_in_progress_id == action.action_id:
                     task.interaction_in_progress_id = None
@@ -1524,6 +1684,7 @@ class ClaudeCodeController:
             output_used=task.output_used,
             deadline_remaining=max(0.0, task.deadline - self._now()),
             limits_hit=tuple(sorted(task.limits_hit)),
+            initial_instruction_submitted=task.initial_instruction_submitted,
         )
         task.last_result = result
         return result

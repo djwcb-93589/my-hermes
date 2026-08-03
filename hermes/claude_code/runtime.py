@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from hermes.claude_code.contracts import (
+    CLAUDE_CODE_ACTIVE_PROCESS_STATUSES,
     ClaudeCodeActionRequired,
     ClaudeCodeProcessLog,
     ClaudeCodeProcessPort,
