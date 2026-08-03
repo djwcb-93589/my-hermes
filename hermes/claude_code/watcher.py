@@ -151,6 +151,7 @@ class _CompletionWatchRecord:
     watch_id: str
     process_id: str
     session_owner: str
+    cwd: str
     target: ClaudeCodeNotificationTarget = field(repr=False)
     display_name: str | None
     created_at: float
@@ -354,6 +355,7 @@ class ClaudeCodeCompletionWatcher:
             watch_id=self._make_watch_id(process_id, session_owner),
             process_id=process_id,
             session_owner=session_owner,
+            cwd=snapshot.session_ref.cwd,
             target=notification_target,
             display_name=display_name,
             created_at=now,
@@ -544,13 +546,16 @@ class ClaudeCodeCompletionWatcher:
                         )
             return
         if error.error_type == "controller_task_not_found":
+            await self._handle_controller_task_lost(record)
+            return
+        if error.error_type == "terminal_observation_reserve_exhausted":
             async with record.operation_lock:
                 async with self._guard:
                     if self._records_by_watch_id.get(record.watch_id) is record:
                         self._close_record_locked(
                             record,
-                            ClaudeCodeCompletionWatchState.CLOSED,
-                            error_type="controller_poll_failed",
+                            ClaudeCodeCompletionWatchState.NOTIFICATION_FAILED,
+                            error_type=error.error_type,
                         )
             return
         await self._record_error(
@@ -558,6 +563,60 @@ class ClaudeCodeCompletionWatcher:
             "controller_poll_failed",
             retry_at=self._now() + self._policy.notification_retry_interval,
         )
+
+    async def _handle_controller_task_lost(
+        self,
+        record: _CompletionWatchRecord,
+    ) -> None:
+        """仅把已验证且仍 active 的 Watch 丢失转换为无 Snapshot 的 LOST 通知。"""
+
+        async with record.operation_lock:
+            async with self._guard:
+                if self._records_by_watch_id.get(record.watch_id) is not record:
+                    return
+                if record.state != ClaudeCodeCompletionWatchState.ACTIVE:
+                    return
+                target_owner = record.target.session_owner
+                if target_owner is None:
+                    self._close_record_locked(
+                        record,
+                        ClaudeCodeCompletionWatchState.CLOSED,
+                        error_type="watch_target_invalid",
+                    )
+                    return
+                if target_owner != record.session_owner:
+                    self._close_record_locked(
+                        record,
+                        ClaudeCodeCompletionWatchState.CLOSED,
+                        error_type="watch_owner_mismatch",
+                    )
+                    return
+                if record.notification is not None:
+                    return
+                record.state = ClaudeCodeCompletionWatchState.TERMINAL_DETECTED
+                record.updated_at = self._now()
+            try:
+                notification = self._build_controller_task_lost_notification(
+                    record
+                )
+            except Exception:
+                async with self._guard:
+                    if self._records_by_watch_id.get(record.watch_id) is record:
+                        self._close_record_locked(
+                            record,
+                            ClaudeCodeCompletionWatchState.NOTIFICATION_FAILED,
+                            error_type="terminal_notification_build_failed",
+                        )
+                return
+            async with self._guard:
+                if self._records_by_watch_id.get(record.watch_id) is not record:
+                    return
+                record.notification = notification
+                record.notification_id = notification.notification_id
+                record.terminal_state = notification.terminal_state
+                record.state = ClaudeCodeCompletionWatchState.NOTIFICATION_PENDING
+                record.updated_at = self._now()
+            await self._submit_pending_notification_locked(record)
 
     async def _handle_terminal_result(
         self,
@@ -716,6 +775,43 @@ class ClaudeCodeCompletionWatcher:
             completed_at=self._wall_now(),
             safe_output_tail=output,
             limits_hit=result.limits_hit,
+        )
+
+    def _build_controller_task_lost_notification(
+        self,
+        record: _CompletionWatchRecord,
+    ) -> ClaudeCodeTerminalNotification:
+        """在 Controller task 消失时仅使用注册时已验证的安全最小信息。"""
+
+        terminal_state = ClaudeCodeState.LOST
+        return ClaudeCodeTerminalNotification(
+            notification_id=self._lost_notification_id(record),
+            watch_id=record.watch_id,
+            process_id=record.process_id,
+            session_owner=record.session_owner,
+            cwd=record.cwd,
+            terminal_state=terminal_state,
+            controller_outcome="controller_task_not_found",
+            process_status=None,
+            exit_code=None,
+            completed_at=self._wall_now(),
+            safe_output_tail="",
+            limits_hit=(),
+        )
+
+    @staticmethod
+    def _lost_notification_id(record: _CompletionWatchRecord) -> str:
+        """同一 Watch 的 LOST 通知始终复用同一稳定身份。"""
+
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                (
+                    "hermes:claude-code-terminal:"
+                    f"{record.watch_id}:{record.process_id}:"
+                    f"{ClaudeCodeState.LOST.value}"
+                ),
+            )
         )
 
     @staticmethod

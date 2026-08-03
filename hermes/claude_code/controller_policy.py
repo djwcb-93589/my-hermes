@@ -23,6 +23,7 @@ class ClaudeCodeControllerPolicy:
     final_event_limit: int = 64
     terminal_snapshot_limit: int = 64
     terminate_grace_period: float = 2.0
+    terminal_observation_reserve: int = 4
 
     def __post_init__(self) -> None:
         self._require_seconds("poll_interval", self.poll_interval, 0.05, 30.0)
@@ -49,6 +50,12 @@ class ClaudeCodeControllerPolicy:
             self.max_observation_count,
             1,
             100_000,
+        )
+        self._require_count(
+            "terminal_observation_reserve",
+            self.terminal_observation_reserve,
+            1,
+            32,
         )
         self._require_count(
             "interrupt_observation_attempts",

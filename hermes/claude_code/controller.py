@@ -120,6 +120,7 @@ class _ControllerTask:
     deadline: float
     initial_cursor: int
     observation_count: int = 0
+    terminal_observation_count: int = 0
     consecutive_empty_reads: int = 0
     output_used: int = 0
     last_snapshot: ClaudeCodeSnapshot | None = None
@@ -863,6 +864,7 @@ class ClaudeCodeController:
             return self._observe_and_resolve_locked(
                 task,
                 error_type="poll_failed",
+                terminal_observation=True,
             )
         if snapshot.action_required is not None:
             return self._make_result_locked(
@@ -916,11 +918,16 @@ class ClaudeCodeController:
         task: _ControllerTask,
         *,
         error_type: str,
+        terminal_observation: bool = False,
         terminal_outcome: ClaudeCodeControllerOutcome = (
             ClaudeCodeControllerOutcome.TERMINAL
         ),
     ) -> ClaudeCodeControllerResult:
-        snapshot = self._observe_once_locked(task, error_type=error_type)
+        snapshot = self._observe_once_locked(
+            task,
+            error_type=error_type,
+            terminal_observation=terminal_observation,
+        )
         if _snapshot_is_terminal(snapshot):
             return self._finalize_terminal_locked(
                 task,
@@ -1056,13 +1063,12 @@ class ClaudeCodeController:
         task: _ControllerTask,
         *,
         error_type: str,
+        terminal_observation: bool = False,
     ) -> ClaudeCodeSnapshot:
-        if not self._observation_allowed_locked(task):
-            raise ClaudeCodeControllerError(
-                self._limit_outcome_locked(task).value,
-                "Claude Code observation is blocked by a Controller limit",
-                details={"process_id": task.process_id},
-            )
+        terminal_reserve_used = self._claim_observation_slot_locked(
+            task,
+            terminal_observation=terminal_observation,
+        )
         try:
             snapshot = self._runtime.observe(
                 session_owner=task.session_owner,
@@ -1080,6 +1086,7 @@ class ClaudeCodeController:
             task,
             snapshot,
             error_type=error_type,
+            terminal_reserve_used=terminal_reserve_used,
         )
         return snapshot
 
@@ -1089,6 +1096,7 @@ class ClaudeCodeController:
         snapshot: ClaudeCodeSnapshot,
         *,
         error_type: str,
+        terminal_reserve_used: bool,
     ) -> None:
         if snapshot.session_ref.process_id != task.process_id:
             raise ClaudeCodeControllerError(
@@ -1116,7 +1124,8 @@ class ClaudeCodeController:
             )
         cursor_delta = max(0, snapshot.raw_cursor - previous_cursor)
         task.output_used += cursor_delta
-        task.observation_count += 1
+        if not terminal_reserve_used:
+            task.observation_count += 1
         empty = previous is not None and (
             snapshot.raw_cursor == previous.raw_cursor
             and snapshot.state == previous.state
@@ -1159,12 +1168,17 @@ class ClaudeCodeController:
         current = snapshot
         advanced_on_last_attempt = False
         for _ in range(self._policy.final_drain_attempts):
-            if not self._observation_allowed_locked(task):
+            terminal_observation = self._snapshot_has_inactive_process(current)
+            if (
+                not terminal_observation
+                and not self._observation_allowed_locked(task)
+            ):
                 break
             previous_cursor = current.raw_cursor
             current = self._observe_once_locked(
                 task,
                 error_type="final_drain_failed",
+                terminal_observation=terminal_observation,
             )
             if suppress_actions:
                 cleared_current = self._clear_interrupt_action_locked(
@@ -1413,6 +1427,51 @@ class ClaudeCodeController:
             task.limits_hit.add("observation_limit_reached")
             return False
         return True
+
+    def _claim_observation_slot_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        terminal_observation: bool,
+    ) -> bool:
+        """申请一次 observe；保留额度只允许已确认非 active 的终态路径调用。"""
+
+        if task.observation_count < self._policy.max_observation_count:
+            return False
+        task.limits_hit.add("observation_limit_reached")
+        if not terminal_observation:
+            raise ClaudeCodeControllerError(
+                ClaudeCodeControllerOutcome.OBSERVATION_LIMIT_REACHED.value,
+                "Claude Code observation is blocked by a Controller limit",
+                details={"process_id": task.process_id},
+            )
+        if (
+            task.terminal_observation_count
+            >= self._policy.terminal_observation_reserve
+        ):
+            task.limits_hit.add("terminal_observation_reserve_exhausted")
+            raise ClaudeCodeControllerError(
+                "terminal_observation_reserve_exhausted",
+                "Claude Code terminal observation reserve was exhausted",
+                details={
+                    "process_id": task.process_id,
+                    "terminal_observation_reserve": (
+                        self._policy.terminal_observation_reserve
+                    ),
+                },
+            )
+        task.terminal_observation_count += 1
+        return True
+
+    @staticmethod
+    def _snapshot_has_inactive_process(snapshot: ClaudeCodeSnapshot) -> bool:
+        """只按已有 ProcessStatus 确认底层进程已非 active。"""
+
+        return bool(
+            snapshot.process_status is not None
+            and snapshot.process_status
+            not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+        )
 
     def _limit_outcome_locked(
         self,
