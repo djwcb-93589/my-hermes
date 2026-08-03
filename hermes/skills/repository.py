@@ -7,7 +7,7 @@ import json
 import os
 import re
 import shutil
-import uuid
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -561,8 +561,12 @@ class SkillRepository:
                 skill_file = skill_dir / "SKILL.md"
                 if skill_dir.exists() or skill_file.exists():
                     return {"ok": False, "error_type": "exists", "error": f"skill {name!r} was created concurrently", "name": name}
-                temp_dir = self.skills_dir / f".tmp-{name}-{uuid.uuid4().hex}"
-                temp_dir.mkdir()
+                temp_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix=".hs-",
+                        dir=self.skills_dir,
+                    )
+                )
                 atomic_write_text(temp_dir / "SKILL.md", content)
                 atomic_write_text(temp_dir / _GOVERNANCE_FILE, governance_payload)
                 os.replace(temp_dir, skill_dir)

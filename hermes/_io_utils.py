@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -80,16 +81,31 @@ def atomic_write_text(
     调用方传入的换行符按原样编码，不执行平台换行转换。
     异常时清理临时文件并重新抛出,旧文件保持不变。
     """
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    fd: int | None = None
+    tmp_path: Path | None = None
     try:
-        with open(tmp_path, "w", encoding=encoding, newline="") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".h-",
+            suffix=".tmp",
+            dir=file_path.parent,
+        )
+        tmp_path = Path(tmp_name)
+        stream = os.fdopen(fd, "w", encoding=encoding, newline="")
+        fd = None
+        with stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp_path, file_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+        tmp_path = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
