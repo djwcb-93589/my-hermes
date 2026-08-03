@@ -68,4 +68,30 @@ deadline 和取消只停止 Controller 继续等待，默认不发送 interrupt 
 
 Controller 只保存 `process_id`、owner、cwd、固定 deadline、观察/空读/输出计数、最新 Snapshot、有界终态结果以及有界的 opaque action id 消费状态；它不保存用户回复正文。它不复制 Runtime `_sessions`、ProcessManager registry、Handle 或完整输出历史。每个任务使用独立轻量锁，允许不同 cwd 的工作流并发；同 cwd 互斥继续由默认 Runtime 负责。
 
-Controller 尚未接入 AgentLoop，也没有后台 polling worker。P7 只提供原生交互透明冒泡，不提供自动审批、自动认证、自动回答或任何 myHermes 自有权限决策。
+Controller 尚未接入 AgentLoop，也没有自己的后台 polling worker。P7 只提供原生交互透明冒泡，不提供自动审批、自动认证、自动回答或任何 myHermes 自有权限决策。
+
+## P7.5 完成通知 Watcher
+
+P7.5 只在同一 myHermes runtime 内观察已经由当前 Runtime 启动、且已经登记给 Controller 的 Claude Code task：
+
+```text
+register_watch(process_id, session_owner, notification_target)
+→ 内存 Watcher 定期调用一次 Controller.poll(terminal_observation=True)
+→ Controller 已完成 final drain 并返回真实终态
+→ 构造安全、限长通知
+→ NotificationPort 接收
+→ Gateway 持久 Outbox 投递
+→ 注销 Watch
+```
+
+Watcher 只保存 process/owner/target 的最小绑定、有限状态和有限重试信息；Target 还带相同的 `session_owner` 绑定，Watcher 只比较该绑定而不解释平台、聊天、thread 或 reply 字段，因此不能把 Session A 的终态投给 Session B 的 target。同一 process id 在本 runtime 内只允许一个 Watch；可选显示名必须很短，不能传入完整任务 Prompt。Watcher 不读取原始 PTY、不重新实现 Detector/final drain、不拥有 ProcessManager，不会 interrupt、kill、cleanup、扫描或接管外部进程。
+
+终态只以 Controller `result.terminal` 为事实，并使用其中已经 final drain 的公开安全 Snapshot。Watcher 的受限 `terminal_observation=True` 仅让 Controller 先复核真实进程状态：进程仍 active 时，它原样保留旧 ActionRequired 或 stalled；确认非 active 后才进入既有 observe/final drain。它不发送输入、不自动处理动作，普通 `poll` 的暂停语义保持不变。只有 `COMPLETED`、`FAILED`、`INTERRUPTED` 和 `LOST` 会通知；`READY`、`WORKING`、等待输入/审批、stalled、deadline、取消、观察次数限制和普通输出变化绝不生成“已完成”通知。缺少 Detector 完成证据的 `exited` 即使 exit code 为零也保守映射为 failed，不得声称 completed。
+
+通知由确定性代码生成，不调用 LLM。它只包含稳定 notification id、watch/process/owner、cwd、终态、Controller outcome、ProcessStatus、exit code、完成时刻、limits 和再次脱敏、明确限长的公开 `safe_output_tail`；不使用 P7 临时原生 Prompt、ActionRequired 原文、用户回复、Token、密码、认证码、完整 PTY 输出或未被 Snapshot 支持的测试/commit/push 结论。无安全输出尾部时仍可通知状态。
+
+同一 Watch 的同一终态用稳定 `watch_id + terminal_state → notification_id` 去重。通知入队重试始终复用该 ID，`delivery_unknown` 也不得立即生成新 ID；Outbox 已存在或可靠入库即视为 accepted 并注销 Watch。平台发送失败由既有 Outbox retry、分片和恢复处理，Watcher 不创建第二个消息队列。
+
+默认 `get_claude_code_completion_watcher()` 是惰性、进程级单例，首次由 Gateway 组合根注入 NotificationPort，后续同一 runtime 复用。它使用一个受控 asyncio Task 扫描多个 Watch，并以有限并发通过线程桥接调用同步 Controller；策略限制 polling interval、并发 poll、输出尾部、入队尝试、重试间隔和 shutdown 等待，不能零间隔忙轮询。Gateway Adapter 只把平台无关 target 转为独立系统 source identity、确定性平台 payload 和现有持久 Outbox，复用 runtime fencing 与 Outbox worker，不调用平台 API，也不改变原入站消息或 reply 状态；`accepted=True` 仅表示入 Outbox，不表示平台已同步送达。
+
+Watch 仅在内存中存在：runtime 在检测终态前重启时不恢复 Watch、不重新发现旧 CC；已经入 Outbox 的通知仍由 Gateway 的既有 Outbox 恢复。Gateway shutdown 先关闭 Watcher，再进行全局 Session/进程清理；Watcher shutdown 只停止接受和观察，不终止或等待 Claude Code，也不伪造终态通知。P8 将来只需在 Agent 明确启动受管 CC 后，从当前 Gateway 会话构造绑定 target 并调用 `register_watch(process_id, owner, target)`；P7.5 本身不做 Agent 选择、自然语言映射或自动交互/审批。

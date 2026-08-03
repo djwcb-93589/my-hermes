@@ -326,10 +326,17 @@ class ClaudeCodeController:
         session_owner: str,
         process_id: str,
         cancel_checker: Callable[[], bool] | None = None,
+        terminal_observation: bool = False,
     ) -> ClaudeCodeControllerResult:
-        """执行恰好一个有界工作轮次，不 sleep、不自动输入。"""
+        """执行恰好一个有界工作轮次，不 sleep、不自动输入。
+
+        ``terminal_observation`` 仅供完成观察器在旧待处理动作存在时复核
+        真实终态；普通调用保持默认的待处理动作暂停语义。
+        """
 
         self._require_cancel_checker(cancel_checker)
+        if not isinstance(terminal_observation, bool):
+            raise TypeError("terminal_observation must be a boolean")
         task, terminal = self._resolve_task(session_owner, process_id)
         if terminal is not None:
             return terminal
@@ -337,7 +344,11 @@ class ClaudeCodeController:
         with task.lock:
             if task.archived:
                 return self._archived_result(task)
-            return self._poll_locked(task, cancel_checker=cancel_checker)
+            return self._poll_locked(
+                task,
+                cancel_checker=cancel_checker,
+                terminal_observation=terminal_observation,
+            )
 
     def send_instruction(
         self,
@@ -808,6 +819,7 @@ class ClaudeCodeController:
         task: _ControllerTask,
         *,
         cancel_checker: Callable[[], bool] | None,
+        terminal_observation: bool = False,
     ) -> ClaudeCodeControllerResult:
         if task.last_snapshot is None:
             if task.cancelled or self._call_cancel_checker(
@@ -844,6 +856,14 @@ class ClaudeCodeController:
                 snapshot,
                 outcome=ClaudeCodeControllerOutcome.TERMINAL,
             )
+        if (
+            terminal_observation
+            and self._terminal_probe_is_inactive_locked(task)
+        ):
+            return self._observe_and_resolve_locked(
+                task,
+                error_type="poll_failed",
+            )
         if snapshot.action_required is not None:
             return self._make_result_locked(
                 task,
@@ -870,6 +890,26 @@ class ClaudeCodeController:
             task,
             error_type="poll_failed",
         )
+
+    def _terminal_probe_is_inactive_locked(
+        self,
+        task: _ControllerTask,
+    ) -> bool:
+        """仅为观察器复核真实进程终态，活跃时不改写当前 Snapshot。"""
+
+        try:
+            process_snapshot = self._runtime.status(
+                session_owner=task.session_owner,
+                process_id=task.process_id,
+            )
+        except ClaudeCodeRuntimeError as runtime_error:
+            raise self._wrap_runtime_error(
+                "poll_failed",
+                "Claude Code terminal observation probe failed",
+                runtime_error,
+                task.process_id,
+            ) from runtime_error
+        return not process_snapshot.active
 
     def _observe_and_resolve_locked(
         self,

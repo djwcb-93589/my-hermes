@@ -126,6 +126,13 @@ from hermes.gateway.runtime_lease import GatewayRuntimeLease
 from hermes.gateway.runtime_components import (
     build_gateway_runtime_components,
 )
+from hermes.gateway.claude_code_notifications import (
+    GatewayClaudeCodeNotificationPort,
+)
+from hermes.gateway.system_notifications import (
+    GatewaySystemNotificationPublisher,
+    SYSTEM_NOTIFICATION_DELIVERY_KIND,
+)
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
 from hermes.cron.executor import CronExecutor
@@ -1022,6 +1029,18 @@ class GatewayRunner:
         self._file_delivery_task_routes: dict[str, str] = {}
         self._file_delivery_wakeup = asyncio.Event()
         self._system_outbox_tasks: dict[str, asyncio.Task] = {}
+        self._system_notification_publisher = GatewaySystemNotificationPublisher(
+            persistence=self.persistence,
+            adapter_provider=lambda platform: self.adapters.get(platform),
+            runtime_fence_provider=self._runtime_lease.valid_fence,
+            runtime_lease_valid=lambda: self._runtime_lease_valid,
+            gateway_running=lambda: self._lifecycle_phase == "running",
+            outbox_launcher=self.launch_system_outbox,
+        )
+        self._claude_code_notification_port = GatewayClaudeCodeNotificationPort(
+            self._system_notification_publisher,
+        )
+        self._claude_code_completion_watcher = None
         self._lease_shutdown_task: asyncio.Task | None = None
         self._readiness_probe_lock = asyncio.Lock()
         self._readiness_probe_cached_at = 0.0
@@ -2113,8 +2132,18 @@ class GatewayRunner:
     def _is_cron_delivery(delivery: dict) -> bool:
         return str(delivery.get("origin_kind", "")) == "cron"
 
-    async def _launch_system_outbox(self, outbox_id: str, route_key: str) -> None:
-        """发送无入站消息归属的 Cron Outbox，不创建会话或伪造用户事件。"""
+    @staticmethod
+    def _is_system_outbox(outbox: dict) -> bool:
+        """系统投递不属于入站 Queue，恢复时必须绕开普通会话 worker。"""
+
+        delivery_kind = str(outbox.get("delivery_kind", ""))
+        return (
+            delivery_kind.startswith("cron_")
+            or delivery_kind == SYSTEM_NOTIFICATION_DELIVERY_KIND
+        )
+
+    async def launch_system_outbox(self, outbox_id: str, route_key: str) -> None:
+        """发送无入站消息归属的系统 Outbox，不创建会话或伪造用户事件。"""
         task = self._system_outbox_tasks.get(outbox_id)
         if task is not None and not task.done():
             return
@@ -2196,6 +2225,25 @@ class GatewayRunner:
             )
         self._cron_delivery_preparation_wakeup.set()
 
+    async def _start_claude_code_completion_watcher(self) -> None:
+        """在 Gateway 可可靠入 Outbox 后绑定默认 CC 完成观察器。"""
+
+        from hermes.claude_code import get_claude_code_completion_watcher
+
+        watcher = get_claude_code_completion_watcher(
+            notification_port=self._claude_code_notification_port,
+        )
+        await watcher.start()
+        self._claude_code_completion_watcher = watcher
+
+    async def _shutdown_claude_code_completion_watcher(self) -> None:
+        """先停止观察器，再让 Gateway 的全局 Session 清理处理 CC 生命周期。"""
+
+        watcher = self._claude_code_completion_watcher
+        self._claude_code_completion_watcher = None
+        if watcher is not None:
+            await watcher.shutdown()
+
     async def _prepare_claimed_cron_delivery(self, job: CronJob, run: dict, fence: dict) -> None:
         """为已领取的投递准备幂等创建文本 Outbox 与文件投递，绝不重跑 Agent。"""
         config = dict(job.delivery_config or {})
@@ -2263,7 +2311,7 @@ class GatewayRunner:
             }
             created = await self.persistence.call(enqueue_gateway_outbox, outbox, **fence)
             outbox_ids.append(created)
-            await self._launch_system_outbox(created, route_key)
+            await self.launch_system_outbox(created, route_key)
 
         file_delivery_ids: list[str] = []
         failed_artifact_ids: list[str] = []
@@ -2544,7 +2592,7 @@ class GatewayRunner:
         if self._lifecycle_phase != "running":
             return
         if event is None:
-            await self._launch_system_outbox(
+            await self.launch_system_outbox(
                 str(delivery.get("outbox_id") or ""),
                 str(delivery["route_key"]),
             )
@@ -2999,6 +3047,13 @@ class GatewayRunner:
                 f"exception={type(exc).__name__}"
             )
         try:
+            await self._shutdown_claude_code_completion_watcher()
+        except (Exception, asyncio.CancelledError) as exc:
+            print(
+                "  [gateway] startup Claude Code watcher cleanup failed: "
+                f"exception={type(exc).__name__}"
+            )
+        try:
             await self._cancel_background_tasks()
         except (Exception, asyncio.CancelledError) as exc:
             print(
@@ -3275,6 +3330,7 @@ class GatewayRunner:
             self._start_retention_cleanup()
             self._start_file_delivery_dispatcher()
             self._start_cron_delivery_preparation()
+            await self._start_claude_code_completion_watcher()
             self._cron_scheduler.start()
             self._runtime_components.start_heartbeats()
         except Exception as exc:
@@ -3347,6 +3403,13 @@ class GatewayRunner:
                     "  [gateway] Runtime stopping publish failed: "
                     f"exception={type(exc).__name__}"
                 )
+
+            # Watcher 只观察受管 CC；必须在全局 Session/进程清理前停止，
+            # 以免 shutdown 自己造成的终态被当作用户任务完成通知。
+            try:
+                await self._shutdown_claude_code_completion_watcher()
+            except (Exception, asyncio.CancelledError) as exc:
+                record_cleanup_error("claude_code_completion_watcher_stop", exc)
 
             # 入站关闭后先等待已经进入 admission 的请求完成 worker 登记，
             # 再统一取消，避免 global cleanup 漏过迟到的工具调用。
@@ -4872,12 +4935,9 @@ class GatewayRunner:
         )
         rows = await self.persistence.call(get_recoverable_gateway_outbox)
 
-        system_rows = [
-            row for row in rows
-            if str(row.get("delivery_kind", "")).startswith("cron_")
-        ]
+        system_rows = [row for row in rows if self._is_system_outbox(row)]
         for row in system_rows:
-            await self._launch_system_outbox(row["id"], row["route_key"])
+            await self.launch_system_outbox(row["id"], row["route_key"])
         rows = [row for row in rows if row not in system_rows]
 
         grouped: dict[str, list[dict]] = {}

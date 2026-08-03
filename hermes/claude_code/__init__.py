@@ -40,13 +40,29 @@ from hermes.claude_code.normalizer import (
     ClaudeCodeOutputNormalizer,
     NormalizedOutputDelta,
 )
+from hermes.claude_code.notification import (
+    ClaudeCodeNotificationPort,
+    ClaudeCodeNotificationReceipt,
+    ClaudeCodeNotificationTarget,
+    ClaudeCodeTerminalNotification,
+    render_claude_code_terminal_notification,
+)
 from hermes.claude_code.runtime import ClaudeCodeRuntime
+from hermes.claude_code.watcher import (
+    ClaudeCodeCompletionWatch,
+    ClaudeCodeCompletionWatcher,
+    ClaudeCodeCompletionWatcherError,
+    ClaudeCodeCompletionWatcherPolicy,
+    ClaudeCodeCompletionWatchState,
+)
 
 
 _DEFAULT_RUNTIME_LOCK = threading.Lock()
 _default_runtime: ClaudeCodeRuntime | None = None
 _DEFAULT_CONTROLLER_LOCK = threading.Lock()
 _default_controller: ClaudeCodeController | None = None
+_DEFAULT_COMPLETION_WATCHER_LOCK = threading.Lock()
+_default_completion_watcher: ClaudeCodeCompletionWatcher | None = None
 
 
 def create_claude_code_runtime(
@@ -112,9 +128,64 @@ def get_claude_code_controller() -> ClaudeCodeController:
         return _default_controller
 
 
+def create_claude_code_completion_watcher(
+    *,
+    notification_port: ClaudeCodeNotificationPort,
+    controller: ClaudeCodeController | None = None,
+    policy: ClaudeCodeCompletionWatcherPolicy | None = None,
+) -> ClaudeCodeCompletionWatcher:
+    """为显式依赖注入创建 Watcher，不作为每次任务的生产入口。"""
+
+    selected_controller = controller
+    if selected_controller is None:
+        selected_controller = get_claude_code_controller()
+    return ClaudeCodeCompletionWatcher(
+        selected_controller,
+        notification_port,
+        policy=policy,
+    )
+
+
+def get_claude_code_completion_watcher(
+    *,
+    notification_port: ClaudeCodeNotificationPort | None = None,
+) -> ClaudeCodeCompletionWatcher:
+    """惰性复用默认 Controller 的进程级 Watcher；首次调用需注入通知端口。"""
+
+    global _default_completion_watcher
+    with _DEFAULT_COMPLETION_WATCHER_LOCK:
+        watcher = _default_completion_watcher
+        if watcher is None or watcher.is_shutdown:
+            if notification_port is None:
+                raise ClaudeCodeCompletionWatcherError(
+                    "notification_port_unavailable",
+                    "Claude Code completion watcher requires a notification port",
+                )
+            watcher = create_claude_code_completion_watcher(
+                notification_port=notification_port,
+                controller=get_claude_code_controller(),
+            )
+            _default_completion_watcher = watcher
+            return watcher
+        if (
+            notification_port is not None
+            and not watcher.uses_notification_port(notification_port)
+        ):
+            raise ClaudeCodeCompletionWatcherError(
+                "notification_port_unavailable",
+                "Claude Code completion watcher already uses another notification port",
+            )
+        return watcher
+
+
 __all__ = [
     "ClaudeCodeActionKind",
     "ClaudeCodeActionRequired",
+    "ClaudeCodeCompletionWatch",
+    "ClaudeCodeCompletionWatcher",
+    "ClaudeCodeCompletionWatcherError",
+    "ClaudeCodeCompletionWatcherPolicy",
+    "ClaudeCodeCompletionWatchState",
     "ClaudeCodeCurrentInteraction",
     "ClaudeCodeController",
     "ClaudeCodeControllerError",
@@ -126,6 +197,9 @@ __all__ = [
     "ClaudeCodeInteractionResponse",
     "ClaudeCodeOutputDetector",
     "ClaudeCodeOutputNormalizer",
+    "ClaudeCodeNotificationPort",
+    "ClaudeCodeNotificationReceipt",
+    "ClaudeCodeNotificationTarget",
     "ClaudeCodeProcessLog",
     "ClaudeCodeProcessPort",
     "ClaudeCodeProcessSnapshot",
@@ -135,11 +209,15 @@ __all__ = [
     "ClaudeCodeSessionRef",
     "ClaudeCodeSnapshot",
     "ClaudeCodeState",
+    "ClaudeCodeTerminalNotification",
     "DetectionResult",
     "NormalizedOutputDelta",
     "create_claude_code_controller",
+    "create_claude_code_completion_watcher",
     "create_claude_code_runtime",
     "get_claude_code_controller",
+    "get_claude_code_completion_watcher",
     "get_claude_code_runtime",
     "build_claude_code_action_id",
+    "render_claude_code_terminal_notification",
 ]

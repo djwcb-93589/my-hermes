@@ -56,7 +56,7 @@ metadata:
 
 ## 职责边界
 
-通过现有 Terminal Tool 和 Process Tool 启动、观察、纠偏和结束 Claude Code。受管 Runtime 封装同一条 ProcessManager 公共调用链，P5 提供有界输出解释和单次状态观察，P6/P7 Controller 在 Runtime 公共接口之上提供有界工作流编排和原生交互透明冒泡。它们都不是新 Tool，也不拥有进程、PTY、日志或 cleanup 基础设施；Controller 尚未接入 AgentLoop。
+通过现有 Terminal Tool 和 Process Tool 启动、观察、纠偏和结束 Claude Code。受管 Runtime 封装同一条 ProcessManager 公共调用链，P5 提供有界输出解释和单次状态观察，P6/P7 Controller 在 Runtime 公共接口之上提供有界工作流编排和原生交互透明冒泡；P7.5 另以进程内 Completion Watcher 观察 Controller 真实终态，并经 Gateway 既有 Outbox 推送一次安全通知。它们都不是新 Tool，也不拥有进程、PTY、日志或 cleanup 基础设施；AgentLoop 尚未接入。
 
 必须遵守以下边界：
 
@@ -64,7 +64,7 @@ metadata:
 - 保存 Terminal Tool 返回的 `process_id`；不要保存 Handle，不要按 PID 操作系统进程，不要访问 `ProcessManager` 私有字段。
 - 使用 Process Tool 返回的 `next_cursor` 继续读取；不要计算、修正或另建 cursor。
 - 生命周期引用只保存 `process_id`、`session_owner`、`cwd`、cursor 和时间戳；P5 另按 [output-observation.md](references/output-observation.md) 保存有硬上限的解析缓冲与 fingerprint，P6 只增加有界计数、deadline 和最新 Snapshot。ProcessManager process id 仍是唯一运行身份。
-- 不建立完整日志副本、第二套分页器、进程 registry、reader、cleanup 或后台监控服务。
+- 不建立完整日志副本、第二套分页器、进程 registry、reader 或 cleanup；除 P7.5 的受控内存 Completion Watcher 外，不建立其他后台监控服务。
 - 只管理由当前 myHermes runtime、当前 ProcessManager 和当前 owner 启动的会话；不扫描、接管、恢复、终止或清理外部终端中的 Claude Code。
 - 不创建 Claude Code 专用 Tool、Agent 唤醒机制或 Claude hooks。
 - 不自动安装 Claude Code，不依赖任何 `scripts/` 或 `assets/`。
@@ -78,7 +78,7 @@ metadata:
 - [p8-tool-contract.md](references/p8-tool-contract.md)：Terminal/Process 的公开契约。
 - [managed-runtime.md](references/managed-runtime.md)：P4 真实后台 PTY、SessionRef、owner/cwd 互斥和基础生命周期边界。
 - [output-observation.md](references/output-observation.md)：P5/P7.1 增量规范化、双视图、Event/ActionRequired/Snapshot、状态证据和安全降级。
-- [workflow-controller.md](references/workflow-controller.md)：P6/P7.1 有界 poll/wait、ActionRequired 暂停、临时原生交互、中断、终止和 final drain。
+- [workflow-controller.md](references/workflow-controller.md)：P6/P7/P7.5 有界 poll/wait、ActionRequired 暂停、临时原生交互、中断、终止、final drain 和终态单次通知。
 - [approvals.md](references/approvals.md)：P7/P7.1 原生 Prompt、可见选项、稳定 action_id、空 Enter 与统一原样回复。
 - [permissions-and-safety.md](references/permissions-and-safety.md)：权限、凭证和危险操作边界。
 - [claude-code-cli.md](references/claude-code-cli.md)：本 Skill 使用的 CLI 能力。
