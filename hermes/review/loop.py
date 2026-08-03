@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 
 from hermes.agent_loop import AgentLoop, _short_error
 
@@ -111,6 +112,7 @@ class ReviewAgentLoop(AgentLoop):
         skip_remaining = False
 
         for tool_call in tool_calls:
+            tool_started = time.perf_counter()
             tool_name = self._tool_call_name(tool_call)
             if skip_remaining:
                 output = "(error: skipped because an earlier review tool failed)"
@@ -135,11 +137,34 @@ class ReviewAgentLoop(AgentLoop):
             self.on_tool_message(tool_call, tool_msg, output)
 
             if skip_remaining:
+                self._record_tool_observation(
+                    tool_call,
+                    status="skipped",
+                    error_type="prior_tool_failure",
+                    duration_ms=max(0, (time.perf_counter() - tool_started) * 1000),
+                )
                 continue
             if tool_name not in self.tools_used:
                 self.tools_used.append(tool_name)
 
             fatal, error_type = self._classify_tool_error(output, err_status)
+            cancelled = (
+                error_type == "cancelled" or err_status == "cancelled"
+            )
+            self._record_tool_observation(
+                tool_call,
+                status=(
+                    "skipped"
+                    if cancelled
+                    else ("succeeded" if not error_type and not err_status else "failed")
+                ),
+                error_type=(
+                    "cancelled"
+                    if cancelled
+                    else (error_type or err_status or None)
+                ),
+                duration_ms=max(0, (time.perf_counter() - tool_started) * 1000),
+            )
             if fatal:
                 fatal_detail = (
                     err_detail
