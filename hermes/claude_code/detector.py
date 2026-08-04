@@ -68,6 +68,13 @@ _READY_EFFORT_UI_LINE_RE = re.compile(
     r"(?ix)^\s*effort\s*:\s*"
     r"[a-z][a-z0-9_-]{0,15}\s*[\u00b7\u2022]\s*/\s*effort\s*$"
 )
+_INTERRUPT_MENU_RE = re.compile(
+    r"(?is)(?:"
+    r"press\s+ctrl\s*[- ]?c\s+again(?:\s+to\s+exit)?"
+    r"|interrupted\b[^\n]{0,160}\bwhat\s+should\s+claude\s+do\s+instead"
+    r"|what\s+should\s+claude\s+do\s+instead"
+    r")"
+)
 _READY_UI_LINE_RE = re.compile(
     r"(?ix)^\s*(?:"
     r"welcome\s+(?:back|to\s+claude(?:\s+code)?)|"
@@ -267,6 +274,9 @@ class ClaudeCodeOutputDetector:
         self._pending_ready_session_owner: str | None = None
         self._pending_ready_cursor: int | None = None
         self._pending_ready_evidence: frozenset[str] = frozenset()
+        self._session_ready_process_id: str | None = None
+        self._session_ready_session_owner: str | None = None
+        self._session_ready_evidence: frozenset[str] = frozenset()
         self._last_process_status: str | None = None
         self._context_complete = True
         self._semantic_context = ""
@@ -872,6 +882,43 @@ class ClaudeCodeOutputDetector:
             and self._pending_ready_cursor is not None
         )
 
+    def _clear_session_ready_profile(self) -> None:
+        """清除绑定当前受管进程的 Session READY 基线。"""
+
+        self._session_ready_process_id = None
+        self._session_ready_session_owner = None
+        self._session_ready_evidence = frozenset()
+
+    def _session_ready_profile_matches(
+        self,
+        *,
+        process_id: str,
+        session_owner: str,
+    ) -> bool:
+        return (
+            self._session_ready_process_id == process_id
+            and self._session_ready_session_owner == session_owner
+            and len(self._session_ready_evidence) >= 2
+        )
+
+    def _remember_session_ready_profile(
+        self,
+        *,
+        process_id: str,
+        session_owner: str,
+        evidence: frozenset[str],
+    ) -> None:
+        """仅记录有限 READY 类别，不保存输出或任务正文。"""
+
+        bounded_evidence = frozenset(
+            evidence & {"welcome", "manual_mode", "task_input"}
+        )
+        if len(bounded_evidence) < 2:
+            return
+        self._session_ready_process_id = process_id
+        self._session_ready_session_owner = session_owner
+        self._session_ready_evidence = bounded_evidence
+
     def _append_semantic_context(self, text: str) -> None:
         safe_text = redact_claude_code_output(text).strip()
         if not safe_text:
@@ -1055,6 +1102,12 @@ class ClaudeCodeOutputDetector:
         """仅接受可映射回当前安全动作的原生 Prompt 后缀。"""
 
         context = self._interaction_context
+        if (
+            action.kind == ClaudeCodeActionKind.UNKNOWN_PROMPT
+            and self._has_interrupt_menu_semantics(action.prompt_text)
+            and self._has_interrupt_menu_semantics(context)
+        ):
+            return context[-MAX_NATIVE_INTERACTION_PROMPT_CHARS:]
         folder_trust_source = self._folder_trust_action_source(context)
         if folder_trust_source:
             equivalent_action = self._classify_action(
@@ -1203,6 +1256,11 @@ class ClaudeCodeOutputDetector:
             or self._pending_ready_session_owner != session_owner
         ):
             self._clear_pending_ready()
+        if self._session_ready_process_id is not None and (
+            self._session_ready_process_id != process_id
+            or self._session_ready_session_owner != session_owner
+        ):
+            self._clear_session_ready_profile()
         output_candidate = redact_claude_code_output(delta.text).strip()
         interaction_safe_candidate = redact_claude_code_output(
             interaction_delta.text
@@ -1221,6 +1279,7 @@ class ClaudeCodeOutputDetector:
             self._progress_seen = False
             self._ready_seen = False
             self._clear_pending_ready()
+            self._clear_session_ready_profile()
             self._clear_semantic_context()
             self._clear_interaction_context()
             self._outbound_response_pending = False
@@ -1262,9 +1321,11 @@ class ClaudeCodeOutputDetector:
             self._action_required = None
             self._last_action_fingerprint = None
             self._clear_pending_ready()
+            self._clear_session_ready_profile()
             self._clear_interaction_context()
         if delta.limits_hit:
             self._clear_pending_ready()
+            self._clear_session_ready_profile()
 
         outbound_evidence_present = bool(
             self._outbound_inputs or self._matched_echoes
@@ -1353,16 +1414,43 @@ class ClaudeCodeOutputDetector:
             has_ready_ui_fragment,
             has_non_ready_ui_content,
         ) = self._ready_ui_fragment_evidence(candidate)
+        isolated_dollar_ui = self._is_isolated_dollar_ui(candidate)
         ready_context_evidence = self._ready_evidence(context_before) & {
             "welcome",
             "manual_mode",
         }
-        ready_state_signal = ready_signal and ready_ui_only
+        if folder_trust_semantics or (
+            prompt_structure and _AUTH_RE.search(candidate)
+        ):
+            self._clear_session_ready_profile()
+        session_profile_ready_signal = bool(
+            self._session_ready_profile_matches(
+                process_id=process_id,
+                session_owner=session_owner,
+            )
+            and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+            and has_ready_ui_fragment
+            and not has_non_ready_ui_content
+            and not progress_signal
+            and not completion_signal
+            and not failure_signal
+            and not delta.cursor_gap
+            and not delta.limits_hit
+            and not observation_errors
+        )
+        ready_state_signal = bool(
+            (ready_signal and ready_ui_only)
+            or session_profile_ready_signal
+        )
         if output_candidate:
             output_metadata = dict(isolation.metadata)
             if delta.limits_hit:
                 output_metadata["limits_hit"] = delta.limits_hit
             output_metadata["ready_ui_only"] = ready_ui_only
+            output_metadata["ui_non_activity"] = bool(
+                isolated_dollar_ui
+                and not has_non_ready_ui_content
+            )
             self._append_event(
                 events,
                 event_type=ClaudeCodeEventType.OUTPUT,
@@ -1385,6 +1473,7 @@ class ClaudeCodeOutputDetector:
                 metadata={
                     "limits_hit": delta.limits_hit,
                     "ready_ui_only": False,
+                    "ui_non_activity": False,
                 },
             )
         resumed_after_input = bool(
@@ -1442,38 +1531,51 @@ class ClaudeCodeOutputDetector:
                     timestamp=timestamp,
                     text=candidate,
                 )
-            action_source = (
-                candidate
-                if ready_state_signal
-                else self._action_source(candidate, context)
+            action = self._interrupt_menu_action(
+                candidate,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=delta.cursor_start,
+                cursor_end=delta.cursor_end,
+                timestamp=timestamp,
+                process_status=process_status,
+                interrupt_requested=interrupt_requested,
             )
-            if self._context_complete:
-                action = self._classify_action(
-                    action_source,
-                    process_id=process_id,
-                    session_owner=session_owner,
-                    cursor_start=delta.cursor_start,
-                    cursor_end=delta.cursor_end,
-                    timestamp=timestamp,
+            action_source = candidate
+            if action is None:
+                action_source = (
+                    candidate
+                    if ready_state_signal
+                    else self._action_source(candidate, context)
                 )
-            elif self._looks_like_prompt(candidate):
-                action = self._action(
-                    ClaudeCodeActionKind.UNKNOWN_PROMPT,
-                    "Claude Code emitted a prompt after an output gap",
-                    candidate,
-                    "unknown",
-                    process_id=process_id,
-                    session_owner=session_owner,
-                    cursor_start=delta.cursor_start,
-                    cursor_end=delta.cursor_end,
-                    timestamp=timestamp,
-                )
-                action_source = candidate
-            else:
-                action = None
+                if self._context_complete:
+                    action = self._classify_action(
+                        action_source,
+                        process_id=process_id,
+                        session_owner=session_owner,
+                        cursor_start=delta.cursor_start,
+                        cursor_end=delta.cursor_end,
+                        timestamp=timestamp,
+                    )
+                elif self._looks_like_prompt(candidate):
+                    action = self._action(
+                        ClaudeCodeActionKind.UNKNOWN_PROMPT,
+                        "Claude Code emitted a prompt after an output gap",
+                        candidate,
+                        "unknown",
+                        process_id=process_id,
+                        session_owner=session_owner,
+                        cursor_start=delta.cursor_start,
+                        cursor_end=delta.cursor_end,
+                        timestamp=timestamp,
+                    )
+                    action_source = candidate
+                else:
+                    action = None
             if (
                 ready_state_signal
                 and action is not None
+                and not self._has_interrupt_menu_semantics(action.prompt_text)
                 and action.kind
                 in {
                     ClaudeCodeActionKind.CLARIFICATION,
@@ -1562,6 +1664,23 @@ class ClaudeCodeOutputDetector:
                     cursor=delta.cursor_end,
                     evidence=ready_fragment_evidence | ready_context_evidence,
                 )
+            if (
+                ready_state_signal
+                and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+                and not delta.cursor_gap
+                and not delta.limits_hit
+                and not observation_errors
+                and not progress_signal
+                and not completion_signal
+                and not failure_signal
+                and action is None
+                and self._action_required is None
+            ):
+                self._remember_session_ready_profile(
+                    process_id=process_id,
+                    session_owner=session_owner,
+                    evidence=self._ready_evidence(context),
+                )
             if ready_state_signal:
                 self._ready_seen = True
 
@@ -1604,6 +1723,7 @@ class ClaudeCodeOutputDetector:
             self._action_required = None
             self._last_action_fingerprint = None
             self._clear_pending_ready()
+            self._clear_session_ready_profile()
             self._clear_interaction_context()
             self._clear_outbound_input_evidence()
         elif self._state == ClaudeCodeState.WORKING:
@@ -1796,6 +1916,18 @@ class ClaudeCodeOutputDetector:
         return evidence, True, len(ready_lines) != len(lines)
 
     @staticmethod
+    def _is_isolated_dollar_ui(candidate: str) -> bool:
+        """只识别规范化后完整独立的美元提示行。"""
+
+        return bool(_READY_DOLLAR_INPUT_RE.fullmatch(candidate.strip()))
+
+    @staticmethod
+    def _has_interrupt_menu_semantics(text: str) -> bool:
+        """识别本次中断后的有限菜单语义，不依赖历史输出单词。"""
+
+        return bool(_INTERRUPT_MENU_RE.search(text))
+
+    @staticmethod
     def _is_ready_ui_line(line: str) -> bool:
         """确认单行只包含欢迎语、模式提示或已识别的任务输入提示。"""
 
@@ -1857,6 +1989,41 @@ class ClaudeCodeOutputDetector:
             _FOLDER_TRUST_QUESTION_RE.search(text)
             or _FOLDER_TRUST_HEADING_RE.search(text)
             or _FOLDER_TRUST_YES_OPTION_RE.search(text)
+        )
+
+    def _interrupt_menu_action(
+        self,
+        candidate: str,
+        *,
+        process_id: str,
+        session_owner: str,
+        cursor_start: int,
+        cursor_end: int,
+        timestamp: float,
+        process_status: str | None,
+        interrupt_requested: bool,
+    ) -> ClaudeCodeActionRequired | None:
+        """仅在已请求中断且进程仍 active 时生成中断菜单动作。"""
+
+        if not (
+            interrupt_requested
+            and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+            and candidate
+            and self._has_interrupt_menu_semantics(candidate)
+            and not self._is_runtime_permission_prompt(candidate)
+            and not self._has_runtime_permission_semantics(candidate)
+        ):
+            return None
+        return self._action(
+            ClaudeCodeActionKind.UNKNOWN_PROMPT,
+            "Claude Code interruption menu is waiting for user input",
+            candidate,
+            "low",
+            process_id=process_id,
+            session_owner=session_owner,
+            cursor_start=cursor_start,
+            cursor_end=cursor_end,
+            timestamp=timestamp,
         )
 
     def _classify_action(
@@ -2387,7 +2554,10 @@ class ClaudeCodeOutputDetector:
     def _event_counts_as_activity(event: ClaudeCodeEvent) -> bool:
         if event.event_type != ClaudeCodeEventType.OUTPUT:
             return True
-        if event.metadata.get("ready_ui_only") is True:
+        if (
+            event.metadata.get("ready_ui_only") is True
+            or event.metadata.get("ui_non_activity") is True
+        ):
             return False
         return event.metadata.get("source") not in {
             "input_echo",

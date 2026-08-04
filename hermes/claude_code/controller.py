@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 import uuid
@@ -23,7 +24,6 @@ from hermes.claude_code.contracts import (
     ClaudeCodeRuntimeError,
     ClaudeCodeSnapshot,
     ClaudeCodeState,
-    build_claude_code_action_id,
 )
 from hermes.claude_code.controller_policy import (
     ClaudeCodeControllerPolicy,
@@ -40,6 +40,13 @@ _TERMINAL_STATES = frozenset(
     }
 )
 _MAX_RETAINED_INTERACTION_IDS = 128
+_INTERRUPT_MENU_RE = re.compile(
+    r"(?is)(?:"
+    r"press\s+ctrl\s*[- ]?c\s+again(?:\s+to\s+exit)?"
+    r"|interrupted\b[^\n]{0,160}\bwhat\s+should\s+claude\s+do\s+instead"
+    r"|what\s+should\s+claude\s+do\s+instead"
+    r")"
+)
 
 
 class ClaudeCodeControllerOutcome(str, Enum):
@@ -163,6 +170,7 @@ class _ControllerTaskRound:
     ready_after_interrupt_seen: bool = False
     post_interrupt_work_seen: bool = False
     completion_after_interrupt_seen: bool = False
+    interrupt_menu_seen: bool = False
     failure_after_instruction_seen: bool = False
     failure_cursor: int | None = None
     ready_after_failure_seen: bool = False
@@ -1018,6 +1026,7 @@ class ClaudeCodeController:
                     current_round.ready_after_interrupt_seen = False
                     current_round.post_interrupt_work_seen = False
                     current_round.completion_after_interrupt_seen = False
+                    current_round.interrupt_menu_seen = False
                     current_round.stable_ready_count = 0
                 except ClaudeCodeRuntimeError as runtime_error:
                     if runtime_error.delivery_unknown:
@@ -1232,6 +1241,13 @@ class ClaudeCodeController:
                 terminal_observation=True,
             )
         if snapshot.action_required is not None:
+            if self._is_interrupt_menu_snapshot(task, snapshot):
+                round_result = self._try_finalize_running_round_locked(
+                    task,
+                    snapshot,
+                )
+                if round_result is not None:
+                    return round_result
             return self._make_result_locked(
                 task,
                 self._action_outcome(snapshot.action_required),
@@ -1380,7 +1396,9 @@ class ClaudeCodeController:
                 snapshot,
                 outcome=terminal_outcome,
             )
-        if snapshot.action_required is not None:
+        if snapshot.action_required is not None and not (
+            self._is_interrupt_menu_snapshot(task, snapshot)
+        ):
             return self._make_result_locked(
                 task,
                 self._action_outcome(snapshot.action_required),
@@ -1388,46 +1406,24 @@ class ClaudeCodeController:
         round_result = self._try_finalize_running_round_locked(task, snapshot)
         if round_result is not None:
             return round_result
+        if snapshot.action_required is not None:
+            return self._make_result_locked(
+                task,
+                self._action_outcome(snapshot.action_required),
+            )
         if (
             task.consecutive_empty_reads
             >= self._policy.max_consecutive_empty_reads
         ):
-            stalled = ClaudeCodeActionRequired(
-                kind=ClaudeCodeActionKind.STALLED,
-                summary="Claude Code made no observable progress",
-                prompt_text="",
-                options=(),
-                risk="low",
-                cursor=snapshot.raw_cursor,
-                action_id=build_claude_code_action_id(
-                    process_id=task.process_id,
-                    session_owner=task.session_owner,
-                    kind=ClaudeCodeActionKind.STALLED,
-                    prompt_text="",
-                    options=(),
-                    cursor_start=snapshot.raw_cursor,
-                    cursor_end=snapshot.raw_cursor,
-                ),
-                process_id=task.process_id,
-                session_owner=task.session_owner,
-                cursor_start=snapshot.raw_cursor,
-                cursor_end=snapshot.raw_cursor,
-                created_at=(
-                    snapshot.last_observed_at
-                    if snapshot.last_observed_at is not None
-                    else self._now()
-                ),
-            )
-            snapshot = replace(
+            stalled_snapshot = replace(
                 snapshot,
                 state=ClaudeCodeState.UNKNOWN,
-                action_required=stalled,
+                action_required=None,
             )
-            task.last_snapshot = snapshot
             return self._make_result_locked(
                 task,
                 ClaudeCodeControllerOutcome.STALLED,
-                snapshot=snapshot,
+                snapshot=stalled_snapshot,
             )
         limit_outcome = self._limit_outcome_locked(task)
         if limit_outcome is not None:
@@ -1698,6 +1694,7 @@ class ClaudeCodeController:
         current_round.ready_after_interrupt_seen = False
         current_round.post_interrupt_work_seen = False
         current_round.completion_after_interrupt_seen = False
+        current_round.interrupt_menu_seen = False
         current_round.failure_after_instruction_seen = False
         current_round.failure_cursor = None
         current_round.ready_after_failure_seen = False
@@ -1749,6 +1746,38 @@ class ClaudeCodeController:
                 boundary=current_round.latest_instruction_cursor,
             )
         )
+        interrupt_menu_snapshot = self._is_interrupt_menu_snapshot(
+            task,
+            snapshot,
+        )
+        if interrupt_menu_snapshot and not observation_degraded:
+            interrupt_cursor = current_round.interrupt_requested_cursor
+            assert interrupt_cursor is not None
+            events_after_interrupt = tuple(
+                event
+                for event in events
+                if event.cursor_end > interrupt_cursor
+            )
+            post_interrupt_work = any(
+                event.event_type
+                in {
+                    ClaudeCodeEventType.PROGRESS,
+                    ClaudeCodeEventType.COMPLETION_SIGNAL,
+                    ClaudeCodeEventType.FAILURE_SIGNAL,
+                }
+                or (
+                    event.event_type == ClaudeCodeEventType.OUTPUT
+                    and event.metadata.get("ready_ui_only") is not True
+                    and event.metadata.get("ui_non_activity") is not True
+                    and event.metadata.get("source")
+                    not in {"input_echo", "unconfirmed_after_input"}
+                    and not _INTERRUPT_MENU_RE.search(event.text)
+                )
+                for event in events_after_interrupt
+            )
+            if not post_interrupt_work:
+                current_round.interrupt_menu_seen = True
+                current_round.post_interrupt_observation_seen = True
         failure_seen_this_observation = False
         activity_seen_this_observation = False
         for event in events_after_instruction:
@@ -1899,7 +1928,10 @@ class ClaudeCodeController:
             return True
         if event.event_type != ClaudeCodeEventType.OUTPUT:
             return False
-        if event.metadata.get("ready_ui_only") is True:
+        if (
+            event.metadata.get("ready_ui_only") is True
+            or event.metadata.get("ui_non_activity") is True
+        ):
             return False
         source = event.metadata.get("source")
         if source not in {None, "mixed"}:
@@ -2014,7 +2046,9 @@ class ClaudeCodeController:
         current_round = task.active_round
         if current_round is None or current_round.terminal_state is not None:
             return None
-        if snapshot.action_required is not None:
+        if snapshot.action_required is not None and not (
+            self._is_interrupt_menu_snapshot(task, snapshot)
+        ):
             return None
         if not self._snapshot_has_active_process(snapshot):
             return None
@@ -2022,6 +2056,18 @@ class ClaudeCodeController:
             current_round.stable_ready_count
             >= self._policy.startup_ready_observations
         )
+        if (
+            current_round.interrupt_confirmed
+            and current_round.real_activity_seen
+            and current_round.interrupt_menu_seen
+            and not current_round.post_interrupt_work_seen
+            and not current_round.completion_after_interrupt_seen
+        ):
+            return self._finalize_round_locked(
+                task,
+                snapshot,
+                ClaudeCodeState.INTERRUPTED,
+            )
         if (
             current_round.interrupt_confirmed
             and current_round.real_activity_seen
@@ -2279,6 +2325,13 @@ class ClaudeCodeController:
                 )
             snapshot = self._current_snapshot_locked(task)
             if snapshot.action_required is not None:
+                if self._is_interrupt_menu_snapshot(task, snapshot):
+                    round_result = self._try_finalize_running_round_locked(
+                        task,
+                        snapshot,
+                    )
+                    if round_result is not None:
+                        return round_result
                 return self._make_result_locked(
                     task,
                     self._action_outcome(snapshot.action_required),
@@ -2504,6 +2557,41 @@ class ClaudeCodeController:
         """只按已有 ProcessStatus 确认底层进程仍处于 active 状态。"""
 
         return snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+
+    @staticmethod
+    def _is_interrupt_menu_action(
+        action: ClaudeCodeActionRequired | None,
+    ) -> bool:
+        """只把本次 Ctrl+C 后的明确中断菜单视为中断证据。"""
+
+        return bool(
+            action is not None
+            and action.kind == ClaudeCodeActionKind.UNKNOWN_PROMPT
+            and _INTERRUPT_MENU_RE.search(action.prompt_text)
+        )
+
+    def _is_interrupt_menu_snapshot(
+        self,
+        task: _ControllerTask,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> bool:
+        current_round = task.active_round
+        interrupt_cursor = (
+            current_round.interrupt_requested_cursor
+            if current_round is not None
+            else None
+        )
+        return bool(
+            current_round is not None
+            and task.interrupt_requested
+            and current_round.interrupt_confirmed
+            and interrupt_cursor is not None
+            and snapshot.raw_cursor > interrupt_cursor
+            and self._snapshot_has_active_process(snapshot)
+            and self._is_interrupt_menu_action(snapshot.action_required)
+            and snapshot.action_required is not None
+            and snapshot.action_required.cursor_end > interrupt_cursor
+        )
 
     def _limit_outcome_locked(
         self,
