@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -74,6 +75,9 @@ class ClaudeCodeControllerResult:
     limits_hit: tuple[str, ...] = ()
     # 只说明本会话首条任务是否成功提交，不保存任务正文。
     initial_instruction_submitted: bool = False
+    # 轮次终态与进程终态相互独立；运行中的 CC 也可以结束一个任务轮次。
+    round_id: str | None = None
+    round_terminal_state: ClaudeCodeState | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ClaudeCodeSnapshot):
@@ -101,6 +105,15 @@ class ClaudeCodeControllerResult:
             raise ValueError("limits_hit must contain non-empty strings")
         if not isinstance(self.initial_instruction_submitted, bool):
             raise ValueError("initial_instruction_submitted must be a boolean")
+        if self.round_id is not None and (
+            not isinstance(self.round_id, str) or not self.round_id
+        ):
+            raise ValueError("round_id must be a non-empty string or None")
+        if self.round_terminal_state is not None:
+            if self.round_terminal_state not in _TERMINAL_STATES:
+                raise ValueError("round_terminal_state must be terminal or None")
+            if self.round_id is None:
+                raise ValueError("round_terminal_state requires round_id")
 
     @property
     def process_id(self) -> str:
@@ -111,8 +124,49 @@ class ClaudeCodeControllerResult:
         return self.snapshot.action_required
 
     @property
+    def state(self) -> ClaudeCodeState:
+        """优先暴露当前任务轮次终态，不伪造底层 Snapshot 的进程状态。"""
+
+        return self.round_terminal_state or self.snapshot.state
+
+    @property
+    def round_terminal(self) -> bool:
+        return self.round_terminal_state is not None
+
+    @property
+    def process_active(self) -> bool:
+        return self.snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+
+    @property
     def terminal(self) -> bool:
-        return _snapshot_is_terminal(self.snapshot)
+        return self.round_terminal or _snapshot_is_terminal(self.snapshot)
+
+
+@dataclass(slots=True)
+class _ControllerTaskRound:
+    """只保存单次任务轮次的可验证边界与事实，不保存任务或回复正文。"""
+
+    round_id: str
+    round_start_cursor: int
+    latest_instruction_cursor: int
+    round_started_at: float
+    instruction_submitted: bool = True
+    real_activity_seen: bool = False
+    activity_after_instruction_seen: bool = False
+    completion_evidence_seen: bool = False
+    cursor_continuous: bool = True
+    ready_after_instruction_seen: bool = False
+    stable_ready_count: int = 0
+    interrupt_confirmed: bool = False
+    interrupt_requested_cursor: int | None = None
+    post_interrupt_observation_seen: bool = False
+    ready_after_interrupt_seen: bool = False
+    post_interrupt_work_seen: bool = False
+    completion_after_interrupt_seen: bool = False
+    failure_after_instruction_seen: bool = False
+    failure_cursor: int | None = None
+    terminal_state: ClaudeCodeState | None = None
+    terminal_at: float | None = None
 
 @dataclass(slots=True)
 class _ControllerTask:
@@ -131,6 +185,13 @@ class _ControllerTask:
     startup_ready_observation_count: int = 0
     consecutive_empty_reads: int = 0
     output_used: int = 0
+    round_sequence: int = 0
+    active_round: _ControllerTaskRound | None = None
+    terminal_round_results: OrderedDict[str, ClaudeCodeControllerResult] = field(
+        default_factory=OrderedDict,
+        repr=False,
+    )
+    latest_terminal_round_id: str | None = None
     last_snapshot: ClaudeCodeSnapshot | None = None
     last_result: ClaudeCodeControllerResult | None = None
     terminal_events: tuple[ClaudeCodeEvent, ...] = ()
@@ -157,6 +218,7 @@ class _ControllerTask:
 class _TerminalTask:
     session_owner: str
     result: ClaudeCodeControllerResult
+    round_results: OrderedDict[str, ClaudeCodeControllerResult]
 
 
 def _snapshot_is_terminal(snapshot: ClaudeCodeSnapshot) -> bool:
@@ -430,7 +492,10 @@ class ClaudeCodeController:
 
         task.initial_instruction_submitted = True
         task.startup_ready_observation_count = 0
-        task.consecutive_empty_reads = 0
+        self._begin_round_locked(
+            task,
+            round_start_cursor=snapshot.raw_cursor,
+        )
         return self._observe_and_resolve_locked(
             task,
             error_type="poll_failed",
@@ -459,6 +524,24 @@ class ClaudeCodeController:
             >= self._policy.startup_ready_observations
         )
 
+    def _new_round_submission_ready(
+        self,
+        task: _ControllerTask,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> bool:
+        """首条任务沿用启动门禁；后续轮次仅复用已可信收敛的 READY。"""
+
+        if task.active_round is not None:
+            return False
+        if not task.initial_instruction_submitted:
+            return self._deferred_initial_submission_ready(task, snapshot)
+        latest = self._stored_round_result_locked(task, None)
+        return bool(
+            latest is not None
+            and latest.round_terminal
+            and self._initial_submission_ready(snapshot)
+        )
+
     def poll(
         self,
         *,
@@ -466,6 +549,7 @@ class ClaudeCodeController:
         process_id: str,
         cancel_checker: Callable[[], bool] | None = None,
         terminal_observation: bool = False,
+        round_id: str | None = None,
     ) -> ClaudeCodeControllerResult:
         """执行恰好一个有界工作轮次，不 sleep、不自动输入。
 
@@ -476,13 +560,27 @@ class ClaudeCodeController:
         self._require_cancel_checker(cancel_checker)
         if not isinstance(terminal_observation, bool):
             raise TypeError("terminal_observation must be a boolean")
-        task, terminal = self._resolve_task(session_owner, process_id)
+        self._require_round_id(round_id)
+        task, terminal = self._resolve_task(
+            session_owner,
+            process_id,
+            round_id=round_id,
+        )
         if terminal is not None:
             return terminal
         assert task is not None
         with task.lock:
             if task.archived:
                 return self._archived_result(task)
+            if round_id is None and task.active_round is None:
+                return self._poll_between_rounds_locked(
+                    task,
+                    cancel_checker=cancel_checker,
+                )
+            stored_round = self._stored_round_result_locked(task, round_id)
+            if stored_round is not None:
+                return stored_round
+            self._assert_active_round_matches_locked(task, round_id)
             return self._poll_locked(
                 task,
                 cancel_checker=cancel_checker,
@@ -508,7 +606,6 @@ class ClaudeCodeController:
             raise self._terminal_error(process_id)
         assert task is not None
         with task.lock:
-            self._guard_input_locked(task)
             snapshot = self._current_snapshot_locked(task)
             action = snapshot.action_required
             if action is not None and action.kind != ClaudeCodeActionKind.STALLED:
@@ -520,8 +617,14 @@ class ClaudeCodeController:
                         "action_kind": action.kind.value,
                     },
                 )
+            active_round = task.active_round
             initial_submission = not task.initial_instruction_submitted
-            if initial_submission and not self._deferred_initial_submission_ready(
+            starts_new_round = active_round is None
+            if starts_new_round:
+                self._guard_new_round_input_locked(task, snapshot)
+            else:
+                self._guard_input_locked(task)
+            if starts_new_round and not self._new_round_submission_ready(
                 task,
                 snapshot,
             ):
@@ -545,8 +648,18 @@ class ClaudeCodeController:
             if initial_submission:
                 task.initial_instruction_submitted = True
                 task.startup_ready_observation_count = 0
-            task.interrupt_requested = False
-            task.consecutive_empty_reads = 0
+            if starts_new_round:
+                self._begin_round_locked(
+                    task,
+                    round_start_cursor=snapshot.raw_cursor,
+                )
+            else:
+                assert active_round is not None
+                self._note_round_instruction_locked(
+                    task,
+                    active_round,
+                    instruction_cursor=snapshot.raw_cursor,
+                )
             if action is not None:
                 task.last_snapshot = replace(
                     self._current_snapshot_locked(task),
@@ -764,6 +877,12 @@ class ClaudeCodeController:
                 )
                 task.interrupt_requested = False
                 task.consecutive_empty_reads = 0
+                if task.active_round is not None:
+                    self._note_round_instruction_locked(
+                        task,
+                        task.active_round,
+                        instruction_cursor=snapshot.raw_cursor,
+                    )
                 self._clear_current_interaction_locked(
                     task,
                     snapshot=snapshot,
@@ -788,6 +907,7 @@ class ClaudeCodeController:
         session_owner: str,
         process_id: str,
         cancel_checker: Callable[[], bool] | None = None,
+        round_id: str | None = None,
     ) -> ClaudeCodeControllerResult:
         """有界等待待处理动作、终态或任一工作流停止条件。"""
 
@@ -796,12 +916,14 @@ class ClaudeCodeController:
             session_owner=session_owner,
             process_id=process_id,
             cancel_checker=cancel_checker,
+            round_id=round_id,
         )
         while not self._wait_for_action_complete(result):
             result = self._wait_and_poll(
                 session_owner=session_owner,
                 process_id=process_id,
                 cancel_checker=cancel_checker,
+                round_id=round_id,
             )
         return result
 
@@ -811,6 +933,7 @@ class ClaudeCodeController:
         session_owner: str,
         process_id: str,
         cancel_checker: Callable[[], bool] | None = None,
+        round_id: str | None = None,
     ) -> ClaudeCodeControllerResult:
         """有界等待终态，并在任何待处理动作出现时提前返回。"""
 
@@ -819,12 +942,14 @@ class ClaudeCodeController:
             session_owner=session_owner,
             process_id=process_id,
             cancel_checker=cancel_checker,
+            round_id=round_id,
         )
         while not self._wait_for_terminal_complete(result):
             result = self._wait_and_poll(
                 session_owner=session_owner,
                 process_id=process_id,
                 cancel_checker=cancel_checker,
+                round_id=round_id,
             )
         return result
 
@@ -834,15 +959,46 @@ class ClaudeCodeController:
         session_owner: str,
         process_id: str,
         cancel_checker: Callable[[], bool] | None = None,
+        round_id: str | None = None,
     ) -> ClaudeCodeControllerResult:
         """请求一次协作式中断并有限观察；未收敛时不升级为 kill。"""
 
         self._require_cancel_checker(cancel_checker)
-        task, terminal = self._resolve_task(session_owner, process_id)
+        self._require_round_id(round_id)
+        task, terminal = self._resolve_task(
+            session_owner,
+            process_id,
+            round_id=round_id,
+        )
         if terminal is not None:
             return terminal
         assert task is not None
         with task.lock:
+            stored_round = self._stored_round_result_locked(task, round_id)
+            if stored_round is not None:
+                return stored_round
+            self._assert_active_round_matches_locked(task, round_id)
+            current_round = task.active_round
+            if current_round is None:
+                raise ClaudeCodeControllerError(
+                    "no_active_round",
+                    "Claude Code has no active task round to interrupt",
+                    details={"process_id": process_id},
+                )
+            latest_snapshot = self._current_snapshot_locked(task)
+            if (
+                not task.interrupt_requested
+                and latest_snapshot.state == ClaudeCodeState.READY
+                and current_round.stable_ready_count > 0
+            ):
+                settled = self._observe_and_resolve_locked(
+                    task,
+                    error_type="interrupt_failed",
+                )
+                if settled.round_terminal:
+                    return settled
+                if settled.snapshot.state == ClaudeCodeState.READY:
+                    return settled
             if not task.interrupt_requested:
                 interrupted_snapshot = task.last_snapshot
                 try:
@@ -851,6 +1007,17 @@ class ClaudeCodeController:
                         process_id=process_id,
                     )
                     task.interrupt_requested = True
+                    current_round.interrupt_confirmed = True
+                    current_round.interrupt_requested_cursor = (
+                        interrupted_snapshot.raw_cursor
+                        if interrupted_snapshot is not None
+                        else current_round.latest_instruction_cursor
+                    )
+                    current_round.post_interrupt_observation_seen = False
+                    current_round.ready_after_interrupt_seen = False
+                    current_round.post_interrupt_work_seen = False
+                    current_round.completion_after_interrupt_seen = False
+                    current_round.stable_ready_count = 0
                 except ClaudeCodeRuntimeError as runtime_error:
                     if runtime_error.delivery_unknown:
                         task.interrupt_requested = True
@@ -979,16 +1146,30 @@ class ClaudeCodeController:
         *,
         session_owner: str,
         process_id: str,
+        round_id: str | None = None,
     ) -> ClaudeCodeControllerResult:
         """返回 Controller 已保存的最新有界结果，不读取进程。"""
 
-        task, terminal = self._resolve_task(session_owner, process_id)
+        self._require_round_id(round_id)
+        task, terminal = self._resolve_task(
+            session_owner,
+            process_id,
+            round_id=round_id,
+        )
         if terminal is not None:
             return terminal
         assert task is not None
         with task.lock:
             if task.archived:
                 return self._archived_result(task)
+            stored_round = self._stored_round_result_locked(task, round_id)
+            if stored_round is not None:
+                return stored_round
+            self._assert_active_round_matches_locked(task, round_id)
+            if task.active_round is None:
+                latest = self._stored_round_result_locked(task, None)
+                if latest is not None:
+                    return latest
             snapshot = self._current_snapshot_locked(task)
             outcome = self._current_outcome_locked(task, snapshot)
             return self._make_result_locked(task, outcome, snapshot=snapshot)
@@ -1000,6 +1181,11 @@ class ClaudeCodeController:
         cancel_checker: Callable[[], bool] | None,
         terminal_observation: bool = False,
     ) -> ClaudeCodeControllerResult:
+        if task.active_round is None:
+            return self._poll_between_rounds_locked(
+                task,
+                cancel_checker=cancel_checker,
+            )
         if task.last_snapshot is None:
             if task.cancelled or self._call_cancel_checker(
                 cancel_checker,
@@ -1043,6 +1229,87 @@ class ClaudeCodeController:
                 task,
                 error_type="poll_failed",
                 terminal_observation=True,
+            )
+        if snapshot.action_required is not None:
+            return self._make_result_locked(
+                task,
+                self._action_outcome(snapshot.action_required),
+            )
+        round_result = self._try_finalize_running_round_locked(task, snapshot)
+        if round_result is not None:
+            return round_result
+        if task.cancelled or self._call_cancel_checker(
+            cancel_checker,
+            "poll_failed",
+        ):
+            task.cancelled = True
+            return self._make_result_locked(
+                task,
+                ClaudeCodeControllerOutcome.CANCELLED,
+            )
+        limit_outcome = self._limit_outcome_locked(task)
+        if limit_outcome is not None:
+            return self._make_result_locked(task, limit_outcome)
+        if self._now() >= task.deadline:
+            return self._make_result_locked(
+                task,
+                ClaudeCodeControllerOutcome.DEADLINE_EXCEEDED,
+            )
+        return self._observe_and_resolve_locked(
+            task,
+            error_type="poll_failed",
+        )
+
+    def _poll_between_rounds_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        cancel_checker: Callable[[], bool] | None,
+    ) -> ClaudeCodeControllerResult:
+        """保留上一轮冻结结果，同时仍可在真实进程退出时走既有收敛路径。"""
+
+        stored_round = self._stored_round_result_locked(task, None)
+        if stored_round is not None:
+            if self._terminal_probe_is_inactive_locked(task):
+                return self._observe_and_resolve_locked(
+                    task,
+                    error_type="poll_failed",
+                    terminal_observation=True,
+                )
+            return stored_round
+        if task.last_snapshot is None:
+            if task.cancelled or self._call_cancel_checker(
+                cancel_checker,
+                "poll_failed",
+            ):
+                task.cancelled = True
+                raise ClaudeCodeControllerError(
+                    "cancelled",
+                    (
+                        "Claude Code Controller task is cancelled before "
+                        "its first observation"
+                    ),
+                    details={"process_id": task.process_id},
+                )
+            if self._now() >= task.deadline:
+                raise ClaudeCodeControllerError(
+                    "deadline_exceeded",
+                    (
+                        "Claude Code Controller task deadline was reached "
+                        "before its first observation"
+                    ),
+                    details={"process_id": task.process_id},
+                )
+            return self._observe_and_resolve_locked(
+                task,
+                error_type="poll_failed",
+            )
+        snapshot = self._current_snapshot_locked(task)
+        if _snapshot_is_terminal(snapshot):
+            return self._finalize_terminal_locked(
+                task,
+                snapshot,
+                outcome=ClaudeCodeControllerOutcome.TERMINAL,
             )
         if snapshot.action_required is not None:
             return self._make_result_locked(
@@ -1117,6 +1384,9 @@ class ClaudeCodeController:
                 task,
                 self._action_outcome(snapshot.action_required),
             )
+        round_result = self._try_finalize_running_round_locked(task, snapshot)
+        if round_result is not None:
+            return round_result
         if (
             task.consecutive_empty_reads
             >= self._policy.max_consecutive_empty_reads
@@ -1188,6 +1458,9 @@ class ClaudeCodeController:
                 outcome=ClaudeCodeControllerOutcome.TERMINAL,
                 suppress_actions=True,
             )
+        round_result = self._try_finalize_running_round_locked(task, snapshot)
+        if round_result is not None:
+            return round_result
         return None
 
     def _clear_interrupt_action_locked(
@@ -1328,8 +1601,375 @@ class ClaudeCodeController:
             current=snapshot,
         )
         task.last_snapshot = snapshot
+        self._record_round_observation_locked(
+            task,
+            previous=previous,
+            snapshot=snapshot,
+        )
         if task.observation_count >= self._policy.max_observation_count:
             task.limits_hit.add("observation_limit_reached")
+
+    def _begin_round_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        round_start_cursor: int,
+    ) -> _ControllerTaskRound:
+        """仅在普通任务指令确认送达后建立新轮次，不携带指令正文。"""
+
+        if task.active_round is not None:
+            raise ClaudeCodeControllerError(
+                "instruction_failed",
+                "Claude Code already has an active task round",
+                details={"process_id": task.process_id},
+            )
+        if (
+            isinstance(round_start_cursor, bool)
+            or not isinstance(round_start_cursor, int)
+            or round_start_cursor < 0
+        ):
+            raise ClaudeCodeControllerError(
+                "instruction_failed",
+                "Claude Code task round cursor is invalid",
+                details={"process_id": task.process_id},
+            )
+        task.round_sequence += 1
+        now = self._now()
+        round_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                (
+                    "hermes:claude-code-round:"
+                    f"{task.session_owner}:{task.process_id}:{task.round_sequence}"
+                ),
+            )
+        )
+        current_round = _ControllerTaskRound(
+            round_id=round_id,
+            round_start_cursor=round_start_cursor,
+            latest_instruction_cursor=round_start_cursor,
+            round_started_at=now,
+        )
+        task.active_round = current_round
+        task.deadline = now + self._policy.total_deadline
+        task.observation_count = 0
+        task.terminal_observation_count = 0
+        task.consecutive_empty_reads = 0
+        task.cancelled = False
+        task.interrupt_requested = False
+        task.limits_hit.clear()
+        task.terminal_events = ()
+        task.last_result = None
+        return current_round
+
+    def _note_round_instruction_locked(
+        self,
+        task: _ControllerTask,
+        current_round: _ControllerTaskRound,
+        *,
+        instruction_cursor: int,
+    ) -> None:
+        """补充输入仍属于当前轮次，但必须等待该输入后的新事实再收敛。"""
+
+        if task.active_round is not current_round:
+            raise ClaudeCodeControllerError(
+                "instruction_failed",
+                "Claude Code task round is no longer active",
+                details={"process_id": task.process_id},
+            )
+        if (
+            isinstance(instruction_cursor, bool)
+            or not isinstance(instruction_cursor, int)
+            or instruction_cursor < 0
+        ):
+            raise ClaudeCodeControllerError(
+                "instruction_failed",
+                "Claude Code task round cursor is invalid",
+                details={"process_id": task.process_id},
+            )
+        current_round.latest_instruction_cursor = instruction_cursor
+        current_round.activity_after_instruction_seen = False
+        current_round.ready_after_instruction_seen = False
+        current_round.stable_ready_count = 0
+        current_round.interrupt_confirmed = False
+        current_round.interrupt_requested_cursor = None
+        current_round.post_interrupt_observation_seen = False
+        current_round.ready_after_interrupt_seen = False
+        current_round.post_interrupt_work_seen = False
+        current_round.completion_after_interrupt_seen = False
+        current_round.failure_after_instruction_seen = False
+        current_round.failure_cursor = None
+        task.interrupt_requested = False
+        task.consecutive_empty_reads = 0
+
+    def _record_round_observation_locked(
+        self,
+        task: _ControllerTask,
+        *,
+        previous: ClaudeCodeSnapshot | None,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> None:
+        """只把当前轮次边界之后的非 echo 增量事实并入轮次状态。"""
+
+        current_round = task.active_round
+        if current_round is None or not current_round.instruction_submitted:
+            return
+        events = tuple(
+            event
+            for event in snapshot.events
+            if event.cursor_end > current_round.round_start_cursor
+        )
+        if any(
+            event.event_type == ClaudeCodeEventType.CURSOR_GAP
+            for event in events
+        ):
+            current_round.cursor_continuous = False
+            current_round.stable_ready_count = 0
+
+        events_after_instruction = tuple(
+            event
+            for event in events
+            if event.cursor_end > current_round.latest_instruction_cursor
+        )
+        for event in events_after_instruction:
+            if self._event_is_round_failure(event):
+                current_round.failure_after_instruction_seen = True
+                current_round.failure_cursor = event.cursor_end
+                continue
+            if not self._event_is_round_activity(event):
+                continue
+            current_round.real_activity_seen = True
+            current_round.activity_after_instruction_seen = True
+            if event.event_type == ClaudeCodeEventType.COMPLETION_SIGNAL:
+                current_round.completion_evidence_seen = True
+            if (
+                current_round.failure_cursor is not None
+                and event.cursor_end > current_round.failure_cursor
+            ):
+                current_round.failure_after_instruction_seen = False
+                current_round.failure_cursor = None
+
+        if self._is_new_round_ready_observation(
+            current_round,
+            previous=previous,
+            snapshot=snapshot,
+        ):
+            current_round.ready_after_instruction_seen = True
+
+        interrupt_cursor = current_round.interrupt_requested_cursor
+        if (
+            current_round.interrupt_confirmed
+            and interrupt_cursor is not None
+            and current_round.cursor_continuous
+        ):
+            events_after_interrupt = tuple(
+                event
+                for event in events
+                if event.cursor_end > interrupt_cursor
+            )
+            if any(
+                event.event_type == ClaudeCodeEventType.PROGRESS
+                and self._event_is_round_activity(event)
+                for event in events_after_interrupt
+            ):
+                current_round.post_interrupt_work_seen = True
+            if any(
+                event.event_type == ClaudeCodeEventType.COMPLETION_SIGNAL
+                for event in events_after_interrupt
+            ):
+                current_round.completion_after_interrupt_seen = True
+            if self._is_new_interrupt_ready_observation(
+                previous=previous,
+                snapshot=snapshot,
+                interrupt_cursor=interrupt_cursor,
+            ):
+                current_round.post_interrupt_observation_seen = True
+                current_round.ready_after_interrupt_seen = True
+
+        if self._round_ready_observation(current_round, snapshot):
+            current_round.stable_ready_count += 1
+        else:
+            current_round.stable_ready_count = 0
+
+    @staticmethod
+    def _event_is_round_activity(event: ClaudeCodeEvent) -> bool:
+        return event.event_type in {
+            ClaudeCodeEventType.PROGRESS,
+            ClaudeCodeEventType.COMPLETION_SIGNAL,
+        }
+
+    @staticmethod
+    def _event_is_round_failure(event: ClaudeCodeEvent) -> bool:
+        return event.event_type == ClaudeCodeEventType.FAILURE_SIGNAL
+
+    def _is_new_round_ready_observation(
+        self,
+        current_round: _ControllerTaskRound,
+        *,
+        previous: ClaudeCodeSnapshot | None,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> bool:
+        """只接受提交后新出现的 READY，不让旧 READY 或普通重绘越过轮次边界。"""
+
+        if not (
+            current_round.activity_after_instruction_seen
+            and snapshot.raw_cursor > current_round.latest_instruction_cursor
+            and snapshot.state == ClaudeCodeState.READY
+            and snapshot.action_required is None
+            and self._snapshot_has_active_process(snapshot)
+        ):
+            return False
+        return previous is None or (
+            previous.state != ClaudeCodeState.READY
+            or previous.raw_cursor <= current_round.latest_instruction_cursor
+        )
+
+    def _is_new_interrupt_ready_observation(
+        self,
+        *,
+        previous: ClaudeCodeSnapshot | None,
+        snapshot: ClaudeCodeSnapshot,
+        interrupt_cursor: int,
+    ) -> bool:
+        """中断后的 READY 必须是新的状态事实，而不是 Ctrl+C echo 或旧界面重绘。"""
+
+        if not (
+            snapshot.raw_cursor > interrupt_cursor
+            and snapshot.state == ClaudeCodeState.READY
+            and snapshot.action_required is None
+            and self._snapshot_has_active_process(snapshot)
+        ):
+            return False
+        return previous is None or previous.state != ClaudeCodeState.READY
+
+    def _round_ready_observation(
+        self,
+        current_round: _ControllerTaskRound,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> bool:
+        if not (
+            current_round.cursor_continuous
+            and current_round.activity_after_instruction_seen
+            and current_round.ready_after_instruction_seen
+            and snapshot.raw_cursor > current_round.latest_instruction_cursor
+            and snapshot.state == ClaudeCodeState.READY
+            and snapshot.action_required is None
+            and self._snapshot_has_active_process(snapshot)
+        ):
+            return False
+        interrupt_cursor = current_round.interrupt_requested_cursor
+        return (
+            not current_round.interrupt_confirmed
+            or (
+                interrupt_cursor is not None
+                and current_round.post_interrupt_observation_seen
+                and current_round.ready_after_interrupt_seen
+                and snapshot.raw_cursor > interrupt_cursor
+            )
+        )
+
+    def _try_finalize_running_round_locked(
+        self,
+        task: _ControllerTask,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> ClaudeCodeControllerResult | None:
+        """仅凭本轮提交后的组合事实收敛 running 进程中的任务轮次。"""
+
+        current_round = task.active_round
+        if current_round is None or current_round.terminal_state is not None:
+            return None
+        if snapshot.action_required is not None:
+            return None
+        if not self._snapshot_has_active_process(snapshot):
+            return None
+        ready_confirmed = (
+            current_round.stable_ready_count
+            >= self._policy.startup_ready_observations
+        )
+        if (
+            current_round.interrupt_confirmed
+            and current_round.real_activity_seen
+            and current_round.post_interrupt_observation_seen
+            and not current_round.post_interrupt_work_seen
+            and not current_round.completion_after_interrupt_seen
+            and ready_confirmed
+        ):
+            return self._finalize_round_locked(
+                task,
+                snapshot,
+                ClaudeCodeState.INTERRUPTED,
+            )
+        if (
+            current_round.instruction_submitted
+            and current_round.real_activity_seen
+            and current_round.activity_after_instruction_seen
+            and current_round.cursor_continuous
+            and not current_round.failure_after_instruction_seen
+            and ready_confirmed
+        ):
+            return self._finalize_round_locked(
+                task,
+                snapshot,
+                ClaudeCodeState.COMPLETED,
+            )
+        return None
+
+    def _finalize_round_locked(
+        self,
+        task: _ControllerTask,
+        snapshot: ClaudeCodeSnapshot,
+        terminal_state: ClaudeCodeState,
+    ) -> ClaudeCodeControllerResult:
+        """冻结一个 running CC 的任务轮次；不清理进程、SessionRef 或 PTY。"""
+
+        current_round = task.active_round
+        if current_round is None:
+            raise ClaudeCodeControllerError(
+                "controller_round_not_found",
+                "Claude Code has no active task round to finalize",
+                details={"process_id": task.process_id},
+            )
+        if terminal_state not in _TERMINAL_STATES:
+            raise ClaudeCodeControllerError(
+                "instruction_failed",
+                "Claude Code task round terminal state is invalid",
+                details={"process_id": task.process_id},
+            )
+        current_round.terminal_state = terminal_state
+        current_round.terminal_at = self._now()
+        result = self._make_result_locked(
+            task,
+            ClaudeCodeControllerOutcome.TERMINAL,
+            snapshot=snapshot,
+            round_id=current_round.round_id,
+            round_terminal_state=terminal_state,
+        )
+        task.active_round = None
+        self._store_terminal_round_result_locked(task, result)
+        return result
+
+    def _store_terminal_round_result_locked(
+        self,
+        task: _ControllerTask,
+        result: ClaudeCodeControllerResult,
+    ) -> None:
+        round_id = result.round_id
+        if round_id is None:
+            return
+        task.terminal_round_results[round_id] = result
+        task.terminal_round_results.move_to_end(round_id)
+        task.latest_terminal_round_id = round_id
+        while (
+            len(task.terminal_round_results)
+            > self._policy.terminal_snapshot_limit
+        ):
+            removed_round_id, _ = task.terminal_round_results.popitem(
+                last=False
+            )
+            if task.latest_terminal_round_id == removed_round_id:
+                task.latest_terminal_round_id = (
+                    next(reversed(task.terminal_round_results), None)
+                )
 
     def _finalize_terminal_locked(
         self,
@@ -1393,7 +2033,29 @@ class ClaudeCodeController:
             )
         current = replace(current, events=task.terminal_events)
         task.last_snapshot = current
-        result = self._make_result_locked(task, outcome, snapshot=current)
+        current_round = task.active_round
+        round_id = (
+            current_round.round_id
+            if current_round is not None
+            else None
+        )
+        round_terminal_state = self._process_terminal_round_state(
+            current,
+            outcome=outcome,
+        ) if current_round is not None else None
+        if current_round is not None:
+            current_round.terminal_state = round_terminal_state
+            current_round.terminal_at = self._now()
+        result = self._make_result_locked(
+            task,
+            outcome,
+            snapshot=current,
+            round_id=round_id,
+            round_terminal_state=round_terminal_state,
+        )
+        if current_round is not None:
+            task.active_round = None
+            self._store_terminal_round_result_locked(task, result)
         self._archive_task_locked(task, result)
         return result
 
@@ -1434,14 +2096,28 @@ class ClaudeCodeController:
         session_owner: str,
         process_id: str,
         cancel_checker: Callable[[], bool] | None,
+        round_id: str | None = None,
     ) -> ClaudeCodeControllerResult:
-        task, terminal = self._resolve_task(session_owner, process_id)
+        task, terminal = self._resolve_task(
+            session_owner,
+            process_id,
+            round_id=round_id,
+        )
         if terminal is not None:
             return terminal
         assert task is not None
         with task.lock:
             if task.archived:
                 return self._archived_result(task)
+            if round_id is None and task.active_round is None:
+                return self._poll_between_rounds_locked(
+                    task,
+                    cancel_checker=cancel_checker,
+                )
+            stored_round = self._stored_round_result_locked(task, round_id)
+            if stored_round is not None:
+                return stored_round
+            self._assert_active_round_matches_locked(task, round_id)
             if task.last_snapshot is None:
                 return self._poll_locked(
                     task,
@@ -1606,6 +2282,18 @@ class ClaudeCodeController:
                 details={"process_id": task.process_id},
             )
 
+    def _guard_new_round_input_locked(
+        self,
+        task: _ControllerTask,
+        snapshot: ClaudeCodeSnapshot,
+    ) -> None:
+        """上一轮已结束时仅检查底层会话仍可输入，不继承旧轮次预算。"""
+
+        if _snapshot_is_terminal(snapshot):
+            raise self._terminal_error(task.process_id)
+        if not task.initial_instruction_submitted:
+            self._guard_input_locked(task)
+
     def _observation_allowed_locked(self, task: _ControllerTask) -> bool:
         if task.observation_count >= self._policy.max_observation_count:
             task.limits_hit.add("observation_limit_reached")
@@ -1657,6 +2345,12 @@ class ClaudeCodeController:
             not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
         )
 
+    @staticmethod
+    def _snapshot_has_active_process(snapshot: ClaudeCodeSnapshot) -> bool:
+        """只按已有 ProcessStatus 确认底层进程仍处于 active 状态。"""
+
+        return snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+
     def _limit_outcome_locked(
         self,
         task: _ControllerTask,
@@ -1671,6 +2365,9 @@ class ClaudeCodeController:
         task: _ControllerTask,
         snapshot: ClaudeCodeSnapshot,
     ) -> ClaudeCodeControllerOutcome:
+        latest_round = self._stored_round_result_locked(task, None)
+        if task.active_round is None and latest_round is not None:
+            return latest_round.outcome
         if _snapshot_is_terminal(snapshot):
             return ClaudeCodeControllerOutcome.TERMINAL
         if snapshot.action_required is not None:
@@ -1698,8 +2395,13 @@ class ClaudeCodeController:
         outcome: ClaudeCodeControllerOutcome,
         *,
         snapshot: ClaudeCodeSnapshot | None = None,
+        round_id: str | None = None,
+        round_terminal_state: ClaudeCodeState | None = None,
     ) -> ClaudeCodeControllerResult:
         current = snapshot or self._current_snapshot_locked(task)
+        current_round = task.active_round
+        if round_id is None and current_round is not None:
+            round_id = current_round.round_id
         result = ClaudeCodeControllerResult(
             snapshot=current,
             outcome=outcome,
@@ -1709,6 +2411,8 @@ class ClaudeCodeController:
             deadline_remaining=max(0.0, task.deadline - self._now()),
             limits_hit=tuple(sorted(task.limits_hit)),
             initial_instruction_submitted=task.initial_instruction_submitted,
+            round_id=round_id,
+            round_terminal_state=round_terminal_state,
         )
         task.last_result = result
         return result
@@ -1729,6 +2433,72 @@ class ClaudeCodeController:
             exit_code=process_snapshot.exit_code,
         )
 
+    @staticmethod
+    def _process_terminal_round_state(
+        snapshot: ClaudeCodeSnapshot,
+        *,
+        outcome: ClaudeCodeControllerOutcome,
+    ) -> ClaudeCodeState:
+        """沿用现有真实进程终态映射，为正在执行的轮次保留明确结果。"""
+
+        if snapshot.state in _TERMINAL_STATES:
+            return snapshot.state
+        if snapshot.process_status == "lost":
+            return ClaudeCodeState.LOST
+        if snapshot.process_status == "killed" or outcome == (
+            ClaudeCodeControllerOutcome.TERMINATED
+        ):
+            return ClaudeCodeState.INTERRUPTED
+        if snapshot.process_status == "failed_start" or (
+            snapshot.exit_code is not None and snapshot.exit_code != 0
+        ):
+            return ClaudeCodeState.FAILED
+        if snapshot.process_status == "exited":
+            return ClaudeCodeState.FAILED
+        return ClaudeCodeState.LOST
+
+    def _stored_round_result_locked(
+        self,
+        task: _ControllerTask,
+        round_id: str | None,
+    ) -> ClaudeCodeControllerResult | None:
+        if round_id is None:
+            if task.active_round is not None:
+                return None
+            latest_round_id = task.latest_terminal_round_id
+            if latest_round_id is None:
+                return None
+            result = task.terminal_round_results.get(latest_round_id)
+            if result is not None:
+                task.terminal_round_results.move_to_end(latest_round_id)
+            return result
+        result = task.terminal_round_results.get(round_id)
+        if result is not None:
+            task.terminal_round_results.move_to_end(round_id)
+        return result
+
+    def _assert_active_round_matches_locked(
+        self,
+        task: _ControllerTask,
+        round_id: str | None,
+    ) -> None:
+        if round_id is None:
+            return
+        current_round = task.active_round
+        if current_round is None or current_round.round_id != round_id:
+            raise self._round_not_found_error(task.process_id, round_id)
+
+    @staticmethod
+    def _round_not_found_error(
+        process_id: str,
+        round_id: str,
+    ) -> ClaudeCodeControllerError:
+        return ClaudeCodeControllerError(
+            "controller_round_not_found",
+            "Claude Code task round was not found",
+            details={"process_id": process_id, "round_id": round_id},
+        )
+
     def _register_task(self, task: _ControllerTask) -> None:
         with self._tasks_guard:
             if (
@@ -1746,6 +2516,8 @@ class ClaudeCodeController:
         self,
         session_owner: str,
         process_id: str,
+        *,
+        round_id: str | None = None,
     ) -> tuple[_ControllerTask | None, ClaudeCodeControllerResult | None]:
         self._require_nonempty("session_owner", session_owner)
         self._require_nonempty("process_id", process_id)
@@ -1768,7 +2540,13 @@ class ClaudeCodeController:
                         details={"process_id": process_id},
                     )
                 self._terminal_tasks.move_to_end(process_id)
-                return None, terminal.result
+                if round_id is None:
+                    return None, terminal.result
+                result = terminal.round_results.get(round_id)
+                if result is not None:
+                    terminal.round_results.move_to_end(round_id)
+                    return None, result
+                raise self._round_not_found_error(process_id, round_id)
         raise ClaudeCodeControllerError(
             "controller_task_not_found",
             "Claude Code Controller task was not found",
@@ -1788,6 +2566,7 @@ class ClaudeCodeController:
             self._terminal_tasks[task.process_id] = _TerminalTask(
                 session_owner=task.session_owner,
                 result=result,
+                round_results=OrderedDict(task.terminal_round_results),
             )
             self._terminal_tasks.move_to_end(task.process_id)
             while (
@@ -2037,6 +2816,16 @@ class ClaudeCodeController:
             raise ClaudeCodeControllerError(
                 error_type,
                 f"{name} must be a non-empty string",
+            )
+
+    @staticmethod
+    def _require_round_id(round_id: str | None) -> None:
+        if round_id is None:
+            return
+        if not isinstance(round_id, str) or not round_id:
+            raise ClaudeCodeControllerError(
+                "controller_round_not_found",
+                "round_id must be a non-empty string or None",
             )
 
     @staticmethod

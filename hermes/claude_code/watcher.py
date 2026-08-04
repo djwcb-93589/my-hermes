@@ -142,6 +142,7 @@ class ClaudeCodeCompletionWatch:
     last_error_type: str | None
     created_at: float
     updated_at: float
+    round_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -150,6 +151,7 @@ class _CompletionWatchRecord:
 
     watch_id: str
     process_id: str
+    round_id: str
     session_owner: str
     cwd: str
     target: ClaudeCodeNotificationTarget = field(repr=False)
@@ -203,12 +205,18 @@ class ClaudeCodeCompletionWatcher:
         self._poll_semaphore = asyncio.Semaphore(
             self._policy.max_concurrent_polls
         )
-        self._records_by_process: dict[str, _CompletionWatchRecord] = {}
+        self._records_by_round: dict[
+            tuple[str, str, str],
+            _CompletionWatchRecord,
+        ] = {}
         self._records_by_watch_id: dict[str, _CompletionWatchRecord] = {}
         self._closed_watches: OrderedDict[str, ClaudeCodeCompletionWatch] = (
             OrderedDict()
         )
-        self._closed_watch_ids_by_process: OrderedDict[str, str] = OrderedDict()
+        self._closed_watch_ids_by_round: OrderedDict[
+            tuple[str, str, str],
+            str,
+        ] = OrderedDict()
         self._task: asyncio.Task[None] | None = None
         self._started = False
         self._shutting_down = False
@@ -254,7 +262,7 @@ class ClaudeCodeCompletionWatcher:
             self._started = False
             task = self._task
             self._task = None
-            self._records_by_process.clear()
+            self._records_by_round.clear()
             self._records_by_watch_id.clear()
             self._wakeup.set()
             if task is not None and not task.done():
@@ -286,11 +294,14 @@ class ClaudeCodeCompletionWatcher:
         session_owner: str,
         notification_target: ClaudeCodeNotificationTarget,
         display_name: str | None = None,
+        round_id: str | None = None,
     ) -> ClaudeCodeCompletionWatch:
         """验证既有 Controller task 后注册一个进程内完成通知。"""
 
         process_id = self._require_identifier("process_id", process_id, 512)
         session_owner = self._require_identifier("session_owner", session_owner, 1_024)
+        if round_id is not None:
+            round_id = self._require_identifier("round_id", round_id, 512)
         if not isinstance(notification_target, ClaudeCodeNotificationTarget):
             raise ClaudeCodeCompletionWatcherError(
                 "watch_target_invalid",
@@ -311,13 +322,13 @@ class ClaudeCodeCompletionWatcher:
         display_name = self._normalize_display_name(display_name)
         async with self._guard:
             self._require_started_locked()
-            self._assert_process_available_locked(process_id, session_owner)
 
         try:
             result = await asyncio.to_thread(
                 self._controller.snapshot,
                 session_owner=session_owner,
                 process_id=process_id,
+                round_id=round_id,
             )
         except ClaudeCodeControllerError as error:
             if error.error_type == "controller_owner_mismatch":
@@ -330,6 +341,12 @@ class ClaudeCodeCompletionWatcher:
                 raise ClaudeCodeCompletionWatcherError(
                     "watch_not_found",
                     "Claude Code Controller task was not found",
+                    details={"process_id": process_id},
+                ) from error
+            if error.error_type == "controller_round_not_found":
+                raise ClaudeCodeCompletionWatcherError(
+                    "watch_round_unavailable",
+                    "Claude Code task round was not found",
                     details={"process_id": process_id},
                 ) from error
             raise ClaudeCodeCompletionWatcherError(
@@ -350,10 +367,29 @@ class ClaudeCodeCompletionWatcher:
                 details={"process_id": process_id},
             )
 
+        resolved_round_id = result.round_id
+        if resolved_round_id is None:
+            raise ClaudeCodeCompletionWatcherError(
+                "watch_round_unavailable",
+                "Claude Code completion watch requires a submitted task round",
+                details={"process_id": process_id},
+            )
+        if round_id is not None and resolved_round_id != round_id:
+            raise ClaudeCodeCompletionWatcherError(
+                "watch_round_unavailable",
+                "Claude Code Controller returned another task round",
+                details={"process_id": process_id},
+            )
+
         now = self._now()
         record = _CompletionWatchRecord(
-            watch_id=self._make_watch_id(process_id, session_owner),
+            watch_id=self._make_watch_id(
+                process_id,
+                session_owner,
+                resolved_round_id,
+            ),
             process_id=process_id,
+            round_id=resolved_round_id,
             session_owner=session_owner,
             cwd=snapshot.session_ref.cwd,
             target=notification_target,
@@ -363,8 +399,18 @@ class ClaudeCodeCompletionWatcher:
         )
         async with self._guard:
             self._require_started_locked()
-            self._assert_process_available_locked(process_id, session_owner)
-            self._records_by_process[process_id] = record
+            self._assert_round_available_locked(
+                process_id,
+                session_owner,
+                resolved_round_id,
+            )
+            self._records_by_round[
+                self._round_key(
+                    process_id,
+                    session_owner,
+                    resolved_round_id,
+                )
+            ] = record
             self._records_by_watch_id[record.watch_id] = record
             if result.terminal:
                 record.in_flight = True
@@ -516,6 +562,7 @@ class ClaudeCodeCompletionWatcher:
                     session_owner=record.session_owner,
                     process_id=record.process_id,
                     terminal_observation=True,
+                    round_id=record.round_id,
                 )
         except ClaudeCodeControllerError as error:
             await self._record_controller_error(record, error)
@@ -524,6 +571,13 @@ class ClaudeCodeCompletionWatcher:
             await self._record_error(
                 record,
                 "controller_poll_failed",
+                retry_at=self._now() + self._policy.notification_retry_interval,
+            )
+            return
+        if result.round_id != record.round_id:
+            await self._record_error(
+                record,
+                "controller_round_mismatch",
                 retry_at=self._now() + self._policy.notification_retry_interval,
             )
             return
@@ -547,6 +601,16 @@ class ClaudeCodeCompletionWatcher:
             return
         if error.error_type == "controller_task_not_found":
             await self._handle_controller_task_lost(record)
+            return
+        if error.error_type == "controller_round_not_found":
+            async with record.operation_lock:
+                async with self._guard:
+                    if self._records_by_watch_id.get(record.watch_id) is record:
+                        self._close_record_locked(
+                            record,
+                            ClaudeCodeCompletionWatchState.CLOSED,
+                            error_type="watch_round_unavailable",
+                        )
             return
         if error.error_type == "terminal_observation_reserve_exhausted":
             async with record.operation_lock:
@@ -748,7 +812,7 @@ class ClaudeCodeCompletionWatcher:
         record: _CompletionWatchRecord,
         result: ClaudeCodeControllerResult,
     ) -> ClaudeCodeTerminalNotification:
-        """只从 final-drained 公共 Snapshot 构造有限、再次脱敏的通知。"""
+        """只从 Controller 结构化安全 Snapshot 构造有限、再次脱敏的通知。"""
 
         snapshot = result.snapshot
         terminal_state = self._terminal_state(result)
@@ -759,7 +823,11 @@ class ClaudeCodeCompletionWatcher:
         notification_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"hermes:claude-code-terminal:{record.watch_id}:{terminal_state.value}",
+                (
+                    "hermes:claude-code-terminal:"
+                    f"{record.session_owner}:{record.process_id}:"
+                    f"{record.round_id}:{terminal_state.value}"
+                ),
             )
         )
         return ClaudeCodeTerminalNotification(
@@ -808,7 +876,8 @@ class ClaudeCodeCompletionWatcher:
                 uuid.NAMESPACE_URL,
                 (
                     "hermes:claude-code-terminal:"
-                    f"{record.watch_id}:{record.process_id}:"
+                    f"{record.session_owner}:{record.process_id}:"
+                    f"{record.round_id}:"
                     f"{ClaudeCodeState.LOST.value}"
                 ),
             )
@@ -820,6 +889,8 @@ class ClaudeCodeCompletionWatcher:
     ) -> ClaudeCodeState:
         """按既有 Controller 终态合同保守映射，不以成功 exit code 猜测完成。"""
 
+        if result.round_terminal_state is not None:
+            return result.round_terminal_state
         snapshot = result.snapshot
         if snapshot.state in _TERMINAL_STATES:
             return snapshot.state
@@ -852,26 +923,38 @@ class ClaudeCodeCompletionWatcher:
         record.next_attempt_at = 0.0
         record.updated_at = self._now()
         public = self._public_watch(record)
-        self._records_by_process.pop(record.process_id, None)
+        round_key = self._round_key(
+            record.process_id,
+            record.session_owner,
+            record.round_id,
+        )
+        self._records_by_round.pop(round_key, None)
         self._records_by_watch_id.pop(record.watch_id, None)
         self._closed_watches[record.watch_id] = public
         self._closed_watches.move_to_end(record.watch_id)
-        self._closed_watch_ids_by_process[record.process_id] = record.watch_id
-        self._closed_watch_ids_by_process.move_to_end(record.process_id)
+        self._closed_watch_ids_by_round[round_key] = record.watch_id
+        self._closed_watch_ids_by_round.move_to_end(round_key)
         while len(self._closed_watches) > _MAX_CLOSED_WATCHES:
             _, expired = self._closed_watches.popitem(last=False)
-            if self._closed_watch_ids_by_process.get(expired.process_id) == expired.watch_id:
-                self._closed_watch_ids_by_process.pop(expired.process_id, None)
+            expired_key = self._round_key(
+                expired.process_id,
+                expired.session_owner,
+                expired.round_id,
+            )
+            if self._closed_watch_ids_by_round.get(expired_key) == expired.watch_id:
+                self._closed_watch_ids_by_round.pop(expired_key, None)
         return public
 
-    def _assert_process_available_locked(
+    def _assert_round_available_locked(
         self,
         process_id: str,
         session_owner: str,
+        round_id: str,
     ) -> None:
-        """阻止同一受管进程重复绑定不同目标或重复终态通知。"""
+        """同一进程的不同任务轮次可并存，但同一轮次只允许一个 Watch。"""
 
-        existing = self._records_by_process.get(process_id)
+        round_key = self._round_key(process_id, session_owner, round_id)
+        existing = self._records_by_round.get(round_key)
         if existing is not None:
             if existing.session_owner != session_owner:
                 raise ClaudeCodeCompletionWatcherError(
@@ -884,7 +967,7 @@ class ClaudeCodeCompletionWatcher:
                 "Claude Code completion watch is already registered",
                 details={"process_id": process_id},
             )
-        closed_watch_id = self._closed_watch_ids_by_process.get(process_id)
+        closed_watch_id = self._closed_watch_ids_by_round.get(round_key)
         if closed_watch_id is None:
             return
         closed = self._closed_watches.get(closed_watch_id)
@@ -940,11 +1023,26 @@ class ClaudeCodeCompletionWatcher:
         return value
 
     @staticmethod
-    def _make_watch_id(process_id: str, session_owner: str) -> str:
+    def _round_key(
+        process_id: str,
+        session_owner: str,
+        round_id: str,
+    ) -> tuple[str, str, str]:
+        return (session_owner, process_id, round_id)
+
+    @staticmethod
+    def _make_watch_id(
+        process_id: str,
+        session_owner: str,
+        round_id: str,
+    ) -> str:
         return str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"hermes:claude-code-watch:{session_owner}:{process_id}",
+                (
+                    "hermes:claude-code-watch:"
+                    f"{session_owner}:{process_id}:{round_id}"
+                ),
             )
         )
 
@@ -953,6 +1051,7 @@ class ClaudeCodeCompletionWatcher:
         return ClaudeCodeCompletionWatch(
             watch_id=record.watch_id,
             process_id=record.process_id,
+            round_id=record.round_id,
             session_owner=record.session_owner,
             target_id=record.target.target_id,
             display_name=record.display_name,
