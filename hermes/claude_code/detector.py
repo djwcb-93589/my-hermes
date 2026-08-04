@@ -1423,13 +1423,18 @@ class ClaudeCodeOutputDetector:
             prompt_structure and _AUTH_RE.search(candidate)
         ):
             self._clear_session_ready_profile()
-        session_profile_ready_signal = bool(
+        session_profile_fragment_evidence = frozenset(
+            ready_fragment_evidence
+            & {"welcome", "manual_mode", "task_input"}
+        )
+        session_profile_candidate = bool(
             self._session_ready_profile_matches(
                 process_id=process_id,
                 session_owner=session_owner,
             )
             and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
             and has_ready_ui_fragment
+            and session_profile_fragment_evidence
             and not has_non_ready_ui_content
             and not progress_signal
             and not completion_signal
@@ -1437,11 +1442,9 @@ class ClaudeCodeOutputDetector:
             and not delta.cursor_gap
             and not delta.limits_hit
             and not observation_errors
+            and self._action_required is None
         )
-        ready_state_signal = bool(
-            (ready_signal and ready_ui_only)
-            or session_profile_ready_signal
-        )
+        ready_state_signal = ready_signal and ready_ui_only
         if output_candidate:
             output_metadata = dict(isolation.metadata)
             if delta.limits_hit:
@@ -1581,8 +1584,16 @@ class ClaudeCodeOutputDetector:
                     ClaudeCodeActionKind.CLARIFICATION,
                     ClaudeCodeActionKind.UNKNOWN_PROMPT,
                 }
+                and self._action_required is None
+                and not self._has_startup_interaction_semantics(
+                    action.prompt_text
+                )
             ):
                 action = None
+            if action is not None or self._action_required is not None:
+                ready_state_signal = False
+            elif session_profile_candidate:
+                ready_state_signal = True
             if action is not None:
                 action, native_view_unavailable = self._native_action_view(
                     action,
