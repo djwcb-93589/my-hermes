@@ -39,6 +39,7 @@ RECENT_MATCHED_ECHO_TTL_SECONDS = 10.0
 RECENT_MATCHED_ECHO_MATCH_BUDGET = 2
 MAX_ECHO_MATCH_LINES = 16
 MAX_FOLDER_TRUST_HEADING_GAP_CHARS = 512
+MAX_RUNTIME_PERMISSION_PANEL_LINES = 32
 _EVENT_TRUNCATION_MARKER = "\n[… event text truncated …]\n"
 _INPUT_ECHO_OMITTED_TEXT = "[input echo omitted]"
 _CURSOR_GAP_OUTPUT_OMITTED_TEXT = "[output omitted after cursor gap]"
@@ -80,6 +81,35 @@ _FOLDER_TRUST_NO_OPTION_RE = re.compile(
 _FOLDER_TRUST_RESPONSE_RE = re.compile(
     r"(?im)\b(?:enter|select|choose)\s+"
     r"(?:y(?:es)?\s*/\s*n(?:o)?|a(?:lways)?)\s*:\s*$"
+)
+_RUNTIME_PERMISSION_TITLE_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"(?:permission|approval)\s+required\b[^\n]*"
+    r"|(?:allow|approve)\s+(?:this\s+)?(?:action|operation|request)"
+    r"\b[^\n]*[?？]"
+    r"|(?:use\s+(?:tool|skill)\b[^\n]*|run\s+command\b[^\n]*)[?？]"
+    r"|(?:权限|批准).*(?:需要|请求|确认)"
+    r"|(?:是否(?:允许|批准)).*[？?]"
+    r")\s*$"
+)
+_RUNTIME_PERMISSION_NUMBERED_OPTION_RE = re.compile(
+    r"(?m)^\s*(?P<number>\d+)[.)]\s+.+\s*$"
+)
+_RUNTIME_PERMISSION_RESPONSE_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"(?:enter|choose|select)\s+(?:an?\s+)?(?:selection|option)"
+    r"(?:\s*\[[^\]\n]{1,64}\])?"
+    r"|press\s+enter"
+    r"|escape\s+to\s+cancel"
+    r")[^\n]{0,160}:?\s*$"
+)
+_RUNTIME_PERMISSION_ALLOW_OPTION_RE = re.compile(
+    r"(?i)\b(?:yes|allow|approve|proceed|continue|grant|run|use)\b|"
+    r"(?:允许|批准|继续)"
+)
+_RUNTIME_PERMISSION_DENY_OPTION_RE = re.compile(
+    r"(?i)\b(?:no|deny|reject|cancel|decline|exit|abort)\b|"
+    r"(?:拒绝|取消|退出)"
 )
 _PROGRESS_RE = re.compile(
     r"(?i)\b(?:analys(?:e|ing)|inspect(?:ing)?|read(?:ing)?|"
@@ -869,6 +899,12 @@ class ClaudeCodeOutputDetector:
             timestamp=timestamp,
         )
         if not interaction_source:
+            retained_action = self._retained_native_runtime_permission_view(
+                action,
+                interaction_candidate=interaction_candidate,
+            )
+            if retained_action is not None:
+                return retained_action, False
             return action, True
         raw_options = self._extract_options(
             interaction_source,
@@ -888,6 +924,30 @@ class ClaudeCodeOutputDetector:
             raw_options=raw_options,
             native_prompt_fingerprint=native_prompt_fingerprint,
         ), False
+
+    def _retained_native_runtime_permission_view(
+        self,
+        action: ClaudeCodeActionRequired,
+        *,
+        interaction_candidate: str,
+    ) -> ClaudeCodeActionRequired | None:
+        """仅在同一权限面板的局部重绘时保留已验证的原生视图。"""
+
+        current = self._action_required
+        if (
+            current is None
+            or current.raw_prompt_text is None
+            or current.raw_options is None
+            or self._safe_action_fingerprint(current)
+            != self._safe_action_fingerprint(action)
+            or not self._is_runtime_permission_prompt(action.prompt_text)
+        ):
+            return None
+        if not self._has_runtime_permission_fragment(
+            redact_claude_code_output(interaction_candidate).strip()
+        ):
+            return None
+        return current
 
     def _clear_native_view_for_safe_action(
         self,
@@ -948,6 +1008,31 @@ class ClaudeCodeOutputDetector:
                 return folder_trust_source[
                     -MAX_NATIVE_INTERACTION_PROMPT_CHARS:
                 ]
+        runtime_permission_context = (
+            self._runtime_permission_native_source_context(
+                action,
+                context=context,
+            )
+        )
+        runtime_permission_source = self._runtime_permission_action_source(
+            runtime_permission_context,
+            maximum_chars=MAX_NATIVE_INTERACTION_PROMPT_CHARS,
+        )
+        if runtime_permission_source:
+            equivalent_action = self._classify_action(
+                redact_claude_code_output(runtime_permission_source).strip(),
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
+            )
+            if (
+                equivalent_action is not None
+                and self._safe_action_fingerprint(equivalent_action)
+                == self._safe_action_fingerprint(action)
+            ):
+                return runtime_permission_source
         lines = [line for line in context.splitlines() if line.strip()]
         for start in range(len(lines) - 1, -1, -1):
             source = "\n".join(lines[start:])[
@@ -968,6 +1053,30 @@ class ClaudeCodeOutputDetector:
             ):
                 return source
         return ""
+
+    def _runtime_permission_native_source_context(
+        self,
+        action: ClaudeCodeActionRequired,
+        *,
+        context: str,
+    ) -> str:
+        """仅用当前临时原生视图补齐同一权限面板的分段重绘。"""
+
+        current = self._action_required
+        if (
+            not context
+            or current is None
+            or current.raw_prompt_text is None
+            or current.raw_options is None
+            or action.kind != ClaudeCodeActionKind.APPROVAL
+            or not self._is_runtime_permission_prompt(current.prompt_text)
+            or not self._is_runtime_permission_prompt(action.prompt_text)
+        ):
+            return context
+        return self._with_current_candidate(
+            current.raw_prompt_text,
+            context,
+        )
 
     def _native_prompt_fingerprint(
         self,
@@ -1537,6 +1646,7 @@ class ClaudeCodeOutputDetector:
         clarification = bool(_CLARIFICATION_RE.search(candidate))
         options = self._extract_options(candidate)
         folder_trust = self._is_folder_trust_prompt(candidate)
+        runtime_permission = self._is_runtime_permission_prompt(candidate)
         if auth and (
             prompt_like
             or approval
@@ -1568,6 +1678,10 @@ class ClaudeCodeOutputDetector:
             )
         if self._has_folder_trust_semantics(candidate):
             return None
+        if self._has_runtime_permission_semantics(candidate) and not (
+            runtime_permission
+        ):
+            return None
         if destructive and prompt_like and (approval or options):
             return self._action(
                 ClaudeCodeActionKind.DESTRUCTIVE_ACTION,
@@ -1592,7 +1706,23 @@ class ClaudeCodeOutputDetector:
                 cursor_end=cursor_end,
                 timestamp=timestamp,
             )
-        if approval and prompt_like:
+        if runtime_permission:
+            return self._action(
+                ClaudeCodeActionKind.APPROVAL,
+                "Claude Code requests runtime permission confirmation",
+                candidate,
+                "medium",
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
+            )
+        if (
+            approval
+            and prompt_like
+            and self._has_explicit_approval_prompt(candidate)
+        ):
             return self._action(
                 ClaudeCodeActionKind.APPROVAL,
                 "Claude Code requests permission or confirmation",
@@ -1642,6 +1772,52 @@ class ClaudeCodeOutputDetector:
         )
 
     @staticmethod
+    def _has_runtime_permission_fragment(text: str) -> bool:
+        """识别可用于恢复运行中权限面板的有界片段。"""
+
+        return bool(
+            _RUNTIME_PERMISSION_TITLE_RE.search(text)
+            or _RUNTIME_PERMISSION_NUMBERED_OPTION_RE.search(text)
+            or _RUNTIME_PERMISSION_RESPONSE_RE.search(text)
+        )
+
+    @staticmethod
+    def _has_runtime_permission_semantics(text: str) -> bool:
+        """仅以明确权限标题或问题阻止不完整面板过早分类。"""
+
+        return bool(_RUNTIME_PERMISSION_TITLE_RE.search(text))
+
+    @staticmethod
+    def _is_runtime_permission_prompt(text: str) -> bool:
+        """用标题、选项和回复提示的组合确认运行中权限面板。"""
+
+        if not _RUNTIME_PERMISSION_TITLE_RE.search(text):
+            return False
+        options = tuple(_RUNTIME_PERMISSION_NUMBERED_OPTION_RE.finditer(text))
+        option_numbers = {match.group("number") for match in options}
+        has_allow_or_deny_option = any(
+            _RUNTIME_PERMISSION_ALLOW_OPTION_RE.search(match.group(0))
+            or _RUNTIME_PERMISSION_DENY_OPTION_RE.search(match.group(0))
+            for match in options
+        )
+        return len(option_numbers) >= 2 or (
+            bool(_RUNTIME_PERMISSION_RESPONSE_RE.search(text))
+            and has_allow_or_deny_option
+        )
+
+    @staticmethod
+    def _has_explicit_approval_prompt(text: str) -> bool:
+        """避免普通编号列表仅因出现权限词而被当作确认请求。"""
+
+        if _PROMPT_VERB_RE.search(text) or _INLINE_OPTION_RE.search(text):
+            return True
+        return any(
+            _APPROVAL_RE.search(line)
+            and line.rstrip().endswith(("?", "？"))
+            for line in text.splitlines()
+        )
+
+    @staticmethod
     def _action_source(
         candidate: str,
         context: str,
@@ -1656,6 +1832,9 @@ class ClaudeCodeOutputDetector:
             or ClaudeCodeOutputDetector._has_folder_trust_semantics(
                 candidate
             )
+            or ClaudeCodeOutputDetector._has_runtime_permission_fragment(
+                candidate
+            )
         ):
             return candidate
         contextual = (
@@ -1663,8 +1842,25 @@ class ClaudeCodeOutputDetector:
             if redact_context
             else context.strip()
         )
+        contextual = ClaudeCodeOutputDetector._with_current_candidate(
+            contextual,
+            candidate,
+        )
         if not contextual:
             return candidate
+        runtime_permission_source = (
+            ClaudeCodeOutputDetector._runtime_permission_action_source(
+                contextual,
+                candidate=candidate,
+                maximum_chars=MAX_DETECTION_CONTEXT_CHARS,
+            )
+        )
+        if runtime_permission_source and (
+            ClaudeCodeOutputDetector._has_runtime_permission_fragment(
+                candidate
+            )
+        ):
+            return runtime_permission_source
         folder_trust_source = (
             ClaudeCodeOutputDetector._folder_trust_action_source(contextual)
         )
@@ -1680,6 +1876,63 @@ class ClaudeCodeOutputDetector:
                     -MAX_DETECTION_CONTEXT_CHARS:
                 ]
         return contextual[-MAX_DETECTION_CONTEXT_CHARS:]
+
+    @staticmethod
+    def _with_current_candidate(context: str, candidate: str) -> str:
+        """保证临时恢复文本的尾部包含本轮非空 candidate。"""
+
+        contextual = context.strip()
+        current = candidate.strip()
+        if not contextual:
+            return current
+        if not current or contextual.endswith(current):
+            return contextual
+        return f"{contextual}\n{current}"
+
+    @classmethod
+    def _runtime_permission_action_source(
+        cls,
+        context: str,
+        *,
+        candidate: str = "",
+        maximum_chars: int,
+    ) -> str:
+        """从最近权限标题恢复有界面板，不吸收标题前的普通输出。"""
+
+        contextual = cls._with_current_candidate(context, candidate)
+        matches = tuple(_RUNTIME_PERMISSION_TITLE_RE.finditer(contextual))
+        if not matches:
+            return ""
+        return cls._bounded_runtime_permission_panel(
+            contextual[matches[-1].start():],
+            maximum_chars=maximum_chars,
+        )
+
+    @staticmethod
+    def _bounded_runtime_permission_panel(
+        panel: str,
+        *,
+        maximum_chars: int,
+    ) -> str:
+        """同时限制权限面板的行数和字符数，并保留标题与当前尾部。"""
+
+        if maximum_chars <= 0:
+            return ""
+        lines = panel.splitlines()
+        if len(lines) > MAX_RUNTIME_PERMISSION_PANEL_LINES:
+            lines = [
+                lines[0],
+                *lines[-(MAX_RUNTIME_PERMISSION_PANEL_LINES - 1):],
+            ]
+        bounded = "\n".join(lines).strip()
+        if len(bounded) <= maximum_chars:
+            return bounded
+        title = lines[0].strip() if lines else ""
+        marker = " [… permission panel truncated …] "
+        tail_size = maximum_chars - len(title) - len(marker)
+        if tail_size <= 0:
+            return ""
+        return f"{title}{marker}{bounded[-tail_size:]}"
 
     @staticmethod
     def _folder_trust_action_source(context: str) -> str:
