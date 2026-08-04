@@ -128,6 +128,7 @@ class _ControllerTask:
     terminal_observation_count: int = 0
     initial_instruction_submitted: bool = False
     startup_interaction_resolved: bool = False
+    startup_ready_observation_count: int = 0
     consecutive_empty_reads: int = 0
     output_used: int = 0
     last_snapshot: ClaudeCodeSnapshot | None = None
@@ -296,7 +297,7 @@ class ClaudeCodeController:
         *,
         cancel_checker: Callable[[], bool] | None,
     ) -> ClaudeCodeControllerResult | None:
-        """有界等待首个可信 READY，绝不保存或自动重放初始任务。"""
+        """有界等待连续可信 READY，绝不保存或自动重放初始任务。"""
 
         terminal_observation = False
         for attempt in range(self._policy.startup_observation_attempts):
@@ -328,7 +329,7 @@ class ClaudeCodeController:
                     task,
                     ClaudeCodeControllerOutcome.DEADLINE_EXCEEDED,
                 )
-            if self._initial_submission_ready(snapshot):
+            if self._deferred_initial_submission_ready(task, snapshot):
                 return None
             if attempt + 1 >= self._policy.startup_observation_attempts:
                 break
@@ -371,7 +372,7 @@ class ClaudeCodeController:
         """只在已观察到 READY 后提交一次初始任务，并保留既有失败清理。"""
 
         snapshot = self._current_snapshot_locked(task)
-        if not self._initial_submission_ready(snapshot):
+        if not self._deferred_initial_submission_ready(task, snapshot):
             return self._make_result_locked(
                 task,
                 ClaudeCodeControllerOutcome.STARTUP_NOT_READY,
@@ -400,7 +401,7 @@ class ClaudeCodeController:
         if limit_outcome is not None:
             return self._make_result_locked(task, limit_outcome)
         try:
-            self._runtime.submit(
+            self._submit_instruction(
                 session_owner=task.session_owner,
                 process_id=task.process_id,
                 data=initial_task,
@@ -428,6 +429,7 @@ class ClaudeCodeController:
             ) from submit_error
 
         task.initial_instruction_submitted = True
+        task.startup_ready_observation_count = 0
         task.consecutive_empty_reads = 0
         return self._observe_and_resolve_locked(
             task,
@@ -444,15 +446,18 @@ class ClaudeCodeController:
             and snapshot.process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
         )
 
-    @classmethod
     def _deferred_initial_submission_ready(
-        cls,
-        _task: _ControllerTask,
+        self,
+        task: _ControllerTask,
         snapshot: ClaudeCodeSnapshot,
     ) -> bool:
-        """延后首投只依据当前 READY，旧交互标记不能替代状态事实。"""
+        """首投须经连续 READY 观察，旧交互标记不能替代状态事实。"""
 
-        return cls._initial_submission_ready(snapshot)
+        return (
+            self._initial_submission_ready(snapshot)
+            and task.startup_ready_observation_count
+            >= self._policy.startup_ready_observations
+        )
 
     def poll(
         self,
@@ -525,7 +530,7 @@ class ClaudeCodeController:
                     ClaudeCodeControllerOutcome.STARTUP_NOT_READY,
                 )
             try:
-                self._runtime.submit(
+                self._submit_instruction(
                     session_owner=session_owner,
                     process_id=process_id,
                     data=instruction,
@@ -539,6 +544,7 @@ class ClaudeCodeController:
                 ) from runtime_error
             if initial_submission:
                 task.initial_instruction_submitted = True
+                task.startup_ready_observation_count = 0
             task.interrupt_requested = False
             task.consecutive_empty_reads = 0
             if action is not None:
@@ -551,6 +557,28 @@ class ClaudeCodeController:
                 task,
                 error_type="poll_failed",
             )
+
+    def _submit_instruction(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        data: str,
+    ) -> int:
+        """任务指令优先使用 Runtime 的专用分步提交，不改变交互回复。"""
+
+        submit_task = getattr(self._runtime, "submit_task", None)
+        if callable(submit_task):
+            return submit_task(
+                session_owner=session_owner,
+                process_id=process_id,
+                data=data,
+            )
+        return self._runtime.submit(
+            session_owner=session_owner,
+            process_id=process_id,
+            data=data,
+        )
 
     def current_interaction(
         self,
@@ -1288,6 +1316,12 @@ class ClaudeCodeController:
             task.consecutive_empty_reads += 1
         else:
             task.consecutive_empty_reads = 0
+        if task.initial_instruction_submitted:
+            task.startup_ready_observation_count = 0
+        elif self._initial_submission_ready(snapshot):
+            task.startup_ready_observation_count += 1
+        else:
+            task.startup_ready_observation_count = 0
         self._invalidate_replaced_interaction_locked(
             task,
             previous=previous,

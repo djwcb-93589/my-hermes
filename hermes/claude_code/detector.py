@@ -38,6 +38,7 @@ OUTBOUND_INPUT_PREFIX_CHARS = 16
 RECENT_MATCHED_ECHO_TTL_SECONDS = 10.0
 RECENT_MATCHED_ECHO_MATCH_BUDGET = 2
 MAX_ECHO_MATCH_LINES = 16
+MAX_FOLDER_TRUST_HEADING_GAP_CHARS = 512
 _EVENT_TRUNCATION_MARKER = "\n[… event text truncated …]\n"
 _INPUT_ECHO_OMITTED_TEXT = "[input echo omitted]"
 _CURSOR_GAP_OUTPUT_OMITTED_TEXT = "[output omitted after cursor gap]"
@@ -61,9 +62,20 @@ _READY_TASK_INPUT_RE = re.compile(
     r"\bready\s+(?:for|to\s+accept)\b|"
     r"^\s*(?:[>❯›»])\s*$|可以开始|请输入任务)"
 )
-_FOLDER_TRUST_RE = re.compile(
-    r"(?i)\bdo\s+you\s+trust\s+(?:the\s+)?files?\s+in\s+"
-    r"(?:this|the)\s+(?:folder|directory)\b"
+_FOLDER_TRUST_QUESTION_RE = re.compile(
+    r"(?i)\b(?:do\s+you\s+trust\s+(?:the\s+)?files?\s+in\s+"
+    r"(?:this|the)\s+(?:folder|directory)|"
+    r"is\s+this\s+(?:a\s+)?project\b[^\n?]{0,160}\bcreated\b"
+    r"[^\n?]{0,160}\btrust\b)"
+)
+_FOLDER_TRUST_HEADING_RE = re.compile(
+    r"(?im)^\s*quick\s+safety\s+check\s*:?\s*$"
+)
+_FOLDER_TRUST_YES_OPTION_RE = re.compile(
+    r"(?im)^\s*y[.)]\s+yes\b[^\n]{0,160}\btrust\b"
+)
+_FOLDER_TRUST_NO_OPTION_RE = re.compile(
+    r"(?im)^\s*n[.)]\s+no\b[^\n]{0,160}\b(?:exit|quit|leave)\b"
 )
 _FOLDER_TRUST_RESPONSE_RE = re.compile(
     r"(?im)\b(?:enter|select|choose)\s+"
@@ -918,6 +930,24 @@ class ClaudeCodeOutputDetector:
         """仅接受可映射回当前安全动作的原生 Prompt 后缀。"""
 
         context = self._interaction_context
+        folder_trust_source = self._folder_trust_action_source(context)
+        if folder_trust_source:
+            equivalent_action = self._classify_action(
+                redact_claude_code_output(folder_trust_source).strip(),
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
+            )
+            if (
+                equivalent_action is not None
+                and self._safe_action_fingerprint(equivalent_action)
+                == self._safe_action_fingerprint(action)
+            ):
+                return folder_trust_source[
+                    -MAX_NATIVE_INTERACTION_PROMPT_CHARS:
+                ]
         lines = [line for line in context.splitlines() if line.strip()]
         for start in range(len(lines) - 1, -1, -1):
             source = "\n".join(lines[start:])[
@@ -1116,17 +1146,33 @@ class ClaudeCodeOutputDetector:
                 self._expire_pending_interaction_context()
             )
         context = self._semantic_context[-MAX_DETECTION_CONTEXT_CHARS:]
-        prompt_structure = bool(
-            candidate and self._looks_like_prompt(candidate)
+        folder_trust_semantics = bool(
+            candidate
+            and self._has_folder_trust_semantics(candidate)
         )
-        progress_signal = bool(candidate and _PROGRESS_RE.search(candidate))
+        prompt_structure = bool(
+            candidate
+            and (
+                self._looks_like_prompt(candidate)
+                or folder_trust_semantics
+            )
+        )
+        progress_signal = bool(
+            candidate
+            and not folder_trust_semantics
+            and _PROGRESS_RE.search(candidate)
+        )
         completion_signal = bool(
             candidate
             and _COMPLETION_RE.search(candidate)
             and not _NEGATED_COMPLETION_RE.search(candidate)
             and not prompt_structure
         )
-        failure_signal = bool(candidate and _FAILURE_RE.search(candidate))
+        failure_signal = bool(
+            candidate
+            and not folder_trust_semantics
+            and _FAILURE_RE.search(candidate)
+        )
         ready_signal = bool(
             candidate
             and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
@@ -1138,10 +1184,10 @@ class ClaudeCodeOutputDetector:
             and not prompt_structure
         )
         if resumed_after_input:
+            # 输入后的首段普通文本可能仍是未匹配的回显，不能单独构成进度。
             self._outbound_response_pending = False
             self._action_required = None
             self._last_action_fingerprint = None
-            self._progress_seen = True
             self._clear_suppressed_action_fingerprints()
 
         if candidate and not prompt_structure and (
@@ -1448,7 +1494,7 @@ class ClaudeCodeOutputDetector:
         if not text:
             return False
         if (
-            _FOLDER_TRUST_RE.search(text)
+            cls._has_folder_trust_semantics(text)
             or _AUTH_RE.search(text)
             or _APPROVAL_RE.search(text)
         ):
@@ -1459,6 +1505,16 @@ class ClaudeCodeOutputDetector:
             return True
         return cls._looks_like_prompt(text) and not bool(
             _READY_TASK_INPUT_RE.search(text)
+        )
+
+    @staticmethod
+    def _has_folder_trust_semantics(text: str) -> bool:
+        """识别目录信任交互的有界片段，完整性另由组合证据确认。"""
+
+        return bool(
+            _FOLDER_TRUST_QUESTION_RE.search(text)
+            or _FOLDER_TRUST_HEADING_RE.search(text)
+            or _FOLDER_TRUST_YES_OPTION_RE.search(text)
         )
 
     def _classify_action(
@@ -1480,7 +1536,7 @@ class ClaudeCodeOutputDetector:
         approval = bool(_APPROVAL_RE.search(candidate))
         clarification = bool(_CLARIFICATION_RE.search(candidate))
         options = self._extract_options(candidate)
-        folder_trust = bool(_FOLDER_TRUST_RE.search(candidate))
+        folder_trust = self._is_folder_trust_prompt(candidate)
         if auth and (
             prompt_like
             or approval
@@ -1499,11 +1555,6 @@ class ClaudeCodeOutputDetector:
                 timestamp=timestamp,
             )
         if folder_trust:
-            if not (
-                prompt_like
-                and self._folder_trust_prompt_complete(candidate, options)
-            ):
-                return None
             return self._action(
                 ClaudeCodeActionKind.APPROVAL,
                 "Claude Code requests folder trust confirmation",
@@ -1515,6 +1566,8 @@ class ClaudeCodeOutputDetector:
                 cursor_end=cursor_end,
                 timestamp=timestamp,
             )
+        if self._has_folder_trust_semantics(candidate):
+            return None
         if destructive and prompt_like and (approval or options):
             return self._action(
                 ClaudeCodeActionKind.DESTRUCTIVE_ACTION,
@@ -1578,16 +1631,14 @@ class ClaudeCodeOutputDetector:
         return None
 
     @staticmethod
-    def _folder_trust_prompt_complete(
-        text: str,
-        options: tuple[str, ...],
-    ) -> bool:
-        """只在目录信任 Prompt 的可选项已完整出现后创建动作。"""
+    def _is_folder_trust_prompt(text: str) -> bool:
+        """用问题、明确 y/n 选项和输入提示组合确认目录信任 Prompt。"""
 
         return bool(
-            len(options) >= 2
-            or _INLINE_OPTION_RE.search(text)
-            or _FOLDER_TRUST_RESPONSE_RE.search(text)
+            _FOLDER_TRUST_QUESTION_RE.search(text)
+            and _FOLDER_TRUST_YES_OPTION_RE.search(text)
+            and _FOLDER_TRUST_NO_OPTION_RE.search(text)
+            and _FOLDER_TRUST_RESPONSE_RE.search(text)
         )
 
     @staticmethod
@@ -1602,6 +1653,9 @@ class ClaudeCodeOutputDetector:
         if not (
             ClaudeCodeOutputDetector._looks_like_prompt(candidate)
             or _LINE_OPTION_RE.search(candidate)
+            or ClaudeCodeOutputDetector._has_folder_trust_semantics(
+                candidate
+            )
         ):
             return candidate
         contextual = (
@@ -1615,9 +1669,8 @@ class ClaudeCodeOutputDetector:
             ClaudeCodeOutputDetector._folder_trust_action_source(contextual)
         )
         if folder_trust_source and (
-            _FOLDER_TRUST_RE.search(candidate)
+            ClaudeCodeOutputDetector._has_folder_trust_semantics(candidate)
             or _FOLDER_TRUST_RESPONSE_RE.search(candidate)
-            or len(_LINE_OPTION_RE.findall(candidate)) >= 2
         ):
             return folder_trust_source
         lines = [line for line in contextual.splitlines() if line.strip()]
@@ -1632,10 +1685,18 @@ class ClaudeCodeOutputDetector:
     def _folder_trust_action_source(context: str) -> str:
         """从最后一个目录信任问题开始保留有界交互块。"""
 
-        matches = tuple(_FOLDER_TRUST_RE.finditer(context))
+        matches = tuple(_FOLDER_TRUST_QUESTION_RE.finditer(context))
         if not matches:
             return ""
-        return context[matches[-1].start() :][
+        start = matches[-1].start()
+        headings = tuple(
+            _FOLDER_TRUST_HEADING_RE.finditer(context[:start])
+        )
+        if headings and start - headings[-1].end() <= (
+            MAX_FOLDER_TRUST_HEADING_GAP_CHARS
+        ):
+            start = headings[-1].start()
+        return context[start:][
             -MAX_DETECTION_CONTEXT_CHARS:
         ]
 

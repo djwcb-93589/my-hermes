@@ -382,6 +382,30 @@ class ClaudeCodeRuntime:
             )
             return result
 
+    def submit_task(
+        self,
+        *,
+        session_owner: str,
+        process_id: str,
+        data: str,
+    ) -> int:
+        """分两步提交任务文本和 Enter，不改变原生交互回复的通路。"""
+
+        if not isinstance(data, str) or not data.strip():
+            raise ValueError("Claude Code task must be non-empty text")
+        with self._lock:
+            text_bytes = self.write(
+                session_owner=session_owner,
+                process_id=process_id,
+                data=data,
+            )
+            enter_bytes = self.submit(
+                session_owner=session_owner,
+                process_id=process_id,
+                data="",
+            )
+            return text_bytes + enter_bytes
+
     def status(
         self,
         *,

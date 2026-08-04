@@ -25,6 +25,7 @@ class ClaudeCodeControllerPolicy:
     terminate_grace_period: float = 2.0
     terminal_observation_reserve: int = 4
     startup_observation_attempts: int = 4
+    startup_ready_observations: int = 2
 
     def __post_init__(self) -> None:
         self._require_seconds("poll_interval", self.poll_interval, 0.05, 30.0)
@@ -64,6 +65,17 @@ class ClaudeCodeControllerPolicy:
             1,
             20,
         )
+        self._require_count(
+            "startup_ready_observations",
+            self.startup_ready_observations,
+            2,
+            20,
+        )
+        if self.startup_ready_observations > self.startup_observation_attempts:
+            raise ValueError(
+                "startup_ready_observations must not exceed "
+                "startup_observation_attempts"
+            )
         self._require_count(
             "interrupt_observation_attempts",
             self.interrupt_observation_attempts,
