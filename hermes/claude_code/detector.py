@@ -61,7 +61,12 @@ _READY_TASK_INPUT_RE = re.compile(
     r"\bwhat\s+would\s+you\s+like(?:\s+to\s+do)?\b|"
     r"\benter\s+(?:a\s+)?(?:task|prompt)\b|"
     r"\bready\s+(?:for|to\s+accept)\b|"
-    r"^\s*(?:[>❯›»])\s*$|可以开始|请输入任务)"
+    r"^\s*(?:[>$❯›»])\s*$|可以开始|请输入任务)"
+)
+_READY_DOLLAR_INPUT_RE = re.compile(r"(?m)^\s*\$\s*$")
+_READY_EFFORT_UI_LINE_RE = re.compile(
+    r"(?ix)^\s*effort\s*:\s*"
+    r"[a-z][a-z0-9_-]{0,15}\s*[\u00b7\u2022]\s*/\s*effort\s*$"
 )
 _READY_UI_LINE_RE = re.compile(
     r"(?ix)^\s*(?:"
@@ -72,7 +77,7 @@ _READY_UI_LINE_RE = re.compile(
     r"enter\s+(?:a\s+)?(?:task|prompt)|"
     r"ready\s+(?:for|to\s+accept)(?:\s+(?:your\s+)?"
     r"(?:next\s+)?(?:task|prompt))?|"
-    r"[>\u276f\u2794]"
+    r"[>\u276f\u2794\$]"
     r")\s*[!?.,:;]*\s*$"
 )
 _FOLDER_TRUST_QUESTION_RE = re.compile(
@@ -1640,7 +1645,11 @@ class ClaudeCodeOutputDetector:
         normalized = line.strip()
         if not normalized:
             return True
-        if _READY_UI_LINE_RE.fullmatch(normalized):
+        if (
+            _READY_UI_LINE_RE.fullmatch(normalized)
+            or _READY_DOLLAR_INPUT_RE.fullmatch(normalized)
+            or _READY_EFFORT_UI_LINE_RE.fullmatch(normalized)
+        ):
             return True
         return bool(
             any(ord(character) > 127 for character in normalized)
@@ -1656,7 +1665,10 @@ class ClaudeCodeOutputDetector:
             evidence.add("welcome")
         if _READY_MANUAL_MODE_RE.search(text):
             evidence.add("manual_mode")
-        if _READY_TASK_INPUT_RE.search(text):
+        if (
+            _READY_TASK_INPUT_RE.search(text)
+            or _READY_DOLLAR_INPUT_RE.search(text)
+        ):
             evidence.add("task_input")
         return frozenset(evidence)
 
