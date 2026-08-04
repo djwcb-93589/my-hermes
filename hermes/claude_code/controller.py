@@ -1750,6 +1750,7 @@ class ClaudeCodeController:
             )
         )
         failure_seen_this_observation = False
+        activity_seen_this_observation = False
         for event in events_after_instruction:
             if self._event_is_round_failure(
                 event,
@@ -1774,16 +1775,29 @@ class ClaudeCodeController:
                 observation_degraded=observation_degraded,
             ):
                 continue
+            activity_seen_this_observation = True
             current_round.real_activity_seen = True
             current_round.activity_after_instruction_seen = True
+            if current_round.failure_after_instruction_seen:
+                current_round.ready_after_instruction_seen = False
+                current_round.ready_after_failure_seen = False
+                current_round.stable_ready_count = 0
             if event.event_type == ClaudeCodeEventType.COMPLETION_SIGNAL:
                 current_round.completion_evidence_seen = True
+
+        if current_round.failure_after_instruction_seen and (
+            observation_degraded or snapshot.action_required is not None
+        ):
+            current_round.ready_after_instruction_seen = False
+            current_round.ready_after_failure_seen = False
+            current_round.stable_ready_count = 0
 
         if not observation_degraded and self._is_new_round_ready_observation(
             current_round,
             previous=previous,
             snapshot=snapshot,
             failure_seen_this_observation=failure_seen_this_observation,
+            activity_seen_this_observation=activity_seen_this_observation,
         ):
             current_round.ready_after_instruction_seen = True
             if current_round.failure_after_instruction_seen:
@@ -1885,6 +1899,8 @@ class ClaudeCodeController:
             return True
         if event.event_type != ClaudeCodeEventType.OUTPUT:
             return False
+        if event.metadata.get("ready_ui_only") is True:
+            return False
         source = event.metadata.get("source")
         if source not in {None, "mixed"}:
             return False
@@ -1915,6 +1931,7 @@ class ClaudeCodeController:
         previous: ClaudeCodeSnapshot | None,
         snapshot: ClaudeCodeSnapshot,
         failure_seen_this_observation: bool,
+        activity_seen_this_observation: bool,
     ) -> bool:
         """只接受提交后新出现的 READY，不让旧 READY 或普通重绘越过轮次边界。"""
 
@@ -1931,6 +1948,8 @@ class ClaudeCodeController:
             return (
                 current_round.failure_cursor is not None
                 and not failure_seen_this_observation
+                and not activity_seen_this_observation
+                and snapshot.raw_cursor > current_round.failure_cursor
             )
         return previous is None or (
             previous.state != ClaudeCodeState.READY

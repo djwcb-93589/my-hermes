@@ -63,6 +63,18 @@ _READY_TASK_INPUT_RE = re.compile(
     r"\bready\s+(?:for|to\s+accept)\b|"
     r"^\s*(?:[>❯›»])\s*$|可以开始|请输入任务)"
 )
+_READY_UI_LINE_RE = re.compile(
+    r"(?ix)^\s*(?:"
+    r"welcome\s+(?:back|to\s+claude(?:\s+code)?)|"
+    r"manual\s+mode\s*(?:(?::|\bis\b)\s*)?(?:on|enabled)|"
+    r"how\s+can\s+i\s+help|"
+    r"what\s+would\s+you\s+like(?:\s+to\s+do)?|"
+    r"enter\s+(?:a\s+)?(?:task|prompt)|"
+    r"ready\s+(?:for|to\s+accept)(?:\s+(?:your\s+)?"
+    r"(?:next\s+)?(?:task|prompt))?|"
+    r"[>\u276f\u2794]"
+    r")\s*[!?.,:;]*\s*$"
+)
 _FOLDER_TRUST_QUESTION_RE = re.compile(
     r"(?i)\b(?:do\s+you\s+trust\s+(?:the\s+)?files?\s+in\s+"
     r"(?:this|the)\s+(?:folder|directory)|"
@@ -1216,32 +1228,6 @@ class ClaudeCodeOutputDetector:
             isolation.metadata["source"] = "cursor_gap"
             if outbound_evidence_present:
                 isolation.metadata["input_echo_unconfirmed"] = True
-        if output_candidate:
-            output_metadata = dict(isolation.metadata)
-            if delta.limits_hit:
-                output_metadata["limits_hit"] = delta.limits_hit
-            self._append_event(
-                events,
-                event_type=ClaudeCodeEventType.OUTPUT,
-                process_id=process_id,
-                cursor_start=delta.cursor_start,
-                cursor_end=delta.cursor_end,
-                timestamp=timestamp,
-                text=display_output or _INPUT_ECHO_OMITTED_TEXT,
-                metadata=output_metadata,
-            )
-        elif delta.limits_hit:
-            self._append_event(
-                events,
-                event_type=ClaudeCodeEventType.OUTPUT,
-                process_id=process_id,
-                cursor_start=delta.cursor_start,
-                cursor_end=delta.cursor_end,
-                timestamp=timestamp,
-                text="Claude Code output reached a normalization limit",
-                metadata={"limits_hit": delta.limits_hit},
-            )
-
         pending_interaction_expired = False
         if candidate and not delta.cursor_gap:
             self._append_semantic_context(candidate)
@@ -1287,6 +1273,47 @@ class ClaudeCodeOutputDetector:
             and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
             and self._is_verified_ready_signal(candidate, context)
         )
+        ready_ui_only = (
+            not delta.cursor_gap
+            and not delta.limits_hit
+            and not observation_errors
+            and self._is_ready_ui_only_output(
+                candidate,
+                ready_signal=ready_signal,
+                progress_signal=progress_signal,
+                completion_signal=completion_signal,
+                failure_signal=failure_signal,
+            )
+        )
+        if output_candidate:
+            output_metadata = dict(isolation.metadata)
+            if delta.limits_hit:
+                output_metadata["limits_hit"] = delta.limits_hit
+            output_metadata["ready_ui_only"] = ready_ui_only
+            self._append_event(
+                events,
+                event_type=ClaudeCodeEventType.OUTPUT,
+                process_id=process_id,
+                cursor_start=delta.cursor_start,
+                cursor_end=delta.cursor_end,
+                timestamp=timestamp,
+                text=display_output or _INPUT_ECHO_OMITTED_TEXT,
+                metadata=output_metadata,
+            )
+        elif delta.limits_hit:
+            self._append_event(
+                events,
+                event_type=ClaudeCodeEventType.OUTPUT,
+                process_id=process_id,
+                cursor_start=delta.cursor_start,
+                cursor_end=delta.cursor_end,
+                timestamp=timestamp,
+                text="Claude Code output reached a normalization limit",
+                metadata={
+                    "limits_hit": delta.limits_hit,
+                    "ready_ui_only": False,
+                },
+            )
         resumed_after_input = bool(
             candidate
             and self._outbound_response_pending
@@ -1582,6 +1609,43 @@ class ClaudeCodeOutputDetector:
         if not candidate_evidence:
             return False
         return len(self._ready_evidence(context)) >= 2
+
+    @classmethod
+    def _is_ready_ui_only_output(
+        cls,
+        candidate: str,
+        *,
+        ready_signal: bool,
+        progress_signal: bool,
+        completion_signal: bool,
+        failure_signal: bool,
+    ) -> bool:
+        """只标记已验证且不含任务正文的纯 READY 界面增量。"""
+
+        if not ready_signal or not candidate:
+            return False
+        if progress_signal or completion_signal or failure_signal:
+            return False
+        lines = tuple(
+            line.strip()
+            for line in candidate.splitlines()
+            if line.strip()
+        )
+        return bool(lines) and all(cls._is_ready_ui_line(line) for line in lines)
+
+    @staticmethod
+    def _is_ready_ui_line(line: str) -> bool:
+        """确认单行只包含欢迎语、模式提示或已识别的任务输入提示。"""
+
+        normalized = line.strip()
+        if not normalized:
+            return True
+        if _READY_UI_LINE_RE.fullmatch(normalized):
+            return True
+        return bool(
+            any(ord(character) > 127 for character in normalized)
+            and _READY_TASK_INPUT_RE.fullmatch(normalized)
+        )
 
     @staticmethod
     def _ready_evidence(text: str) -> frozenset[str]:
@@ -2154,6 +2218,8 @@ class ClaudeCodeOutputDetector:
     def _event_counts_as_activity(event: ClaudeCodeEvent) -> bool:
         if event.event_type != ClaudeCodeEventType.OUTPUT:
             return True
+        if event.metadata.get("ready_ui_only") is True:
+            return False
         return event.metadata.get("source") not in {
             "input_echo",
             "unconfirmed_after_input",
