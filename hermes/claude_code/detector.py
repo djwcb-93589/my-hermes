@@ -270,6 +270,7 @@ class ClaudeCodeOutputDetector:
         self._failure_seen = False
         self._progress_seen = False
         self._ready_seen = False
+        self._round_activity_seen = False
         self._pending_ready_process_id: str | None = None
         self._pending_ready_session_owner: str | None = None
         self._pending_ready_cursor: int | None = None
@@ -313,6 +314,7 @@ class ClaudeCodeOutputDetector:
         self._failure_seen = False
         self._progress_seen = False
         self._ready_seen = False
+        self._round_activity_seen = False
         self._clear_pending_ready()
         self._context_complete = True
         self._outbound_response_pending = False
@@ -329,6 +331,7 @@ class ClaudeCodeOutputDetector:
         self._failure_seen = False
         self._progress_seen = False
         self._ready_seen = False
+        self._round_activity_seen = False
         self._clear_pending_ready()
         self._state = ClaudeCodeState.STARTING
         self._clear_semantic_context()
@@ -992,6 +995,8 @@ class ClaudeCodeOutputDetector:
         action: ClaudeCodeActionRequired,
         *,
         interaction_candidate: str,
+        interaction_source: str = "",
+        allow_interrupt_fallback: bool = False,
         process_id: str,
         session_owner: str,
         cursor_start: int,
@@ -1000,28 +1005,33 @@ class ClaudeCodeOutputDetector:
     ) -> tuple[ClaudeCodeActionRequired, bool]:
         """只在已有安全 Action 后附加短暂原生 Prompt 视图。"""
 
-        if not interaction_candidate:
-            return action, False
-        interaction_source = self._native_action_source(
-            action,
-            process_id=process_id,
-            session_owner=session_owner,
-            cursor_start=cursor_start,
-            cursor_end=cursor_end,
-            timestamp=timestamp,
-        )
+        had_interaction_input = bool(interaction_candidate or interaction_source)
+        if not interaction_source and interaction_candidate:
+            interaction_source = self._native_action_source(
+                action,
+                process_id=process_id,
+                session_owner=session_owner,
+                cursor_start=cursor_start,
+                cursor_end=cursor_end,
+                timestamp=timestamp,
+            )
         if not interaction_source:
-            retained_action = self._retained_native_runtime_permission_view(
+            retained_action = self._retained_native_action_view(
                 action,
                 interaction_candidate=interaction_candidate,
             )
             if retained_action is not None:
                 return retained_action, False
-            return action, True
+            if allow_interrupt_fallback:
+                interaction_source = self._safe_interrupt_menu_source(action)
+        if not interaction_source:
+            return action, had_interaction_input
         raw_options = self._extract_options(
             interaction_source,
             redact_output=False,
         )[:MAX_NATIVE_INTERACTION_OPTIONS]
+        if not raw_options:
+            raw_options = action.options[:MAX_NATIVE_INTERACTION_OPTIONS]
         native_prompt_fingerprint = self._native_prompt_fingerprint(
             interaction_source,
             raw_options,
@@ -1037,29 +1047,178 @@ class ClaudeCodeOutputDetector:
             native_prompt_fingerprint=native_prompt_fingerprint,
         ), False
 
-    def _retained_native_runtime_permission_view(
+    def _retained_native_action_view(
         self,
         action: ClaudeCodeActionRequired,
         *,
         interaction_candidate: str,
     ) -> ClaudeCodeActionRequired | None:
-        """仅在同一权限面板的局部重绘时保留已验证的原生视图。"""
+        """按未消费 Action 身份保留临时原生视图，兼容同语义重绘。"""
 
         current = self._action_required
         if (
             current is None
             or current.raw_prompt_text is None
             or current.raw_options is None
-            or self._safe_action_fingerprint(current)
-            != self._safe_action_fingerprint(action)
-            or not self._is_runtime_permission_prompt(action.prompt_text)
+            or current.process_id != action.process_id
+            or current.session_owner != action.session_owner
+            or (
+                current.action_id != action.action_id
+                and self._safe_action_fingerprint(current)
+                != self._safe_action_fingerprint(action)
+            )
         ):
             return None
-        if not self._has_runtime_permission_fragment(
-            redact_claude_code_output(interaction_candidate).strip()
+        if current.action_id == action.action_id:
+            return current
+        safe_fragment = redact_claude_code_output(interaction_candidate).strip()
+        if not safe_fragment or not self._action_view_fragment_matches(
+            action,
+            safe_fragment,
         ):
             return None
         return current
+
+    @classmethod
+    def _action_view_fragment_matches(
+        cls,
+        action: ClaudeCodeActionRequired,
+        fragment: str,
+    ) -> bool:
+        """只接受仍能证明属于同一 Action 的局部原生片段。"""
+
+        if (
+            action.kind == ClaudeCodeActionKind.UNKNOWN_PROMPT
+            and cls._has_interrupt_menu_semantics(action.prompt_text)
+        ):
+            return cls._has_interrupt_menu_semantics(fragment)
+        if cls._is_runtime_permission_prompt(action.prompt_text):
+            return cls._has_runtime_permission_fragment(fragment)
+        if cls._has_folder_trust_semantics(action.prompt_text):
+            return cls._has_folder_trust_semantics(fragment)
+        return bool(
+            cls._looks_like_prompt(fragment)
+            or _INLINE_OPTION_RE.search(fragment)
+            or _LINE_OPTION_RE.search(fragment)
+        )
+
+    @classmethod
+    def _interrupt_menu_interaction_source(
+        cls,
+        action: ClaudeCodeActionRequired,
+        interaction_delta: NormalizedOutputDelta,
+        excluded_lines: frozenset[int],
+    ) -> str:
+        """从同一 cursor 页提取已遮蔽 echo 的中断菜单范围。"""
+
+        if (
+            action.kind != ClaudeCodeActionKind.UNKNOWN_PROMPT
+            or not cls._has_interrupt_menu_semantics(action.prompt_text)
+            or interaction_delta.cursor_gap
+            or not interaction_delta.text
+        ):
+            return ""
+        safe_lines = tuple(
+            redact_claude_code_output(line)
+            for line in interaction_delta.text.splitlines()
+        )
+        source_lines = tuple(interaction_delta.text.splitlines())
+        if len(safe_lines) != len(source_lines):
+            return ""
+        selected_lines = cls._interrupt_menu_line_indices(
+            "\n".join(safe_lines),
+            action.options,
+        )
+        if not selected_lines or any(
+            index in excluded_lines for index in selected_lines
+        ):
+            return ""
+        source = "\n".join(safe_lines[index] for index in selected_lines)
+        if not cls._has_interrupt_menu_semantics(source):
+            return ""
+        return source[-MAX_NATIVE_INTERACTION_PROMPT_CHARS :].strip()
+
+    @classmethod
+    def _safe_interrupt_menu_source(
+        cls,
+        action: ClaudeCodeActionRequired,
+    ) -> str:
+        """无可靠原生映射时仅保留当前安全 Action 的中断范围。"""
+
+        if (
+            action.kind != ClaudeCodeActionKind.UNKNOWN_PROMPT
+            or not cls._has_interrupt_menu_semantics(action.prompt_text)
+        ):
+            return ""
+        return cls._bounded_interrupt_menu_source(
+            action.prompt_text,
+            action.options,
+        )
+
+    @classmethod
+    def _bounded_interrupt_menu_source(
+        cls,
+        text: str,
+        options: tuple[str, ...],
+    ) -> str:
+        safe_text = redact_claude_code_output(text).strip()
+        if not safe_text:
+            return ""
+        selected_lines = cls._interrupt_menu_line_indices(safe_text, options)
+        if not selected_lines:
+            return ""
+        source = "\n".join(
+            safe_text.splitlines()[index] for index in selected_lines
+        )
+        return source[-MAX_NATIVE_INTERACTION_PROMPT_CHARS :].strip()
+
+    @staticmethod
+    def _interrupt_menu_line_indices(
+        text: str,
+        options: tuple[str, ...],
+    ) -> tuple[int, ...]:
+        lines = text.splitlines()
+        if not lines:
+            return ()
+        matches = tuple(_INTERRUPT_MENU_RE.finditer(text))
+        if not matches:
+            return ()
+        marker_line = text[: matches[-1].start()].count("\n")
+        option_keys = {
+            " ".join(option.split()).casefold()
+            for option in options
+            if option.strip()
+        }
+
+        def is_option_or_gap(index: int) -> bool:
+            line = lines[index].strip()
+            if not line:
+                return True
+            if not option_keys:
+                return False
+            if not (
+                _LINE_OPTION_RE.fullmatch(line)
+                or _INLINE_OPTION_RE.search(line)
+            ):
+                return False
+            normalized = " ".join(line.split()).casefold()
+            return any(
+                normalized == option_key
+                or normalized.endswith(option_key)
+                for option_key in option_keys
+            )
+
+        start = marker_line
+        while start > 0 and is_option_or_gap(start - 1):
+            start -= 1
+        end = marker_line + 1
+        while end < len(lines) and is_option_or_gap(end):
+            end += 1
+        return tuple(
+            index
+            for index in range(start, end)
+            if index == marker_line or is_option_or_gap(index)
+        )
 
     def _clear_native_view_for_safe_action(
         self,
@@ -1278,6 +1437,7 @@ class ClaudeCodeOutputDetector:
             self._failure_seen = False
             self._progress_seen = False
             self._ready_seen = False
+            self._round_activity_seen = False
             self._clear_pending_ready()
             self._clear_session_ready_profile()
             self._clear_semantic_context()
@@ -1410,11 +1570,19 @@ class ClaudeCodeOutputDetector:
             )
         )
         (
-            ready_fragment_evidence,
-            has_ready_ui_fragment,
+            _ready_fragment_evidence,
+            _has_ready_ui_fragment,
             has_non_ready_ui_content,
         ) = self._ready_ui_fragment_evidence(candidate)
+        (
+            ready_tail_fragment_evidence,
+            has_ready_ui_tail,
+            has_non_ready_ui_prefix,
+        ) = self._ready_ui_tail_fragment_evidence(candidate)
         isolated_dollar_ui = self._is_isolated_dollar_ui(candidate)
+        if candidate and has_non_ready_ui_content and not isolated_dollar_ui:
+            # 仅记录本轮确实出现的非 UI 输出，供 Session profile 补足历史证据。
+            self._round_activity_seen = True
         ready_context_evidence = self._ready_evidence(context_before) & {
             "welcome",
             "manual_mode",
@@ -1423,28 +1591,46 @@ class ClaudeCodeOutputDetector:
             prompt_structure and _AUTH_RE.search(candidate)
         ):
             self._clear_session_ready_profile()
+        session_profile_matches = self._session_ready_profile_matches(
+            process_id=process_id,
+            session_owner=session_owner,
+        )
         session_profile_fragment_evidence = frozenset(
-            ready_fragment_evidence
+            ready_tail_fragment_evidence
             & {"welcome", "manual_mode", "task_input"}
         )
-        session_profile_candidate = bool(
-            self._session_ready_profile_matches(
-                process_id=process_id,
-                session_owner=session_owner,
-            )
+        session_profile_common = bool(
+            session_profile_matches
             and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
-            and has_ready_ui_fragment
+            and has_ready_ui_tail
             and session_profile_fragment_evidence
-            and not has_non_ready_ui_content
-            and not progress_signal
-            and not completion_signal
-            and not failure_signal
+            and self._round_activity_seen
+            and not isolated_dollar_ui
             and not delta.cursor_gap
             and not delta.limits_hit
             and not observation_errors
             and self._action_required is None
         )
+        session_profile_candidate = bool(
+            session_profile_common
+            and not has_non_ready_ui_prefix
+            and not progress_signal
+            and not completion_signal
+            and not failure_signal
+        )
+        session_profile_history_evidence = (
+            self._session_ready_evidence
+            if session_profile_matches
+            else frozenset()
+        )
         ready_state_signal = ready_signal and ready_ui_only
+        if (
+            task_submitted
+            and session_profile_matches
+            and not self._round_activity_seen
+        ):
+            # 已建立 Session profile 后，历史证据不能在没有本轮真实活动时恢复 READY。
+            ready_state_signal = False
         if output_candidate:
             output_metadata = dict(isolation.metadata)
             if delta.limits_hit:
@@ -1534,7 +1720,7 @@ class ClaudeCodeOutputDetector:
                     timestamp=timestamp,
                     text=candidate,
                 )
-            action = self._interrupt_menu_action(
+            interrupt_menu_action = self._interrupt_menu_action(
                 candidate,
                 process_id=process_id,
                 session_owner=session_owner,
@@ -1544,6 +1730,7 @@ class ClaudeCodeOutputDetector:
                 process_status=process_status,
                 interrupt_requested=interrupt_requested,
             )
+            action = interrupt_menu_action
             action_source = candidate
             if action is None:
                 action_source = (
@@ -1595,9 +1782,22 @@ class ClaudeCodeOutputDetector:
             elif session_profile_candidate:
                 ready_state_signal = True
             if action is not None:
+                interaction_source = ""
+                if interrupt_menu_action is not None:
+                    interaction_source = (
+                        self._interrupt_menu_interaction_source(
+                            action,
+                            interaction_delta,
+                            isolation.excluded_lines,
+                        )
+                    )
                 action, native_view_unavailable = self._native_action_view(
                     action,
                     interaction_candidate=interaction_candidate,
+                    interaction_source=interaction_source,
+                    allow_interrupt_fallback=(
+                        interrupt_menu_action is not None
+                    ),
                     process_id=process_id,
                     session_owner=session_owner,
                     cursor_start=delta.cursor_start,
@@ -1632,8 +1832,9 @@ class ClaudeCodeOutputDetector:
             if pending_ready_matches:
                 pending_evidence = (
                     self._pending_ready_evidence
-                    | ready_fragment_evidence
+                    | ready_tail_fragment_evidence
                     | ready_context_evidence
+                    | session_profile_history_evidence
                 )
                 pending_degraded = bool(
                     self._action_required is not None
@@ -1664,8 +1865,8 @@ class ClaudeCodeOutputDetector:
             if (
                 not ready_state_signal
                 and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
-                and has_ready_ui_fragment
-                and has_non_ready_ui_content
+                and has_ready_ui_tail
+                and has_non_ready_ui_prefix
                 and not action
                 and self._action_required is None
             ):
@@ -1673,7 +1874,11 @@ class ClaudeCodeOutputDetector:
                     process_id=process_id,
                     session_owner=session_owner,
                     cursor=delta.cursor_end,
-                    evidence=ready_fragment_evidence | ready_context_evidence,
+                    evidence=(
+                        ready_tail_fragment_evidence
+                        | ready_context_evidence
+                        | session_profile_history_evidence
+                    ),
                 )
             if (
                 ready_state_signal
@@ -1925,6 +2130,29 @@ class ClaudeCodeOutputDetector:
             return frozenset(), False, bool(lines)
         evidence = cls._ready_evidence("\n".join(ready_lines))
         return evidence, True, len(ready_lines) != len(lines)
+
+    @classmethod
+    def _ready_ui_tail_fragment_evidence(
+        cls,
+        candidate: str,
+    ) -> tuple[frozenset[str], bool, bool]:
+        """只提取输出尾部连续 READY UI，允许前面保留真实回答正文。"""
+
+        lines = tuple(
+            line.strip()
+            for line in candidate.splitlines()
+            if line.strip()
+        )
+        if not lines:
+            return frozenset(), False, False
+        tail_start = len(lines)
+        while tail_start > 0 and cls._is_ready_ui_line(lines[tail_start - 1]):
+            tail_start -= 1
+        if tail_start == len(lines):
+            return frozenset(), False, False
+        tail_lines = lines[tail_start:]
+        evidence = cls._ready_evidence("\n".join(tail_lines))
+        return evidence, True, tail_start > 0
 
     @staticmethod
     def _is_isolated_dollar_ui(candidate: str) -> bool:
