@@ -165,6 +165,7 @@ class _ControllerTaskRound:
     completion_after_interrupt_seen: bool = False
     failure_after_instruction_seen: bool = False
     failure_cursor: int | None = None
+    ready_after_failure_seen: bool = False
     terminal_state: ClaudeCodeState | None = None
     terminal_at: float | None = None
 
@@ -1699,6 +1700,7 @@ class ClaudeCodeController:
         current_round.completion_after_interrupt_seen = False
         current_round.failure_after_instruction_seen = False
         current_round.failure_cursor = None
+        current_round.ready_after_failure_seen = False
         task.interrupt_requested = False
         task.consecutive_empty_reads = 0
 
@@ -1717,11 +1719,22 @@ class ClaudeCodeController:
         events = tuple(
             event
             for event in snapshot.events
-            if event.cursor_end > current_round.round_start_cursor
+            if self._event_belongs_to_round(
+                task,
+                current_round,
+                event,
+                boundary=current_round.round_start_cursor,
+            )
+        )
+        observation_degraded = self._round_observation_is_degraded(
+            task,
+            snapshot.events,
         )
         if any(
-            event.event_type == ClaudeCodeEventType.CURSOR_GAP
-            for event in events
+            event.process_id == task.process_id
+            and event.event_type == ClaudeCodeEventType.CURSOR_GAP
+            and event.cursor_end > current_round.round_start_cursor
+            for event in snapshot.events
         ):
             current_round.cursor_continuous = False
             current_round.stable_ready_count = 0
@@ -1729,32 +1742,52 @@ class ClaudeCodeController:
         events_after_instruction = tuple(
             event
             for event in events
-            if event.cursor_end > current_round.latest_instruction_cursor
+            if self._event_belongs_to_round(
+                task,
+                current_round,
+                event,
+                boundary=current_round.latest_instruction_cursor,
+            )
         )
+        failure_seen_this_observation = False
         for event in events_after_instruction:
-            if self._event_is_round_failure(event):
+            if self._event_is_round_failure(
+                event,
+                snapshot=snapshot,
+                observation_degraded=observation_degraded,
+            ):
+                failure_seen_this_observation = True
                 current_round.failure_after_instruction_seen = True
-                current_round.failure_cursor = event.cursor_end
+                current_round.failure_cursor = max(
+                    current_round.failure_cursor or 0,
+                    event.cursor_end,
+                )
+                current_round.real_activity_seen = True
+                current_round.activity_after_instruction_seen = True
+                current_round.ready_after_instruction_seen = False
+                current_round.ready_after_failure_seen = False
+                current_round.stable_ready_count = 0
                 continue
-            if not self._event_is_round_activity(event):
+            if not self._event_counts_as_round_activity(
+                event,
+                snapshot=snapshot,
+                observation_degraded=observation_degraded,
+            ):
                 continue
             current_round.real_activity_seen = True
             current_round.activity_after_instruction_seen = True
             if event.event_type == ClaudeCodeEventType.COMPLETION_SIGNAL:
                 current_round.completion_evidence_seen = True
-            if (
-                current_round.failure_cursor is not None
-                and event.cursor_end > current_round.failure_cursor
-            ):
-                current_round.failure_after_instruction_seen = False
-                current_round.failure_cursor = None
 
-        if self._is_new_round_ready_observation(
+        if not observation_degraded and self._is_new_round_ready_observation(
             current_round,
             previous=previous,
             snapshot=snapshot,
+            failure_seen_this_observation=failure_seen_this_observation,
         ):
             current_round.ready_after_instruction_seen = True
+            if current_round.failure_after_instruction_seen:
+                current_round.ready_after_failure_seen = True
 
         interrupt_cursor = current_round.interrupt_requested_cursor
         if (
@@ -1769,7 +1802,6 @@ class ClaudeCodeController:
             )
             if any(
                 event.event_type == ClaudeCodeEventType.PROGRESS
-                and self._event_is_round_activity(event)
                 for event in events_after_interrupt
             ):
                 current_round.post_interrupt_work_seen = True
@@ -1786,21 +1818,95 @@ class ClaudeCodeController:
                 current_round.post_interrupt_observation_seen = True
                 current_round.ready_after_interrupt_seen = True
 
-        if self._round_ready_observation(current_round, snapshot):
+        if (
+            not observation_degraded
+            and self._round_ready_observation(current_round, snapshot)
+        ):
             current_round.stable_ready_count += 1
         else:
             current_round.stable_ready_count = 0
 
     @staticmethod
-    def _event_is_round_activity(event: ClaudeCodeEvent) -> bool:
-        return event.event_type in {
-            ClaudeCodeEventType.PROGRESS,
-            ClaudeCodeEventType.COMPLETION_SIGNAL,
-        }
+    def _event_belongs_to_round(
+        task: _ControllerTask,
+        current_round: _ControllerTaskRound,
+        event: ClaudeCodeEvent,
+        *,
+        boundary: int,
+    ) -> bool:
+        """按进程身份与绝对 cursor 边界隔离当前轮次的增量事件。"""
+
+        return (
+            event.process_id == task.process_id
+            and event.cursor_start >= boundary
+            and event.cursor_end > current_round.round_start_cursor
+            and event.cursor_end > boundary
+        )
 
     @staticmethod
-    def _event_is_round_failure(event: ClaudeCodeEvent) -> bool:
-        return event.event_type == ClaudeCodeEventType.FAILURE_SIGNAL
+    def _round_observation_is_degraded(
+        task: _ControllerTask,
+        events: tuple[ClaudeCodeEvent, ...],
+    ) -> bool:
+        """本次读取出现 gap、错误或安全降级时不采用其中的活动证据。"""
+
+        for event in events:
+            if event.process_id != task.process_id:
+                continue
+            if event.event_type in {
+                ClaudeCodeEventType.CURSOR_GAP,
+                ClaudeCodeEventType.READ_ERROR,
+            }:
+                return True
+            if event.metadata.get("source") == "cursor_gap":
+                return True
+            if (
+                event.metadata.get("limits_hit")
+                or event.metadata.get("event_text_truncated")
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _event_counts_as_round_activity(
+        event: ClaudeCodeEvent,
+        *,
+        snapshot: ClaudeCodeSnapshot,
+        observation_degraded: bool,
+    ) -> bool:
+        """只接受可归属且无降级的真实工作输出，不重新解析任务正文。"""
+
+        if observation_degraded or snapshot.action_required is not None:
+            return False
+        if event.event_type in {
+            ClaudeCodeEventType.PROGRESS,
+            ClaudeCodeEventType.COMPLETION_SIGNAL,
+        }:
+            return True
+        if event.event_type != ClaudeCodeEventType.OUTPUT:
+            return False
+        source = event.metadata.get("source")
+        if source not in {None, "mixed"}:
+            return False
+        return not (
+            event.metadata.get("limits_hit")
+            or event.metadata.get("event_text_truncated")
+        )
+
+    @staticmethod
+    def _event_is_round_failure(
+        event: ClaudeCodeEvent,
+        *,
+        snapshot: ClaudeCodeSnapshot,
+        observation_degraded: bool,
+    ) -> bool:
+        """只使用 Detector 已结构化且未被安全降级的失败事实。"""
+
+        return (
+            event.event_type == ClaudeCodeEventType.FAILURE_SIGNAL
+            and not observation_degraded
+            and snapshot.action_required is None
+        )
 
     def _is_new_round_ready_observation(
         self,
@@ -1808,6 +1914,7 @@ class ClaudeCodeController:
         *,
         previous: ClaudeCodeSnapshot | None,
         snapshot: ClaudeCodeSnapshot,
+        failure_seen_this_observation: bool,
     ) -> bool:
         """只接受提交后新出现的 READY，不让旧 READY 或普通重绘越过轮次边界。"""
 
@@ -1819,6 +1926,12 @@ class ClaudeCodeController:
             and self._snapshot_has_active_process(snapshot)
         ):
             return False
+        if current_round.failure_after_instruction_seen:
+            # 失败与 READY 同批出现时，下一次观察才可作为失败后的稳定 READY。
+            return (
+                current_round.failure_cursor is not None
+                and not failure_seen_this_observation
+            )
         return previous is None or (
             previous.state != ClaudeCodeState.READY
             or previous.raw_cursor <= current_round.latest_instruction_cursor
@@ -1851,6 +1964,10 @@ class ClaudeCodeController:
             current_round.cursor_continuous
             and current_round.activity_after_instruction_seen
             and current_round.ready_after_instruction_seen
+            and (
+                not current_round.failure_after_instruction_seen
+                or current_round.ready_after_failure_seen
+            )
             and snapshot.raw_cursor > current_round.latest_instruction_cursor
             and snapshot.state == ClaudeCodeState.READY
             and snapshot.action_required is None
@@ -1898,6 +2015,24 @@ class ClaudeCodeController:
                 task,
                 snapshot,
                 ClaudeCodeState.INTERRUPTED,
+            )
+        if task.interrupt_requested and not current_round.interrupt_confirmed:
+            return None
+        if (
+            current_round.instruction_submitted
+            and not current_round.interrupt_confirmed
+            and current_round.failure_after_instruction_seen
+            and current_round.failure_cursor is not None
+            and current_round.real_activity_seen
+            and current_round.activity_after_instruction_seen
+            and current_round.cursor_continuous
+            and current_round.ready_after_failure_seen
+            and ready_confirmed
+        ):
+            return self._finalize_round_locked(
+                task,
+                snapshot,
+                ClaudeCodeState.FAILED,
             )
         if (
             current_round.instruction_submitted
