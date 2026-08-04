@@ -263,6 +263,10 @@ class ClaudeCodeOutputDetector:
         self._failure_seen = False
         self._progress_seen = False
         self._ready_seen = False
+        self._pending_ready_process_id: str | None = None
+        self._pending_ready_session_owner: str | None = None
+        self._pending_ready_cursor: int | None = None
+        self._pending_ready_evidence: frozenset[str] = frozenset()
         self._last_process_status: str | None = None
         self._context_complete = True
         self._semantic_context = ""
@@ -299,6 +303,7 @@ class ClaudeCodeOutputDetector:
         self._failure_seen = False
         self._progress_seen = False
         self._ready_seen = False
+        self._clear_pending_ready()
         self._context_complete = True
         self._outbound_response_pending = False
         self._clear_semantic_context()
@@ -314,6 +319,7 @@ class ClaudeCodeOutputDetector:
         self._failure_seen = False
         self._progress_seen = False
         self._ready_seen = False
+        self._clear_pending_ready()
         self._state = ClaudeCodeState.STARTING
         self._clear_semantic_context()
         self._clear_recent_event_fingerprints()
@@ -331,6 +337,7 @@ class ClaudeCodeOutputDetector:
             )
         self._action_required = None
         self._last_action_fingerprint = None
+        self._clear_pending_ready()
         self._clear_interaction_context()
         if self._state in {
             ClaudeCodeState.WAITING_INPUT,
@@ -824,6 +831,47 @@ class ClaudeCodeOutputDetector:
         self._semantic_context = ""
         self._last_semantic_context_fingerprint = ""
 
+    def _clear_pending_ready(self) -> None:
+        """清除仅用于跨观察确认 READY 的有限结构化证据。"""
+
+        self._pending_ready_process_id = None
+        self._pending_ready_session_owner = None
+        self._pending_ready_cursor = None
+        self._pending_ready_evidence = frozenset()
+
+    def _remember_pending_ready(
+        self,
+        *,
+        process_id: str,
+        session_owner: str,
+        cursor: int,
+        evidence: frozenset[str],
+    ) -> None:
+        """只保留进程、游标和有限 READY 类别，不保留输出正文。"""
+
+        bounded_evidence = frozenset(
+            evidence & {"welcome", "manual_mode", "task_input"}
+        )
+        if not bounded_evidence:
+            self._clear_pending_ready()
+            return
+        self._pending_ready_process_id = process_id
+        self._pending_ready_session_owner = session_owner
+        self._pending_ready_cursor = cursor
+        self._pending_ready_evidence = bounded_evidence
+
+    def _pending_ready_matches(
+        self,
+        *,
+        process_id: str,
+        session_owner: str,
+    ) -> bool:
+        return (
+            self._pending_ready_process_id == process_id
+            and self._pending_ready_session_owner == session_owner
+            and self._pending_ready_cursor is not None
+        )
+
     def _append_semantic_context(self, text: str) -> None:
         safe_text = redact_claude_code_output(text).strip()
         if not safe_text:
@@ -1150,6 +1198,11 @@ class ClaudeCodeOutputDetector:
 
         events: list[ClaudeCodeEvent] = []
         previous_action_fingerprint = self._last_action_fingerprint
+        if self._pending_ready_process_id is not None and (
+            self._pending_ready_process_id != process_id
+            or self._pending_ready_session_owner != session_owner
+        ):
+            self._clear_pending_ready()
         output_candidate = redact_claude_code_output(delta.text).strip()
         interaction_safe_candidate = redact_claude_code_output(
             interaction_delta.text
@@ -1167,6 +1220,7 @@ class ClaudeCodeOutputDetector:
             self._failure_seen = False
             self._progress_seen = False
             self._ready_seen = False
+            self._clear_pending_ready()
             self._clear_semantic_context()
             self._clear_interaction_context()
             self._outbound_response_pending = False
@@ -1207,7 +1261,10 @@ class ClaudeCodeOutputDetector:
         if observation_errors:
             self._action_required = None
             self._last_action_fingerprint = None
+            self._clear_pending_ready()
             self._clear_interaction_context()
+        if delta.limits_hit:
+            self._clear_pending_ready()
 
         outbound_evidence_present = bool(
             self._outbound_inputs or self._matched_echoes
@@ -1234,6 +1291,7 @@ class ClaudeCodeOutputDetector:
             if outbound_evidence_present:
                 isolation.metadata["input_echo_unconfirmed"] = True
         pending_interaction_expired = False
+        context_before = self._semantic_context[-MAX_DETECTION_CONTEXT_CHARS:]
         if candidate and not delta.cursor_gap:
             self._append_semantic_context(candidate)
         if interaction_candidate and not delta.cursor_gap:
@@ -1284,12 +1342,22 @@ class ClaudeCodeOutputDetector:
             and not observation_errors
             and self._is_ready_ui_only_output(
                 candidate,
-                ready_signal=ready_signal,
+                context_before=context_before,
                 progress_signal=progress_signal,
                 completion_signal=completion_signal,
                 failure_signal=failure_signal,
             )
         )
+        (
+            ready_fragment_evidence,
+            has_ready_ui_fragment,
+            has_non_ready_ui_content,
+        ) = self._ready_ui_fragment_evidence(candidate)
+        ready_context_evidence = self._ready_evidence(context_before) & {
+            "welcome",
+            "manual_mode",
+        }
+        ready_state_signal = ready_signal and ready_ui_only
         if output_candidate:
             output_metadata = dict(isolation.metadata)
             if delta.limits_hit:
@@ -1335,10 +1403,11 @@ class ClaudeCodeOutputDetector:
             progress_signal
             or completion_signal
             or failure_signal
-            or ready_signal
+            or ready_state_signal
         ):
             self._clear_suppressed_action_fingerprints()
 
+        action: ClaudeCodeActionRequired | None = None
         if not delta.cursor_gap:
             if progress_signal:
                 self._progress_seen = True
@@ -1373,12 +1442,9 @@ class ClaudeCodeOutputDetector:
                     timestamp=timestamp,
                     text=candidate,
                 )
-            if ready_signal:
-                self._ready_seen = True
-
             action_source = (
                 candidate
-                if ready_signal
+                if ready_state_signal
                 else self._action_source(candidate, context)
             )
             if self._context_complete:
@@ -1406,7 +1472,7 @@ class ClaudeCodeOutputDetector:
             else:
                 action = None
             if (
-                ready_signal
+                ready_state_signal
                 and action is not None
                 and action.kind
                 in {
@@ -1440,11 +1506,64 @@ class ClaudeCodeOutputDetector:
                 progress_signal
                 or completion_signal
                 or failure_signal
-                or ready_signal
+                or ready_state_signal
             ):
                 self._action_required = None
                 self._last_action_fingerprint = None
                 self._clear_interaction_context()
+
+            pending_ready_matches = self._pending_ready_matches(
+                process_id=process_id,
+                session_owner=session_owner,
+            )
+            if pending_ready_matches:
+                pending_evidence = (
+                    self._pending_ready_evidence
+                    | ready_fragment_evidence
+                    | ready_context_evidence
+                )
+                pending_degraded = bool(
+                    self._action_required is not None
+                    or action is not None
+                    or progress_signal
+                    or completion_signal
+                    or failure_signal
+                    or has_non_ready_ui_content
+                )
+                if (
+                    process_status not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+                    or pending_degraded
+                    or self._pending_ready_cursor is None
+                    or delta.cursor_end < self._pending_ready_cursor
+                ):
+                    self._clear_pending_ready()
+                elif len(pending_evidence) >= 2:
+                    ready_state_signal = True
+                    self._ready_seen = True
+                    self._clear_pending_ready()
+                else:
+                    self._pending_ready_cursor = delta.cursor_end
+                    self._pending_ready_evidence = frozenset(
+                        pending_evidence
+                        & {"welcome", "manual_mode", "task_input"}
+                    )
+
+            if (
+                not ready_state_signal
+                and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+                and has_ready_ui_fragment
+                and has_non_ready_ui_content
+                and not action
+                and self._action_required is None
+            ):
+                self._remember_pending_ready(
+                    process_id=process_id,
+                    session_owner=session_owner,
+                    cursor=delta.cursor_end,
+                    evidence=ready_fragment_evidence | ready_context_evidence,
+                )
+            if ready_state_signal:
+                self._ready_seen = True
 
         if self._process_just_exited(process_status):
             self._append_event(
@@ -1476,11 +1595,15 @@ class ClaudeCodeOutputDetector:
             progress_signal=progress_signal,
             completion_signal=completion_signal,
             failure_signal=failure_signal,
-            ready_signal=ready_signal,
+            ready_signal=ready_state_signal,
+            allow_ready_history=not (
+                bool(candidate) and has_non_ready_ui_content
+            ),
         )
         if lost or process_status in _TERMINAL_PROCESS_STATUSES:
             self._action_required = None
             self._last_action_fingerprint = None
+            self._clear_pending_ready()
             self._clear_interaction_context()
             self._clear_outbound_input_evidence()
         elif self._state == ClaudeCodeState.WORKING:
@@ -1528,6 +1651,7 @@ class ClaudeCodeOutputDetector:
         completion_signal: bool,
         failure_signal: bool,
         ready_signal: bool,
+        allow_ready_history: bool,
     ) -> ClaudeCodeState:
         if lost or process_status == "lost":
             return ClaudeCodeState.LOST
@@ -1575,7 +1699,7 @@ class ClaudeCodeOutputDetector:
                 return ClaudeCodeState.UNKNOWN
             return ClaudeCodeState.WAITING_APPROVAL
 
-        if ready_signal or self._ready_seen:
+        if ready_signal or (allow_ready_history and self._ready_seen):
             return ClaudeCodeState.READY
         if task_submitted and (
             progress_signal
@@ -1620,14 +1744,14 @@ class ClaudeCodeOutputDetector:
         cls,
         candidate: str,
         *,
-        ready_signal: bool,
+        context_before: str,
         progress_signal: bool,
         completion_signal: bool,
         failure_signal: bool,
     ) -> bool:
         """只标记已验证且不含任务正文的纯 READY 界面增量。"""
 
-        if not ready_signal or not candidate:
+        if not candidate:
             return False
         if progress_signal or completion_signal or failure_signal:
             return False
@@ -1636,7 +1760,40 @@ class ClaudeCodeOutputDetector:
             for line in candidate.splitlines()
             if line.strip()
         )
-        return bool(lines) and all(cls._is_ready_ui_line(line) for line in lines)
+        if not lines or not all(cls._is_ready_ui_line(line) for line in lines):
+            return False
+
+        evidence = cls._ready_evidence(candidate)
+        if "task_input" not in evidence:
+            return True
+        trusted_context_evidence = cls._ready_evidence(context_before) & {
+            "welcome",
+            "manual_mode",
+        }
+        return bool(
+            trusted_context_evidence
+            or evidence & {"welcome", "manual_mode"}
+        )
+
+    @classmethod
+    def _ready_ui_fragment_evidence(
+        cls,
+        candidate: str,
+    ) -> tuple[frozenset[str], bool, bool]:
+        """提取 READY UI 行的有限类别，并标记是否混入普通内容。"""
+
+        lines = tuple(
+            line.strip()
+            for line in candidate.splitlines()
+            if line.strip()
+        )
+        ready_lines = tuple(
+            line for line in lines if cls._is_ready_ui_line(line)
+        )
+        if not ready_lines:
+            return frozenset(), False, bool(lines)
+        evidence = cls._ready_evidence("\n".join(ready_lines))
+        return evidence, True, len(ready_lines) != len(lines)
 
     @staticmethod
     def _is_ready_ui_line(line: str) -> bool:
