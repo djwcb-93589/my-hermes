@@ -7,6 +7,7 @@ import threading
 
 from hermes.claude_code.agent_adapter import (
     CLAUDE_CODE_GRANT_CONTEXT_KEY,
+    CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY,
     ClaudeCodeAgentAdapter,
     ClaudeCodeAgentAdapterError,
     ClaudeCodeInvocationGrant,
@@ -359,6 +360,10 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
                 grant=grant,
                 process_id=normalized["process_id"],
             )
+        sink = kwargs.get(CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY)
+        if sink is not None and callable(getattr(sink, "capture_controller_result", None)):
+            # sink 只保存安全 action 投影；Tool result 仍不暴露 native prompt。
+            sink.capture_controller_result(result)
         return _result_envelope(action, result)
     except ClaudeCodeRuntimeError as error:
         return _error_envelope(

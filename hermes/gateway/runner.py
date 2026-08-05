@@ -35,6 +35,21 @@ from hermes.config import (
 from hermes.claude_code.invocation_context import (
     prepare_gateway_claude_code_invocation,
 )
+from hermes.claude_code.agent_adapter import (
+    ClaudeCodeAgentAdapter,
+    ClaudeCodeOwner,
+    create_gateway_claude_code_continuation_grant,
+)
+from hermes.claude_code.continuation import (
+    ClaudeCodeContinuationStore,
+    render_claude_code_interaction,
+    safe_observation_from_controller_result,
+)
+from hermes.claude_code.request_detector import (
+    ClaudeCodeRequestOperation,
+    detect_claude_code_request,
+)
+from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 from hermes.hooks import (
     AsyncHookRegistry,
     SyncObservationBridge,
@@ -606,6 +621,7 @@ class _GatewayAgentResult:
     failure_type: str | None = None
     pending_steer: tuple[SteerEntry, ...] = ()
     progressive_controller: ProgressiveReplyController | None = None
+    claude_code_interaction: dict | None = None
 
 
 class _GatewayAgentRunError(RuntimeError):
@@ -828,6 +844,7 @@ class GatewayRunner:
         hook_registry: AsyncHookRegistry | None = None,
         process_manager=None,
         runtime_status_publisher: RuntimeStatusPublisher | None = None,
+        claude_code_adapter: ClaudeCodeAgentAdapter | None = None,
     ):
         # Gateway 的配置校验依赖全局元数据，先完成幂等注册。
         if process_manager is None:
@@ -837,6 +854,9 @@ class GatewayRunner:
 
             process_manager = default_process_manager
         self._process_manager = process_manager
+        self._claude_code_continuations = ClaudeCodeContinuationStore()
+        # 仅在真实 continuation 回复时惰性创建，不让普通 Gateway 启动触碰 CC runtime。
+        self._claude_code_adapter = claude_code_adapter
         register_all(process_manager=self._process_manager)
         if hook_registry is not None and not isinstance(
             hook_registry,
@@ -1221,6 +1241,30 @@ class GatewayRunner:
             )
             return False
 
+    def _apply_claude_code_interaction(
+        self,
+        route_key: str,
+        conversation_id: str,
+        observation: dict | None,
+    ) -> str | None:
+        """应用本轮安全 sink 观察并返回可冒泡的安全提示。"""
+
+        if not isinstance(observation, dict):
+            return None
+        try:
+            owner = ClaudeCodeOwner.from_gateway_route_key(route_key).session_owner
+        except (TypeError, ValueError):
+            return None
+        _status, pending = self._claude_code_continuations.apply_observation(observation)
+        if pending is None or pending.owner != owner:
+            return None
+        if pending.originating_conversation_id != conversation_id:
+            return None
+        rendered = render_claude_code_interaction(pending)
+        if _status == "conflict":
+            return "claude_code_interaction_conflict: another interaction is still pending.\n" + rendered
+        return rendered
+
     @staticmethod
     def _safe_agent_result(result: dict) -> _GatewayAgentResult:
         """把 Agent 结构化错误映射为固定文案，绝不发送原始异常。"""
@@ -1232,18 +1276,23 @@ class GatewayRunner:
             pending_steer = tuple(pending_steer)
         else:
             pending_steer = ()
+        interaction = result.get("claude_code_interaction")
+        if not isinstance(interaction, dict):
+            interaction = None
         if result.get("ok", False):
             response = str(final_response or "")
             if response:
                 return _GatewayAgentResult(
                     response,
                     pending_steer=pending_steer,
+                    claude_code_interaction=interaction,
                 )
             return _GatewayAgentResult(
                 _SAFE_INTERNAL_REPLY,
                 failed=True,
                 failure_type="empty_response",
                 pending_steer=pending_steer,
+                claude_code_interaction=interaction,
             )
 
         status = str(result.get("status", "") or "")
@@ -1252,6 +1301,7 @@ class GatewayRunner:
             return _GatewayAgentResult(
                 None,
                 pending_steer=pending_steer,
+                claude_code_interaction=interaction,
             )
         if error_type == "persistence_error":
             return _GatewayAgentResult(
@@ -1259,6 +1309,7 @@ class GatewayRunner:
                 failed=True,
                 failure_type="persistence_error",
                 pending_steer=pending_steer,
+                claude_code_interaction=interaction,
             )
         if status == "model_error" or error_type == "model_error":
             detail = str(final_response or "").lower()
@@ -1268,18 +1319,21 @@ class GatewayRunner:
                     failed=True,
                     failure_type="model_timeout",
                     pending_steer=pending_steer,
+                    claude_code_interaction=interaction,
                 )
             return _GatewayAgentResult(
                 _SAFE_MODEL_UNAVAILABLE_REPLY,
                 failed=True,
                 failure_type="model_unavailable",
                 pending_steer=pending_steer,
+                claude_code_interaction=interaction,
             )
         return _GatewayAgentResult(
             _SAFE_INTERNAL_REPLY,
             failed=True,
             failure_type=error_type or status or "internal_error",
             pending_steer=pending_steer,
+            claude_code_interaction=interaction,
         )
 
     @staticmethod
@@ -6022,6 +6076,14 @@ class GatewayRunner:
             route_key, self._build_gateway_prompt(event.source),
         )
 
+        if await self._maybe_handle_claude_code_continuation(
+            event,
+            ctx,
+            route_key,
+            from_queue=from_queue,
+        ):
+            return
+
         if self._route_has_active_worker(ctx):
             if not from_queue:
                 self.sessions.event_sequence(ctx, event)
@@ -6192,6 +6254,136 @@ class GatewayRunner:
             steer_mailbox=steer_mailbox,
         )
 
+    async def _maybe_handle_claude_code_continuation(
+        self,
+        event: MessageEvent,
+        ctx,
+        route_key: str,
+        *,
+        from_queue: bool,
+    ) -> bool:
+        """在 AgentLoop 前处理可信的 Claude Code ActionRequired 回复。"""
+
+        if from_queue or event.message_type is not MessageType.TEXT:
+            return False
+        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        if any(
+            key in metadata
+            for key in {
+                "file_delivery_id",
+                "notification",
+                "origin_kind",
+                "system",
+                "internal",
+                "generated",
+            }
+        ):
+            return False
+        try:
+            owner = ClaudeCodeOwner.from_gateway_route_key(route_key).session_owner
+        except (TypeError, ValueError):
+            return False
+        pending = self._claude_code_continuations.get(owner)
+        if pending is None:
+            return False
+        request = detect_claude_code_request(event.text)
+        if request is not None:
+            if request.operation in {
+                ClaudeCodeRequestOperation.POLL,
+                ClaudeCodeRequestOperation.REQUEST_INTERRUPT,
+                ClaudeCodeRequestOperation.TERMINATE,
+            }:
+                return False
+            content = (
+                "claude_code_interaction_pending: Claude Code 正在等待交互，请先回复当前提示，不能启动新的任务。\n"
+                + render_claude_code_interaction(pending)
+            )
+            await self._send_continuation_reply(route_key, event, content, ctx)
+            return True
+        if pending.delivery_unknown:
+            await self._send_continuation_reply(
+                route_key,
+                event,
+                "claude_code_delivery_unknown: 上一条 Claude Code 回复送达状态未知，请先使用 poll、interrupt 或 terminate。",
+                ctx,
+            )
+            return True
+        if pending.originating_conversation_id != ctx.conversation_id:
+            # /new 后普通文本不能自动绑定旧 conversation；控制请求仍由上面放行。
+            return False
+        try:
+            adapter = self._claude_code_adapter
+            if adapter is None:
+                adapter = ClaudeCodeAgentAdapter()
+                self._claude_code_adapter = adapter
+            grant = create_gateway_claude_code_continuation_grant(
+                route_key=route_key,
+                turn_id=uuid.uuid4().hex,
+                created_at=time.time(),
+                expires_at=time.time() + 300.0,
+                source_message_id=event.message_id,
+            )
+            result = await asyncio.to_thread(
+                adapter.reply_to_interaction,
+                grant=grant,
+                process_id=pending.process_id,
+                round_id=pending.round_id,
+                action_id=pending.action_id,
+                response=event.text,
+            )
+            observation = safe_observation_from_controller_result(
+                result,
+                environment="gateway",
+                owner=owner,
+                conversation_id=pending.originating_conversation_id,
+                source_message_id=event.message_id,
+                operation="reply",
+            )
+            _status, next_pending = self._claude_code_continuations.apply_observation(
+                observation
+            )
+            content = (
+                render_claude_code_interaction(next_pending)
+                if next_pending is not None
+                else "claude_code_reply_delivered: Claude Code 已接收你的回复，正在继续处理。"
+            )
+        except ClaudeCodeRuntimeError as error:
+            if error.delivery_unknown:
+                self._claude_code_continuations.mark_delivery_unknown(
+                    owner,
+                    process_id=pending.process_id,
+                    action_id=pending.action_id,
+                )
+                content = (
+                    "claude_code_delivery_unknown: Claude Code 回复送达状态未知；未自动重试。请先使用 poll、interrupt 或 terminate。"
+                )
+            else:
+                self._claude_code_continuations.clear_if_identity(
+                    owner,
+                    process_id=pending.process_id,
+                    action_id=pending.action_id,
+                    round_id=pending.round_id,
+                )
+                content = "claude_code_interaction_stale: Claude Code 交互已失效，请重新 poll 查看当前状态。"
+        except (TypeError, ValueError):
+            content = "claude_code_interaction_stale: Claude Code 交互回复被拒绝，请重新 poll 查看当前状态。"
+        await self._send_continuation_reply(route_key, event, content, ctx)
+        return True
+
+    async def _send_continuation_reply(self, route_key: str, event: MessageEvent, content: str, ctx) -> None:
+        """发送安全 continuation 提示；不把原始回复写入 Agent history。"""
+
+        if event.source.platform not in self.adapters:
+            await self._reply(event, content)
+            return
+        await self._start_durable_reply_async(
+            route_key,
+            event,
+            content[:8192],
+            "claude_code_interaction",
+            ctx,
+        )
+
     async def _process(
         self,
         route_key: str,
@@ -6240,6 +6432,21 @@ class GatewayRunner:
             else:
                 # 保留嵌入式调用和既有 monkeypatch 返回纯文本的兼容性。
                 agent_result = _GatewayAgentResult(raw_agent_result)
+            interaction_notice = self._apply_claude_code_interaction(
+                route_key,
+                ctx.conversation_id,
+                agent_result.claude_code_interaction,
+            )
+            if interaction_notice:
+                response_text = agent_result.response or ""
+                agent_result = replace(
+                    agent_result,
+                    response=(
+                        interaction_notice
+                        if not response_text
+                        else f"{response_text}\n\n{interaction_notice}"
+                    ),
+                )
             progressive_controller = agent_result.progressive_controller
             await self._close_progressive_controller(
                 progressive_controller,
@@ -7222,6 +7429,7 @@ class GatewayRunner:
                 source_message_id=event.message_id,
                 base_policy=tool_policy,
                 registry=registry,
+                originating_conversation_id=conversation_id,
             )
             if claude_code_invocation is not None:
                 tool_policy = claude_code_invocation.tool_policy

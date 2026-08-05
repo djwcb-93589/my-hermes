@@ -804,7 +804,11 @@ def _persistence_error_response(exc, steer_mailbox=None) -> dict:
     }
 
 
-def _conversation_result_response(result: AgentLoopResult) -> dict:
+def _conversation_result_response(
+    result: AgentLoopResult,
+    *,
+    tool_context: dict | None = None,
+) -> dict:
     """把同步 / 异步循环结果映射为统一的对外返回格式。"""
     if result.status == "completed":
         final = result.summary
@@ -835,7 +839,7 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
     else:
         final = f"(agent ended: status={result.status}, error={result.error})"
 
-    return {
+    response = {
         "final_response": final,
         "messages": result.messages,
         "ok": result.ok,
@@ -848,6 +852,16 @@ def _conversation_result_response(result: AgentLoopResult) -> dict:
         "tool_call_count": result.tool_call_count,
         "pending_steer": result.pending_steer,
     }
+    sink = (tool_context or {}).get(
+        "_claude_code_interaction_sink"
+    ) if isinstance(tool_context, dict) else None
+    if sink is not None and callable(getattr(sink, "snapshot", None)):
+        # 这里只携带安全 action 投影，原生 prompt 和用户回复不进入模型结果。
+        try:
+            response["claude_code_interaction"] = sink.snapshot()
+        except Exception:
+            response["claude_code_interaction"] = {"observed": False}
+    return response
 
 
 def _select_conversation_tools(
@@ -934,7 +948,7 @@ def run_conversation(
     result: AgentLoopResult = loop.run(user_message)
 
     # 同步 / 异步入口使用同一映射,避免两条链路返回格式漂移。
-    response = _conversation_result_response(result)
+    response = _conversation_result_response(result, tool_context=tool_context)
     try:
         coordinator = (
             background_review_coordinator
@@ -1078,7 +1092,7 @@ async def run_conversation_async(
                 steer_mailbox,
             )
         result: AgentLoopResult = await loop.run(user_message)
-        response = _conversation_result_response(result)
+        response = _conversation_result_response(result, tool_context=tool_context)
         if result.status == "awaiting_approval":
             response["agent_state"] = loop.export_resume_state()
         try:

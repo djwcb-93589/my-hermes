@@ -8,11 +8,13 @@ from dataclasses import dataclass
 
 from hermes.claude_code.agent_adapter import (
     CLAUDE_CODE_GRANT_CONTEXT_KEY,
+    CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY,
     CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT,
     ClaudeCodeInvocationGrant,
     create_cli_claude_code_grant,
     create_gateway_claude_code_grant,
 )
+from hermes.claude_code.continuation import ClaudeCodeInteractionSink
 from hermes.claude_code.request_detector import (
     ClaudeCodeExplicitRequest,
     ClaudeCodeRequestOperation,
@@ -87,6 +89,8 @@ def _build_context(
     base_policy: ToolPolicy,
     registry,
     grant: ClaudeCodeInvocationGrant,
+    originating_conversation_id: str | None = None,
+    source_message_id: str | None = None,
 ) -> ClaudeCodeInvocationContext | None:
     dynamic_policy = _expanded_tool_policy(base_policy, registry=registry)
     if dynamic_policy is None:
@@ -97,11 +101,20 @@ def _build_context(
         return None
     if "claude_code" not in resolution.allowed_tool_names:
         return None
+    sink = ClaudeCodeInteractionSink(
+        environment=grant.environment,
+        owner=grant.owner.session_owner,
+        conversation_id=originating_conversation_id or grant.owner.session_owner,
+        source_message_id=source_message_id,
+    )
     return ClaudeCodeInvocationContext(
         request=request,
         grant=grant,
         tool_policy=dynamic_policy,
-        tool_context={CLAUDE_CODE_GRANT_CONTEXT_KEY: grant},
+        tool_context={
+            CLAUDE_CODE_GRANT_CONTEXT_KEY: grant,
+            CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY: sink,
+        },
     )
 
 
@@ -119,6 +132,8 @@ def prepare_cli_claude_code_invocation(
     registry,
     turn_id: str | None = None,
     now: float | None = None,
+    originating_conversation_id: str | None = None,
+    source_message_id: str | None = None,
 ) -> ClaudeCodeInvocationContext | None:
     """在 CLI 当前真实用户消息上原子准备一次性 Grant。"""
 
@@ -141,6 +156,8 @@ def prepare_cli_claude_code_invocation(
         base_policy=base_policy,
         registry=registry,
         grant=grant,
+        originating_conversation_id=originating_conversation_id or session_key,
+        source_message_id=source_message_id,
     )
 
 
@@ -153,6 +170,7 @@ def prepare_gateway_claude_code_invocation(
     registry,
     turn_id: str | None = None,
     now: float | None = None,
+    originating_conversation_id: str | None = None,
 ) -> ClaudeCodeInvocationContext | None:
     """在 Gateway 当前 MessageEvent 上原子准备一次性 Grant。"""
 
@@ -183,6 +201,8 @@ def prepare_gateway_claude_code_invocation(
         base_policy=base_policy,
         registry=registry,
         grant=grant,
+        originating_conversation_id=originating_conversation_id or route_key,
+        source_message_id=source_message_id,
     )
 
 
