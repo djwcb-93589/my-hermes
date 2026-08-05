@@ -39,6 +39,8 @@ _OBSERVATION_REQUIRED_COLUMNS = frozenset({
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
     "duration_ms",
     "stop_reason",
     "iterations",

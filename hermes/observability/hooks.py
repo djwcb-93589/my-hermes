@@ -146,6 +146,14 @@ def _model_call_observation(context: HookContext) -> ModelCallObservation:
     token_usage = payload.get("token_usage", {})
     if not isinstance(token_usage, Mapping):
         raise TypeError("token_usage must be a mapping")
+    prompt_tokens = _optional_nonnegative_int(
+        token_usage.get("prompt_tokens"),
+        "prompt_tokens",
+    )
+    prompt_cache_tokens = _prompt_cache_tokens(
+        token_usage,
+        prompt_tokens=prompt_tokens,
+    )
     return ModelCallObservation(
         observation_id=observation_id,
         run_id=run_id,
@@ -159,10 +167,7 @@ def _model_call_observation(context: HookContext) -> ModelCallObservation:
             payload.get("tool_call_count"),
             "tool_call_count",
         ),
-        prompt_tokens=_optional_nonnegative_int(
-            token_usage.get("prompt_tokens"),
-            "prompt_tokens",
-        ),
+        prompt_tokens=prompt_tokens,
         completion_tokens=_optional_nonnegative_int(
             token_usage.get("completion_tokens"),
             "completion_tokens",
@@ -172,6 +177,8 @@ def _model_call_observation(context: HookContext) -> ModelCallObservation:
             "total_tokens",
         ),
         duration_ms=_nonnegative_int(payload.get("duration_ms"), "duration_ms"),
+        prompt_cache_hit_tokens=prompt_cache_tokens[0],
+        prompt_cache_miss_tokens=prompt_cache_tokens[1],
     )
 
 
@@ -232,3 +239,37 @@ def _optional_nonnegative_int(value: object, field_name: str) -> int | None:
     if value is None:
         return None
     return _nonnegative_int(value, field_name)
+
+
+def _prompt_cache_tokens(
+    token_usage: Mapping[str, object],
+    *,
+    prompt_tokens: int | None,
+) -> tuple[int | None, int | None]:
+    """Return a valid DeepSeek cache pair without weakening the projection.
+
+    Cache fields are optional response facts.  A malformed or incomplete pair
+    is dropped locally so ordinary token counts still reach the Observation
+    Sink; no value is inferred or replaced with zero.
+    """
+
+    hit_raw = token_usage.get("prompt_cache_hit_tokens")
+    miss_raw = token_usage.get("prompt_cache_miss_tokens")
+    if hit_raw is None and miss_raw is None:
+        return None, None
+    if (
+        type(hit_raw) is not int
+        or hit_raw < 0
+        or type(miss_raw) is not int
+        or miss_raw < 0
+    ):
+        logger.warning(
+            "Observation cache token fields unavailable: invalid field type"
+        )
+        return None, None
+    if prompt_tokens is None or prompt_tokens != hit_raw + miss_raw:
+        logger.warning(
+            "Observation cache token fields unavailable: inconsistent token sum"
+        )
+        return None, None
+    return hit_raw, miss_raw

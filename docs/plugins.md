@@ -49,6 +49,11 @@ Hook ID 会加上 Plugin 命名空间，最终形如 `audit-log:audit_tool_resul
 
 当前事件包括 `pre_llm_call`、`pre_tool_call`、`post_llm_call`、`post_tool_call` 和 `run_end`。控制 Hook 失败、超时或返回无效值时默认阻止；观察 Hook 失败会与 Agent 主流程隔离。观察 Hook 的返回值只保存在结构化分发结果中供诊断使用，AgentLoop 不消费它们。
 
+`post_llm_call` 的 `token_usage` 在 DeepSeek API 返回时可包含
+`prompt_cache_hit_tokens` 和 `prompt_cache_miss_tokens`。Hermes 只被动记录服务端
+返回的非负计数；字段缺失或非法时保持不可评估，不从通用 `cached_tokens` 推导，
+也不在本阶段计算命中率或费用、控制或预热服务端缓存。GLM 缓存统计不在本阶段支持。
+
 同步 CLI Registry 不接受异步 callback；Gateway 的 Async Registry 同时接受同步和异步 callback。同步 callback 通过线程执行，超时只能停止等待，不能强制终止线程，因此不要写死循环、无限阻塞或无超时网络请求。
 
 ## 管理命令

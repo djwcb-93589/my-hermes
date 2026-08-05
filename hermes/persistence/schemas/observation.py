@@ -40,6 +40,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
             total_tokens INTEGER CHECK (
                 total_tokens IS NULL OR total_tokens >= 0
             ),
+            prompt_cache_hit_tokens INTEGER CHECK (
+                prompt_cache_hit_tokens IS NULL OR prompt_cache_hit_tokens >= 0
+            ),
+            prompt_cache_miss_tokens INTEGER CHECK (
+                prompt_cache_miss_tokens IS NULL OR prompt_cache_miss_tokens >= 0
+            ),
             duration_ms INTEGER CHECK (
                 duration_ms IS NULL OR duration_ms >= 0
             ),
@@ -70,6 +76,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
                     AND prompt_tokens IS NULL
                     AND completion_tokens IS NULL
                     AND total_tokens IS NULL
+                    AND prompt_cache_hit_tokens IS NULL
+                    AND prompt_cache_miss_tokens IS NULL
                     AND stop_reason IS NULL
                     AND iterations IS NULL
                     AND has_final_reply IS NULL
@@ -85,6 +93,21 @@ def create_schema(conn: sqlite3.Connection) -> None:
                     AND has_text IS NOT NULL
                     AND tool_call_count IS NOT NULL
                     AND duration_ms IS NOT NULL
+                    AND (
+                        (
+                            prompt_cache_hit_tokens IS NULL
+                            AND prompt_cache_miss_tokens IS NULL
+                        )
+                        OR (
+                            prompt_cache_hit_tokens IS NOT NULL
+                            AND prompt_cache_miss_tokens IS NOT NULL
+                            AND prompt_tokens IS NOT NULL
+                            AND prompt_tokens = (
+                                prompt_cache_hit_tokens
+                                + prompt_cache_miss_tokens
+                            )
+                        )
+                    )
                     AND stop_reason IS NULL
                     AND iterations IS NULL
                     AND has_final_reply IS NULL
@@ -104,6 +127,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
                     AND prompt_tokens IS NULL
                     AND completion_tokens IS NULL
                     AND total_tokens IS NULL
+                    AND prompt_cache_hit_tokens IS NULL
+                    AND prompt_cache_miss_tokens IS NULL
                     AND duration_ms IS NULL
                     AND stop_reason IS NOT NULL
                     AND length(stop_reason) > 0

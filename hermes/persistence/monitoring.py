@@ -33,7 +33,8 @@ _OBSERVATION_TIMELINE_COLUMNS = (
     "observation_id, event_type, run_id, parent_run_id, created_at, "
     "tool_call_id, tool_name, status, success, error_type, finish_reason, "
     "has_text, tool_call_count, prompt_tokens, completion_tokens, "
-    "total_tokens, duration_ms, stop_reason, iterations, has_final_reply"
+    "total_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens, "
+    "duration_ms, stop_reason, iterations, has_final_reply"
 )
 _TOOL_EXECUTION_SAFE_COLUMNS = (
     "execution_id, environment, session_id, source_message_id, cron_run_id, "
@@ -303,7 +304,7 @@ def _tool_execution_filters(
 
 
 def _timeline_entry(row: tuple) -> RunTimelineEntry:
-    if len(row) != 20:
+    if len(row) != 22:
         raise ValueError("observation record is invalid")
     common = {
         "observation_id": _required_text(row[0]),
@@ -314,7 +315,10 @@ def _timeline_entry(row: tuple) -> RunTimelineEntry:
     }
     event_type = common["event_type"]
     if event_type is ObservationEventType.TOOL_CALL:
-        _require_null_fields(row, (10, 11, 12, 13, 14, 15, 17, 18, 19))
+        _require_null_fields(
+            row,
+            (10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21),
+        )
         return ToolCallObservationView(
             **common,
             tool_call_id=_required_text(row[5]),
@@ -325,7 +329,7 @@ def _timeline_entry(row: tuple) -> RunTimelineEntry:
             duration_ms=_nonnegative_int(row[16]),
         )
     if event_type is ObservationEventType.MODEL_CALL:
-        _require_null_fields(row, (5, 6, 7, 8, 9, 17, 18, 19))
+        _require_null_fields(row, (5, 6, 7, 8, 9, 19, 20, 21))
         return ModelCallObservationView(
             **common,
             finish_reason=_optional_text(row[10]),
@@ -334,17 +338,22 @@ def _timeline_entry(row: tuple) -> RunTimelineEntry:
             prompt_tokens=_optional_nonnegative_int(row[13]),
             completion_tokens=_optional_nonnegative_int(row[14]),
             total_tokens=_optional_nonnegative_int(row[15]),
-            duration_ms=_nonnegative_int(row[16]),
+            prompt_cache_hit_tokens=_optional_nonnegative_int(row[16]),
+            prompt_cache_miss_tokens=_optional_nonnegative_int(row[17]),
+            duration_ms=_nonnegative_int(row[18]),
         )
     if event_type is ObservationEventType.RUN_END:
-        _require_null_fields(row, (5, 6, 8, 9, 10, 11, 13, 14, 15, 16))
+        _require_null_fields(
+            row,
+            (5, 6, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18),
+        )
         return RunObservationView(
             **common,
             status=_required_text(row[7]),
-            stop_reason=_required_text(row[17]),
-            iterations=_nonnegative_int(row[18]),
+            stop_reason=_required_text(row[19]),
+            iterations=_nonnegative_int(row[20]),
             tool_call_count=_nonnegative_int(row[12]),
-            has_final_reply=_database_bool(row[19]),
+            has_final_reply=_database_bool(row[21]),
         )
     raise ValueError("observation event_type is invalid")
 

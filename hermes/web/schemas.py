@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from hermes.backend_control import (
     BACKEND_REQUEST_ID_PATTERN,
@@ -387,6 +387,30 @@ class ModelObservationResponse(_ObservationResponseBase):
     completion_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
     duration_ms: int = Field(ge=0)
+    prompt_cache_hit_tokens: StrictInt | None = Field(default=None, ge=0)
+    prompt_cache_miss_tokens: StrictInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_prompt_cache_tokens(self) -> Self:
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.prompt_cache_miss_tokens is None
+        ):
+            raise ValueError(
+                "prompt cache hit and miss tokens must be provided together"
+            )
+        if self.prompt_cache_hit_tokens is not None:
+            if self.prompt_tokens is None:
+                raise ValueError(
+                    "prompt cache tokens require prompt_tokens"
+                )
+            if self.prompt_tokens != (
+                self.prompt_cache_hit_tokens
+                + self.prompt_cache_miss_tokens
+            ):
+                raise ValueError(
+                    "prompt cache tokens must sum to prompt_tokens"
+                )
+        return self
 
 
 class RunObservationResponse(_ObservationResponseBase):

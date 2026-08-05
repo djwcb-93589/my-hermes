@@ -243,6 +243,8 @@ class ModelCallObservationView(ObservationSummary):
     completion_tokens: int | None
     total_tokens: int | None
     duration_ms: int
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
 
     def __post_init__(self) -> None:
         ObservationSummary.__post_init__(self)
@@ -277,6 +279,33 @@ class ModelCallObservationView(ObservationSummary):
                     field_name,
                 ),
             )
+        for field_name in (
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_nonnegative_int(
+                    getattr(self, field_name),
+                    field_name,
+                ),
+            )
+        cache_hit_tokens = self.prompt_cache_hit_tokens
+        cache_miss_tokens = self.prompt_cache_miss_tokens
+        if (cache_hit_tokens is None) != (cache_miss_tokens is None):
+            raise ValueError(
+                "prompt cache hit and miss tokens must be provided together"
+            )
+        if cache_hit_tokens is not None:
+            if self.prompt_tokens is None:
+                raise ValueError(
+                    "prompt cache tokens require prompt_tokens"
+                )
+            if self.prompt_tokens != cache_hit_tokens + cache_miss_tokens:
+                raise ValueError(
+                    "prompt cache tokens must sum to prompt_tokens"
+                )
         object.__setattr__(
             self,
             "duration_ms",

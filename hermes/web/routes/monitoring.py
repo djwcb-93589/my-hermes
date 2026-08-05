@@ -221,6 +221,8 @@ def _observation_response(item: ObservationSummary) -> ObservationResponse:
             completion_tokens=item.completion_tokens,
             total_tokens=item.total_tokens,
             duration_ms=item.duration_ms,
+            prompt_cache_hit_tokens=item.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens=item.prompt_cache_miss_tokens,
         )
     if isinstance(item, RunObservationView):
         return RunObservationResponse(

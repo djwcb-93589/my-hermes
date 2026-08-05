@@ -471,6 +471,51 @@ def _optional_int(value) -> int | None:
         return None
 
 
+def _optional_nonnegative_int(value) -> int | None:
+    """Read an optional usage count without coercing invalid values."""
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _deepseek_prompt_cache_usage(
+    usage,
+    *,
+    prompt_tokens: int | None,
+) -> dict[str, int]:
+    """Project only the paired cache counts returned by DeepSeek.
+
+    The response is read passively.  Generic ``cached_tokens`` and provider
+    hints are deliberately not used as substitutes for these fields.
+    """
+    try:
+        hit_raw = _object_value(usage, "prompt_cache_hit_tokens")
+        miss_raw = _object_value(usage, "prompt_cache_miss_tokens")
+    except Exception:
+        logger.warning(
+            "DeepSeek cache token observation unavailable: field read failed"
+        )
+        return {}
+    if hit_raw is None and miss_raw is None:
+        return {}
+    hit_tokens = _optional_nonnegative_int(hit_raw)
+    miss_tokens = _optional_nonnegative_int(miss_raw)
+    if hit_tokens is None or miss_tokens is None:
+        logger.warning(
+            "DeepSeek cache token observation unavailable: invalid field type"
+        )
+        return {}
+    if prompt_tokens is None or prompt_tokens != hit_tokens + miss_tokens:
+        logger.warning(
+            "DeepSeek cache token observation unavailable: inconsistent token sum"
+        )
+        return {}
+    return {
+        "prompt_cache_hit_tokens": hit_tokens,
+        "prompt_cache_miss_tokens": miss_tokens,
+    }
+
+
 def _content_char_count(value) -> int:
     """只统计正文长度，不复制或持久化正文。"""
     if value is None:
@@ -1186,13 +1231,20 @@ class AgentLoop:
     def _hook_token_usage(response) -> dict[str, int]:
         """提取可安全暴露的模型 token 统计，不保留原始响应对象。"""
         usage = _object_value(response, "usage")
+        prompt_tokens = _optional_int(_object_value(usage, "prompt_tokens"))
         values = {
-            "prompt_tokens": _optional_int(_object_value(usage, "prompt_tokens")),
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": _optional_int(
                 _object_value(usage, "completion_tokens")
             ),
             "total_tokens": _optional_int(_object_value(usage, "total_tokens")),
         }
+        values.update(
+            _deepseek_prompt_cache_usage(
+                usage,
+                prompt_tokens=prompt_tokens,
+            )
+        )
         return {
             name: value
             for name, value in values.items()

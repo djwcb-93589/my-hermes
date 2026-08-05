@@ -52,6 +52,8 @@ class _PersistedObservation:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
     duration_ms: int | None = None
     stop_reason: str | None = None
     iterations: int | None = None
@@ -74,6 +76,8 @@ class _PersistedObservation:
             self.prompt_tokens,
             self.completion_tokens,
             self.total_tokens,
+            self.prompt_cache_hit_tokens,
+            self.prompt_cache_miss_tokens,
             self.duration_ms,
             self.stop_reason,
             self.iterations,
@@ -84,7 +88,8 @@ class _PersistedObservation:
 _EVENT_COLUMNS = (
     "event_type, run_id, parent_run_id, tool_call_id, tool_name, status, "
     "success, error_type, finish_reason, has_text, tool_call_count, "
-    "prompt_tokens, completion_tokens, total_tokens, duration_ms, "
+    "prompt_tokens, completion_tokens, total_tokens, "
+    "prompt_cache_hit_tokens, prompt_cache_miss_tokens, duration_ms, "
     "stop_reason, iterations, has_final_reply"
 )
 _MAX_PERSISTED_IDENTIFIER_LENGTH = 256
@@ -258,6 +263,14 @@ class SQLiteObservationSink:
                     observation.total_tokens,
                     "total_tokens",
                 ),
+                prompt_cache_hit_tokens=_optional_persisted_count(
+                    observation.prompt_cache_hit_tokens,
+                    "prompt_cache_hit_tokens",
+                ),
+                prompt_cache_miss_tokens=_optional_persisted_count(
+                    observation.prompt_cache_miss_tokens,
+                    "prompt_cache_miss_tokens",
+                ),
                 duration_ms=_persisted_count(
                     observation.duration_ms,
                     "duration_ms",
@@ -332,8 +345,8 @@ class SQLiteObservationSink:
                         INSERT INTO observations (
                             observation_id, {_EVENT_COLUMNS}, created_at
                         ) VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         """,
                         (
