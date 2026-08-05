@@ -1275,6 +1275,7 @@ class ClaudeCodeOutputDetector:
             and self._has_interrupt_menu_semantics(context)
         ):
             return context[-MAX_NATIVE_INTERACTION_PROMPT_CHARS:]
+        context = self._native_context_without_ready_ui(context)
         folder_trust_source = self._folder_trust_action_source(context)
         if folder_trust_source:
             equivalent_action = self._classify_action(
@@ -1338,6 +1339,31 @@ class ClaudeCodeOutputDetector:
             ):
                 return source
         return ""
+
+    @classmethod
+    def _native_context_without_ready_ui(cls, context: str) -> str:
+        """依据安全投影移除已确认的 READY 尾部，保留原生正文。"""
+
+        raw_context = context.strip()
+        if not raw_context:
+            return ""
+        safe_context = redact_claude_code_output(raw_context).strip()
+        if not safe_context:
+            return ""
+        _, safe_tail, _ = cls._split_ready_ui_tail(safe_context)
+        if not safe_tail:
+            return raw_context
+        raw_lines = raw_context.splitlines()
+        safe_tail_lines = safe_tail.splitlines()
+        if not safe_tail_lines or len(raw_lines) < len(safe_tail_lines):
+            return raw_context
+        raw_tail_lines = raw_lines[-len(safe_tail_lines) :]
+        if tuple(
+            redact_claude_code_output(line).strip()
+            for line in raw_tail_lines
+        ) != tuple(line.strip() for line in safe_tail_lines):
+            return raw_context
+        return "\n".join(raw_lines[: -len(safe_tail_lines)]).strip()
 
     def _runtime_permission_native_source_context(
         self,
