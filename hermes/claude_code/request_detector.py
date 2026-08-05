@@ -46,9 +46,11 @@ _START_INTENT_RE = re.compile(
 )
 _TASK_RE = re.compile(
     r"(?ix)(?:"
-    r"修改|修复|检查|完成|实现|执行|运行|启动|停止|终止|结束|关闭|更新|重构|添加|删除|编写|创建|做|"
+    r"修改|修复|检查|完成|实现|执行|运行|启动|停止|终止|结束|关闭|读取|读出|输出|写入|保存|更新|重构|添加|删除|编写|创建|做|"
     r"测试|审查|分析|处理|迁移|提交|查找|生成|构建|fix|modify|implement|"
-    r"complete|run|execute|start|stop|terminate|end|close|shutdown|update|refactor|add|remove|write|create|test|do|"
+    r"complete|run|execute|start|stop|terminate|end|close|shutdown|update|refactor|add|remove|"
+    r"(?<![A-Za-z0-9_])(?:read|print|write|save|output)(?![A-Za-z0-9_])|"
+    r"create|test|do|"
     r"review|check|build|handle|migrate|commit"
     r")"
 )
@@ -99,10 +101,15 @@ _POLL_QUERY_RE = re.compile(
     rf"(?:当前|现在|目前|最新|状态|进度|输出|结果|完成了吗|结束了吗|"
     rf"运行到哪|在哪里|做到哪|正在做什么|有结果了吗|status|progress|"
     rf"output|latest|where|doing)"
-    rf"|{_MARKER_TOKEN}\s*(?:当前|现在|目前|最新)?"
-    rf"(?:是什么|是)?\s*(?:有)?\s*(?:状态|进度|输出|结果|完成了吗|结束了吗|"
-    rf"运行到哪|在哪里|做到哪|正在做什么|有结果了吗|status|progress|"
-    rf"output|latest)"
+    rf"|{_MARKER_TOKEN}\s*(?:"
+    rf"(?:当前|现在|目前|最新)\s*(?:是什么|是)?\s*(?:有)?\s*"
+    rf"(?:状态|进度|输出|结果|完成了吗|结束了吗|运行到哪|在哪里|"
+    rf"做到哪|正在做什么|有结果了吗|status|progress|output|latest)"
+    rf"|(?:完成了吗|结束了吗|运行到哪|在哪里|做到哪|正在做什么|"
+    rf"有结果了吗|status|progress)"
+    rf"|(?:有\s*)?(?:输出|结果)\s*(?:了吗|了什么|是什么|吗)"
+    rf"|(?:状态|进度)\s*(?:如何|怎样|是什么|吗)?"
+    rf")"
     rf"|{_MARKER_TOKEN}.{{0,20}}(?:检查|查看|查询)\s*"
     rf"(?:当前|现在|目前|最新)\s*(?:状态|进度|输出|结果)"
     rf")"
@@ -152,6 +159,37 @@ _CONTROL_POLITE_PREFIX_RE = re.compile(
     r"(?ix)^(?:请(?:\s*先)?|先|麻烦(?:\s*先)?|"
     r"please(?:\s+first)?|first)$"
 )
+_TASK_CLAUSE_SPLIT_RE = re.compile(
+    r"(?ix)"
+    r"(?:\s*(?:但是|不过|而是|但|并且|以及|且|和)\s*)"
+    r"|(?:\s+\b(?:and|then|but)\b\s*)"
+    r"|(?=\s*(?:不要|别|禁止|无需|不必|不让|不交给|不启动|"
+    r"不调用|不使用|不用|不需要|do\s+not|don't|never|without))"
+)
+_NEGATED_TASK_CLAUSE_RE = re.compile(
+    r"(?ix)^\s*(?:不要|别|禁止|无需|不必|不让|不交给|不启动|"
+    r"不调用|不使用|不用|不需要|do\s+not|don't|never|without)"
+)
+_NON_EXECUTION_CLAUSE_RE = re.compile(
+    r"(?ix)^\s*(?:你\s*)?(?:支持|能否|是否|可以|能|会不会|了解|知道)"
+)
+
+
+def _has_task_evidence(surface: str) -> bool:
+    """只接受正向可执行子句，排除安全限制和能力询问。"""
+
+    for raw_clause in _TASK_CLAUSE_SPLIT_RE.split(surface):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        if (
+            _NEGATED_TASK_CLAUSE_RE.match(clause)
+            or _NON_EXECUTION_CLAUSE_RE.match(clause)
+        ):
+            continue
+        if _TASK_RE.search(clause):
+            return True
+    return False
 
 
 def _has_standalone_control_match(
@@ -237,7 +275,7 @@ class ClaudeCodeExplicitRequestDetector:
 
         if (
             _START_INTENT_RE.search(candidate_surface)
-            and _TASK_RE.search(candidate_surface)
+            and _has_task_evidence(candidate_surface)
         ):
             return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.START)
         return None
