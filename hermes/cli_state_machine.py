@@ -18,6 +18,17 @@ from hermes.cli_approval import execute_cli_approval
 from hermes.claude_code.invocation_context import (
     prepare_cli_claude_code_invocation,
 )
+from hermes.claude_code.agent_adapter import (
+    ClaudeCodeAgentAdapter,
+    ClaudeCodeOwner,
+    create_cli_claude_code_continuation_grant,
+)
+from hermes.claude_code.continuation import (
+    ClaudeCodeContinuationStore,
+    render_claude_code_interaction,
+    safe_observation_from_controller_result,
+)
+from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 from hermes.claude_code.request_detector import (
     ClaudeCodeRequestOperation,
     detect_claude_code_request,
@@ -153,6 +164,7 @@ class CLIWorkerTask:
     idle_timeout_seconds: float | None = None
     foreground_active: bool = False
     deferred_session_id: str | None = None
+    continuation_pending: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +344,7 @@ class CLIWorker:
         publish_result: Callable[[CLIWorkerResult], None],
         hook_registry: SyncHookRegistry | None = None,
         process_manager: CLIProcessManager | None = None,
+        claude_code_adapter: ClaudeCodeAgentAdapter | None = None,
     ) -> None:
         if hook_registry is not None and not isinstance(
             hook_registry,
@@ -342,6 +355,8 @@ class CLIWorker:
         self._publish_result = publish_result
         self._hook_registry = hook_registry
         self._process_manager = process_manager
+        # 仅在真正收到 continuation 回复时惰性创建，避免普通 CLI 启动触碰 CC runtime。
+        self._claude_code_adapter = claude_code_adapter
         self._tasks: queue.Queue[CLIWorkerTask | None] = queue.Queue()
         self._results: queue.Queue[CLIWorkerResult] = queue.Queue()
         self._lock = threading.Lock()
@@ -433,6 +448,8 @@ class CLIWorker:
         """为单项工作创建、使用并关闭 SQLite 连接。"""
         if task.kind == "idle_cleanup":
             return self._run_idle_cleanup_task(task)
+        if task.kind == "claude_code_reply":
+            return self._run_claude_code_reply_task(task)
         conn = init_db(DB_PATH)
         try:
             if task.kind == "conversation":
@@ -458,6 +475,95 @@ class CLIWorker:
             )
         finally:
             conn.close()
+
+    def _run_claude_code_reply_task(self, task: CLIWorkerTask) -> CLIWorkerResult:
+        """不经过 AgentLoop，按 pending 身份执行一次原样交互回复。"""
+
+        pending = task.continuation_pending
+        if task.session_id is None or not isinstance(pending, dict):
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                error="claude_code interaction is no longer available",
+            )
+        try:
+            adapter = self._claude_code_adapter
+            if adapter is None:
+                adapter = ClaudeCodeAgentAdapter()
+                self._claude_code_adapter = adapter
+            grant = create_cli_claude_code_continuation_grant(
+                session_key=task.session_id,
+                turn_id=uuid.uuid4().hex,
+                created_at=time.time(),
+                expires_at=time.time() + 300.0,
+            )
+            result = adapter.reply_to_interaction(
+                grant=grant,
+                process_id=str(pending.get("process_id", "")),
+                round_id=pending.get("round_id"),
+                action_id=str(pending.get("action_id", "")),
+                response=task.user_input,
+            )
+            owner = ClaudeCodeOwner.from_cli_session_key(task.session_id).session_owner
+            observation = safe_observation_from_controller_result(
+                result,
+                environment="cli",
+                owner=owner,
+                conversation_id=str(pending.get("conversation_id", task.session_id)),
+                operation="reply",
+            )
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                conversation_result={
+                    "claude_code_interaction": observation,
+                    "final_response": "",
+                },
+            )
+        except ClaudeCodeRuntimeError as error:
+            if error.delivery_unknown:
+                retained = dict(pending)
+                retained["delivery_unknown"] = True
+                observation = {"observed": True, "pending": retained}
+                return CLIWorkerResult(
+                    kind=task.kind,
+                    session_id=task.session_id,
+                    conversation_result={"claude_code_interaction": observation},
+                    error="claude_code_delivery_unknown: Claude Code reply delivery is unknown; no retry was sent",
+                )
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                conversation_result={
+                    "claude_code_interaction": {
+                        "observed": True,
+                        "clear_identity": {
+                            "owner": pending.get("owner", ""),
+                            "process_id": pending.get("process_id", ""),
+                            "action_id": pending.get("action_id", ""),
+                            "round_id": pending.get("round_id"),
+                        },
+                    }
+                },
+                error=f"claude_code_interaction_stale: {error.safe_message}",
+            )
+        except (TypeError, ValueError):
+            return CLIWorkerResult(
+                kind=task.kind,
+                session_id=task.session_id,
+                conversation_result={
+                    "claude_code_interaction": {
+                        "observed": True,
+                        "clear_identity": {
+                            "owner": pending.get("owner", ""),
+                            "process_id": pending.get("process_id", ""),
+                            "action_id": pending.get("action_id", ""),
+                            "round_id": pending.get("round_id"),
+                        },
+                    }
+                },
+                error="claude_code_interaction_stale: Claude Code interaction reply was rejected",
+            )
 
     def _run_idle_cleanup_task(
         self,
@@ -824,6 +930,7 @@ class CLIController:
         idle_cleanup_interval_seconds: float = (
             DEFAULT_CLI_IDLE_CLEANUP_INTERVAL_SECONDS
         ),
+        continuation_store: ClaudeCodeContinuationStore | None = None,
     ) -> None:
         self._events = events
         self._worker = worker
@@ -831,6 +938,7 @@ class CLIController:
         self._cached_prompt = cached_prompt
         self._tool_policy = tool_policy
         self._process_manager = process_manager
+        self._continuation_store = continuation_store or ClaudeCodeContinuationStore()
         self._session_id: str | None = None
         self._pending_approval: dict | None = None
         self._session_choices: dict[str, str] = {}
@@ -1080,6 +1188,11 @@ class CLIController:
             return False
 
         self._session_id = None
+        try:
+            owner = ClaudeCodeOwner.from_cli_session_key(session_id).session_owner
+            self._continuation_store.clear(owner)
+        except (TypeError, ValueError):
+            pass
         self._forget_deferred_session(session_id)
         self._pending_approval = None
         self._ui.show_message(
@@ -1143,6 +1256,8 @@ class CLIController:
                     f"message queue is full (limit: {self._message_queue.limit})."
                 )
             return False
+        if self._route_pending_claude_code_message(user_input):
+            return True
         task = self._conversation_task(user_input)
         if self._submit_task(task, begins_stream=True):
             self._mark_activity()
@@ -1154,6 +1269,51 @@ class CLIController:
         self._ui.show_message(
             f"message queue is full (limit: {self._message_queue.limit})."
         )
+        return False
+
+    def _route_pending_claude_code_message(self, user_input: str) -> bool:
+        """在普通 AgentLoop 前确定性消费当前会话的 Claude Code action。"""
+
+        session_id = self._session_id
+        if session_id is None:
+            return False
+        try:
+            owner = ClaudeCodeOwner.from_cli_session_key(session_id).session_owner
+        except (TypeError, ValueError):
+            return False
+        pending = self._continuation_store.get(owner)
+        if pending is None:
+            return False
+        request = detect_claude_code_request(user_input)
+        if request is not None:
+            if request.operation in {
+                ClaudeCodeRequestOperation.POLL,
+                ClaudeCodeRequestOperation.REQUEST_INTERRUPT,
+                ClaudeCodeRequestOperation.TERMINATE,
+            }:
+                # 控制请求继续走正常 P8.2 grant，不被 pending 当作回复。
+                return False
+            self._ui.show_message(
+                "claude_code_interaction_pending: Claude Code 正在等待交互，请先回复当前提示，不能启动新的任务。"
+            )
+            return True
+        if pending.delivery_unknown:
+            self._ui.show_message(
+                "claude_code_delivery_unknown: 上一条 Claude Code 回复送达状态未知，请先使用 poll、interrupt 或 terminate。"
+            )
+            return True
+        if pending.originating_conversation_id != session_id:
+            # /resume 或新会话不能自动把普通文本交给旧 action。
+            return False
+        task = CLIWorkerTask(
+            kind="claude_code_reply",
+            session_id=session_id,
+            user_input=user_input,
+            continuation_pending=pending.to_safe_dict(),
+        )
+        if self._submit_task(task, begins_stream=False):
+            self._mark_activity()
+            return True
         return False
 
     def _conversation_task(self, user_input: str) -> CLIWorkerTask:
@@ -1178,6 +1338,7 @@ class CLIController:
                     session_key=candidate_session_id,
                     base_policy=self._tool_policy,
                     registry=registry,
+                    originating_conversation_id=candidate_session_id,
                 )
                 if invocation is not None:
                     session_id = candidate_session_id
@@ -1370,7 +1531,10 @@ class CLIController:
             self._restore_pending_steer(result)
             self._apply_worker_result(result)
             self._mark_activity()
-            if result.kind == "cancel_approval" and result.error is None:
+            if result.kind == "claude_code_reply":
+                if result.error is not None:
+                    self._ui.show_message(result.error)
+            elif result.kind == "cancel_approval" and result.error is None:
                 self._ui.show_message("当前审批已取消。")
             else:
                 self._ui.show_worker_result(result)
@@ -1469,6 +1633,21 @@ class CLIController:
             if result.error is None:
                 self._pending_approval = None
             return
+        if result.kind == "claude_code_reply":
+            conversation_result = result.conversation_result
+            observation = (
+                conversation_result.get("claude_code_interaction")
+                if isinstance(conversation_result, dict)
+                else None
+            )
+            if isinstance(observation, dict):
+                _status, pending = self._continuation_store.apply_observation(observation)
+                if pending is not None:
+                    rendered = render_claude_code_interaction(pending)
+                    if _status == "conflict":
+                        rendered = "claude_code_interaction_conflict: another interaction is still pending.\n" + rendered
+                    self._ui.show_message(rendered)
+            return
         conversation_result = result.conversation_result
         if not isinstance(conversation_result, dict):
             return
@@ -1477,6 +1656,14 @@ class CLIController:
             self._pending_approval = request if isinstance(request, dict) else None
         else:
             self._pending_approval = None
+        observation = conversation_result.get("claude_code_interaction")
+        if isinstance(observation, dict):
+            _status, pending = self._continuation_store.apply_observation(observation)
+            if pending is not None:
+                rendered = render_claude_code_interaction(pending)
+                if _status == "conflict":
+                    rendered = "claude_code_interaction_conflict: another interaction is still pending.\n" + rendered
+                self._ui.show_message(rendered)
 
     def _submit_next_queued_message(self) -> None:
         if (

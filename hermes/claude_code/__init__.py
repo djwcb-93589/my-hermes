@@ -25,14 +25,25 @@ from hermes.claude_code.contracts import (
 )
 from hermes.claude_code.agent_adapter import (
     CLAUDE_CODE_GRANT_CONTEXT_KEY,
+    CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY,
     CLAUDE_CODE_INVOCATION_PURPOSE,
     CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT,
     ClaudeCodeAgentAdapter,
     ClaudeCodeAgentAdapterError,
     ClaudeCodeInvocationGrant,
+    ClaudeCodeInteractionView,
     ClaudeCodeOwner,
     create_cli_claude_code_grant,
+    create_cli_claude_code_continuation_grant,
     create_gateway_claude_code_grant,
+    create_gateway_claude_code_continuation_grant,
+)
+from hermes.claude_code.continuation import (
+    ClaudeCodeContinuationConflict,
+    ClaudeCodeContinuationStore,
+    ClaudeCodeInteractionSink,
+    ClaudeCodePendingInteraction,
+    render_claude_code_interaction,
 )
 from hermes.claude_code.request_detector import (
     ClaudeCodeExplicitRequest,
@@ -242,6 +253,11 @@ __all__ = [
     "ClaudeCodeSnapshot",
     "ClaudeCodeState",
     "ClaudeCodeOwner",
+    "ClaudeCodeInteractionView",
+    "ClaudeCodeContinuationConflict",
+    "ClaudeCodeContinuationStore",
+    "ClaudeCodeInteractionSink",
+    "ClaudeCodePendingInteraction",
     "ClaudeCodeTerminalNotification",
     "DetectionResult",
     "NormalizedOutputDelta",
@@ -249,7 +265,9 @@ __all__ = [
     "create_claude_code_completion_watcher",
     "create_claude_code_runtime",
     "create_cli_claude_code_grant",
+    "create_cli_claude_code_continuation_grant",
     "create_gateway_claude_code_grant",
+    "create_gateway_claude_code_continuation_grant",
     "get_claude_code_controller",
     "get_claude_code_completion_watcher",
     "get_claude_code_runtime",
@@ -258,4 +276,5 @@ __all__ = [
     "prepare_cli_claude_code_invocation",
     "prepare_gateway_claude_code_invocation",
     "render_claude_code_terminal_notification",
+    "render_claude_code_interaction",
 ]

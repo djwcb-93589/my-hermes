@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from hermes.claude_code.contracts import ClaudeCodeRuntimeError
+from hermes.claude_code.contracts import ClaudeCodeInteractionResponse
 
 
 CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT = "claude_code_invocation"
@@ -18,18 +19,33 @@ CLAUDE_CODE_INVOCATION_PURPOSE = "managed_claude_code"
 """Grant 只能用于本受管 Claude Code Tool 边界。"""
 
 CLAUDE_CODE_GRANT_CONTEXT_KEY = "_claude_code_invocation_grant"
+CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY = "_claude_code_interaction_sink"
 """Tool Handler 使用的私有上下文键，不进入模型 schema 或结果。"""
 
 _ALLOWED_ENVIRONMENTS = frozenset({"cli", "gateway"})
-_ALLOWED_OPERATIONS = frozenset(
+_PUBLIC_OPERATIONS = frozenset(
     {"start", "poll", "request_interrupt", "terminate"}
 )
-_DEFAULT_ALLOWED_OPERATIONS = _ALLOWED_OPERATIONS
+_ALLOWED_OPERATIONS = frozenset(
+    {
+        "start",
+        "poll",
+        "request_interrupt",
+        "terminate",
+        "current_interaction",
+        "reply_to_interaction",
+    }
+)
+_DEFAULT_ALLOWED_OPERATIONS = _PUBLIC_OPERATIONS
 _MAX_OWNER_LENGTH = 1_024
 _MAX_TURN_ID_LENGTH = 512
 _MAX_PURPOSE_LENGTH = 128
 _MAX_SOURCE_MESSAGE_LENGTH = 1_024
 _MAX_GRANT_LIFETIME_SECONDS = 900.0
+_MAX_INTERACTION_REPLY_LENGTH = 8_192
+_CONTINUATION_OPERATIONS = frozenset(
+    {"current_interaction", "reply_to_interaction"}
+)
 
 
 class ClaudeCodeAgentAdapterError(ClaudeCodeRuntimeError):
@@ -64,6 +80,18 @@ def _timestamp(field_name: str, value: object) -> float:
     ):
         raise ValueError(f"{field_name} must be a non-negative timestamp")
     return float(value)
+
+
+def _bounded_reply(value: object) -> str:
+    """保留用户原样回复（包括空字符串），只做长度和 NUL 边界检查。"""
+
+    if not isinstance(value, str):
+        raise ValueError("response must be text")
+    if len(value) > _MAX_INTERACTION_REPLY_LENGTH:
+        raise ValueError("response exceeds the supported length")
+    if "\x00" in value:
+        raise ValueError("response contains a NUL character")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +172,13 @@ class ClaudeCodeInvocationGrant:
         compare=False,
         hash=False,
     )
+    _reply_consumed: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
     _lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -217,6 +252,11 @@ class ClaudeCodeInvocationGrant:
         with self._lock:
             return self._start_consumed
 
+    @property
+    def reply_consumed(self) -> bool:
+        with self._lock:
+            return self._reply_consumed
+
     def validate(self, *, now: float | None = None) -> None:
         """验证 grant 的用途、owner、环境和时间范围。"""
 
@@ -261,6 +301,44 @@ class ClaudeCodeInvocationGrant:
                     "Claude Code start grant has already been consumed",
                 )
             object.__setattr__(self, "_start_consumed", True)
+
+    def consume_reply(self, *, now: float | None = None) -> None:
+        """原子消费一次续接回复 grant，防止同一回复被重复提交。"""
+
+        self.validate(now=now)
+        with self._lock:
+            if self._reply_consumed:
+                raise ClaudeCodeAgentAdapterError(
+                    "grant_reused",
+                    "Claude Code interaction reply grant has already been consumed",
+                )
+            object.__setattr__(self, "_reply_consumed", True)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeInteractionView:
+    """Adapter 给 CLI/Gateway 的安全交互视图；native 字段只在当前调用栈暂存。"""
+
+    process_id: str
+    round_id: str | None
+    action_id: str
+    kind: str
+    summary: str
+    prompt_text: str
+    options: tuple[str, ...]
+    native_prompt: str | None = None
+    native_options: tuple[str, ...] = ()
+
+    def safe_dict(self) -> dict:
+        return {
+            "process_id": self.process_id,
+            "round_id": self.round_id,
+            "action_id": self.action_id,
+            "kind": self.kind,
+            "summary": self.summary,
+            "prompt_text": self.prompt_text,
+            "options": list(self.options),
+        }
 
 
 class ClaudeCodeAgentAdapter:
@@ -382,6 +460,102 @@ class ClaudeCodeAgentAdapter:
             process_id=process_id,
         )
 
+    def current_interaction(
+        self,
+        *,
+        grant: ClaudeCodeInvocationGrant,
+        process_id: str,
+        round_id: str | None = None,
+    ) -> ClaudeCodeInteractionView | None:
+        """读取当前交互的安全投影；不读取 PTY 或 Controller 私有字段。"""
+
+        self._validate_grant(grant, operation="current_interaction")
+        process_id = _bounded_text(
+            "process_id",
+            process_id,
+            maximum=_MAX_OWNER_LENGTH,
+        )
+        if round_id is not None:
+            round_id = _bounded_text("round_id", round_id, maximum=_MAX_TURN_ID_LENGTH)
+        current_method = getattr(self._controller, "current_interaction", None)
+        if not callable(current_method):
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_unavailable",
+                "Claude Code interaction view is unavailable",
+            )
+        native = current_method(
+            session_owner=grant.owner.session_owner,
+            process_id=process_id,
+        )
+        if native is None:
+            return None
+        action = getattr(native, "action", native)
+        observed_round_id = round_id
+        native_prompt = None
+        native_options: tuple[str, ...] = ()
+        native_prompt = getattr(native, "prompt_text", None)
+        native_options = tuple(getattr(native, "options", ()) or ())
+        return ClaudeCodeInteractionView(
+            process_id=process_id,
+            round_id=observed_round_id,
+            action_id=str(getattr(action, "action_id", "")),
+            kind=str(getattr(getattr(action, "kind", None), "value", getattr(action, "kind", "unknown_prompt"))),
+            summary=str(getattr(action, "summary", "Claude Code requires input")),
+            prompt_text=str(getattr(action, "prompt_text", "")),
+            options=tuple(getattr(action, "options", ()) or ()),
+            native_prompt=native_prompt,
+            native_options=native_options,
+        )
+
+    def reply_to_interaction(
+        self,
+        *,
+        grant: ClaudeCodeInvocationGrant,
+        process_id: str,
+        round_id: str | None,
+        action_id: str,
+        response: str,
+    ):
+        """经 coordinator 的显式用户确认提交一次原样回复。"""
+
+        self._validate_grant(grant, operation="reply_to_interaction")
+        process_id = _bounded_text(
+            "process_id",
+            process_id,
+            maximum=_MAX_OWNER_LENGTH,
+        )
+        action_id = _bounded_text("action_id", action_id, maximum=_MAX_OWNER_LENGTH)
+        if round_id is not None:
+            round_id = _bounded_text("round_id", round_id, maximum=_MAX_TURN_ID_LENGTH)
+        response = _bounded_reply(response)
+        view = self.current_interaction(
+            grant=grant,
+            process_id=process_id,
+            round_id=round_id,
+        )
+        if view is None or view.action_id != action_id:
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_stale",
+                "Claude Code interaction is no longer current",
+            )
+        grant.consume_reply(now=self._clock())
+        reply_method = getattr(self._controller, "reply_to_interaction", None)
+        if not callable(reply_method):
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_unavailable",
+                "Claude Code interaction reply is unavailable",
+            )
+        return reply_method(
+            response=ClaudeCodeInteractionResponse(
+                action_id=action_id,
+                process_id=process_id,
+                session_owner=grant.owner.session_owner,
+                response=response,
+                user_confirmed=True,
+                created_at=self._clock(),
+            )
+        )
+
 
 def create_gateway_claude_code_grant(
     *,
@@ -403,6 +577,26 @@ def create_gateway_claude_code_grant(
         expires_at=expires_at,
         source_message_id=source_message_id,
         allowed_operations=frozenset(allowed_operations),
+    )
+
+
+def create_gateway_claude_code_continuation_grant(
+    *,
+    route_key: str,
+    turn_id: str,
+    created_at: float,
+    expires_at: float,
+    source_message_id: str | None = None,
+) -> ClaudeCodeInvocationGrant:
+    """创建仅供 coordinator current/reply 使用的短期内部 grant。"""
+
+    return create_gateway_claude_code_grant(
+        route_key=route_key,
+        turn_id=turn_id,
+        created_at=created_at,
+        expires_at=expires_at,
+        source_message_id=source_message_id,
+        allowed_operations=_CONTINUATION_OPERATIONS,
     )
 
 
@@ -429,14 +623,38 @@ def create_cli_claude_code_grant(
     )
 
 
+def create_cli_claude_code_continuation_grant(
+    *,
+    session_key: str,
+    turn_id: str,
+    created_at: float,
+    expires_at: float,
+    source_message_id: str | None = None,
+) -> ClaudeCodeInvocationGrant:
+    """创建 CLI coordinator 专用的 current/reply grant。"""
+
+    return create_cli_claude_code_grant(
+        session_key=session_key,
+        turn_id=turn_id,
+        created_at=created_at,
+        expires_at=expires_at,
+        source_message_id=source_message_id,
+        allowed_operations=_CONTINUATION_OPERATIONS,
+    )
+
+
 __all__ = [
     "CLAUDE_CODE_GRANT_CONTEXT_KEY",
+    "CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY",
     "CLAUDE_CODE_INVOCATION_PURPOSE",
     "CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT",
     "ClaudeCodeAgentAdapter",
     "ClaudeCodeAgentAdapterError",
     "ClaudeCodeInvocationGrant",
+    "ClaudeCodeInteractionView",
     "ClaudeCodeOwner",
     "create_cli_claude_code_grant",
+    "create_cli_claude_code_continuation_grant",
     "create_gateway_claude_code_grant",
+    "create_gateway_claude_code_continuation_grant",
 ]
