@@ -148,7 +148,10 @@ _TERMINATE_CONTROL_RE = re.compile(
     rf"{_CONTROL_BOUNDARY_RE}"
     rf")"
 )
-_CONTROL_POLITE_PREFIX_RE = re.compile(r"(?ix)^(?:请|please)$")
+_CONTROL_POLITE_PREFIX_RE = re.compile(
+    r"(?ix)^(?:请(?:\s*先)?|先|麻烦(?:\s*先)?|"
+    r"please(?:\s+first)?|first)$"
+)
 
 
 def _has_standalone_control_match(
