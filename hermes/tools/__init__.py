@@ -613,6 +613,7 @@ def register_all(
     staging_registry = ToolRegistry()
     from hermes.tools.terminal import register as _terminal
     from hermes.tools.process import register as _process
+    from hermes.tools.claude_code import register as _claude_code
     from hermes.tools.file import register as _file
     from hermes.tools.memory import register as _memory
     from hermes.tools.delegate import register as _delegate
@@ -639,6 +640,7 @@ def register_all(
                 staging_registry,
                 process_manager=active_process_manager,
             )
+    _claude_code(staging_registry)
     _file(staging_registry)
     _memory(staging_registry)
     try:
