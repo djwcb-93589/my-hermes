@@ -53,6 +53,9 @@ from hermes.claude_code.request_detector import (
     detect_claude_code_request,
 )
 from hermes.claude_code.contracts import ClaudeCodeRuntimeError
+from hermes.claude_code.watch_registration import (
+    CLAUDE_CODE_WATCH_REGISTRATION_SINK_CONTEXT_KEY,
+)
 from hermes.hooks import (
     AsyncHookRegistry,
     SyncObservationBridge,
@@ -149,6 +152,8 @@ from hermes.gateway.runtime_components import (
 )
 from hermes.gateway.claude_code_notifications import (
     GatewayClaudeCodeNotificationPort,
+    GatewayClaudeCodeWatchRegistrationSink,
+    build_gateway_claude_code_notification_target_for_event,
 )
 from hermes.gateway.system_notifications import (
     GatewaySystemNotificationPublisher,
@@ -1678,6 +1683,34 @@ class GatewayRunner:
             "gateway_file_transfer_config": self.file_transfer_config,
             "gateway_runtime_fence": fence if fence else None,
         }
+
+    def _build_claude_code_watch_registration_sink(
+        self,
+        event: MessageEvent,
+        route_key: str,
+    ) -> GatewayClaudeCodeWatchRegistrationSink:
+        """为当前显式 Gateway 请求创建一次性的受信 Watch 注册边界。"""
+
+        try:
+            session_owner = ClaudeCodeOwner.from_gateway_route_key(
+                route_key,
+            ).session_owner
+            target = build_gateway_claude_code_notification_target_for_event(
+                event,
+                session_owner=session_owner,
+            )
+        except (TypeError, ValueError):
+            return GatewayClaudeCodeWatchRegistrationSink(
+                watcher=self._claude_code_completion_watcher,
+                notification_target=None,
+                loop=asyncio.get_running_loop(),
+                initialization_error="watch_target_invalid",
+            )
+        return GatewayClaudeCodeWatchRegistrationSink(
+            watcher=self._claude_code_completion_watcher,
+            notification_target=target,
+            loop=asyncio.get_running_loop(),
+        )
 
     def _database_delivery_fence_state(
         self,
@@ -7493,6 +7526,12 @@ class GatewayRunner:
             # Grant 与动态 ToolPolicy 针对同一个 MessageEvent 一次性注入，
             # 不进入 Gateway history、resume state 或持久化上下文。
             tool_context.update(claude_code_invocation.tool_context)
+            tool_context[
+                CLAUDE_CODE_WATCH_REGISTRATION_SINK_CONTEXT_KEY
+            ] = self._build_claude_code_watch_registration_sink(
+                task_event,
+                route_key,
+            )
         progressive_controller = self._create_progressive_controller(
             task_event,
             ctx,

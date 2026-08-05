@@ -14,6 +14,11 @@ from hermes.claude_code.agent_adapter import (
 )
 from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 from hermes.tool_declarations.claude_code import TOOL_DECLARATIONS
+from hermes.claude_code.watch_registration import (
+    CLAUDE_CODE_WATCH_REGISTRATION_SINK_CONTEXT_KEY,
+    ClaudeCodeWatchRegistrationResult,
+    not_applicable_watch_registration,
+)
 from hermes.tools import register_declared_handlers
 
 
@@ -97,6 +102,7 @@ def _empty_envelope(operation: str) -> dict:
         "error_type": None,
         "retryable": False,
         "delivery_unknown": False,
+        "notification_watch": not_applicable_watch_registration().to_safe_dict(),
     }
 
 
@@ -178,7 +184,12 @@ def _safe_events(snapshot) -> list[dict]:
     return safe_events
 
 
-def _result_envelope(operation: str, result) -> str:
+def _result_envelope(
+    operation: str,
+    result,
+    *,
+    notification_watch: dict | None = None,
+) -> str:
     snapshot = result.snapshot
     session_ref = snapshot.session_ref if snapshot is not None else None
     # raw_cursor 是 Controller/Runtime 的绝对 cursor；Handler 不消费、不推进它。
@@ -208,7 +219,47 @@ def _result_envelope(operation: str, result) -> str:
         "action_required": _safe_action(result.action_required),
         "limits_hit": list(result.limits_hit),
     })
+    if notification_watch is not None:
+        payload["notification_watch"] = dict(notification_watch)
     return _json(payload)
+
+
+def _watch_registration_status(
+    *,
+    action: str,
+    result,
+    grant: ClaudeCodeInvocationGrant,
+    sink: object,
+) -> dict:
+    """把 Gateway 私有注册 Sink 投影成有限 Tool 状态。"""
+
+    if action != "start" or grant.environment != "gateway":
+        return not_applicable_watch_registration().to_safe_dict()
+    register = getattr(sink, "register_start_result", None)
+    if not callable(register):
+        return ClaudeCodeWatchRegistrationResult(
+            status="registration_failed",
+            error_type="watch_sink_unavailable",
+            retryable=True,
+        ).to_safe_dict()
+    try:
+        registration = register(
+            result=result,
+            session_owner=grant.owner.session_owner,
+        )
+    except Exception:
+        return ClaudeCodeWatchRegistrationResult(
+            status="registration_failed",
+            error_type="watch_registration_failed",
+            retryable=False,
+        ).to_safe_dict()
+    if not isinstance(registration, ClaudeCodeWatchRegistrationResult):
+        return ClaudeCodeWatchRegistrationResult(
+            status="registration_failed",
+            error_type="watch_registration_failed",
+            retryable=False,
+        ).to_safe_dict()
+    return registration.to_safe_dict()
 
 
 def _default_claude_code_adapter() -> ClaudeCodeAgentAdapter:
@@ -365,7 +416,17 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
         if sink is not None and callable(getattr(sink, "capture_controller_result", None)):
             # sink 只保存安全 action 投影；Tool result 仍不暴露 native prompt。
             sink.capture_controller_result(result)
-        return _result_envelope(action, result)
+        notification_watch = _watch_registration_status(
+            action=action,
+            result=result,
+            grant=grant,
+            sink=kwargs.get(CLAUDE_CODE_WATCH_REGISTRATION_SINK_CONTEXT_KEY),
+        )
+        return _result_envelope(
+            action,
+            result,
+            notification_watch=notification_watch,
+        )
     except ClaudeCodeRuntimeError as error:
         # 控制操作失败也要进入本轮 run-local continuation 观察；这里只传递
         # 有界身份和错误分类，不把 Grant、异常对象或原生终端内容带入 sink。

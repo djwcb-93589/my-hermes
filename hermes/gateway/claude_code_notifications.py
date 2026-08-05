@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import hashlib
 import json
 
@@ -10,6 +12,13 @@ from hermes.claude_code.notification import (
     ClaudeCodeNotificationTarget,
     ClaudeCodeTerminalNotification,
     render_claude_code_terminal_notification,
+)
+from hermes.claude_code.watch_registration import (
+    ClaudeCodeWatchRegistrationResult,
+)
+from hermes.claude_code.watcher import (
+    ClaudeCodeCompletionWatch,
+    ClaudeCodeCompletionWatcherError,
 )
 from hermes.gateway.system_notifications import (
     GatewaySystemNotificationPublisher,
@@ -56,6 +65,251 @@ class GatewayClaudeCodeNotificationPort:
             delivery_id=receipt.delivery_id,
             retryable=receipt.retryable,
             error_type=error_type,
+        )
+
+
+class GatewayClaudeCodeWatchRegistrationSink:
+    """在 Tool 同步线程与当前 Gateway Watcher 之间建立受信边界。"""
+
+    _REGISTRATION_TIMEOUT_SECONDS = 30.0
+
+    def __init__(
+        self,
+        *,
+        watcher,
+        notification_target: ClaudeCodeNotificationTarget | None,
+        loop: asyncio.AbstractEventLoop,
+        initialization_error: str | None = None,
+    ) -> None:
+        if not isinstance(loop, asyncio.AbstractEventLoop):
+            raise TypeError("loop must be an event loop")
+        self._watcher = watcher
+        self._notification_target = notification_target
+        self._loop = loop
+        self._initialization_error = initialization_error
+
+    def register_start_result(
+        self,
+        *,
+        result: object,
+        session_owner: str,
+    ) -> ClaudeCodeWatchRegistrationResult:
+        """只接受成功 start 的公共结果，不保存 task 或 target 到 Tool。"""
+
+        if self._initialization_error is not None:
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type=self._initialization_error,
+                retryable=False,
+            )
+        target = self._notification_target
+        if target is None:
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watch_target_invalid",
+                retryable=False,
+            )
+        if target.session_owner != session_owner:
+            return ClaudeCodeWatchRegistrationResult(
+                status="target_conflict",
+                error_type="watch_owner_mismatch",
+                retryable=False,
+            )
+        process_id = getattr(result, "process_id", None)
+        round_id = getattr(result, "round_id", None)
+        if (
+            not isinstance(process_id, str)
+            or not process_id.strip()
+            or not isinstance(round_id, str)
+            or not round_id.strip()
+            or getattr(result, "initial_instruction_submitted", False)
+            is not True
+        ):
+            return ClaudeCodeWatchRegistrationResult(
+                status="not_registered_no_round",
+                error_type="round_unavailable",
+                retryable=False,
+            )
+        snapshot = getattr(result, "snapshot", None)
+        session_ref = getattr(snapshot, "session_ref", None)
+        if session_ref is None:
+            return ClaudeCodeWatchRegistrationResult(
+                status="not_registered_no_round",
+                error_type="round_unavailable",
+                retryable=False,
+            )
+        result_owner = getattr(session_ref, "session_owner", None)
+        result_process_id = getattr(session_ref, "process_id", None)
+        if (
+            result_owner != session_owner
+            or result_process_id != process_id
+        ):
+            return ClaudeCodeWatchRegistrationResult(
+                status="target_conflict",
+                error_type="watch_owner_mismatch",
+                retryable=False,
+            )
+        watcher = self._watcher
+        if watcher is None:
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watcher_unavailable",
+                retryable=True,
+            )
+        if self._loop.is_closed():
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watcher_unavailable",
+                retryable=True,
+            )
+        future = asyncio.run_coroutine_threadsafe(
+            self._register_or_reuse(
+                watcher=watcher,
+                process_id=process_id,
+                session_owner=session_owner,
+                round_id=round_id,
+                target=target,
+            ),
+            self._loop,
+        )
+        try:
+            status, watch = future.result(
+                timeout=self._REGISTRATION_TIMEOUT_SECONDS,
+            )
+        except FutureTimeoutError:
+            future.cancel()
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watch_registration_timeout",
+                retryable=True,
+            )
+        except Exception as error:
+            return self._watcher_error_result(error)
+        if not isinstance(watch, ClaudeCodeCompletionWatch):
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watch_registration_failed",
+                retryable=False,
+            )
+        return ClaudeCodeWatchRegistrationResult(
+            status=status,
+            registered=True,
+            watch_id=watch.watch_id,
+        )
+
+    async def _register_or_reuse(
+        self,
+        *,
+        watcher,
+        process_id: str,
+        session_owner: str,
+        round_id: str,
+        target: ClaudeCodeNotificationTarget,
+    ) -> tuple[str, ClaudeCodeCompletionWatch]:
+        existing = await self._find_existing_watch(
+            watcher=watcher,
+            process_id=process_id,
+            session_owner=session_owner,
+            round_id=round_id,
+            target=target,
+        )
+        if existing is not None:
+            return "already_registered", existing
+        try:
+            watch = await watcher.register_watch(
+                process_id=process_id,
+                session_owner=session_owner,
+                round_id=round_id,
+                notification_target=target,
+            )
+        except ClaudeCodeCompletionWatcherError as error:
+            if error.error_type != "watch_already_registered":
+                raise
+            existing = await self._find_existing_watch(
+                watcher=watcher,
+                process_id=process_id,
+                session_owner=session_owner,
+                round_id=round_id,
+                target=target,
+            )
+            if existing is not None:
+                return "already_registered", existing
+            raise
+        return "registered", watch
+
+    @staticmethod
+    async def _find_existing_watch(
+        *,
+        watcher,
+        process_id: str,
+        session_owner: str,
+        round_id: str,
+        target: ClaudeCodeNotificationTarget,
+    ) -> ClaudeCodeCompletionWatch | None:
+        watches = await watcher.list_watches(include_closed=True)
+        for watch in watches:
+            if (
+                watch.process_id != process_id
+                or watch.session_owner != session_owner
+                or watch.round_id != round_id
+            ):
+                continue
+            if watch.target_id != target.target_id:
+                raise ClaudeCodeCompletionWatcherError(
+                    "watch_target_conflict",
+                    "Claude Code completion watch is bound to another target",
+                )
+            return watch
+        return None
+
+    @staticmethod
+    def _watcher_error_result(error: Exception) -> ClaudeCodeWatchRegistrationResult:
+        if isinstance(error, ClaudeCodeCompletionWatcherError):
+            error_type = error.error_type
+            if error_type in {
+                "watch_owner_mismatch",
+                "watch_target_invalid",
+                "watch_target_conflict",
+            }:
+                return ClaudeCodeWatchRegistrationResult(
+                    status="target_conflict",
+                    error_type=error_type,
+                    retryable=False,
+                )
+            if error_type == "watch_already_registered":
+                return ClaudeCodeWatchRegistrationResult(
+                    status="already_registered",
+                    error_type=error_type,
+                    retryable=False,
+                )
+            if error_type in {
+                "watch_round_unavailable",
+                "watch_not_found",
+            }:
+                return ClaudeCodeWatchRegistrationResult(
+                    status="not_registered_no_round",
+                    error_type=error_type,
+                    retryable=error.retryable,
+                )
+            if error_type in {
+                "watcher_not_started",
+                "watcher_shutting_down",
+                "notification_port_unavailable",
+            }:
+                return ClaudeCodeWatchRegistrationResult(
+                    status="registration_failed",
+                    error_type="watcher_unavailable",
+                    retryable=error.retryable,
+                )
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type=error_type,
+                retryable=error.retryable,
+            )
+        return ClaudeCodeWatchRegistrationResult(
+            status="registration_failed",
+            error_type="watch_registration_failed",
+            retryable=False,
         )
 
 
@@ -131,6 +385,7 @@ def _optional_target_text(field_name: str, value: object) -> str | None:
 
 __all__ = [
     "GatewayClaudeCodeNotificationPort",
+    "GatewayClaudeCodeWatchRegistrationSink",
     "build_gateway_claude_code_notification_target",
     "build_gateway_claude_code_notification_target_for_event",
 ]
