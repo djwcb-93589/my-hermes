@@ -24,7 +24,8 @@ class ClaudeCodeExplicitRequest:
 
 
 _CLAUDE_MARKER = r"(?:claude\s*[- ]\s*code|claude-code)"
-_MARKER = rf"(?:{_CLAUDE_MARKER}|\bcc\b)"
+_CC_MARKER = r"(?<![A-Za-z0-9_])cc(?![A-Za-z0-9_])"
+_MARKER = rf"(?:{_CLAUDE_MARKER}|{_CC_MARKER})"
 _MARKER_TOKEN = (
     rf"(?:[\"'“‘「『]?\s*{_MARKER}\s*"
     rf"[\"'”’」』]?)"
@@ -61,13 +62,16 @@ _NEGATION_RE = re.compile(
     rf"|(?:不想|不打算)\s*(?:使用|用|让|交给|启动|调用)?\s*{_MARKER_TOKEN}"
     rf")"
 )
-_REFERENCE_RE = re.compile(
-    rf"(?ix)(?:"
-    rf"(?:文档(?:中|里)?|翻译|引用|示例|例子|比较|说明|what\s+is|"
-    rf"do\s+you\s+support|translate|documentation|example|compare)"
-    rf".{{0,100}}{_MARKER}"
-    rf")"
+_REFERENCE_SEGMENT_RE = re.compile(
+    r"(?ix)^\s*(?:请\s*)?(?:"
+    r"翻译|translate|引用|quote|"
+    r"(?:文档(?:中|里)?|documentation)(?:写着|提到|说明|记录|内容)?|"
+    r"(?:示例|例子|example)(?:\s*[:：]|\b)|"
+    r"(?:比较|compare)(?:一下|一番)?|"
+    r"(?:说明|explain)(?:一下)?(?:\s+|[:：])"
+    r")"
 )
+_SEGMENT_SPLIT_RE = re.compile(r"[\r\n,，;；。！？!?]+")
 _WHOLE_QUOTED_RE = re.compile(
     r'''(?is)^\s*(?:"[^"\r\n]{1,512}"|'[^'\r\n]{1,512}'|'''
     r'''“[^”\r\n]{1,512}”|‘[^’\r\n]{1,512}’|'''
@@ -97,21 +101,32 @@ _POLL_QUERY_RE = re.compile(
     rf")"
 )
 _CONTROL_TARGET_RE = (
-    r"(?:当前|刚才|现在|正在运行的|这个|该|本轮|任务|进程|会话|"
-    r"current|previous|running|this|the|task|process|session)"
+    r"(?:当前|刚才|现在|正在运行的|这个|该|本轮|current|previous|"
+    r"running|this|the)"
+)
+_CONTROL_NOUN_RE = r"(?:任务|进程|会话|task|process|session)"
+_CONTROL_OBJECT_RE = (
+    rf"(?:(?:{_CONTROL_TARGET_RE})\s*(?:的\s*)?"
+    rf"(?:{_CONTROL_NOUN_RE})?|{_CONTROL_NOUN_RE})"
+)
+_CONTROL_FILLER_RE = r"(?:一下|一会儿|先|please)?\s*"
+_CONTROL_ACTION_SUFFIX_RE = (
+    rf"{_CONTROL_FILLER_RE}(?:{_CONTROL_OBJECT_RE}\s*)?"
 )
 _INTERRUPT_CONTROL_RE = re.compile(
     rf"(?ix)(?:"
-    rf"{_INTERRUPT_RE}\s*(?:{_CONTROL_TARGET_RE}\s*)?{_MARKER_TOKEN}"
-    rf"(?:\s*{_CONTROL_TARGET_RE})?"
-    rf"|{_MARKER_TOKEN}\s*{_INTERRUPT_RE}\s+{_CONTROL_TARGET_RE}"
+    rf"{_INTERRUPT_RE}\s*{_CONTROL_ACTION_SUFFIX_RE}{_MARKER_TOKEN}"
+    rf"(?:\s*{_CONTROL_OBJECT_RE})?"
+    rf"|{_MARKER_TOKEN}\s*{_INTERRUPT_RE}\s*"
+    rf"{_CONTROL_FILLER_RE}{_CONTROL_OBJECT_RE}"
     rf")"
 )
 _TERMINATE_CONTROL_RE = re.compile(
     rf"(?ix)(?:"
-    rf"{_TERMINATE_RE}\s*(?:{_CONTROL_TARGET_RE}\s*)?{_MARKER_TOKEN}"
-    rf"(?:\s*{_CONTROL_TARGET_RE})?"
-    rf"|{_MARKER_TOKEN}\s*{_TERMINATE_RE}\s+{_CONTROL_TARGET_RE}"
+    rf"{_TERMINATE_RE}\s*{_CONTROL_ACTION_SUFFIX_RE}{_MARKER_TOKEN}"
+    rf"(?:\s*{_CONTROL_OBJECT_RE})?"
+    rf"|{_MARKER_TOKEN}\s*{_TERMINATE_RE}\s*"
+    rf"{_CONTROL_FILLER_RE}{_CONTROL_OBJECT_RE}"
     rf")"
 )
 
@@ -132,6 +147,23 @@ def _message_surface(message: str) -> str:
     return re.sub(r"`[^`\r\n]*`", " ", surface)
 
 
+def _candidate_surface(surface: str) -> str:
+    """去除局部引用片段，保留后续独立的直接请求。"""
+
+    candidates: list[str] = []
+    for raw_segment in _SEGMENT_SPLIT_RE.split(surface):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if (
+            _MARKER_RE.search(segment)
+            and _REFERENCE_SEGMENT_RE.match(segment)
+        ):
+            continue
+        candidates.append(segment)
+    return " ".join(candidates).strip()
+
+
 class ClaudeCodeExplicitRequestDetector:
     """只分析当前一条真实人类消息，不读取历史、模型输出或 Tool 参数。"""
 
@@ -139,27 +171,32 @@ class ClaudeCodeExplicitRequestDetector:
         if not isinstance(message, str):
             return None
         surface = _message_surface(message).strip()
-        if not surface or not _MARKER_RE.search(surface):
+        if not surface:
+            return None
+        candidate_surface = _candidate_surface(surface)
+        if not candidate_surface or not _MARKER_RE.search(candidate_surface):
             return None
         if (
-            _NEGATION_RE.search(surface)
-            or _REFERENCE_RE.search(surface)
-            or _WHOLE_QUOTED_RE.fullmatch(surface)
+            _NEGATION_RE.search(candidate_surface)
+            or _WHOLE_QUOTED_RE.fullmatch(candidate_surface)
         ):
             return None
 
-        if _TERMINATE_CONTROL_RE.search(surface):
+        if _TERMINATE_CONTROL_RE.search(candidate_surface):
             return ClaudeCodeExplicitRequest(
                 ClaudeCodeRequestOperation.TERMINATE
             )
-        if _INTERRUPT_CONTROL_RE.search(surface):
+        if _INTERRUPT_CONTROL_RE.search(candidate_surface):
             return ClaudeCodeExplicitRequest(
                 ClaudeCodeRequestOperation.REQUEST_INTERRUPT
             )
-        if _POLL_QUERY_RE.search(surface):
+        if _POLL_QUERY_RE.search(candidate_surface):
             return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.POLL)
 
-        if _START_INTENT_RE.search(surface) and _TASK_RE.search(surface):
+        if (
+            _START_INTENT_RE.search(candidate_surface)
+            and _TASK_RE.search(candidate_surface)
+        ):
             return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.START)
         return None
 
