@@ -173,6 +173,8 @@ class _ControllerTaskRound:
     interrupt_menu_seen: bool = False
     failure_after_instruction_seen: bool = False
     failure_cursor: int | None = None
+    observation_sequence: int = 0
+    failure_observation_sequence: int | None = None
     ready_after_failure_seen: bool = False
     terminal_state: ClaudeCodeState | None = None
     terminal_at: float | None = None
@@ -1597,6 +1599,10 @@ class ClaudeCodeController:
             previous=previous,
             current=snapshot,
         )
+        current_round = task.active_round
+        if current_round is not None:
+            # 每个 round 独立编号，允许同 cursor 的后续空读参与失败收敛。
+            current_round.observation_sequence += 1
         task.last_snapshot = snapshot
         self._record_round_observation_locked(
             task,
@@ -1697,6 +1703,7 @@ class ClaudeCodeController:
         current_round.interrupt_menu_seen = False
         current_round.failure_after_instruction_seen = False
         current_round.failure_cursor = None
+        current_round.failure_observation_sequence = None
         current_round.ready_after_failure_seen = False
         task.interrupt_requested = False
         task.consecutive_empty_reads = 0
@@ -1820,6 +1827,11 @@ class ClaudeCodeController:
             current_round.ready_after_instruction_seen = False
             current_round.ready_after_failure_seen = False
             current_round.stable_ready_count = 0
+
+        if failure_seen_this_observation:
+            current_round.failure_observation_sequence = (
+                current_round.observation_sequence
+            )
 
         if not observation_degraded and self._is_new_round_ready_observation(
             current_round,
@@ -1979,9 +1991,12 @@ class ClaudeCodeController:
             # 失败与 READY 同批出现时，下一次观察才可作为失败后的稳定 READY。
             return (
                 current_round.failure_cursor is not None
+                and current_round.failure_observation_sequence is not None
+                and current_round.observation_sequence
+                > current_round.failure_observation_sequence
                 and not failure_seen_this_observation
                 and not activity_seen_this_observation
-                and snapshot.raw_cursor > current_round.failure_cursor
+                and snapshot.raw_cursor >= current_round.failure_cursor
             )
         return previous is None or (
             previous.state != ClaudeCodeState.READY
