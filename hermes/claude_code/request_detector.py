@@ -25,15 +25,19 @@ class ClaudeCodeExplicitRequest:
 
 _CLAUDE_MARKER = r"(?:claude\s*[- ]\s*code|claude-code)"
 _MARKER = rf"(?:{_CLAUDE_MARKER}|\bcc\b)"
+_MARKER_TOKEN = (
+    rf"(?:[\"'“‘「『]?\s*{_MARKER}\s*"
+    rf"[\"'”’」』]?)"
+)
 _MARKER_RE = re.compile(rf"(?i){_MARKER}")
 _START_INTENT_RE = re.compile(
     rf"(?ix)(?:"
-    rf"(?:使用|用|让|交给|启动|调用|委托|通过)\s*{_MARKER}"
-    rf"|{_MARKER}\s*(?:帮我|替我|来|执行|完成|处理|修改|检查|修复|运行|"
+    rf"(?:使用|用|让|交给|启动|调用|委托|通过)\s*{_MARKER_TOKEN}"
+    rf"|{_MARKER_TOKEN}\s*(?:帮我|替我|来|执行|完成|处理|修改|检查|修复|运行|"
     rf"实现|编写|创建|更新|审查|分析|测试)"
     rf"|(?:use|run|start|invoke|call|ask|let|have|delegate\s+to)\s+"
-    rf"{_MARKER}"
-    rf"|{_MARKER}\s+(?:to\s+)?(?:fix|modify|implement|complete|run|execute|"
+    rf"{_MARKER_TOKEN}"
+    rf"|{_MARKER_TOKEN}\s+(?:to\s+)?(?:fix|modify|implement|complete|run|execute|"
     rf"update|refactor|add|remove|write|create|test|review|check|build|handle)"
     rf")"
 )
@@ -48,15 +52,13 @@ _TASK_RE = re.compile(
 _NEGATION_RE = re.compile(
     rf"(?ix)(?:"
     rf"(?:do\s+not|don't|never)\s+(?:want\s+to\s+|need\s+to\s+)?"
-    rf"(?:use|using|run|let|ask|start|invoke|call)?\s*{_MARKER}"
-    rf"|without\s+(?:using\s+|use\s+of\s+)?{_MARKER}"
-    rf"|no\s+need\s+to\s+(?:use|run|start|invoke|call)\s*{_MARKER}"
-    rf"|no\s+(?:need\s+for\s+)?{_MARKER}"
+    rf"(?:use|using|run|let|ask|start|invoke|call)?\s*{_MARKER_TOKEN}"
+    rf"|without\s+(?:using\s+|use\s+of\s+)?{_MARKER_TOKEN}"
+    rf"|no\s+need\s+to\s+(?:use|run|start|invoke|call)\s*{_MARKER_TOKEN}"
+    rf"|no\s+(?:need\s+for\s+)?{_MARKER_TOKEN}"
     rf"|(?:不要|别|禁止|无需|不必|不让|不交给|不启动|不调用|不使用|不用|不需要)\s*"
-    rf"(?:使用|用|让|交给|启动|调用)?\s*{_MARKER}"
-    rf"|(?:不想|不打算)\s*(?:使用|用|让|交给|启动|调用)?\s*{_MARKER}"
-    rf"|{_MARKER}.{{0,48}}(?:不要|别|禁止|不让|不执行|不使用|"
-    rf"do\s+not|don't|never|without)"
+    rf"(?:使用|用|让|交给|启动|调用)?\s*{_MARKER_TOKEN}"
+    rf"|(?:不想|不打算)\s*(?:使用|用|让|交给|启动|调用)?\s*{_MARKER_TOKEN}"
     rf")"
 )
 _REFERENCE_RE = re.compile(
@@ -64,8 +66,13 @@ _REFERENCE_RE = re.compile(
     rf"(?:文档(?:中|里)?|翻译|引用|示例|例子|比较|说明|what\s+is|"
     rf"do\s+you\s+support|translate|documentation|example|compare)"
     rf".{{0,100}}{_MARKER}"
-    rf"|[\"'“‘][^\r\n]{{0,160}}{_MARKER}"
     rf")"
+)
+_WHOLE_QUOTED_RE = re.compile(
+    r'''(?is)^\s*(?:"[^"\r\n]{1,512}"|'[^'\r\n]{1,512}'|'''
+    r'''“[^”\r\n]{1,512}”|‘[^’\r\n]{1,512}’|'''
+    r'''「[^」\r\n]{1,512}」|『[^』\r\n]{1,512}』)\s*'''
+    r'''[.!?。！？]?\s*$'''
 )
 _INTERRUPT_RE = (
     r"(?:中断|打断|暂停|interrupt|pause|ctrl\s*[- ]?c)"
@@ -73,9 +80,39 @@ _INTERRUPT_RE = (
 _TERMINATE_RE = (
     r"(?:终止|结束|杀掉|停止|关闭|kill|terminate|stop|shutdown)"
 )
-_POLL_RE = (
-    r"(?:状态|输出|进度|运行到哪|在哪里|做到哪|正在做什么|最新|status|"
-    r"output|progress|running|latest|doing|where|完成了吗|结束了吗|结果)"
+_POLL_QUERY_RE = re.compile(
+    rf"(?ix)(?:"
+    rf"(?:查看|查询|获取|显示|汇报|看看|问一下|check|show|"
+    rf"what(?:'s|\s+is)|how\s+far|where\s+is)"
+    rf".{{0,40}}{_MARKER_TOKEN}.{{0,60}}"
+    rf"(?:当前|现在|目前|最新|状态|进度|输出|结果|完成了吗|结束了吗|"
+    rf"运行到哪|在哪里|做到哪|正在做什么|有结果了吗|status|progress|"
+    rf"output|latest|where|doing)"
+    rf"|{_MARKER_TOKEN}\s*(?:当前|现在|目前|最新)?"
+    rf"(?:是什么|是)?\s*(?:有)?\s*(?:状态|进度|输出|结果|完成了吗|结束了吗|"
+    rf"运行到哪|在哪里|做到哪|正在做什么|有结果了吗|status|progress|"
+    rf"output|latest)"
+    rf"|{_MARKER_TOKEN}.{{0,20}}(?:检查|查看|查询)\s*"
+    rf"(?:当前|现在|目前|最新)\s*(?:状态|进度|输出|结果)"
+    rf")"
+)
+_CONTROL_TARGET_RE = (
+    r"(?:当前|刚才|现在|正在运行的|这个|该|本轮|任务|进程|会话|"
+    r"current|previous|running|this|the|task|process|session)"
+)
+_INTERRUPT_CONTROL_RE = re.compile(
+    rf"(?ix)(?:"
+    rf"{_INTERRUPT_RE}\s*(?:{_CONTROL_TARGET_RE}\s*)?{_MARKER_TOKEN}"
+    rf"(?:\s*{_CONTROL_TARGET_RE})?"
+    rf"|{_MARKER_TOKEN}\s*{_INTERRUPT_RE}\s+{_CONTROL_TARGET_RE}"
+    rf")"
+)
+_TERMINATE_CONTROL_RE = re.compile(
+    rf"(?ix)(?:"
+    rf"{_TERMINATE_RE}\s*(?:{_CONTROL_TARGET_RE}\s*)?{_MARKER_TOKEN}"
+    rf"(?:\s*{_CONTROL_TARGET_RE})?"
+    rf"|{_MARKER_TOKEN}\s*{_TERMINATE_RE}\s+{_CONTROL_TARGET_RE}"
+    rf")"
 )
 
 
@@ -95,17 +132,6 @@ def _message_surface(message: str) -> str:
     return re.sub(r"`[^`\r\n]*`", " ", surface)
 
 
-def _near_marker(surface: str, phrase: str) -> bool:
-    """只接受操作词与 Claude 标识位于有限范围内的显式表达。"""
-
-    return bool(
-        re.search(
-            rf"(?ix)(?:{phrase}).{{0,80}}{_MARKER}|{_MARKER}.{{0,80}}(?:{phrase})",
-            surface,
-        )
-    )
-
-
 class ClaudeCodeExplicitRequestDetector:
     """只分析当前一条真实人类消息，不读取历史、模型输出或 Tool 参数。"""
 
@@ -115,22 +141,26 @@ class ClaudeCodeExplicitRequestDetector:
         surface = _message_surface(message).strip()
         if not surface or not _MARKER_RE.search(surface):
             return None
-        if _NEGATION_RE.search(surface) or _REFERENCE_RE.search(surface):
+        if (
+            _NEGATION_RE.search(surface)
+            or _REFERENCE_RE.search(surface)
+            or _WHOLE_QUOTED_RE.fullmatch(surface)
+        ):
             return None
 
-        if _START_INTENT_RE.search(surface) and _TASK_RE.search(surface):
-            return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.START)
-
-        if _near_marker(surface, _TERMINATE_RE):
+        if _TERMINATE_CONTROL_RE.search(surface):
             return ClaudeCodeExplicitRequest(
                 ClaudeCodeRequestOperation.TERMINATE
             )
-        if _near_marker(surface, _INTERRUPT_RE):
+        if _INTERRUPT_CONTROL_RE.search(surface):
             return ClaudeCodeExplicitRequest(
                 ClaudeCodeRequestOperation.REQUEST_INTERRUPT
             )
-        if _near_marker(surface, _POLL_RE):
+        if _POLL_QUERY_RE.search(surface):
             return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.POLL)
+
+        if _START_INTENT_RE.search(surface) and _TASK_RE.search(surface):
+            return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.START)
         return None
 
 
