@@ -326,7 +326,7 @@ def _timeline_entry(row: tuple) -> RunTimelineEntry:
             status=_required_text(row[7]),
             success=_database_bool(row[8]),
             error_type=_optional_text(row[9]),
-            duration_ms=_nonnegative_int(row[16]),
+            duration_ms=_nonnegative_int(row[18]),
         )
     if event_type is ObservationEventType.MODEL_CALL:
         _require_null_fields(row, (5, 6, 7, 8, 9, 19, 20, 21))
