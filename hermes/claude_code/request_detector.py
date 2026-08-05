@@ -34,19 +34,21 @@ _MARKER_RE = re.compile(rf"(?i){_MARKER}")
 _START_INTENT_RE = re.compile(
     rf"(?ix)(?:"
     rf"(?:使用|用|让|交给|启动|调用|委托|通过)\s*{_MARKER_TOKEN}"
-    rf"|{_MARKER_TOKEN}\s*(?:帮我|替我|来|执行|完成|处理|修改|检查|修复|运行|"
+    rf"|{_MARKER_TOKEN}\s*(?:帮我|替我|来|执行|完成|处理|修改|检查|修复|运行|启动|停止|"
+    rf"终止|结束|关闭|"
     rf"实现|编写|创建|更新|审查|分析|测试)"
     rf"|(?:use|run|start|invoke|call|ask|let|have|delegate\s+to)\s+"
     rf"{_MARKER_TOKEN}"
     rf"|{_MARKER_TOKEN}\s+(?:to\s+)?(?:fix|modify|implement|complete|run|execute|"
-    rf"update|refactor|add|remove|write|create|test|review|check|build|handle)"
+    rf"update|refactor|add|remove|write|create|test|review|check|build|handle|"
+    rf"start|stop|terminate|end|close|shutdown)"
     rf")"
 )
 _TASK_RE = re.compile(
     r"(?ix)(?:"
-    r"修改|修复|检查|完成|实现|执行|运行|更新|重构|添加|删除|编写|创建|做|"
+    r"修改|修复|检查|完成|实现|执行|运行|启动|停止|终止|结束|关闭|更新|重构|添加|删除|编写|创建|做|"
     r"测试|审查|分析|处理|迁移|提交|查找|生成|构建|fix|modify|implement|"
-    r"complete|run|execute|update|refactor|add|remove|write|create|test|do|"
+    r"complete|run|execute|start|stop|terminate|end|close|shutdown|update|refactor|add|remove|write|create|test|do|"
     r"review|check|build|handle|migrate|commit"
     r")"
 )
@@ -57,6 +59,11 @@ _NEGATION_RE = re.compile(
     rf"|without\s+(?:using\s+|use\s+of\s+)?{_MARKER_TOKEN}"
     rf"|no\s+need\s+to\s+(?:use|run|start|invoke|call)\s*{_MARKER_TOKEN}"
     rf"|no\s+(?:need\s+for\s+)?{_MARKER_TOKEN}"
+    rf"|(?:stop|no\s+longer)\s+(?:using|use|letting|let|asking|ask|"
+    rf"starting|start|invoking|invoke|calling|call|running|run)?\s*"
+    rf"{_MARKER_TOKEN}"
+    rf"|(?:停止|不再|别再)\s*(?:使用|用|让|交给|启动|调用|委托)?\s*"
+    rf"{_MARKER_TOKEN}"
     rf"|(?:不要|别|禁止|无需|不必|不让|不交给|不启动|不调用|不使用|不用|不需要)\s*"
     rf"(?:使用|用|让|交给|启动|调用)?\s*{_MARKER_TOKEN}"
     rf"|(?:不想|不打算)\s*(?:使用|用|让|交给|启动|调用)?\s*{_MARKER_TOKEN}"
@@ -101,34 +108,60 @@ _POLL_QUERY_RE = re.compile(
     rf")"
 )
 _CONTROL_TARGET_RE = (
-    r"(?:当前|刚才|现在|正在运行的|这个|该|本轮|current|previous|"
-    r"running|this|the)"
+    r"(?:当前|刚才|现在|正在运行的|这个|该|本轮|"
+    r"the\s+(?:current|previous|running)|current|previous|running|this)"
 )
-_CONTROL_NOUN_RE = r"(?:任务|进程|会话|task|process|session)"
-_CONTROL_OBJECT_RE = (
-    rf"(?:(?:{_CONTROL_TARGET_RE})\s*(?:的\s*)?"
-    rf"(?:{_CONTROL_NOUN_RE})?|{_CONTROL_NOUN_RE})"
+_CONTROL_NOUN_RE = r"(?:任务|进程|会话|运行|task|process|session|run)"
+_CONTROL_TARGET_OBJECT_RE = (
+    rf"(?:{_CONTROL_TARGET_RE})\s*(?:的\s*)?{_CONTROL_NOUN_RE}"
 )
 _CONTROL_FILLER_RE = r"(?:一下|一会儿|先|please)?\s*"
-_CONTROL_ACTION_SUFFIX_RE = (
-    rf"{_CONTROL_FILLER_RE}(?:{_CONTROL_OBJECT_RE}\s*)?"
+_CONTROL_MARKER_OBJECT_RE = (
+    rf"(?:the\s+)?{_MARKER_TOKEN}(?:\s*{_CONTROL_NOUN_RE})?"
 )
+_CONTROL_TARGET_MARKER_OBJECT_RE = (
+    rf"(?:{_CONTROL_TARGET_RE})\s*(?:的\s*)?"
+    rf"{_CONTROL_MARKER_OBJECT_RE}"
+)
+_CONTROL_EXPLICIT_OBJECT_RE = (
+    rf"(?:{_CONTROL_TARGET_OBJECT_RE}|{_CONTROL_TARGET_MARKER_OBJECT_RE}|"
+    rf"{_CONTROL_NOUN_RE})"
+)
+_CONTROL_BOUNDARY_RE = r"(?!\s*[A-Za-z0-9_\u3400-\u9fff])"
 _INTERRUPT_CONTROL_RE = re.compile(
     rf"(?ix)(?:"
-    rf"{_INTERRUPT_RE}\s*{_CONTROL_ACTION_SUFFIX_RE}{_MARKER_TOKEN}"
-    rf"(?:\s*{_CONTROL_OBJECT_RE})?"
+    rf"{_INTERRUPT_RE}\s*{_CONTROL_FILLER_RE}"
+    rf"(?:{_CONTROL_TARGET_MARKER_OBJECT_RE}|{_CONTROL_MARKER_OBJECT_RE})"
+    rf"{_CONTROL_BOUNDARY_RE}"
     rf"|{_MARKER_TOKEN}\s*{_INTERRUPT_RE}\s*"
-    rf"{_CONTROL_FILLER_RE}{_CONTROL_OBJECT_RE}"
+    rf"{_CONTROL_FILLER_RE}{_CONTROL_EXPLICIT_OBJECT_RE}"
+    rf"{_CONTROL_BOUNDARY_RE}"
     rf")"
 )
 _TERMINATE_CONTROL_RE = re.compile(
     rf"(?ix)(?:"
-    rf"{_TERMINATE_RE}\s*{_CONTROL_ACTION_SUFFIX_RE}{_MARKER_TOKEN}"
-    rf"(?:\s*{_CONTROL_OBJECT_RE})?"
+    rf"{_TERMINATE_RE}\s*{_CONTROL_FILLER_RE}"
+    rf"(?:{_CONTROL_TARGET_MARKER_OBJECT_RE}|{_CONTROL_MARKER_OBJECT_RE})"
+    rf"{_CONTROL_BOUNDARY_RE}"
     rf"|{_MARKER_TOKEN}\s*{_TERMINATE_RE}\s*"
-    rf"{_CONTROL_FILLER_RE}{_CONTROL_OBJECT_RE}"
+    rf"{_CONTROL_FILLER_RE}{_CONTROL_EXPLICIT_OBJECT_RE}"
+    rf"{_CONTROL_BOUNDARY_RE}"
     rf")"
 )
+_CONTROL_POLITE_PREFIX_RE = re.compile(r"(?ix)^(?:请|please)$")
+
+
+def _has_standalone_control_match(
+    pattern: re.Pattern[str],
+    surface: str,
+) -> bool:
+    """仅接受独立的控制句，避免把任务正文中的控制动词冒泡为权限操作。"""
+
+    match = pattern.search(surface)
+    if match is None:
+        return False
+    prefix = surface[: match.start()].strip()
+    return not prefix or _CONTROL_POLITE_PREFIX_RE.fullmatch(prefix) is not None
 
 
 def _message_surface(message: str) -> str:
@@ -182,11 +215,17 @@ class ClaudeCodeExplicitRequestDetector:
         ):
             return None
 
-        if _TERMINATE_CONTROL_RE.search(candidate_surface):
+        if _has_standalone_control_match(
+            _TERMINATE_CONTROL_RE,
+            candidate_surface,
+        ):
             return ClaudeCodeExplicitRequest(
                 ClaudeCodeRequestOperation.TERMINATE
             )
-        if _INTERRUPT_CONTROL_RE.search(candidate_surface):
+        if _has_standalone_control_match(
+            _INTERRUPT_CONTROL_RE,
+            candidate_surface,
+        ):
             return ClaudeCodeExplicitRequest(
                 ClaudeCodeRequestOperation.REQUEST_INTERRUPT
             )
