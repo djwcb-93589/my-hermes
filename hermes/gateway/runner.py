@@ -43,8 +43,10 @@ from hermes.claude_code.agent_adapter import (
 from hermes.claude_code.continuation import (
     ClaudeCodeContinuationStore,
     classify_continuation_error,
+    is_startup_interaction_resolved,
     render_claude_code_interaction,
     safe_observation_from_controller_result,
+    startup_interaction_resolved_message,
 )
 from hermes.claude_code.request_detector import (
     ClaudeCodeRequestOperation,
@@ -6359,6 +6361,7 @@ class GatewayRunner:
                 conversation_id=pending.originating_conversation_id,
                 source_message_id=event.message_id,
                 operation="reply",
+                accepted_pending=pending,
             )
             _status, next_pending = self._claude_code_continuations.apply_observation(
                 observation
@@ -6366,7 +6369,11 @@ class GatewayRunner:
             content = (
                 render_claude_code_interaction(next_pending)
                 if next_pending is not None
-                else "claude_code_reply_delivered: Claude Code 已接收你的回复，正在继续处理。"
+                else (
+                    startup_interaction_resolved_message()
+                    if is_startup_interaction_resolved(observation)
+                    else "claude_code_reply_delivered: Claude Code 已接收你的回复，正在继续处理。"
+                )
             )
         except ClaudeCodeRuntimeError as error:
             if error.delivery_unknown:

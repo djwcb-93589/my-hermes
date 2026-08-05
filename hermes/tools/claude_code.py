@@ -318,6 +318,7 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
             str(error),
         )
 
+    grant = None
     try:
         grant = _grant_from_context(kwargs)
         if not grant.allows_operation(action):
@@ -366,6 +367,25 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
             sink.capture_controller_result(result)
         return _result_envelope(action, result)
     except ClaudeCodeRuntimeError as error:
+        # 控制操作失败也要进入本轮 run-local continuation 观察；这里只传递
+        # 有界身份和错误分类，不把 Grant、异常对象或原生终端内容带入 sink。
+        sink = kwargs.get(CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY)
+        grant_value = grant
+        if (
+            action in {"poll", "request_interrupt", "terminate"}
+            and isinstance(grant_value, ClaudeCodeInvocationGrant)
+            and sink is not None
+            and callable(getattr(sink, "capture_controller_error", None))
+        ):
+            sink.capture_controller_error(
+                operation=action,
+                owner=grant_value.owner.session_owner,
+                process_id=normalized.get("process_id", ""),
+                round_id=normalized.get("round_id"),
+                error_type=error.error_type,
+                retryable=error.retryable,
+                delivery_unknown=error.delivery_unknown,
+            )
         return _error_envelope(
             action,
             _normalize_controller_error_type(error.error_type),

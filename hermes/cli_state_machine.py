@@ -25,9 +25,12 @@ from hermes.claude_code.agent_adapter import (
 )
 from hermes.claude_code.continuation import (
     ClaudeCodeContinuationStore,
+    ClaudeCodePendingInteraction,
     classify_continuation_error,
+    is_startup_interaction_resolved,
     render_claude_code_interaction,
     safe_observation_from_controller_result,
+    startup_interaction_resolved_message,
 )
 from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 from hermes.claude_code.request_detector import (
@@ -506,12 +509,14 @@ class CLIWorker:
                 response=task.user_input,
             )
             owner = ClaudeCodeOwner.from_cli_session_key(task.session_id).session_owner
+            accepted_pending = ClaudeCodePendingInteraction.from_safe_dict(pending)
             observation = safe_observation_from_controller_result(
                 result,
                 environment="cli",
                 owner=owner,
                 conversation_id=str(pending.get("conversation_id", task.session_id)),
                 operation="reply",
+                accepted_pending=accepted_pending,
             )
             return CLIWorkerResult(
                 kind=task.kind,
@@ -519,7 +524,13 @@ class CLIWorker:
                 conversation_result={
                     "claude_code_interaction": observation,
                     "final_response": "",
+                    "status": observation.get("continuation_status"),
                 },
+                error=(
+                    startup_interaction_resolved_message()
+                    if is_startup_interaction_resolved(observation)
+                    else None
+                ),
             )
         except ClaudeCodeRuntimeError as error:
             if error.delivery_unknown:
@@ -575,6 +586,7 @@ class CLIWorker:
                             "process_id": pending.get("process_id", ""),
                             "action_id": pending.get("action_id", ""),
                             "round_id": pending.get("round_id"),
+                            "strict_round": True,
                         },
                     }
                 },
