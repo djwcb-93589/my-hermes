@@ -12,6 +12,11 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
+from hermes.claude_code.contracts import (
+    CLAUDE_CODE_ACTIVE_PROCESS_STATUSES,
+    CLAUDE_CODE_PROCESS_STATUSES,
+)
+
 
 MAX_CONTINUATION_ENTRIES = 256
 DEFAULT_CONTINUATION_TTL_SECONDS = 900.0
@@ -453,11 +458,26 @@ class ClaudeCodeContinuationStore:
         if (
             not isinstance(observed_process_id, str)
             or observed_process_id != current.process_id
-            or "observed_round_id" not in observation
-            or observed_round_id != current.round_id
         ):
             return "ignored", current
         action_present = observation.get("action_present")
+        # 进程终态是唯一允许跨 round 清理的成功事实；round_terminal
+        # 本身不能代替进程生命周期状态，因为中断菜单可能仍可回复。
+        if (
+            observation.get("observed") is True
+            and observation.get("controller_success") is True
+            and observation.get("process_active") is False
+            and observation.get("process_terminal") is True
+            and action_present is False
+            and observation.get("delivery_unknown") is not True
+        ):
+            self.clear(current.owner)
+            return "cleared", None
+        if (
+            "observed_round_id" not in observation
+            or observed_round_id != current.round_id
+        ):
+            return "ignored", current
         if action_present is True:
             return "same", current
         if action_present is not False:
@@ -562,6 +582,9 @@ class ClaudeCodeInteractionSink:
         self._result_status = {
             "owner": self.owner,
             "conversation_id": self.conversation_id,
+            # 该标记只由本 Sink 从 Controller 公共成功结果生成，
+            # 不由模型参数或 Tool JSON 传入。
+            "controller_success": True,
             "state": str(state) if state is not None else None,
             "outcome": str(outcome) if outcome is not None else None,
             "process_active": bool(getattr(result, "process_active", False)),
@@ -574,6 +597,15 @@ class ClaudeCodeInteractionSink:
                 getattr(result, "initial_instruction_submitted", False)
             ),
         }
+        snapshot = getattr(result, "snapshot", None)
+        process_status = getattr(snapshot, "process_status", None)
+        process_active = bool(getattr(result, "process_active", False))
+        self._result_status["process_terminal"] = bool(
+            isinstance(process_status, str)
+            and process_status in CLAUDE_CODE_PROCESS_STATUSES
+            and process_status not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+            and not process_active
+        )
         accepted_identity = None
         if (
             isinstance(accepted_pending, ClaudeCodePendingInteraction)
@@ -597,7 +629,6 @@ class ClaudeCodeInteractionSink:
             "value",
             getattr(action, "kind", None),
         )
-        process_active = bool(getattr(result, "process_active", False))
         action_is_valid = bool(
             action is not None
             and isinstance(process_id, str)
@@ -635,7 +666,6 @@ class ClaudeCodeInteractionSink:
             self._pending = None
             self._delivery_unknown = bool(getattr(result, "delivery_unknown", False))
             return
-        snapshot = getattr(result, "snapshot", None)
         session_ref = getattr(snapshot, "session_ref", None)
         cwd = getattr(session_ref, "cwd", None)
         now = float(self._clock())
