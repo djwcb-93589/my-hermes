@@ -10,6 +10,7 @@ from typing import Callable, Iterable
 
 from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 from hermes.claude_code.contracts import ClaudeCodeInteractionResponse
+from hermes.claude_code.continuation import is_identity_stale_error
 
 
 CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT = "claude_code_invocation"
@@ -477,28 +478,87 @@ class ClaudeCodeAgentAdapter:
         )
         if round_id is not None:
             round_id = _bounded_text("round_id", round_id, maximum=_MAX_TURN_ID_LENGTH)
+        snapshot_method = getattr(self._controller, "snapshot", None)
+        if not callable(snapshot_method):
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_unavailable",
+                "Claude Code interaction snapshot is unavailable",
+            )
+        try:
+            snapshot_result = snapshot_method(
+                session_owner=grant.owner.session_owner,
+                process_id=process_id,
+                round_id=round_id,
+            )
+        except ClaudeCodeRuntimeError as error:
+            if is_identity_stale_error(error.error_type):
+                raise ClaudeCodeAgentAdapterError(
+                    "interaction_stale",
+                    "Claude Code interaction is no longer current",
+                    details={"cause_error_type": error.error_type},
+                ) from error
+            raise
+        observed_process_id = getattr(snapshot_result, "process_id", None)
+        observed_round_id = getattr(snapshot_result, "round_id", None)
+        safe_action = getattr(snapshot_result, "action_required", None)
+        if (
+            observed_process_id != process_id
+            or (round_id is not None and observed_round_id != round_id)
+            or not bool(getattr(snapshot_result, "process_active", False))
+            or safe_action is None
+            or getattr(safe_action, "process_id", None) != process_id
+            or getattr(safe_action, "session_owner", None)
+            != grant.owner.session_owner
+            or not getattr(safe_action, "action_id", None)
+        ):
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_stale",
+                "Claude Code interaction is no longer current",
+            )
         current_method = getattr(self._controller, "current_interaction", None)
         if not callable(current_method):
             raise ClaudeCodeAgentAdapterError(
                 "interaction_unavailable",
                 "Claude Code interaction view is unavailable",
             )
-        native = current_method(
-            session_owner=grant.owner.session_owner,
-            process_id=process_id,
-        )
+        try:
+            native = current_method(
+                session_owner=grant.owner.session_owner,
+                process_id=process_id,
+            )
+        except ClaudeCodeRuntimeError as error:
+            if is_identity_stale_error(error.error_type):
+                raise ClaudeCodeAgentAdapterError(
+                    "interaction_stale",
+                    "Claude Code interaction is no longer current",
+                    details={"cause_error_type": error.error_type},
+                ) from error
+            raise
         if native is None:
-            return None
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_stale",
+                "Claude Code interaction is no longer current",
+            )
         action = getattr(native, "action", native)
-        observed_round_id = round_id
+        native_action_id = getattr(action, "action_id", None)
+        if (
+            native_action_id != getattr(safe_action, "action_id", None)
+            or getattr(action, "process_id", None) != process_id
+            or getattr(action, "session_owner", None)
+            != grant.owner.session_owner
+        ):
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_stale",
+                "Claude Code interaction is no longer current",
+            )
         native_prompt = None
         native_options: tuple[str, ...] = ()
         native_prompt = getattr(native, "prompt_text", None)
         native_options = tuple(getattr(native, "options", ()) or ())
         return ClaudeCodeInteractionView(
-            process_id=process_id,
+            process_id=str(observed_process_id),
             round_id=observed_round_id,
-            action_id=str(getattr(action, "action_id", "")),
+            action_id=str(native_action_id or ""),
             kind=str(getattr(getattr(action, "kind", None), "value", getattr(action, "kind", "unknown_prompt"))),
             summary=str(getattr(action, "summary", "Claude Code requires input")),
             prompt_text=str(getattr(action, "prompt_text", "")),

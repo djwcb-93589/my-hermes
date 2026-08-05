@@ -21,6 +21,72 @@ MAX_SAFE_OPTIONS = 16
 MAX_SAFE_OPTION_LENGTH = 512
 MAX_ID_LENGTH = 1024
 
+# 仅允许明确的身份失效错误清除 continuation。未知错误按临时错误处理，
+# 这样一次内部异常不会让用户失去仍然可能有效的原生交互。
+_IDENTITY_STALE_ERROR_TYPES = frozenset(
+    {
+        "owner_mismatch",
+        "controller_owner_mismatch",
+        "session_owner_mismatch",
+        "process_not_found",
+        "session_not_found",
+        "controller_task_not_found",
+        "task_not_found",
+        "controller_round_not_found",
+        "round_not_found",
+        "round_mismatch",
+        "terminal_session",
+        "interaction_stale",
+        "interaction_not_found",
+        "interaction_absent",
+        "interaction_expired",
+        "interaction_already_resolved",
+        "interaction_id_mismatch",
+        "action_required_absent",
+        "interaction_consumed",
+        "terminal_no_interaction",
+    }
+)
+_TRANSIENT_ERROR_TYPES = frozenset(
+    {
+        "poll_failed",
+        "runtime_unavailable",
+        "controller_unavailable",
+        "read_failed",
+        "status_failed",
+        "wait_failed",
+        "interaction_response_failed",
+        "interaction_response_unavailable",
+        "interaction_in_progress",
+        "deadline_exceeded",
+        "timeout",
+        "cancelled",
+        "startup_not_ready",
+        "coordinator_error",
+        "coordinator_unavailable",
+        "cleanup_failed",
+    }
+)
+
+
+def classify_continuation_error(
+    error_type: object,
+    *,
+    retryable: bool = False,
+) -> str:
+    """按稳定错误类型决定保留还是清除 continuation。"""
+
+    normalized = error_type.strip().lower() if isinstance(error_type, str) else ""
+    if normalized in _IDENTITY_STALE_ERROR_TYPES:
+        return "stale"
+    if normalized in _TRANSIENT_ERROR_TYPES or retryable:
+        return "transient"
+    # 未知的协调层错误不能证明 action 已失效，保守保留。
+    return "transient"
+
+
+def is_identity_stale_error(error_type: object) -> bool:
+    return classify_continuation_error(error_type) == "stale"
 
 def _safe_text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
@@ -252,19 +318,53 @@ class ClaudeCodeContinuationStore:
             self._entries[owner] = ClaudeCodePendingInteraction(**values)
             return True
 
-    def apply_observation(self, observation: Mapping[str, object]) -> tuple[str, ClaudeCodePendingInteraction | None]:
-        """应用 Conversation sink 的安全观察，不接收原始 action 对象。"""
+    def apply_observation(
+        self,
+        observation: Mapping[str, object],
+    ) -> tuple[str, ClaudeCodePendingInteraction | None]:
+        """兼容旧调用点，统一使用 observation reconciliation。"""
+
+        return self.reconcile_observation(observation)
+
+    def reconcile_observation(
+        self,
+        observation: Mapping[str, object],
+    ) -> tuple[str, ClaudeCodePendingInteraction | None]:
+        """按 Controller 的安全身份字段收敛现有 continuation。"""
 
         if not isinstance(observation, Mapping):
-            return "ignored", self.get("")
+            return "ignored", None
         pending_data = observation.get("pending")
         if isinstance(pending_data, Mapping):
             try:
                 pending = ClaudeCodePendingInteraction.from_safe_dict(pending_data)
-                status = self.upsert(pending, replace_existing=True)
-                return status, pending
-            except (TypeError, ValueError, ClaudeCodeContinuationConflict):
+            except (TypeError, ValueError):
                 return "conflict", self.get(str(pending_data.get("owner", "")))
+            observed_owner = observation.get("owner")
+            observed_conversation = observation.get("conversation_id")
+            if (
+                observed_owner is not None
+                and observed_owner != pending.owner
+            ) or (
+                observed_conversation is not None
+                and observed_conversation != pending.originating_conversation_id
+            ):
+                return "ignored", self.get(pending.owner)
+            current = self.get(pending.owner)
+            # 不允许不同 process/round 的 run-local observation 覆盖当前动作。
+            if current is not None and (
+                current.process_id != pending.process_id
+                or current.round_id != pending.round_id
+                or current.originating_conversation_id
+                != pending.originating_conversation_id
+            ):
+                return "conflict", current
+            try:
+                status = self.upsert(pending, replace_existing=True)
+            except ClaudeCodeContinuationConflict:
+                return "conflict", self.get(pending.owner)
+            return status, pending
+
         clear_data = observation.get("clear_identity")
         if isinstance(clear_data, Mapping):
             owner = str(clear_data.get("owner", ""))
@@ -275,7 +375,34 @@ class ClaudeCodeContinuationStore:
                 round_id=clear_data.get("round_id"),
             )
             return "cleared", self.get(owner)
-        return "ignored", None
+
+        current_owner = observation.get("owner")
+        if not isinstance(current_owner, str) or not current_owner.strip():
+            return "ignored", None
+        current = self.get(current_owner)
+        if current is None:
+            return "ignored", None
+        # 只有明确携带同一 process/round，才可清除无 action 的 pending。
+        observed_process_id = observation.get("observed_process_id")
+        observed_round_id = observation.get("observed_round_id")
+        if (
+            not isinstance(observed_process_id, str)
+            or observed_process_id != current.process_id
+            or "observed_round_id" not in observation
+            or observed_round_id != current.round_id
+        ):
+            return "ignored", current
+        action_present = observation.get("action_present")
+        if action_present is True:
+            return "same", current
+        if action_present is not False:
+            return "same", current
+        if bool(observation.get("action_consumed")) or bool(
+            observation.get("observed")
+        ):
+            self.clear(current.owner)
+            return "cleared", None
+        return "same", current
 
 
 class ClaudeCodeInteractionSink:
@@ -310,21 +437,41 @@ class ClaudeCodeInteractionSink:
         state = getattr(getattr(result, "state", None), "value", getattr(result, "state", None))
         outcome = getattr(getattr(result, "outcome", None), "value", getattr(result, "outcome", None))
         self._result_status = {
+            "owner": self.owner,
+            "conversation_id": self.conversation_id,
             "state": str(state) if state is not None else None,
             "outcome": str(outcome) if outcome is not None else None,
             "process_active": bool(getattr(result, "process_active", False)),
             "round_terminal": bool(getattr(result, "round_terminal", False)),
             "process_id": process_id,
             "round_id": getattr(result, "round_id", None),
+            "observed_process_id": process_id,
+            "observed_round_id": getattr(result, "round_id", None),
         }
-        if bool(getattr(result, "round_terminal", False)) or state in {
-            "completed",
-            "failed",
-            "interrupted",
-            "lost",
-        }:
-            action = None
         action_id = getattr(action, "action_id", None) if action is not None else None
+        action_process = getattr(action, "process_id", None) if action is not None else None
+        action_owner = getattr(action, "session_owner", None) if action is not None else None
+        action_kind = getattr(
+            getattr(action, "kind", None),
+            "value",
+            getattr(action, "kind", None),
+        )
+        process_active = bool(getattr(result, "process_active", False))
+        action_is_valid = bool(
+            action is not None
+            and isinstance(process_id, str)
+            and process_id
+            and isinstance(action_id, str)
+            and action_id
+            and action_process == process_id
+            and action_owner == self.owner
+            and str(action_kind) != "stalled"
+            and process_active
+        )
+        self._result_status["action_present"] = action_is_valid
+        self._result_status["action_consumed"] = False
+        if action is not None and not action_is_valid:
+            action = None
         if (
             action is None
             or not isinstance(process_id, str)
@@ -423,6 +570,10 @@ def safe_observation_from_controller_result(
     sink.capture_controller_result(result)
     observation = sink.snapshot()
     if operation == "reply":
+        observation["action_consumed"] = (
+            "pending" not in observation
+            and not bool(observation.get("delivery_unknown"))
+        )
         if "pending" in observation:
             observation["outcome"] = "awaiting_claude_code_interaction"
         elif observation.get("round_terminal"):
@@ -438,6 +589,8 @@ __all__ = [
     "ClaudeCodeInteractionSink",
     "ClaudeCodePendingInteraction",
     "DEFAULT_CONTINUATION_TTL_SECONDS",
+    "classify_continuation_error",
+    "is_identity_stale_error",
     "render_claude_code_interaction",
     "safe_observation_from_controller_result",
 ]

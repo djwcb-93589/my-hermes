@@ -42,6 +42,7 @@ from hermes.claude_code.agent_adapter import (
 )
 from hermes.claude_code.continuation import (
     ClaudeCodeContinuationStore,
+    classify_continuation_error,
     render_claude_code_interaction,
     safe_observation_from_controller_result,
 )
@@ -6264,7 +6265,7 @@ class GatewayRunner:
     ) -> bool:
         """在 AgentLoop 前处理可信的 Claude Code ActionRequired 回复。"""
 
-        if from_queue or event.message_type is not MessageType.TEXT:
+        if event.message_type is not MessageType.TEXT:
             return False
         metadata = event.metadata if isinstance(event.metadata, dict) else {}
         if any(
@@ -6287,6 +6288,21 @@ class GatewayRunner:
         if pending is None:
             return False
         request = detect_claude_code_request(event.text)
+        if from_queue:
+            if request is not None and request.operation in {
+                ClaudeCodeRequestOperation.POLL,
+                ClaudeCodeRequestOperation.REQUEST_INTERRUPT,
+                ClaudeCodeRequestOperation.TERMINATE,
+            }:
+                return False
+            await self._send_continuation_reply(
+                route_key,
+                event,
+                "claude_code_interaction_pending: 当前队列消息未绑定待处理交互，请显式回复当前提示或执行 poll/interrupt/terminate。\n"
+                + render_claude_code_interaction(pending),
+                ctx,
+            )
+            return True
         if request is not None:
             if request.operation in {
                 ClaudeCodeRequestOperation.POLL,
@@ -6309,8 +6325,13 @@ class GatewayRunner:
             )
             return True
         if pending.originating_conversation_id != ctx.conversation_id:
-            # /new 后普通文本不能自动绑定旧 conversation；控制请求仍由上面放行。
-            return False
+            await self._send_continuation_reply(
+                route_key,
+                event,
+                "claude_code_interaction_pending: 当前 conversation 与待处理交互不匹配，请显式 poll 或切换会话。",
+                ctx,
+            )
+            return True
         try:
             adapter = self._claude_code_adapter
             if adapter is None:
@@ -6357,7 +6378,10 @@ class GatewayRunner:
                 content = (
                     "claude_code_delivery_unknown: Claude Code 回复送达状态未知；未自动重试。请先使用 poll、interrupt 或 terminate。"
                 )
-            else:
+            elif classify_continuation_error(
+                error.error_type,
+                retryable=error.retryable,
+            ) == "stale":
                 self._claude_code_continuations.clear_if_identity(
                     owner,
                     process_id=pending.process_id,
@@ -6365,8 +6389,13 @@ class GatewayRunner:
                     round_id=pending.round_id,
                 )
                 content = "claude_code_interaction_stale: Claude Code 交互已失效，请重新 poll 查看当前状态。"
+            else:
+                content = (
+                    "claude_code_interaction_retryable: Claude Code 交互暂时无法读取或提交；"
+                    "未自动重试，请稍后显式重试。"
+                )
         except (TypeError, ValueError):
-            content = "claude_code_interaction_stale: Claude Code 交互回复被拒绝，请重新 poll 查看当前状态。"
+            content = "claude_code_interaction_retryable: Claude Code 交互回复未提交，请检查输入后显式重试。"
         await self._send_continuation_reply(route_key, event, content, ctx)
         return True
 
