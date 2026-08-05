@@ -6,6 +6,7 @@ import json
 import threading
 
 from hermes.claude_code.agent_adapter import (
+    CLAUDE_CODE_GRANT_CONTEXT_KEY,
     ClaudeCodeAgentAdapter,
     ClaudeCodeAgentAdapterError,
     ClaudeCodeInvocationGrant,
@@ -14,9 +15,6 @@ from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 from hermes.tool_declarations.claude_code import TOOL_DECLARATIONS
 from hermes.tools import register_declared_handlers
 
-
-CLAUDE_CODE_GRANT_CONTEXT_KEY = "_claude_code_invocation_grant"
-"""只允许宿主通过 tool_context 注入，绝不出现在模型 Tool schema。"""
 
 _ACTIONS = frozenset({
     "start",
@@ -321,6 +319,12 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
 
     try:
         grant = _grant_from_context(kwargs)
+        if not grant.allows_operation(action):
+            return _error_envelope(
+                action,
+                "grant_operation_not_authorized",
+                "Claude Code invocation grant does not allow this operation",
+            )
         selected_adapter = adapter or _default_claude_code_adapter()
         cancel_checker = kwargs.get("cancel_checker")
         if cancel_checker is not None and not callable(cancel_checker):

@@ -32,6 +32,9 @@ from hermes.config import (
     PATH_ACCESS_POLICY,
     load_gateway_busy_input_mode,
 )
+from hermes.claude_code.invocation_context import (
+    prepare_gateway_claude_code_invocation,
+)
 from hermes.hooks import (
     AsyncHookRegistry,
     SyncObservationBridge,
@@ -1111,6 +1114,12 @@ class GatewayRunner:
             )
         enabled_toolsets = frozenset(
             self._gateway_platform_toolsets.get(platform, ())
+        )
+        # Claude Code 只能由当前真实用户消息触发的动态策略临时加入。
+        enabled_toolsets = frozenset(
+            toolset
+            for toolset in enabled_toolsets
+            if toolset != "claude_code"
         )
         trusted_context = frozenset(
             {"gateway_file_delivery"}
@@ -7186,6 +7195,36 @@ class GatewayRunner:
             else None
         )
         tool_policy = self._tool_policy_for_source(task_event.source)
+        claude_code_invocation = None
+        event_metadata = (
+            event.metadata
+            if isinstance(event.metadata, dict)
+            else {}
+        )
+        is_current_user_text = (
+            event.message_type is MessageType.TEXT
+            and not any(
+                key in event_metadata
+                for key in {
+                    "file_delivery_id",
+                    "notification",
+                    "origin_kind",
+                    "system",
+                    "internal",
+                    "generated",
+                }
+            )
+        )
+        if not resume_from_history and is_current_user_text:
+            claude_code_invocation = prepare_gateway_claude_code_invocation(
+                event.text,
+                route_key=route_key,
+                source_message_id=event.message_id,
+                base_policy=tool_policy,
+                registry=registry,
+            )
+            if claude_code_invocation is not None:
+                tool_policy = claude_code_invocation.tool_policy
         enabled_toolsets = registry.resolve(tool_policy).toolsets
         tool_context = {
             "interactive_approval": False,
@@ -7206,6 +7245,10 @@ class GatewayRunner:
                 route_key,
                 conversation_id,
             ))
+        if claude_code_invocation is not None:
+            # Grant 与动态 ToolPolicy 针对同一个 MessageEvent 一次性注入，
+            # 不进入 Gateway history、resume state 或持久化上下文。
+            tool_context.update(claude_code_invocation.tool_context)
         progressive_controller = self._create_progressive_controller(
             task_event,
             ctx,

@@ -15,11 +15,19 @@ from enum import Enum
 from typing import TYPE_CHECKING, Callable, Protocol
 
 from hermes.cli_approval import execute_cli_approval
+from hermes.claude_code.invocation_context import (
+    prepare_cli_claude_code_invocation,
+)
+from hermes.claude_code.request_detector import (
+    ClaudeCodeRequestOperation,
+    detect_claude_code_request,
+)
 from hermes.config import DB_PATH
 from hermes.conversation import run_conversation
 from hermes.hooks import SyncHookRegistry
 from hermes.db import (
     create_session,
+    ensure_session,
     get_session_messages,
     init_db,
     list_cli_sessions,
@@ -135,6 +143,7 @@ class CLIWorkerTask:
     user_input: str = ""
     cached_prompt: str = ""
     tool_policy: object | None = None
+    tool_context: dict | None = None
     approval_request: dict | None = None
     approval_scope: str = "once"
     current_session_id: str | None = None
@@ -524,7 +533,13 @@ class CLIWorker:
             return ()
 
     def _run_conversation_task(self, conn, task: CLIWorkerTask) -> CLIWorkerResult:
-        session_id = task.session_id or create_session(conn)
+        session_id = task.session_id
+        if session_id is None:
+            session_id = create_session(conn)
+        else:
+            # 显式 Claude Code 首轮可能先在 Controller 生成 session key，Worker
+            # 只负责建立对应持久化 session，不把 Grant 写入数据库。
+            ensure_session(conn, session_id, source="cli")
         steer_kwargs = (
             {"steer_mailbox": task.steer_mailbox}
             if task.steer_mailbox is not None
@@ -541,6 +556,7 @@ class CLIWorker:
                     task.cancel_event.is_set if task.cancel_event is not None else None
                 ),
                 tool_policy=task.tool_policy,
+                tool_context=task.tool_context,
                 stream_sink=self._stream_sink,
                 hook_registry=self._hook_registry,
                 **steer_kwargs,
@@ -1141,12 +1157,40 @@ class CLIController:
         return False
 
     def _conversation_task(self, user_input: str) -> CLIWorkerTask:
+        session_id = self._session_id
+        tool_policy = self._tool_policy
+        tool_context = None
+        request = detect_claude_code_request(user_input)
+        if request is not None:
+            # 首条 start 请求可以在 Worker 建库前生成可信 session key；控制请求
+            # 没有现有 session 时则保持默认隐藏，避免凭空创建可接管 owner。
+            candidate_session_id = session_id
+            if (
+                candidate_session_id is None
+                and request.operation == ClaudeCodeRequestOperation.START
+            ):
+                candidate_session_id = str(uuid.uuid4())
+            if candidate_session_id is not None:
+                from hermes.tools import registry
+
+                invocation = prepare_cli_claude_code_invocation(
+                    user_input,
+                    session_key=candidate_session_id,
+                    base_policy=self._tool_policy,
+                    registry=registry,
+                )
+                if invocation is not None:
+                    session_id = candidate_session_id
+                    tool_policy = invocation.tool_policy
+                    tool_context = invocation.tool_context
+        # Grant 只在本轮任务对象中短暂传递，绝不进入消息或 session 持久化。
         return CLIWorkerTask(
             kind="conversation",
-            session_id=self._session_id,
+            session_id=session_id,
             user_input=user_input,
             cached_prompt=self._cached_prompt,
-            tool_policy=self._tool_policy,
+            tool_policy=tool_policy,
+            tool_context=tool_context,
         )
 
     def _submit_task(self, task: CLIWorkerTask, *, begins_stream: bool = False) -> bool:

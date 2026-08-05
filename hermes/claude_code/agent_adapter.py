@@ -6,7 +6,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterable
 
 from hermes.claude_code.contracts import ClaudeCodeRuntimeError
 
@@ -17,7 +17,14 @@ CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT = "claude_code_invocation"
 CLAUDE_CODE_INVOCATION_PURPOSE = "managed_claude_code"
 """Grant 只能用于本受管 Claude Code Tool 边界。"""
 
+CLAUDE_CODE_GRANT_CONTEXT_KEY = "_claude_code_invocation_grant"
+"""Tool Handler 使用的私有上下文键，不进入模型 schema 或结果。"""
+
 _ALLOWED_ENVIRONMENTS = frozenset({"cli", "gateway"})
+_ALLOWED_OPERATIONS = frozenset(
+    {"start", "poll", "request_interrupt", "terminate"}
+)
+_DEFAULT_ALLOWED_OPERATIONS = _ALLOWED_OPERATIONS
 _MAX_OWNER_LENGTH = 1_024
 _MAX_TURN_ID_LENGTH = 512
 _MAX_PURPOSE_LENGTH = 128
@@ -127,6 +134,9 @@ class ClaudeCodeInvocationGrant:
     created_at: float
     expires_at: float
     source_message_id: str | None = None
+    allowed_operations: frozenset[str] = field(
+        default_factory=lambda: _DEFAULT_ALLOWED_OPERATIONS,
+    )
     _start_consumed: bool = field(
         default=False,
         init=False,
@@ -177,12 +187,30 @@ class ClaudeCodeInvocationGrant:
                 source_message_id,
                 maximum=_MAX_SOURCE_MESSAGE_LENGTH,
             )
+        raw_operations = self.allowed_operations
+        if isinstance(raw_operations, str):
+            raise ValueError("allowed_operations must be a collection")
+        try:
+            allowed_operations = frozenset(
+                str(item).strip().lower() for item in raw_operations
+            )
+        except TypeError as exc:
+            raise ValueError(
+                "allowed_operations must be a collection"
+            ) from exc
+        if not allowed_operations or not allowed_operations.issubset(
+            _ALLOWED_OPERATIONS
+        ):
+            raise ValueError(
+                "allowed_operations contains an unsupported operation"
+            )
         object.__setattr__(self, "environment", environment)
         object.__setattr__(self, "turn_id", turn_id)
         object.__setattr__(self, "purpose", purpose)
         object.__setattr__(self, "created_at", created_at)
         object.__setattr__(self, "expires_at", expires_at)
         object.__setattr__(self, "source_message_id", source_message_id)
+        object.__setattr__(self, "allowed_operations", allowed_operations)
 
     @property
     def start_consumed(self) -> bool:
@@ -213,6 +241,14 @@ class ClaudeCodeInvocationGrant:
                 "owner_context_missing",
                 "Claude Code invocation grant is expired",
             )
+
+    def allows_operation(self, operation: str) -> bool:
+        """判断 Grant 是否包含当前 Tool action，不改变 Grant 状态。"""
+
+        return (
+            isinstance(operation, str)
+            and operation.strip().lower() in self.allowed_operations
+        )
 
     def consume_start(self, *, now: float | None = None) -> None:
         """原子消费一次 start 权限，拒绝同一 Grant 重复启动。"""
@@ -266,13 +302,23 @@ class ClaudeCodeAgentAdapter:
 
         return self._controller
 
-    def _validate_grant(self, grant: ClaudeCodeInvocationGrant) -> None:
+    def _validate_grant(
+        self,
+        grant: ClaudeCodeInvocationGrant,
+        *,
+        operation: str,
+    ) -> None:
         if not isinstance(grant, ClaudeCodeInvocationGrant):
             raise ClaudeCodeAgentAdapterError(
                 "owner_context_missing",
                 "Claude Code invocation grant is required",
             )
         grant.validate(now=self._clock())
+        if not grant.allows_operation(operation):
+            raise ClaudeCodeAgentAdapterError(
+                "grant_operation_not_authorized",
+                "Claude Code invocation grant does not allow this operation",
+            )
 
     def start(
         self,
@@ -282,7 +328,7 @@ class ClaudeCodeAgentAdapter:
         task: str,
         cancel_checker=None,
     ):
-        self._validate_grant(grant)
+        self._validate_grant(grant, operation="start")
         grant.consume_start(now=self._clock())
         return self._controller.start_task(
             user_requested=True,
@@ -300,7 +346,7 @@ class ClaudeCodeAgentAdapter:
         round_id: str | None = None,
         cancel_checker=None,
     ):
-        self._validate_grant(grant)
+        self._validate_grant(grant, operation="poll")
         return self._controller.poll(
             session_owner=grant.owner.session_owner,
             process_id=process_id,
@@ -316,7 +362,7 @@ class ClaudeCodeAgentAdapter:
         round_id: str,
         cancel_checker=None,
     ):
-        self._validate_grant(grant)
+        self._validate_grant(grant, operation="request_interrupt")
         return self._controller.request_interrupt(
             session_owner=grant.owner.session_owner,
             process_id=process_id,
@@ -330,7 +376,7 @@ class ClaudeCodeAgentAdapter:
         grant: ClaudeCodeInvocationGrant,
         process_id: str,
     ):
-        self._validate_grant(grant)
+        self._validate_grant(grant, operation="terminate")
         return self._controller.terminate(
             session_owner=grant.owner.session_owner,
             process_id=process_id,
@@ -344,8 +390,9 @@ def create_gateway_claude_code_grant(
     created_at: float,
     expires_at: float,
     source_message_id: str | None = None,
+    allowed_operations: Iterable[str] = _DEFAULT_ALLOWED_OPERATIONS,
 ) -> ClaudeCodeInvocationGrant:
-    """供未来 Gateway 受信入口显式签发 Grant；本阶段不自动调用。"""
+    """由可信 Gateway 入口按当前 MessageEvent 显式签发短期 Grant。"""
 
     return ClaudeCodeInvocationGrant(
         environment="gateway",
@@ -355,6 +402,7 @@ def create_gateway_claude_code_grant(
         created_at=created_at,
         expires_at=expires_at,
         source_message_id=source_message_id,
+        allowed_operations=frozenset(allowed_operations),
     )
 
 
@@ -365,8 +413,9 @@ def create_cli_claude_code_grant(
     created_at: float,
     expires_at: float,
     source_message_id: str | None = None,
+    allowed_operations: Iterable[str] = _DEFAULT_ALLOWED_OPERATIONS,
 ) -> ClaudeCodeInvocationGrant:
-    """供未来 CLI 受信入口显式签发 Grant；本阶段不自动调用。"""
+    """由可信 CLI 入口按当前用户轮次显式签发短期 Grant。"""
 
     return ClaudeCodeInvocationGrant(
         environment="cli",
@@ -376,10 +425,12 @@ def create_cli_claude_code_grant(
         created_at=created_at,
         expires_at=expires_at,
         source_message_id=source_message_id,
+        allowed_operations=frozenset(allowed_operations),
     )
 
 
 __all__ = [
+    "CLAUDE_CODE_GRANT_CONTEXT_KEY",
     "CLAUDE_CODE_INVOCATION_PURPOSE",
     "CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT",
     "ClaudeCodeAgentAdapter",

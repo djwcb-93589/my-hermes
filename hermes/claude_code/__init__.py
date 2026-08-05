@@ -24,6 +24,7 @@ from hermes.claude_code.contracts import (
     build_claude_code_action_id,
 )
 from hermes.claude_code.agent_adapter import (
+    CLAUDE_CODE_GRANT_CONTEXT_KEY,
     CLAUDE_CODE_INVOCATION_PURPOSE,
     CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT,
     ClaudeCodeAgentAdapter,
@@ -32,6 +33,17 @@ from hermes.claude_code.agent_adapter import (
     ClaudeCodeOwner,
     create_cli_claude_code_grant,
     create_gateway_claude_code_grant,
+)
+from hermes.claude_code.request_detector import (
+    ClaudeCodeExplicitRequest,
+    ClaudeCodeExplicitRequestDetector,
+    ClaudeCodeRequestOperation,
+    detect_claude_code_request,
+)
+from hermes.claude_code.invocation_context import (
+    ClaudeCodeInvocationContext,
+    prepare_cli_claude_code_invocation,
+    prepare_gateway_claude_code_invocation,
 )
 from hermes.claude_code.controller import (
     ClaudeCodeController,
@@ -189,6 +201,7 @@ def get_claude_code_completion_watcher(
 
 
 __all__ = [
+    "CLAUDE_CODE_GRANT_CONTEXT_KEY",
     "CLAUDE_CODE_INVOCATION_PURPOSE",
     "CLAUDE_CODE_REQUIRED_TRUSTED_CONTEXT",
     "ClaudeCodeActionKind",
@@ -208,7 +221,10 @@ __all__ = [
     "ClaudeCodeControllerResult",
     "ClaudeCodeEvent",
     "ClaudeCodeEventType",
+    "ClaudeCodeExplicitRequest",
+    "ClaudeCodeExplicitRequestDetector",
     "ClaudeCodeInteractionResponse",
+    "ClaudeCodeInvocationContext",
     "ClaudeCodeInvocationGrant",
     "ClaudeCodeOutputDetector",
     "ClaudeCodeOutputNormalizer",
@@ -221,6 +237,7 @@ __all__ = [
     "ClaudeCodeReadResult",
     "ClaudeCodeRuntime",
     "ClaudeCodeRuntimeError",
+    "ClaudeCodeRequestOperation",
     "ClaudeCodeSessionRef",
     "ClaudeCodeSnapshot",
     "ClaudeCodeState",
@@ -237,5 +254,8 @@ __all__ = [
     "get_claude_code_completion_watcher",
     "get_claude_code_runtime",
     "build_claude_code_action_id",
+    "detect_claude_code_request",
+    "prepare_cli_claude_code_invocation",
+    "prepare_gateway_claude_code_invocation",
     "render_claude_code_terminal_notification",
 ]
