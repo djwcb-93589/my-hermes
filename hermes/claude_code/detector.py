@@ -275,6 +275,7 @@ class ClaudeCodeOutputDetector:
         self._pending_ready_session_owner: str | None = None
         self._pending_ready_cursor: int | None = None
         self._pending_ready_evidence: frozenset[str] = frozenset()
+        self._pending_ready_fresh_evidence: frozenset[str] = frozenset()
         self._session_ready_process_id: str | None = None
         self._session_ready_session_owner: str | None = None
         self._session_ready_evidence: frozenset[str] = frozenset()
@@ -851,6 +852,7 @@ class ClaudeCodeOutputDetector:
         self._pending_ready_session_owner = None
         self._pending_ready_cursor = None
         self._pending_ready_evidence = frozenset()
+        self._pending_ready_fresh_evidence = frozenset()
 
     def _remember_pending_ready(
         self,
@@ -859,19 +861,25 @@ class ClaudeCodeOutputDetector:
         session_owner: str,
         cursor: int,
         evidence: frozenset[str],
+        fresh_evidence: frozenset[str],
     ) -> None:
         """只保留进程、游标和有限 READY 类别，不保留输出正文。"""
 
+        allowed_evidence = {"welcome", "manual_mode", "task_input"}
         bounded_evidence = frozenset(
-            evidence & {"welcome", "manual_mode", "task_input"}
+            evidence & allowed_evidence
         )
-        if not bounded_evidence:
+        bounded_fresh_evidence = frozenset(
+            fresh_evidence & allowed_evidence
+        )
+        if not bounded_evidence or not bounded_fresh_evidence:
             self._clear_pending_ready()
             return
         self._pending_ready_process_id = process_id
         self._pending_ready_session_owner = session_owner
         self._pending_ready_cursor = cursor
         self._pending_ready_evidence = bounded_evidence
+        self._pending_ready_fresh_evidence = bounded_fresh_evidence
 
     def _pending_ready_matches(
         self,
@@ -1525,37 +1533,41 @@ class ClaudeCodeOutputDetector:
                 self._expire_pending_interaction_context()
             )
         context = self._semantic_context[-MAX_DETECTION_CONTEXT_CHARS:]
+        (
+            ready_ui_prefix,
+            ready_ui_tail,
+            ready_tail_fragment_evidence,
+        ) = self._split_ready_ui_tail(candidate)
+        has_ready_ui_tail = bool(ready_ui_tail)
+        has_non_ready_ui_prefix = bool(ready_ui_prefix)
+        action_candidate = ready_ui_prefix if has_ready_ui_tail else candidate
+        isolated_dollar_ui = self._is_isolated_dollar_ui(candidate)
         folder_trust_semantics = bool(
-            candidate
-            and self._has_folder_trust_semantics(candidate)
+            action_candidate
+            and self._has_folder_trust_semantics(action_candidate)
         )
         prompt_structure = bool(
-            candidate
+            action_candidate
             and (
-                self._looks_like_prompt(candidate)
+                self._looks_like_prompt(action_candidate)
                 or folder_trust_semantics
             )
         )
         progress_signal = bool(
-            candidate
+            action_candidate
             and not folder_trust_semantics
-            and _PROGRESS_RE.search(candidate)
+            and _PROGRESS_RE.search(action_candidate)
         )
         completion_signal = bool(
-            candidate
-            and _COMPLETION_RE.search(candidate)
-            and not _NEGATED_COMPLETION_RE.search(candidate)
+            action_candidate
+            and _COMPLETION_RE.search(action_candidate)
+            and not _NEGATED_COMPLETION_RE.search(action_candidate)
             and not prompt_structure
         )
         failure_signal = bool(
-            candidate
+            action_candidate
             and not folder_trust_semantics
-            and _FAILURE_RE.search(candidate)
-        )
-        ready_signal = bool(
-            candidate
-            and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
-            and self._is_verified_ready_signal(candidate, context)
+            and _FAILURE_RE.search(action_candidate)
         )
         ready_ui_only = (
             not delta.cursor_gap
@@ -1574,21 +1586,31 @@ class ClaudeCodeOutputDetector:
             _has_ready_ui_fragment,
             has_non_ready_ui_content,
         ) = self._ready_ui_fragment_evidence(candidate)
-        (
-            ready_tail_fragment_evidence,
-            has_ready_ui_tail,
-            has_non_ready_ui_prefix,
-        ) = self._ready_ui_tail_fragment_evidence(candidate)
-        isolated_dollar_ui = self._is_isolated_dollar_ui(candidate)
-        if candidate and has_non_ready_ui_content and not isolated_dollar_ui:
+        ready_signal = bool(
+            (ready_ui_tail or candidate)
+            and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
+            and self._is_verified_ready_signal(
+                ready_ui_tail or candidate,
+                context,
+            )
+        )
+        round_activity_before_observation = self._round_activity_seen
+        round_activity_marked = False
+        if (
+            candidate
+            and has_non_ready_ui_content
+            and not isolated_dollar_ui
+            and not self._looks_like_prompt(action_candidate)
+        ):
             # 仅记录本轮确实出现的非 UI 输出，供 Session profile 补足历史证据。
             self._round_activity_seen = True
+            round_activity_marked = True
         ready_context_evidence = self._ready_evidence(context_before) & {
             "welcome",
             "manual_mode",
         }
         if folder_trust_semantics or (
-            prompt_structure and _AUTH_RE.search(candidate)
+            prompt_structure and _AUTH_RE.search(action_candidate)
         ):
             self._clear_session_ready_profile()
         session_profile_matches = self._session_ready_profile_matches(
@@ -1623,7 +1645,11 @@ class ClaudeCodeOutputDetector:
             if session_profile_matches
             else frozenset()
         )
-        ready_state_signal = ready_signal and ready_ui_only
+        ready_state_signal = (
+            ready_signal
+            and ready_ui_only
+            and not isolated_dollar_ui
+        )
         if (
             task_submitted
             and session_profile_matches
@@ -1666,7 +1692,7 @@ class ClaudeCodeOutputDetector:
                 },
             )
         resumed_after_input = bool(
-            candidate
+            action_candidate
             and self._outbound_response_pending
             and not prompt_structure
         )
@@ -1731,12 +1757,12 @@ class ClaudeCodeOutputDetector:
                 interrupt_requested=interrupt_requested,
             )
             action = interrupt_menu_action
-            action_source = candidate
+            action_source = action_candidate
             if action is None:
                 action_source = (
-                    candidate
+                    action_candidate
                     if ready_state_signal
-                    else self._action_source(candidate, context)
+                    else self._action_source(action_candidate, context_before)
                 )
                 if self._context_complete:
                     action = self._classify_action(
@@ -1747,11 +1773,11 @@ class ClaudeCodeOutputDetector:
                         cursor_end=delta.cursor_end,
                         timestamp=timestamp,
                     )
-                elif self._looks_like_prompt(candidate):
+                elif self._looks_like_prompt(action_candidate):
                     action = self._action(
                         ClaudeCodeActionKind.UNKNOWN_PROMPT,
                         "Claude Code emitted a prompt after an output gap",
-                        candidate,
+                        action_candidate,
                         "unknown",
                         process_id=process_id,
                         session_owner=session_owner,
@@ -1759,7 +1785,7 @@ class ClaudeCodeOutputDetector:
                         cursor_end=delta.cursor_end,
                         timestamp=timestamp,
                     )
-                    action_source = candidate
+                    action_source = action_candidate
                 else:
                     action = None
             if (
@@ -1781,6 +1807,13 @@ class ClaudeCodeOutputDetector:
                 ready_state_signal = False
             elif session_profile_candidate:
                 ready_state_signal = True
+            if (
+                round_activity_marked
+                and not round_activity_before_observation
+                and (action is not None or self._action_required is not None)
+            ):
+                # 交互提示可能带有普通文本，不能把本次提示误记为任务活动。
+                self._round_activity_seen = False
             if action is not None:
                 interaction_source = ""
                 if interrupt_menu_action is not None:
@@ -1836,6 +1869,10 @@ class ClaudeCodeOutputDetector:
                     | ready_context_evidence
                     | session_profile_history_evidence
                 )
+                pending_fresh_evidence = (
+                    self._pending_ready_fresh_evidence
+                    | ready_tail_fragment_evidence
+                )
                 pending_degraded = bool(
                     self._action_required is not None
                     or action is not None
@@ -1844,14 +1881,25 @@ class ClaudeCodeOutputDetector:
                     or failure_signal
                     or has_non_ready_ui_content
                 )
+                pending_confirmation_allowed = bool(
+                    not candidate
+                    or (
+                        ready_tail_fragment_evidence
+                        and not isolated_dollar_ui
+                    )
+                )
                 if (
                     process_status not in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
                     or pending_degraded
                     or self._pending_ready_cursor is None
                     or delta.cursor_end < self._pending_ready_cursor
+                    or not pending_fresh_evidence
                 ):
                     self._clear_pending_ready()
-                elif len(pending_evidence) >= 2:
+                elif (
+                    pending_confirmation_allowed
+                    and len(pending_evidence) >= 2
+                ):
                     ready_state_signal = True
                     self._ready_seen = True
                     self._clear_pending_ready()
@@ -1861,12 +1909,17 @@ class ClaudeCodeOutputDetector:
                         pending_evidence
                         & {"welcome", "manual_mode", "task_input"}
                     )
+                    self._pending_ready_fresh_evidence = frozenset(
+                        pending_fresh_evidence
+                        & {"welcome", "manual_mode", "task_input"}
+                    )
 
             if (
                 not ready_state_signal
                 and process_status in CLAUDE_CODE_ACTIVE_PROCESS_STATUSES
                 and has_ready_ui_tail
                 and has_non_ready_ui_prefix
+                and ready_tail_fragment_evidence
                 and not action
                 and self._action_required is None
             ):
@@ -1879,6 +1932,7 @@ class ClaudeCodeOutputDetector:
                         | ready_context_evidence
                         | session_profile_history_evidence
                     ),
+                    fresh_evidence=ready_tail_fragment_evidence,
                 )
             if (
                 ready_state_signal
@@ -1932,7 +1986,8 @@ class ClaudeCodeOutputDetector:
             failure_signal=failure_signal,
             ready_signal=ready_state_signal,
             allow_ready_history=not (
-                bool(candidate) and has_non_ready_ui_content
+                bool(candidate)
+                and (has_non_ready_ui_content or isolated_dollar_ui)
             ),
         )
         if lost or process_status in _TERMINAL_PROCESS_STATUSES:
@@ -2132,27 +2187,45 @@ class ClaudeCodeOutputDetector:
         return evidence, True, len(ready_lines) != len(lines)
 
     @classmethod
+    def _split_ready_ui_tail(
+        cls,
+        candidate: str,
+    ) -> tuple[str, str, frozenset[str]]:
+        """将正文与尾部连续 READY UI 分开，保留有界文本范围。"""
+
+        lines = candidate.splitlines()
+        if not lines:
+            return candidate, "", frozenset()
+        tail_end = len(lines)
+        while tail_end > 0 and not lines[tail_end - 1].strip():
+            tail_end -= 1
+        tail_start = tail_end
+        found_ready_line = False
+        while tail_start > 0:
+            line = lines[tail_start - 1].strip()
+            if line and cls._is_ready_ui_line(line):
+                tail_start -= 1
+                found_ready_line = True
+                continue
+            if not line and found_ready_line:
+                tail_start -= 1
+                continue
+            break
+        if not found_ready_line:
+            return candidate, "", frozenset()
+        prefix = "\n".join(lines[:tail_start]).strip()
+        tail = "\n".join(lines[tail_start:tail_end]).strip()
+        return prefix, tail, cls._ready_evidence(tail)
+
+    @classmethod
     def _ready_ui_tail_fragment_evidence(
         cls,
         candidate: str,
     ) -> tuple[frozenset[str], bool, bool]:
-        """只提取输出尾部连续 READY UI，允许前面保留真实回答正文。"""
+        """提取尾部 READY UI 的类别，并标记是否混入正文。"""
 
-        lines = tuple(
-            line.strip()
-            for line in candidate.splitlines()
-            if line.strip()
-        )
-        if not lines:
-            return frozenset(), False, False
-        tail_start = len(lines)
-        while tail_start > 0 and cls._is_ready_ui_line(lines[tail_start - 1]):
-            tail_start -= 1
-        if tail_start == len(lines):
-            return frozenset(), False, False
-        tail_lines = lines[tail_start:]
-        evidence = cls._ready_evidence("\n".join(tail_lines))
-        return evidence, True, tail_start > 0
+        prefix, tail, evidence = cls._split_ready_ui_tail(candidate)
+        return evidence, bool(tail), bool(prefix)
 
     @staticmethod
     def _is_isolated_dollar_ui(candidate: str) -> bool:
