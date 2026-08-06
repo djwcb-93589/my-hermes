@@ -1,5 +1,5 @@
 """
-模拟 agent 调用 browser 模块的 P3 高级读取演示脚本。
+模拟 agent 调用 browser 模块的高级读取演示脚本。
 
 流程:
   1. navigate 到 Wikipedia 文章页
@@ -79,7 +79,7 @@ def main() -> int:
         pass
 
     url = "https://en.wikipedia.org/wiki/Python_(programming_language)"
-    print("演示:用 browser 模块的 P3 高级读取(get_text + console)")
+    print("演示：用 browser 模块的高级读取（get_text + console）")
 
     try:
         with BrowserSession(headless=True) as s:
@@ -190,7 +190,7 @@ def main() -> int:
         return 1
 
     print(f"\n{'=' * 60}")
-    print("P3 演示完成。")
+    print("高级读取演示完成。")
     return 0
 
 

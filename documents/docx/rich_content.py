@@ -1,4 +1,4 @@
-"""P4.3 富内容与 section 操作的校验、统一规划和输出复检。"""
+"""富内容与 section 操作的校验、统一规划和输出复检。"""
 
 from __future__ import annotations
 
@@ -266,7 +266,7 @@ def validate_rich_operation(
     operation: object,
     operation_index: int,
 ) -> ValidatedRichOperation | None:
-    """识别并验证一个 P4.3 公共操作；非 P4.3 类型返回 None。"""
+    """识别并验证一个富内容公共操作；其他类型返回 None。"""
 
     if isinstance(operation, InsertImageAfter):
         if not isinstance(operation.image_path, (str, os.PathLike)):

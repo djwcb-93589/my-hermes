@@ -1,4 +1,4 @@
-"""基于 cua-driver 的 P6 基础操作 Backend。"""
+"""基于 cua-driver 的 Computer Use 操作 Backend。"""
 
 import base64
 import binascii
@@ -35,10 +35,10 @@ from ..transport import CuaDriverClient, CuaDriverConfig
 _REQUIRED_OBSERVATION_TOOLS = frozenset(
     {"list_apps", "list_windows", "wait"}
 )
-_REQUIRED_P5_ACTION_TOOLS = frozenset(
+_REQUIRED_CORE_ACTION_TOOLS = frozenset(
     {"click", "double_click", "type_text", "press_key", "hotkey"}
 )
-_REQUIRED_P6_ACTION_TOOLS = frozenset(
+_REQUIRED_EXTENDED_ACTION_TOOLS = frozenset(
     {"drag", "scroll", "set_value"}
 )
 _CAPTURE_TOOLS = ("get_window_state", "screenshot")
@@ -127,25 +127,25 @@ class CuaDriverBackend(ComputerUseBackend):
                     },
                 )
             missing_actions = sorted(
-                _REQUIRED_P5_ACTION_TOOLS - self._tool_names
+                _REQUIRED_CORE_ACTION_TOOLS - self._tool_names
             )
             if missing_actions:
                 raise BackendUnavailableError(
-                    "cua-driver does not provide required P5 action tools.",
+                    "cua-driver does not provide required core action tools.",
                     details={
                         "reason": "missing_required_tools",
                         "tools": missing_actions,
                     },
                 )
-            missing_p6_actions = sorted(
-                _REQUIRED_P6_ACTION_TOOLS - self._tool_names
+            missing_extended_actions = sorted(
+                _REQUIRED_EXTENDED_ACTION_TOOLS - self._tool_names
             )
-            if missing_p6_actions:
+            if missing_extended_actions:
                 raise BackendUnavailableError(
-                    "cua-driver does not provide required P6 action tools.",
+                    "cua-driver does not provide required extended action tools.",
                     details={
                         "reason": "missing_required_tools",
-                        "tools": missing_p6_actions,
+                        "tools": missing_extended_actions,
                     },
                 )
             self._try_start_session()

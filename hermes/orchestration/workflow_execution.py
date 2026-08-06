@@ -252,7 +252,7 @@ class WorkflowExecutionResult:
 
     @property
     def executed_task_ids(self) -> tuple[str, ...]:
-        """兼容 P3.1 名称；实际语义是中央提交顺序。"""
+        """兼容旧属性名；实际语义是中央提交顺序。"""
 
         return self.scheduled_task_ids
 

@@ -2900,7 +2900,7 @@ def _verify_temporary_package(
     rich_plan: RichContentPlan,
     verify_rich: bool,
 ) -> None:
-    """复检 package mutation 字节保真及 P4.3 富内容关系。"""
+    """复检 package mutation 字节保真及富内容关系。"""
 
     with (
         DocxPackage.open(source_path) as source_package,

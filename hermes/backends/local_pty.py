@@ -593,7 +593,7 @@ class LocalPtyBackgroundProcessHandle(BackgroundProcessHandle):
         return self._submit_input_operation("submit", data + enter)
 
     def close_stdin(self) -> bool:
-        """P8 不模拟 PTY EOF，也不改变后续 write/submit 资格。"""
+        """不模拟 PTY EOF，也不改变后续 write/submit 资格。"""
 
         raise ProcessInputCloseUnsupportedError(
             "Closing stdin is not supported for PTY processes"

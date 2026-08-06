@@ -222,7 +222,7 @@ class PageExtractor:
         truncated = result.get("truncated")
         if isinstance(match_count, bool) or not isinstance(match_count, int) or not isinstance(truncated, bool):
             raise ExtractionError("extract_failed", "页面内搜索统计信息无效")
-        refs = self._session._p9_refs_for_selector_locked(ref_selector)
+        refs = self._session._refs_for_selector_locked(ref_selector)
         matches: list[dict[str, Any]] = []
         for item in self._ensure_list(result.get("matches"), name="页面内搜索"):
             ref_index = item.get("_ref_index")
@@ -270,7 +270,7 @@ class PageExtractor:
             ),
             name="链接提取",
         )
-        refs = self._session._p9_refs_for_selector_locked("a[href]")
+        refs = self._session._refs_for_selector_locked("a[href]")
         seen_urls: set[str] = set()
         links: list[dict[str, Any]] = []
         source_truncated = len(raw_links) > limit
@@ -384,7 +384,9 @@ class PageExtractor:
             ),
             name="表单提取",
         )
-        const_refs = self._session._p9_refs_for_selector_locked("input, textarea, select")
+        const_refs = self._session._refs_for_selector_locked(
+            "input, textarea, select"
+        )
         forms: list[dict[str, Any]] = []
         for form in raw_forms[:limit]:
             fields = form.get("fields")
@@ -719,7 +721,7 @@ class PageExtractor:
                 if cancel_event is not None and cancel_event.is_set():
                     return cancelled()
                 remaining_ms = max(1, int((deadline - monotonic()) * 1000))
-                navigation = self._session._p9_navigate_locked(
+                navigation = self._session._navigate_for_pagination_locked(
                     next_url,
                     remaining_ms,
                     _cancel_event=cancel_event,
@@ -732,7 +734,7 @@ class PageExtractor:
                 if cancel_event is not None and cancel_event.is_set():
                     return cancelled()
                 remaining_ms = max(1, int((deadline - monotonic()) * 1000))
-                navigation = self._session._p9_click_next_button_locked(
+                navigation = self._session._click_pagination_next_locked(
                     index,
                     remaining_ms,
                     _cancel_event=cancel_event,

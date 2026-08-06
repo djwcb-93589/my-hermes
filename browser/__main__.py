@@ -18,16 +18,16 @@ CLI:``python -m browser <url> [--action ...]``。
     # 下拉选择
     python -m browser https://example.com --action select --ref e3 --value "option1"
 
-    # P2 单页操作:reload / scroll
+    # 单页导航操作：reload / scroll
     python -m browser https://en.wikipedia.org --action reload
     python -m browser https://en.wikipedia.org --action scroll --direction down
 
-    # P3 高级读取:get_text(整页或元素文本)/ console(执行 JS)
+    # 高级读取：get_text（整页或元素文本）/ console（执行 JS）
     python -m browser https://en.wikipedia.org --action get_text
     python -m browser https://en.wikipedia.org --action get_text --ref e1
     python -m browser https://en.wikipedia.org --action console --expression "document.title"
 
-    # P4 条件等待
+    # 条件等待
     python -m browser https://example.com --action wait_url --url-pattern "https://example.com/*"
     python -m browser https://example.com --action wait_text --wait-text "Example Domain"
     python -m browser https://example.com --action wait_ref --ref e1
@@ -178,7 +178,7 @@ def _run_action(s: BrowserSession, args: argparse.Namespace) -> str:
         if not args.ref or args.value is None:
             return _missing_arg("ref/value", "select")
         return s.select(args.ref, args.value, snapshot_id)
-    # P2 动作同样使用本次导航产生的页面版本。
+    # 导航动作同样使用本次导航产生的页面版本。
     if args.action == "back":
         return s.back(snapshot_id)
     if args.action == "forward":
@@ -187,7 +187,7 @@ def _run_action(s: BrowserSession, args: argparse.Namespace) -> str:
         return s.reload(snapshot_id)
     if args.action == "scroll":
         return s.scroll(args.direction, snapshot_id, args.amount)
-    # P3 高级读取:get_text 可选 ref(None=整页),console 执行任意 JS。
+    # 高级读取：get_text 可选 ref（None=整页），console 执行任意 JS。
     if args.action == "get_text":
         # ref=None 传 Python None 表示整页;CLI 用 --ref 缺省即整页。
         return s.get_text(args.ref, snapshot_id, max_chars=args.max_chars)
@@ -195,7 +195,7 @@ def _run_action(s: BrowserSession, args: argparse.Namespace) -> str:
         if not args.expression:
             return _missing_arg("expression", "console")
         return s.console(args.expression, snapshot_id)
-    # P4 等待动作会使原 snapshot_id 失效，并在成功、超时或取消时都返回新快照。
+    # 等待动作会使原 snapshot_id 失效，并在成功、超时或取消时都返回新快照。
     if args.action == "wait_url":
         if not args.url_pattern:
             return _missing_arg("url-pattern", "wait_url")

@@ -129,7 +129,7 @@ class GatewayClaudeCodeWatchRegistrationSink:
         result: object,
         session_owner: str,
     ) -> ClaudeCodeWatchRegistrationResult:
-        """兼容 P8.4 初始 round 的注册入口。"""
+        """兼容仅注册初始 round 的旧入口。"""
 
         return self.register_submitted_round_result(
             result=result,

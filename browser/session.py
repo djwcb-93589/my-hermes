@@ -8,41 +8,41 @@
 - ``navigate(url)`` -- 打开 URL,返回带 ``snapshot_id`` 的观察结果 JSON
 - ``snapshot()`` -- 对当前 page 取一次 accessibility snapshot,返回观察结果 JSON
 
-交互(P1,操作后自动返回新快照):
+交互操作（每次操作后自动返回新快照）：
 - ``click(ref, snapshot_id)`` -- 点击元素
 - ``type(ref, text, snapshot_id, clear=True)`` -- 在输入框填文字,默认先清空
 - ``press(key, snapshot_id)`` -- 按键盘键(Enter/Tab/Escape 等)
 - ``select(ref, value, snapshot_id)`` -- 下拉选择(<select> 元素)
 
-文件传输与页面产物(P7):
+文件传输与页面产物：
 - ``upload_files(ref, paths, snapshot_id)`` -- 向工作区内的文件选择框上传文件
 - ``download(ref, snapshot_id)`` -- 点击下载并将文件登记为会话产物
 - ``screenshot(snapshot_id)`` / ``screenshot_element(ref, snapshot_id)`` -- 保存 PNG 截图
 
-图片与音频理解(P8):
+图片与音频理解：
 - ``analyze_media(sources, prompt)`` -- 分析会话产物或工作区相对路径中的媒体
 - ``analyze_image`` / ``analyze_audio`` -- 限定单一媒体类型的简化入口
 - ``analyze_page(snapshot_id, prompt)`` -- 截图当前页面后交给配置好的多模态模型
 
-自主浏览与结构化提取(P9):
+自主浏览与结构化提取：
 - ``find_in_page`` / ``extract_links`` / ``extract_tables`` / ``extract_forms``
   / ``extract_metadata`` -- 使用现有快照只读提取页面内容
 - ``collect_paginated`` -- 在页面、结果、文本和时间预算内跟随明确的下一页控件
 
-导航(P2,操作后自动返回新快照):
+导航（每次操作后自动返回新快照）：
 - ``back(snapshot_id)`` -- 回退到上一页
 - ``forward(snapshot_id)`` -- 前进到下一页
 - ``reload(snapshot_id)`` -- 重新加载当前页
 - ``scroll(direction, snapshot_id, amount=400)`` -- 滚动页面(up/down/left/right)
 
-高级读取(P3):
+高级读取：
 - ``get_text(ref, snapshot_id, max_chars=5000)`` -- 读元素/整页连贯文本。
   纯读取:不失效旧 snapshot_id、不取新快照(ref 仍可用)。整页文本默认截断。
 - ``console(expression, snapshot_id)`` -- 执行任意 JS,返回序列化结果。
   逃生舱:AX tree 看不到的元素、结构化数据用它。危险:JS 改 DOM 后旧 ref
   失效,按交互操作处理(失效旧观察、取新快照)。接 agent 时必须 unknown_on_crash。
 
-条件等待(P4,结束后自动返回新快照):
+条件等待（结束后自动返回新快照）：
 - ``wait_for_url(pattern, snapshot_id, timeout_ms=None)`` -- 等待 URL 匹配 glob 模式
 - ``wait_for_text(text, snapshot_id, timeout_ms=None)`` -- 等待可见文本出现
 - ``wait_for_ref(ref, snapshot_id, timeout_ms=None)`` -- 等待已有 ref 对应元素可见
@@ -203,7 +203,7 @@ class BrowserSession:
         self._artifact_directories = self._resolve_artifact_directories()
         self._artifacts: dict[str, _Artifact] = {}
         self._artifact_counter = 0
-        # P9 提取器只读取当前页面；延迟创建以避免普通浏览会话加载无关逻辑。
+        # 提取器只读取当前页面；延迟创建以避免普通浏览会话加载无关逻辑。
         self._page_extractor: Any | None = None
         # 多模态服务不参与页面状态管理。未显式提供时延迟按环境变量创建，
         # 避免未配置 ARK 时影响只使用浏览器能力的会话。
@@ -990,8 +990,8 @@ class BrowserSession:
         except Exception:
             return _err(error_type, error)
 
-    def _p7_ref_error_with_observation_locked(self, result: str) -> str:
-        """P7 的 ref 解析失败时，保留仍有效的当前观察而不换发快照。"""
+    def _ref_error_with_observation_locked(self, result: str) -> str:
+        """ref 解析失败时，保留仍有效的当前观察而不换发快照。"""
         try:
             payload = json.loads(result)
         except (TypeError, json.JSONDecodeError):
@@ -1192,7 +1192,7 @@ class BrowserSession:
             self._require_started_locked()
             return self._context.cookies()
 
-    # --- 会话产物管理(P7) ---
+    # --- 会话产物管理 ---
 
     def list_artifacts(self) -> str:
         """列出当前会话已登记的下载和截图产物，不扫描目录中的其他文件。"""
@@ -1264,7 +1264,7 @@ class BrowserSession:
                 ensure_ascii=False,
             )
 
-    # --- 自主浏览与结构化提取(P9) ---
+    # --- 自主浏览与结构化提取 ---
 
     def _page_extractor_locked(self) -> Any:
         """延迟创建独立提取器，避免把页面解析细节堆入会话类。"""
@@ -1274,7 +1274,7 @@ class BrowserSession:
             self._page_extractor = PageExtractor(self)
         return self._page_extractor
 
-    def _p9_refs_for_selector_locked(self, selector: str) -> dict[int, str]:
+    def _refs_for_selector_locked(self, selector: str) -> dict[int, str]:
         """为只读提取结果补充现有快照中可确定的 ref，不写入临时属性。"""
         if not isinstance(selector, str) or not selector:
             return {}
@@ -1319,7 +1319,7 @@ class BrowserSession:
                 pass
         return refs
 
-    def _p9_navigate_locked(
+    def _navigate_for_pagination_locked(
         self,
         url: str,
         timeout_ms: int,
@@ -1346,7 +1346,7 @@ class BrowserSession:
             )
         )
 
-    def _p9_popup_failure_locked(
+    def _pagination_popup_failure_locked(
         self,
         original_page_id: str | None,
         before_pages: set[str],
@@ -1380,7 +1380,7 @@ class BrowserSession:
             extra={"popup_page_ids": popup_page_ids},
         )
 
-    def _p9_content_marker_locked(self) -> str:
+    def _pagination_content_marker_locked(self) -> str:
         """在浏览器内生成短内容标记，供同 URL 的 AJAX 分页判断是否已更新。"""
         return str(
             self._page.evaluate(
@@ -1408,7 +1408,7 @@ class BrowserSession:
             )
         )
 
-    def _p9_wait_for_button_change_locked(
+    def _wait_for_pagination_change_locked(
         self,
         previous_url: str,
         previous_marker: str,
@@ -1430,7 +1430,7 @@ class BrowserSession:
                 current_marker = str(
                     self._page.evaluate("window.__browserDomVersion || 0")
                 )
-                current_content_marker = self._p9_content_marker_locked()
+                current_content_marker = self._pagination_content_marker_locked()
             except Exception as exc:
                 if self._is_permanent_browser_error(exc):
                     return "page_closed"
@@ -1452,7 +1452,7 @@ class BrowserSession:
             except Exception as exc:
                 return "page_closed" if self._is_permanent_browser_error(exc) else "failed"
 
-    def _p9_click_next_button_locked(
+    def _click_pagination_next_locked(
         self,
         index: int,
         timeout_ms: int,
@@ -1478,7 +1478,7 @@ class BrowserSession:
             previous_position = self._position_marker_locked()
             previous_marker = self._dom_marker_locked()
             try:
-                previous_content_marker = self._p9_content_marker_locked()
+                previous_content_marker = self._pagination_content_marker_locked()
             except Exception as exc:
                 return _err(
                     "page_closed"
@@ -1494,7 +1494,7 @@ class BrowserSession:
                 )
             except Exception as exc:
                 if any(page_id not in before_pages for page_id in self._pages):
-                    return self._p9_popup_failure_locked(
+                    return self._pagination_popup_failure_locked(
                         original_page_id, before_pages
                     )
                 result = self._finalize_interaction_locked(
@@ -1511,13 +1511,13 @@ class BrowserSession:
                     event_collection_timeout_ms=0,
                 )
                 if any(page_id not in before_pages for page_id in self._pages):
-                    return self._p9_popup_failure_locked(
+                    return self._pagination_popup_failure_locked(
                         original_page_id, before_pages
                     )
                 return result
             if self._cancel_requested(_cancel_event):
                 return self._cancelled_result_locked(execution_state="unknown")
-            change = self._p9_wait_for_button_change_locked(
+            change = self._wait_for_pagination_change_locked(
                 previous_url,
                 previous_marker,
                 previous_content_marker,
@@ -1528,7 +1528,9 @@ class BrowserSession:
             if change == "cancelled":
                 return self._cancelled_result_locked(execution_state="unknown")
             if change == "popup":
-                return self._p9_popup_failure_locked(original_page_id, before_pages)
+                return self._pagination_popup_failure_locked(
+                    original_page_id, before_pages
+                )
             if change == "page_closed":
                 return _err("page_closed", "分页时页面已关闭")
             if change == "failed":
@@ -1570,17 +1572,19 @@ class BrowserSession:
                 event_collection_timeout_ms=0,
             )
             if any(page_id not in before_pages for page_id in self._pages):
-                return self._p9_popup_failure_locked(original_page_id, before_pages)
+                return self._pagination_popup_failure_locked(
+                    original_page_id, before_pages
+                )
             return result
 
         return self._execute_with_dialog_policy_locked(click_next)
 
-    def _p9_read_result_locked(
+    def _read_extraction_result_locked(
         self,
         snapshot_id: str,
         operation: Callable[[Any], dict[str, Any]],
     ) -> str:
-        """为纯读取 P9 接口共享页面可用性和快照校验，不换发快照。"""
+        """为纯读取提取接口共享页面可用性和快照校验，不换发快照。"""
         self._require_started_locked()
         no_page_error = self._require_current_page_locked()
         if no_page_error is not None:
@@ -1614,7 +1618,7 @@ class BrowserSession:
     def find_in_page(self, query: str, snapshot_id: str, max_results: int = 20) -> str:
         """只读查找当前页面文本，不滚动、不调用浏览器查找窗口。"""
         with self._lock:
-            return self._p9_read_result_locked(
+            return self._read_extraction_result_locked(
                 snapshot_id,
                 lambda extractor: extractor.find_in_page(query, max_results),
             )
@@ -1622,28 +1626,28 @@ class BrowserSession:
     def extract_links(self, snapshot_id: str, max_items: int = 100) -> str:
         """只读提取当前页面链接及可用 ref，不改变快照生命周期。"""
         with self._lock:
-            return self._p9_read_result_locked(
+            return self._read_extraction_result_locked(
                 snapshot_id, lambda extractor: extractor.extract_links(max_items)
             )
 
     def extract_tables(self, snapshot_id: str, max_items: int = 100) -> str:
         """只读提取页面表格，不滚动或修改 DOM。"""
         with self._lock:
-            return self._p9_read_result_locked(
+            return self._read_extraction_result_locked(
                 snapshot_id, lambda extractor: extractor.extract_tables(max_items)
             )
 
     def extract_forms(self, snapshot_id: str, max_items: int = 100) -> str:
         """只读提取表单结构，绝不提交、填充或聚焦控件。"""
         with self._lock:
-            return self._p9_read_result_locked(
+            return self._read_extraction_result_locked(
                 snapshot_id, lambda extractor: extractor.extract_forms(max_items)
             )
 
     def extract_metadata(self, snapshot_id: str) -> str:
         """只读提取 title、meta、Open Graph 与合法 JSON-LD。"""
         with self._lock:
-            return self._p9_read_result_locked(
+            return self._read_extraction_result_locked(
                 snapshot_id, lambda extractor: extractor.extract_metadata()
             )
 
@@ -1739,7 +1743,7 @@ class BrowserSession:
                     "extract_failed", f"分页收集结果无法序列化: {exc}"
                 )
 
-    # --- 图片与音频理解(P8) ---
+    # --- 图片与音频理解 ---
 
     def _analyzer_locked(self) -> MultimodalAnalyzer:
         """延迟建立模型服务，未配置时只在实际分析时报告错误。"""
@@ -1994,7 +1998,7 @@ class BrowserSession:
                 **page_fields,
             )
 
-    # --- 页面与对话框管理(P5) ---
+    # --- 页面与对话框管理 ---
     def list_pages(self) -> str:
         """返回当前会话所有仍登记的标签页。"""
         with self._lock:
@@ -2194,7 +2198,7 @@ class BrowserSession:
         state.history_markers.append(current_position)
         state.history_index = len(state.history_urls) - 1
 
-    # --- 导航操作(P2) ---
+    # --- 导航操作 ---
     # back / forward / reload / scroll 虽然不针对特定元素，但仍会改变当前
     # 页面。它们也必须携带 snapshot_id，避免晚到请求作用于新页面。
 
@@ -2481,7 +2485,7 @@ class BrowserSession:
             previous_marker, record_navigation=False,
         )
 
-    # --- 条件等待(P4) ---
+    # --- 条件等待 ---
     # 等待会在页面状态变化后生成新快照，因此与交互操作一样会使旧 snapshot_id 失效。
     def wait_for_url(
         self,
@@ -2890,7 +2894,7 @@ class BrowserSession:
             snapshot_attempts=3,
         )
 
-    # --- 高级读取(P3) ---
+    # --- 高级读取 ---
     # get_text 是纯读取,不改变页面状态,因此不失效旧 snapshot_id、不取新快照。
     # 调用方拿到文本后,手里的 ref 仍然有效,可继续 click/type。
     # console 执行任意 JS,可能改变 DOM/状态,因此按交互操作处理:失效旧 ref、取新快照。
@@ -3215,7 +3219,7 @@ class BrowserSession:
                 json.dumps(payload, ensure_ascii=False)
             )
 
-    # --- 文件传输与页面产物(P7) ---
+    # --- 文件传输与页面产物 ---
 
     def upload_files(
         self,
@@ -3257,7 +3261,7 @@ class BrowserSession:
                 resolved_paths.append(resolved)
             target = self._locator_for_ref_locked(ref)
             if isinstance(target, str):
-                return self._p7_ref_error_with_observation_locked(target)
+                return self._ref_error_with_observation_locked(target)
             upload_target_ready = False
             try:
                 details = target.locator.evaluate(
@@ -3356,7 +3360,7 @@ class BrowserSession:
                 return stale_error
             target = self._locator_for_ref_locked(ref)
             if isinstance(target, str):
-                return self._p7_ref_error_with_observation_locked(target)
+                return self._ref_error_with_observation_locked(target)
             return self._execute_with_dialog_policy_locked(
                 lambda: self._download_locked(
                     target,
@@ -3739,7 +3743,7 @@ class BrowserSession:
                 return stale_error
             target = self._locator_for_ref_locked(ref)
             if isinstance(target, str):
-                return self._p7_ref_error_with_observation_locked(target)
+                return self._ref_error_with_observation_locked(target)
             artifact: _Artifact | None = None
             completed = False
             try:
@@ -3751,7 +3755,7 @@ class BrowserSession:
                 clip = self._visible_element_clip_locked(ref)
                 if isinstance(clip, str):
                     self._last_dialog_event = None
-                    return self._p7_ref_error_with_observation_locked(clip)
+                    return self._ref_error_with_observation_locked(clip)
                 artifact = self._publish_artifact_locked(
                     "element-screenshot",
                     self._safe_artifact_filename_locked(
@@ -3812,7 +3816,7 @@ class BrowserSession:
             return classified
         return "upload_failed"
 
-    # --- 完整交互(P6) ---
+    # --- 完整交互 ---
     # 以下定义覆盖早期的 JS 交互实现：先把 backend DOM 节点临时标记为唯一属性，
     # 再交给 Playwright Locator 完成真实用户交互和可操作性检查。
     def click(

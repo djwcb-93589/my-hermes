@@ -1349,7 +1349,7 @@ class CLIController:
                 ClaudeCodeRequestOperation.REQUEST_INTERRUPT,
                 ClaudeCodeRequestOperation.TERMINATE,
             }:
-                # 控制请求继续走正常 P8.2 grant，不被 pending 当作回复。
+                # 控制请求继续走正常 Grant 流程，不被 pending 当作回复。
                 return False
             self._ui.show_message(
                 "claude_code_interaction_pending: Claude Code 正在等待交互，请先回复当前提示，不能启动新的任务。"

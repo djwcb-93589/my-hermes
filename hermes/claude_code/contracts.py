@@ -58,7 +58,7 @@ class ClaudeCodeEventType(str, Enum):
 
 
 class ClaudeCodeActionKind(str, Enum):
-    """需要上层决定但 P5 不会自动执行的动作类别。"""
+    """需要上层决定且不会自动执行的动作类别。"""
 
     CLARIFICATION = "clarification"
     APPROVAL = "approval"

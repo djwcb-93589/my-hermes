@@ -1,5 +1,5 @@
 """
-模拟 agent 调用 browser 模块的 P2 导航操作演示脚本。
+模拟 agent 调用 browser 模块的导航操作演示脚本。
 
 流程:
   1. navigate 到 Python 文章页
@@ -86,7 +86,7 @@ def main() -> int:
     url_python = "https://en.wikipedia.org/wiki/Python_(programming_language)"
     url_rust = "https://en.wikipedia.org/wiki/Rust_(programming_language)"
 
-    print("演示:用 browser 模块的 P2 导航操作浏览 Wikipedia")
+    print("演示：用 browser 模块的导航操作浏览 Wikipedia")
 
     try:
         with BrowserSession(headless=True) as s:
@@ -166,7 +166,7 @@ def main() -> int:
         return 1
 
     print(f"\n{'=' * 60}")
-    print("P2 演示完成。")
+    print("导航操作演示完成。")
     return 0
 
 

@@ -6,7 +6,7 @@ from enum import Enum
 
 
 class HookEventName(str, Enum):
-    """P3 阶段允许注册和分发的固定事件名称。"""
+    """允许注册和分发的固定事件名称。"""
 
     PRE_LLM_CALL = "pre_llm_call"
     PRE_TOOL_CALL = "pre_tool_call"
@@ -24,5 +24,5 @@ def normalize_hook_event_name(value: HookEventName | str) -> str:
 
 
 def normalize_observation_event_name(value: HookEventName | str) -> str:
-    """兼容旧名称；P3 起固定事件集合同时包含控制型事件。"""
+    """兼容旧名称；固定事件集合同时包含控制型事件。"""
     return normalize_hook_event_name(value)

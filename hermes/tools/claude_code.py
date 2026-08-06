@@ -293,7 +293,7 @@ def _watch_registration_status(
         ))
     register = getattr(sink, "register_submitted_round_result", None)
     if not callable(register) and action == "start":
-        # 兼容只实现 P8.4 初始 round 注册方法的旧 Gateway 组合层。
+        # 兼容只实现初始 round 注册方法的旧 Gateway 组合层。
         register = getattr(sink, "register_start_result", None)
     if not callable(register):
         return _record(ClaudeCodeWatchRegistrationResult(
