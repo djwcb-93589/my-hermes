@@ -19,6 +19,7 @@ from hermes.claude_code.watch_registration import (
 from hermes.claude_code.watcher import (
     ClaudeCodeCompletionWatch,
     ClaudeCodeCompletionWatcherError,
+    ClaudeCodeCompletionWatchState,
 )
 from hermes.gateway.system_notifications import (
     GatewaySystemNotificationPublisher,
@@ -72,6 +73,7 @@ class GatewayClaudeCodeWatchRegistrationSink:
     """在 Tool 同步线程与当前 Gateway Watcher 之间建立受信边界。"""
 
     _REGISTRATION_TIMEOUT_SECONDS = 30.0
+    _RECONCILIATION_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -80,6 +82,7 @@ class GatewayClaudeCodeWatchRegistrationSink:
         notification_target: ClaudeCodeNotificationTarget | None,
         loop: asyncio.AbstractEventLoop,
         initialization_error: str | None = None,
+        readiness_provider=None,
     ) -> None:
         if not isinstance(loop, asyncio.AbstractEventLoop):
             raise TypeError("loop must be an event loop")
@@ -87,6 +90,9 @@ class GatewayClaudeCodeWatchRegistrationSink:
         self._notification_target = notification_target
         self._loop = loop
         self._initialization_error = initialization_error
+        if readiness_provider is not None and not callable(readiness_provider):
+            raise TypeError("readiness_provider must be callable")
+        self._readiness_provider = readiness_provider
 
     def register_start_result(
         self,
@@ -102,6 +108,17 @@ class GatewayClaudeCodeWatchRegistrationSink:
                 error_type=self._initialization_error,
                 retryable=False,
             )
+        if self._readiness_provider is not None:
+            try:
+                ready = bool(self._readiness_provider())
+            except Exception:
+                ready = False
+            if not ready:
+                return ClaudeCodeWatchRegistrationResult(
+                    status="registration_failed",
+                    error_type="watcher_unavailable",
+                    retryable=True,
+                )
         target = self._notification_target
         if target is None:
             return ClaudeCodeWatchRegistrationResult(
@@ -162,26 +179,40 @@ class GatewayClaudeCodeWatchRegistrationSink:
                 error_type="watcher_unavailable",
                 retryable=True,
             )
-        future = asyncio.run_coroutine_threadsafe(
-            self._register_or_reuse(
-                watcher=watcher,
-                process_id=process_id,
-                session_owner=session_owner,
-                round_id=round_id,
-                target=target,
-            ),
-            self._loop,
+        registration_coro = self._register_or_reuse(
+            watcher=watcher,
+            process_id=process_id,
+            session_owner=session_owner,
+            round_id=round_id,
+            target=target,
         )
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                registration_coro,
+                self._loop,
+            )
+        except Exception:
+            registration_coro.close()
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watcher_unavailable",
+                retryable=True,
+            )
         try:
             status, watch = future.result(
                 timeout=self._REGISTRATION_TIMEOUT_SECONDS,
             )
         except FutureTimeoutError:
-            future.cancel()
-            return ClaudeCodeWatchRegistrationResult(
-                status="registration_failed",
-                error_type="watch_registration_timeout",
-                retryable=True,
+            # 取消只阻止尚未开始的协程，不能证明注册没有副作用；随后只读核对
+            # 同一 owner/process/round/target，绝不自动再次 register。
+            if not future.done():
+                future.cancel()
+            return self._reconcile_after_timeout(
+                watcher=watcher,
+                process_id=process_id,
+                session_owner=session_owner,
+                round_id=round_id,
+                target=target,
             )
         except Exception as error:
             return self._watcher_error_result(error)
@@ -191,11 +222,7 @@ class GatewayClaudeCodeWatchRegistrationSink:
                 error_type="watch_registration_failed",
                 retryable=False,
             )
-        return ClaudeCodeWatchRegistrationResult(
-            status=status,
-            registered=True,
-            watch_id=watch.watch_id,
-        )
+        return self._watch_registration_result(status, watch)
 
     async def _register_or_reuse(
         self,
@@ -236,6 +263,119 @@ class GatewayClaudeCodeWatchRegistrationSink:
                 return "already_registered", existing
             raise
         return "registered", watch
+
+    def _reconcile_after_timeout(
+        self,
+        *,
+        watcher,
+        process_id: str,
+        session_owner: str,
+        round_id: str,
+        target: ClaudeCodeNotificationTarget,
+    ) -> ClaudeCodeWatchRegistrationResult:
+        """超时后通过 Watcher 公共查询确认结果，不创建第二个 Watch。"""
+
+        reconciliation_coro = self._find_existing_watch(
+            watcher=watcher,
+            process_id=process_id,
+            session_owner=session_owner,
+            round_id=round_id,
+            target=target,
+        )
+        try:
+            reconciliation = asyncio.run_coroutine_threadsafe(
+                reconciliation_coro,
+                self._loop,
+            )
+        except Exception:
+            reconciliation_coro.close()
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_unknown",
+                error_type="watch_registration_unconfirmed",
+                retryable=True,
+            )
+        try:
+            watch = reconciliation.result(
+                timeout=self._RECONCILIATION_TIMEOUT_SECONDS,
+            )
+        except FutureTimeoutError:
+            if not reconciliation.done():
+                reconciliation.cancel()
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_unknown",
+                error_type="watch_registration_unconfirmed",
+                retryable=True,
+            )
+        except Exception as error:
+            mapped = self._watcher_error_result(error)
+            if mapped.status == "target_conflict":
+                return mapped
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_unknown",
+                error_type="watch_registration_unconfirmed",
+                retryable=True,
+            )
+        if watch is None:
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_unknown",
+                error_type="watch_registration_unconfirmed",
+                retryable=True,
+            )
+        return self._watch_registration_result("already_registered", watch)
+
+    @staticmethod
+    def _watch_registration_result(
+        status: str,
+        watch: ClaudeCodeCompletionWatch,
+    ) -> ClaudeCodeWatchRegistrationResult:
+        """把 Watcher 的真实有限状态映射为安全注册结果。"""
+
+        if not isinstance(watch, ClaudeCodeCompletionWatch):
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type="watch_registration_failed",
+                retryable=False,
+            )
+        state = getattr(watch.state, "value", watch.state)
+        confirmed_states = {
+            ClaudeCodeCompletionWatchState.ACTIVE.value,
+            ClaudeCodeCompletionWatchState.TERMINAL_DETECTED.value,
+            ClaudeCodeCompletionWatchState.NOTIFICATION_PENDING.value,
+            ClaudeCodeCompletionWatchState.NOTIFICATION_ACCEPTED.value,
+        }
+        if state in confirmed_states:
+            return ClaudeCodeWatchRegistrationResult(
+                status=status,
+                registered=True,
+                watch_id=watch.watch_id,
+            )
+        if state == ClaudeCodeCompletionWatchState.NOTIFICATION_FAILED.value:
+            error_type = watch.last_error_type or "notification_failed"
+            if not isinstance(error_type, str) or not error_type.strip():
+                error_type = "notification_failed"
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type=error_type[:128],
+                retryable=False,
+            )
+        if state == ClaudeCodeCompletionWatchState.CLOSED.value:
+            error_type = watch.last_error_type
+            if not isinstance(error_type, str) or not error_type.strip():
+                return ClaudeCodeWatchRegistrationResult(
+                    status="registration_unknown",
+                    error_type="watch_closed_unconfirmed",
+                    retryable=True,
+                )
+            return ClaudeCodeWatchRegistrationResult(
+                status="registration_failed",
+                error_type=error_type[:128],
+                retryable=False,
+            )
+        return ClaudeCodeWatchRegistrationResult(
+            status="registration_unknown",
+            error_type="watch_state_unknown",
+            retryable=True,
+        )
 
     @staticmethod
     async def _find_existing_watch(
@@ -278,9 +418,9 @@ class GatewayClaudeCodeWatchRegistrationSink:
                 )
             if error_type == "watch_already_registered":
                 return ClaudeCodeWatchRegistrationResult(
-                    status="already_registered",
+                    status="registration_unknown",
                     error_type=error_type,
-                    retryable=False,
+                    retryable=True,
                 )
             if error_type in {
                 "watch_round_unavailable",

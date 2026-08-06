@@ -17,6 +17,7 @@ _WATCH_REGISTRATION_STATUSES = frozenset(
         "registered",
         "already_registered",
         "registration_failed",
+        "registration_unknown",
         "target_conflict",
     }
 )
@@ -45,6 +46,20 @@ class ClaudeCodeWatchRegistrationResult:
             or len(self.watch_id) > _MAX_WATCH_ID_LENGTH
         ):
             raise ValueError("watch_id must be a bounded string or None")
+        if self.registered and self.status not in {
+            "registered",
+            "already_registered",
+        }:
+            raise ValueError(
+                "registered result must have a confirmed registration status"
+            )
+        if (
+            self.status in {"registered", "already_registered"}
+            and not self.registered
+        ):
+            raise ValueError(
+                "confirmed registration status requires registered=True"
+            )
         if self.registered and not self.watch_id:
             raise ValueError("registered watch requires watch_id")
         if self.error_type is not None and (

@@ -1049,8 +1049,11 @@ class GatewayRunner:
         self._inbox_restored_adapters: set[str] = set()
         self._receiving_adapters: set[str] = set()
         self._startup_in_progress = False
-        self._accepting_external_messages = True
+        self._accepting_external_messages = False
         self._lifecycle_phase = "created"
+        # 系统通知必须等 Outbox、通知端口和默认 Watcher 全部就绪后才能接收。
+        self._system_notification_outbox_ready = False
+        self._system_notifications_ready = False
         self._session_cleanup_task: asyncio.Task | None = None
         self._retention_cleanup_task: asyncio.Task | None = None
         self._file_delivery_dispatcher_task: asyncio.Task | None = None
@@ -1067,6 +1070,7 @@ class GatewayRunner:
             runtime_lease_valid=lambda: self._runtime_lease_valid,
             gateway_running=lambda: self._lifecycle_phase == "running",
             outbox_launcher=self.launch_system_outbox,
+            system_notifications_ready=lambda: self._system_notifications_ready,
         )
         self._claude_code_notification_port = GatewayClaudeCodeNotificationPort(
             self._system_notification_publisher,
@@ -1102,6 +1106,12 @@ class GatewayRunner:
     @property
     def _runtime_lease_valid(self) -> bool:
         return self._runtime_lease.valid
+
+    def _clear_system_notification_readiness(self) -> None:
+        """在租约、Watcher 或 Gateway 生命周期失效时撤销系统通知接收资格。"""
+
+        self._system_notifications_ready = False
+        self._system_notification_outbox_ready = False
 
     @staticmethod
     def _gateway_context_policy_name(source: SessionSource) -> str:
@@ -1705,11 +1715,13 @@ class GatewayRunner:
                 notification_target=None,
                 loop=asyncio.get_running_loop(),
                 initialization_error="watch_target_invalid",
+                readiness_provider=lambda: self._system_notifications_ready,
             )
         return GatewayClaudeCodeWatchRegistrationSink(
             watcher=self._claude_code_completion_watcher,
             notification_target=target,
             loop=asyncio.get_running_loop(),
+            readiness_provider=lambda: self._system_notifications_ready,
         )
 
     def _database_delivery_fence_state(
@@ -1794,6 +1806,7 @@ class GatewayRunner:
 
     def _on_runtime_lease_lost(self, error_type: str | None) -> None:
         """先撤销运行资格，再调度不会自等待的统一安全停止。"""
+        self._clear_system_notification_readiness()
         self._accepting_external_messages = False
         self._route_admission_closed = True
         self._lifecycle_phase = "lease_lost"
@@ -2329,15 +2342,28 @@ class GatewayRunner:
 
         from hermes.claude_code import get_claude_code_completion_watcher
 
+        current = self._claude_code_completion_watcher
+        if current is not None and not current.is_shutdown:
+            await current.start()
+            return
         watcher = get_claude_code_completion_watcher(
             notification_port=self._claude_code_notification_port,
         )
-        await watcher.start()
+        try:
+            await watcher.start()
+        except Exception:
+            # start 可能已经创建了后台 Task；启动失败时立即回收本地取得的实例。
+            try:
+                await watcher.shutdown()
+            except Exception:
+                pass
+            raise
         self._claude_code_completion_watcher = watcher
 
     async def _shutdown_claude_code_completion_watcher(self) -> None:
         """先停止观察器，再让 Gateway 的全局 Session 清理处理 CC 生命周期。"""
 
+        self._clear_system_notification_readiness()
         watcher = self._claude_code_completion_watcher
         self._claude_code_completion_watcher = None
         if watcher is not None:
@@ -3122,6 +3148,9 @@ class GatewayRunner:
         error_type: str = "GatewayStartupFailed",
     ) -> None:
         """启动恢复失败时停止已创建资源并尽早交还租约。"""
+        self._clear_system_notification_readiness()
+        self._accepting_external_messages = False
+        self._route_admission_closed = True
         try:
             await self._runtime_components.fail_startup(error_type)
         except (Exception, asyncio.CancelledError) as exc:
@@ -3234,6 +3263,7 @@ class GatewayRunner:
             )
         self._bind_cron_observation_bridge()
         self._startup_in_progress = True
+        self._clear_system_notification_readiness()
         self._accepting_external_messages = False
         self._route_admission_closed = False
         self._inbox_restored_adapters.clear()
@@ -3377,6 +3407,7 @@ class GatewayRunner:
             self._lifecycle_phase = "gateway_queue_restore"
             await self._restore_queued_messages()
             await self._require_startup_runtime_lease()
+            self._system_notification_outbox_ready = True
         except Exception as exc:
             # Gateway 自身持久状态无法完成恢复时不能开放外部入口。
             await self._abort_startup_after_lease(type(exc).__name__)
@@ -3386,6 +3417,21 @@ class GatewayRunner:
 
         # 此时 Gateway 两层状态已经恢复。Adapter Inbox 可以通过同一个
         # Runner 回调提交，但外部监听器仍未启动，不会混入实时事件。
+        # 外部 Inbox 恢复和实时接收前，先确保默认 Completion Watcher 已启动。
+        self._lifecycle_phase = "claude_code_completion_watcher_start"
+        try:
+            await self._require_startup_runtime_lease()
+            await self._start_claude_code_completion_watcher()
+            await self._require_startup_runtime_lease()
+            if not self._system_notification_outbox_ready:
+                raise RuntimeError("system notification Outbox is not ready")
+            self._system_notifications_ready = True
+        except Exception as exc:
+            await self._abort_startup_after_lease(type(exc).__name__)
+            self._lifecycle_phase = "startup_failed"
+            self._startup_in_progress = False
+            raise
+
         self._lifecycle_phase = "adapter_inbox_restore"
         self._accepting_external_messages = True
         for name, adapter in self.adapters.items():
@@ -3429,7 +3475,6 @@ class GatewayRunner:
             self._start_retention_cleanup()
             self._start_file_delivery_dispatcher()
             self._start_cron_delivery_preparation()
-            await self._start_claude_code_completion_watcher()
             self._cron_scheduler.start()
             self._runtime_components.start_heartbeats()
         except Exception as exc:
@@ -3461,6 +3506,7 @@ class GatewayRunner:
                     f"stage={stage} exception={type(error).__name__}"
                 )
 
+            self._clear_system_notification_readiness()
             self._lifecycle_phase = "stopping"
             self._accepting_external_messages = False
             self._route_admission_closed = True

@@ -59,6 +59,7 @@ class GatewaySystemNotificationPublisher:
         runtime_lease_valid: Callable[[], bool],
         gateway_running: Callable[[], bool],
         outbox_launcher: Callable[[str, str], Awaitable[None]],
+        system_notifications_ready: Callable[[], bool] | None = None,
     ) -> None:
         if not isinstance(persistence, GatewayPersistence):
             raise TypeError("persistence must be a GatewayPersistence")
@@ -71,11 +72,18 @@ class GatewaySystemNotificationPublisher:
         ):
             if not callable(value):
                 raise TypeError(f"{name} must be callable")
+        if system_notifications_ready is not None and not callable(
+            system_notifications_ready
+        ):
+            raise TypeError("system_notifications_ready must be callable")
         self._persistence = persistence
         self._adapter_provider = adapter_provider
         self._runtime_fence_provider = runtime_fence_provider
         self._runtime_lease_valid = runtime_lease_valid
-        self._gateway_running = gateway_running
+        # 兼容旧调用方；GatewayRunner 会注入更严格的系统通知 readiness。
+        self._system_notifications_ready = (
+            system_notifications_ready or gateway_running
+        )
         self._outbox_launcher = outbox_launcher
 
     async def publish(
@@ -218,7 +226,10 @@ class GatewaySystemNotificationPublisher:
 
     def _gateway_can_accept(self) -> bool:
         try:
-            return bool(self._gateway_running() and self._runtime_lease_valid())
+            return bool(
+                self._system_notifications_ready()
+                and self._runtime_lease_valid()
+            )
         except Exception:
             return False
 
