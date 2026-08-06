@@ -47,19 +47,21 @@ HERMES_HOME
 
 ### `skill_view`
 
-只有具备 `skill_read` 的上下文才能调用 `skill_view`，并获得 Skill-First 指引。对于 `claude-code`，只有用户明确要求使用 Claude Code/CC，或明确要求继续、补充指示、停止或控制已有会话后，Agent 才调用 `skill_view(name="claude-code")` 读取完整 `SKILL.md`；需要细节时，再通过同一工具的 `relative_path` 按需读取 package 内的 `references/`、`templates/`、`scripts/` 或 `assets/` 文件。通用 Repository 继续拒绝绝对路径、包外逃逸和符号链接路径。
+只有具备 `skill_read` 的上下文才能调用 `skill_view`，并获得 Skill-First 指引。对于 `claude-code`，只有当前真实用户消息明确要求使用、查询、中断或终止 Claude Code/CC，或对已知受管 Session 提交新的具体任务时，Agent 才调用 `skill_view(name="claude-code")` 读取完整 `SKILL.md`；需要细节时，再通过同一工具的 `relative_path` 按需读取 package 内的 `references/`、`templates/`、`scripts/` 或 `assets/` 文件。通用 Repository 继续拒绝绝对路径、包外逃逸和符号链接路径。
 
 ### `skill_manage`
 
-仅具备 `skill_manage` 的上下文仍会看到 catalog 摘要，但这不等于拥有 `skill_view`，也不会获得依赖 `skill_read` 的 Skill-First 指引。P3 不为修正文档而改变任何实际工具权限。
+仅具备 `skill_manage` 的上下文仍会看到 catalog 摘要，但这不等于拥有 `skill_view`，也不会获得依赖 `skill_read` 的 Skill-First 指引。Skill 文档不改变任何实际 Tool 权限。
 
 ### 用户显式启用
 
-Claude Code Skill 不根据仓库规模、多文件修改、任务复杂度或预计耗时自动触发。Agent 也不主动推荐 Claude Code，或询问用户是否启用。用户未明确要求时继续使用 myHermes 自身工具，不读取本 Skill、不执行 Claude Code preflight，也不启动 Claude Code。Skill 已安装、catalog 可见或 `ready=true` 均不构成用户授权；用户明确要求后仍必须读取 Skill、执行 preflight，并继续遵守原任务范围和审批边界。
+Claude Code Skill 不根据仓库规模、多文件修改、任务复杂度或预计耗时自动触发。Agent 也不主动推荐 Claude Code，或询问用户是否启用。用户未明确要求时继续使用 myHermes 自身工具，不读取本 Skill，也不启动 Claude Code。Skill 已安装、catalog 可见或 `ready=true` 均不构成用户授权。
 
-`local_skill.py install` 成功不会把 Skill 热注入已经构建并正在使用的 Agent 上下文。安装后应新建 Agent 对话/运行上下文；对于启动时缓存 Prompt 的入口，应重启相关 runtime。新上下文构建时才通过现有链路重新扫描。P3 不增加当前会话热重载、目录监听或专用缓存失效机制。
+用户明确要求后，Agent 可以读取 Skill 并提取当前任务的文件、测试、依赖、Git、网络和重构边界；代码修改与测试阶段仍严格分离。Agent 不通过 Terminal、Process 或裸 Claude CLI 执行版本、PATH、PTY、认证或参数探测，也不运行 `command -v claude`、`claude --version`、`claude --help` 或等价 probe。executable、cwd、PTY、同 cwd 互斥、READY 与启动错误检查均由受管 `claude_code(action="start")`、Adapter、Controller 与 Runtime 在既有边界内处理。
 
-使用 `python local_skill.py status` 可以确认安装状态；`ready=true` 只表示安装副本结构、ownership 和 revision 完整，不表示当前 Agent 已发现、具备 `skill_read`、获得用户启用授权、调用过 `skill_view`、通过 preflight，或已经启动 Claude Code。确认这些状态必须留到新 Agent 上下文中的独立 T3；不能从安装器状态推断。
+`local_skill.py install` 成功不会把 Skill 热注入已经构建并正在使用的 Agent 上下文。安装后应新建 Agent 对话/运行上下文；对于启动时缓存 Prompt 的入口，应重启相关 runtime。新上下文构建时才通过现有链路重新扫描。当前不提供会话热重载、目录监听或专用缓存失效机制。
+
+使用 `python local_skill.py status` 可以确认安装状态；`ready=true` 只表示安装副本结构、ownership 和 revision 完整，不表示当前 Agent 已发现、具备 `skill_read`、获得用户启用授权、调用过 `skill_view` 或已经启动 Claude Code。这些事实只能由新建 Agent 上下文中的可信入站授权和受管 Tool 结果确认，不能从安装器状态推断。
 
 安装与发现本身不构成 Claude Code 授权，也不会把 Tool 热注入已有 Agent run。当前新 run 中，只有可信入站链路从当前真实用户消息识别到明确 Claude Code 请求，才会同时注入短生命周期 Grant、可信 ToolPolicy 上下文并动态开放 `claude_code` Tool。
 
@@ -67,11 +69,16 @@ Claude Code Skill 不根据仓库规模、多文件修改、任务复杂度或�
 
 ```text
 当前真实用户明确请求
+→ 可信入站识别与短生命周期 Grant
 → 动态开放 claude_code Tool
 → ClaudeCodeAgentAdapter
 → ClaudeCodeController
 → Runtime / ProcessManager / PTY
 → Claude Code CLI
 ```
+
+模型可调用的公开 action 仅有 `start`、`poll`、`send_instruction`、`request_interrupt` 和 `terminate`。`current_interaction`、`reply_to_interaction`、`user_confirmed` 与 `action_id` 属于内部确定性 Conversation 续接合同，不是模型可调用或可填写的 action。
+
+对于已有受管 Session，活动 round 不接受普通补充 stdin。`send_instruction` 只能创建新 round，且必须显式提供受管 `process_id`、最新终态 `round_id` 和当前用户给出的明确新任务。上一 round 必须终态、Session 必须 READY、不得存在活动 round 或未消费 ActionRequired；不得猜测“最近会话”，也不得通过重新 `start` 模拟续接。
 
 AgentLoop 继续通过通用 Tool 调度该能力，不直接嵌入 Controller。安装器不生成 Grant、不伪造 owner、不启动 Claude CLI，也不把旧 Terminal/Process 裸 CLI 设为受管 Tool 失败后的 fallback；完整受管使用规则见 package 的 [SKILL.md](../SKILL.md)。
