@@ -129,7 +129,20 @@ class GatewayClaudeCodeWatchRegistrationSink:
         result: object,
         session_owner: str,
     ) -> ClaudeCodeWatchRegistrationResult:
-        """只接受成功 start 的公共结果，不保存 task 或 target 到 Tool。"""
+        """兼容 P8.4 初始 round 的注册入口。"""
+
+        return self.register_submitted_round_result(
+            result=result,
+            session_owner=session_owner,
+        )
+
+    def register_submitted_round_result(
+        self,
+        *,
+        result: object,
+        session_owner: str,
+    ) -> ClaudeCodeWatchRegistrationResult:
+        """只接受已提交 round 的公共结果，不保存 task 或 target 到 Tool。"""
 
         if self._initialization_error is not None:
             return ClaudeCodeWatchRegistrationResult(

@@ -28,6 +28,9 @@ _CLAUDE_CODE_TOOLSET = "claude_code"
 _ALLOWED_OPERATIONS_BY_REQUEST = {
     ClaudeCodeRequestOperation.START: frozenset({"start", "poll"}),
     ClaudeCodeRequestOperation.POLL: frozenset({"poll"}),
+    ClaudeCodeRequestOperation.SEND_INSTRUCTION: frozenset(
+        {"send_instruction", "poll"}
+    ),
     ClaudeCodeRequestOperation.REQUEST_INTERRUPT: frozenset(
         {"request_interrupt", "poll"}
     ),

@@ -603,6 +603,7 @@ class ClaudeCodeController:
         *,
         session_owner: str,
         process_id: str,
+        round_id: str,
         instruction: str,
     ) -> ClaudeCodeControllerResult:
         """提交用户明确给出的补充或延后初始指令，不处理待审批动作。"""
@@ -612,11 +613,18 @@ class ClaudeCodeController:
                 "instruction_failed",
                 "Claude Code instruction must be non-empty",
             )
-        task, terminal = self._resolve_task(session_owner, process_id)
+        self._require_explicit_round_id(round_id)
+        task, terminal = self._resolve_task(
+            session_owner,
+            process_id,
+            round_id=round_id,
+        )
         if terminal is not None:
             raise self._terminal_error(process_id)
         assert task is not None
         with task.lock:
+            # 在 task 锁内重验调用方已知的 round，避免旧上下文自动落到更新后的 round。
+            self._assert_send_round_matches_locked(task, round_id)
             snapshot = self._current_snapshot_locked(task)
             action = snapshot.action_required
             if action is not None and action.kind != ClaudeCodeActionKind.STALLED:
@@ -2745,6 +2753,27 @@ class ClaudeCodeController:
         if current_round is None or current_round.round_id != round_id:
             raise self._round_not_found_error(task.process_id, round_id)
 
+    def _assert_send_round_matches_locked(
+        self,
+        task: _ControllerTask,
+        round_id: str,
+    ) -> None:
+        """仅允许基于当前 active round 或最近已终结 round 创建/补充任务。"""
+
+        current_round = task.active_round
+        if current_round is not None:
+            if current_round.round_id != round_id:
+                if round_id in task.terminal_round_results:
+                    raise self._round_mismatch_error(task.process_id, round_id)
+                raise self._round_not_found_error(task.process_id, round_id)
+            return
+        if task.latest_terminal_round_id is None:
+            raise self._round_not_found_error(task.process_id, round_id)
+        if task.latest_terminal_round_id != round_id:
+            if round_id in task.terminal_round_results:
+                raise self._round_mismatch_error(task.process_id, round_id)
+            raise self._round_not_found_error(task.process_id, round_id)
+
     @staticmethod
     def _round_not_found_error(
         process_id: str,
@@ -2753,6 +2782,19 @@ class ClaudeCodeController:
         return ClaudeCodeControllerError(
             "controller_round_not_found",
             "Claude Code task round was not found",
+            details={"process_id": process_id, "round_id": round_id},
+        )
+
+    @staticmethod
+    def _round_mismatch_error(
+        process_id: str,
+        round_id: str,
+    ) -> ClaudeCodeControllerError:
+        """调用方指定的 round 曾有效，但已不是可提交新指令的当前身份。"""
+
+        return ClaudeCodeControllerError(
+            "controller_round_mismatch",
+            "Claude Code task round is no longer current",
             details={"process_id": process_id, "round_id": round_id},
         )
 
@@ -3083,6 +3125,16 @@ class ClaudeCodeController:
             raise ClaudeCodeControllerError(
                 "controller_round_not_found",
                 "round_id must be a non-empty string or None",
+            )
+
+    @staticmethod
+    def _require_explicit_round_id(round_id: object) -> None:
+        """新指令必须携带调用方已知的 round，不允许按“最新”自动选择。"""
+
+        if not isinstance(round_id, str) or not round_id.strip():
+            raise ClaudeCodeControllerError(
+                "controller_round_not_found",
+                "round_id is required for a Claude Code instruction",
             )
 
     @staticmethod

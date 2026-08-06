@@ -25,12 +25,19 @@ from hermes.tools import register_declared_handlers
 _ACTIONS = frozenset({
     "start",
     "poll",
+    "send_instruction",
     "request_interrupt",
     "terminate",
 })
 _ARGUMENTS_BY_ACTION = {
     "start": frozenset({"action", "cwd", "task"}),
     "poll": frozenset({"action", "process_id", "round_id"}),
+    "send_instruction": frozenset({
+        "action",
+        "process_id",
+        "round_id",
+        "instruction",
+    }),
     "request_interrupt": frozenset({
         "action",
         "process_id",
@@ -42,6 +49,7 @@ _MAX_CWD_LENGTH = 4_096
 _MAX_TASK_LENGTH = 65_535
 _MAX_PROCESS_ID_LENGTH = 512
 _MAX_ROUND_ID_LENGTH = 512
+_MAX_INSTRUCTION_LENGTH = 65_535
 
 # 只暴露 Detector 已经生成的、对 Agent 有帮助且不会携带原生交互正文的元数据。
 # 其余 metadata 仍属于 Controller 内部诊断信息，不进入 Tool 公共合同。
@@ -66,12 +74,18 @@ _ERROR_TYPE_ALIASES = {
     "controller_task_not_found": "process_not_found",
     "session_not_found": "process_not_found",
     "controller_round_not_found": "round_mismatch",
+    "controller_round_mismatch": "round_mismatch",
     "cwd_required": "invalid_cwd",
+    "terminal_session": "session_terminal",
 }
 
 
 class _ClaudeCodeToolArgumentError(ValueError):
     """Tool 参数错误，不触碰 Controller 生命周期。"""
+
+    def __init__(self, message: str, *, error_type: str = "invalid_args") -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 def _json(payload: dict) -> str:
@@ -230,19 +244,30 @@ def _watch_registration_status(
     result,
     grant: ClaudeCodeInvocationGrant,
     sink: object,
+    previous_round_id: str | None = None,
 ) -> dict:
     """把 Gateway 私有注册 Sink 投影成有限 Tool 状态。"""
 
-    def _task_was_started() -> bool:
+    def _submitted_round_is_confirmed() -> bool:
         process_id = getattr(result, "process_id", None)
         round_id = getattr(result, "round_id", None)
-        return (
+        base_result = (
             isinstance(process_id, str)
             and bool(process_id.strip())
             and isinstance(round_id, str)
             and bool(round_id.strip())
-            and getattr(result, "initial_instruction_submitted", False)
-            is True
+            and not bool(getattr(result, "delivery_unknown", False))
+        )
+        if not base_result:
+            return False
+        if action == "start":
+            return getattr(result, "initial_instruction_submitted", False) is True
+        # Controller 仅在 submit 成功后才生成新 round；不同于调用方旧 round
+        # 的新 identity 因而是新任务已提交的公开证明。
+        return (
+            action == "send_instruction"
+            and isinstance(previous_round_id, str)
+            and round_id != previous_round_id
         )
 
     def _record(registration: ClaudeCodeWatchRegistrationResult) -> dict:
@@ -251,16 +276,25 @@ def _watch_registration_status(
             try:
                 capture(
                     registration,
-                    task_started=_task_was_started(),
+                    task_started=_submitted_round_is_confirmed(),
                 )
             except Exception:
                 # 注册摘要失败不能改变已经返回给 Tool 的注册结果。
                 pass
         return registration.to_safe_dict()
 
-    if action != "start" or grant.environment != "gateway":
+    if action not in {"start", "send_instruction"} or grant.environment != "gateway":
         return not_applicable_watch_registration().to_safe_dict()
-    register = getattr(sink, "register_start_result", None)
+    if not _submitted_round_is_confirmed():
+        return _record(ClaudeCodeWatchRegistrationResult(
+            status="not_registered_no_round",
+            error_type="round_unavailable",
+            retryable=False,
+        ))
+    register = getattr(sink, "register_submitted_round_result", None)
+    if not callable(register) and action == "start":
+        # 兼容只实现 P8.4 初始 round 注册方法的旧 Gateway 组合层。
+        register = getattr(sink, "register_start_result", None)
     if not callable(register):
         return _record(ClaudeCodeWatchRegistrationResult(
             status="registration_failed",
@@ -316,7 +350,38 @@ def _bounded_argument(
         raise _ClaudeCodeToolArgumentError(
             f"{name} exceeds the supported length"
         )
+    if "\x00" in normalized:
+        raise _ClaudeCodeToolArgumentError(f"{name} contains a NUL character")
     return normalized
+
+
+def _managed_session_reference_argument(
+    args: dict,
+    name: str,
+    *,
+    maximum: int,
+) -> str:
+    """新指令不猜测 session；缺失或非法身份直接返回受管引用错误。"""
+
+    try:
+        value = _bounded_argument(
+            args,
+            name,
+            maximum=maximum,
+            required=True,
+        )
+    except _ClaudeCodeToolArgumentError as error:
+        raise _ClaudeCodeToolArgumentError(
+            "send_instruction requires an explicit managed process_id and round_id",
+            error_type="managed_session_reference_required",
+        ) from error
+    assert value is not None
+    if any(ord(character) < 0x20 for character in value):
+        raise _ClaudeCodeToolArgumentError(
+            "send_instruction requires an explicit managed process_id and round_id",
+            error_type="managed_session_reference_required",
+        )
+    return value
 
 
 def _validate_args(args: object) -> tuple[str, dict]:
@@ -343,6 +408,23 @@ def _validate_args(args: object) -> tuple[str, dict]:
             args,
             "task",
             maximum=_MAX_TASK_LENGTH,
+            required=True,
+        )
+    elif action == "send_instruction":
+        normalized["process_id"] = _managed_session_reference_argument(
+            args,
+            "process_id",
+            maximum=_MAX_PROCESS_ID_LENGTH,
+        )
+        normalized["round_id"] = _managed_session_reference_argument(
+            args,
+            "round_id",
+            maximum=_MAX_ROUND_ID_LENGTH,
+        )
+        normalized["instruction"] = _bounded_argument(
+            args,
+            "instruction",
+            maximum=_MAX_INSTRUCTION_LENGTH,
             required=True,
         )
     else:
@@ -390,7 +472,7 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
         )
         return _error_envelope(
             "invalid" if operation not in _ACTIONS else operation,
-            "invalid_args",
+            error.error_type,
             str(error),
         )
 
@@ -425,6 +507,13 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
                 round_id=normalized.get("round_id"),
                 cancel_checker=cancel_checker,
             )
+        elif action == "send_instruction":
+            result = selected_adapter.send_instruction(
+                grant=grant,
+                process_id=normalized["process_id"],
+                round_id=normalized["round_id"],
+                instruction=normalized["instruction"],
+            )
         elif action == "request_interrupt":
             result = selected_adapter.request_interrupt(
                 grant=grant,
@@ -446,6 +535,7 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
             result=result,
             grant=grant,
             sink=kwargs.get(CLAUDE_CODE_WATCH_REGISTRATION_SINK_CONTEXT_KEY),
+            previous_round_id=normalized.get("round_id"),
         )
         return _result_envelope(
             action,
@@ -472,9 +562,17 @@ def run_claude_code(args, *, adapter=None, **kwargs) -> str:
                 retryable=error.retryable,
                 delivery_unknown=error.delivery_unknown,
             )
+        error_type = _normalize_controller_error_type(error.error_type)
+        if (
+            action == "send_instruction"
+            and error.error_type == "controller_round_not_found"
+        ):
+            error_type = "round_not_found"
+        if action == "send_instruction" and error.delivery_unknown:
+            error_type = "instruction_delivery_unknown"
         return _error_envelope(
             action,
-            _normalize_controller_error_type(error.error_type),
+            error_type,
             error.safe_message,
             retryable=error.retryable,
             delivery_unknown=error.delivery_unknown,

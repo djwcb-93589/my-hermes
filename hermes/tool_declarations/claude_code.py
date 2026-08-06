@@ -15,7 +15,9 @@ TOOL_DECLARATIONS = (
             "description": (
                 "Run a user-authorized managed Claude Code workflow through "
                 "the existing Controller. Supported actions are start, poll, "
-                "request_interrupt, and terminate. The tool does not expose "
+                "send_instruction, request_interrupt, and terminate. "
+                "send_instruction requires a previously returned process_id "
+                "and round_id plus a new explicit instruction. The tool does not expose "
                 "session owners, notification targets, executable paths, "
                 "permission bypass flags, raw PTY output, or native prompt "
                 "reply operations. It is disabled unless a trusted current "
@@ -29,6 +31,7 @@ TOOL_DECLARATIONS = (
                         "enum": [
                             "start",
                             "poll",
+                            "send_instruction",
                             "request_interrupt",
                             "terminate",
                         ],
@@ -48,6 +51,10 @@ TOOL_DECLARATIONS = (
                     "round_id": {
                         "type": "string",
                         "maxLength": 512,
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "maxLength": 65_535,
                     },
                 },
                 "required": ["action"],

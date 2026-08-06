@@ -12,6 +12,7 @@ class ClaudeCodeRequestOperation(str, Enum):
 
     START = "start"
     POLL = "poll"
+    SEND_INSTRUCTION = "send_instruction"
     REQUEST_INTERRUPT = "request_interrupt"
     TERMINATE = "terminate"
 
@@ -114,6 +115,32 @@ _POLL_QUERY_RE = re.compile(
     rf"(?:当前|现在|目前|最新)\s*(?:状态|进度|输出|结果)"
     rf")"
 )
+_SESSION_REFERENCE_RE = (
+    r"(?:当前|刚才|这个|本轮|正在运行(?:的)?|现有|已有|"
+    r"current|previous|running|existing|this)"
+)
+_SESSION_NOUN_RE = r"(?:会话|任务|进程|运行|session|task|process|run)"
+_SEND_INSTRUCTION_REQUEST_RE = re.compile(
+    rf"(?ix)(?:"
+    # 明确把任务交给已知的当前或最近 Claude Code。
+    rf"(?:请\s*)?(?:让|交给|用|使用)\s*"
+    rf"{_SESSION_REFERENCE_RE}\s*(?:的\s*)?{_MARKER_TOKEN}"
+    rf"(?:\s*{_SESSION_NOUN_RE})?"
+    # 支持 Claude Code 名称在前、随后明确说明其当前受管对象的中文语序。
+    rf"|(?:请\s*)?(?:让|交给|用|使用)\s*{_MARKER_TOKEN}\s*"
+    rf"{_SESSION_REFERENCE_RE}\s*(?:的\s*)?{_SESSION_NOUN_RE}"
+    # “继续让 CC”本身明确承接已有会话；孤立“继续”仍不构成授权。
+    rf"|(?:继续|接着|再)\s*(?:请\s*)?(?:让|交给|用|使用)\s*{_MARKER_TOKEN}"
+    # “给当前 Claude Code 一个新任务”必须同时指明既有会话和新任务语义。
+    rf"|(?:给|向)\s*{_SESSION_REFERENCE_RE}\s*(?:的\s*)?{_MARKER_TOKEN}"
+    rf"(?:\s*{_SESSION_NOUN_RE})?\s*(?:一个\s*)?"
+    rf"(?:新任务|任务|新指令|指令)"
+    # 英文只覆盖同样明确的续接和当前会话指向。
+    rf"|(?:please\s+)?(?:continue|resume|again)\s+(?:with\s+)?{_MARKER_TOKEN}\b"
+    rf"|(?:ask|have|let)\s+(?:the\s+)?"
+    rf"(?:current|previous|running|this)\s+{_MARKER_TOKEN}"
+    rf")"
+)
 _CONTROL_TARGET_RE = (
     r"(?:当前|刚才|现在|正在运行的|这个|该|本轮|"
     r"the\s+(?:current|previous|running)|current|previous|running|this)"
@@ -190,6 +217,15 @@ def _has_task_evidence(surface: str) -> bool:
         if _TASK_RE.search(clause):
             return True
     return False
+
+
+def _is_send_instruction_request(surface: str) -> bool:
+    """只授权明确指向既有受管会话且带有新任务正文的续接请求。"""
+
+    return bool(
+        _SEND_INSTRUCTION_REQUEST_RE.search(surface)
+        and _has_task_evidence(surface)
+    )
 
 
 def _has_standalone_control_match(
@@ -272,6 +308,11 @@ class ClaudeCodeExplicitRequestDetector:
             )
         if _POLL_QUERY_RE.search(candidate_surface):
             return ClaudeCodeExplicitRequest(ClaudeCodeRequestOperation.POLL)
+
+        if _is_send_instruction_request(candidate_surface):
+            return ClaudeCodeExplicitRequest(
+                ClaudeCodeRequestOperation.SEND_INSTRUCTION
+            )
 
         if (
             _START_INTENT_RE.search(candidate_surface)

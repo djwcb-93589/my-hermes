@@ -25,12 +25,13 @@ CLAUDE_CODE_INTERACTION_SINK_CONTEXT_KEY = "_claude_code_interaction_sink"
 
 _ALLOWED_ENVIRONMENTS = frozenset({"cli", "gateway"})
 _PUBLIC_OPERATIONS = frozenset(
-    {"start", "poll", "request_interrupt", "terminate"}
+    {"start", "poll", "send_instruction", "request_interrupt", "terminate"}
 )
 _ALLOWED_OPERATIONS = frozenset(
     {
         "start",
         "poll",
+        "send_instruction",
         "request_interrupt",
         "terminate",
         "current_interaction",
@@ -44,6 +45,7 @@ _MAX_PURPOSE_LENGTH = 128
 _MAX_SOURCE_MESSAGE_LENGTH = 1_024
 _MAX_GRANT_LIFETIME_SECONDS = 900.0
 _MAX_INTERACTION_REPLY_LENGTH = 8_192
+_MAX_INSTRUCTION_LENGTH = 65_535
 _CONTINUATION_OPERATIONS = frozenset(
     {"current_interaction", "reply_to_interaction"}
 )
@@ -92,6 +94,20 @@ def _bounded_reply(value: object) -> str:
         raise ValueError("response exceeds the supported length")
     if "\x00" in value:
         raise ValueError("response contains a NUL character")
+    return value
+
+
+def _bounded_instruction(value: object) -> str:
+    """仅在当前调用栈内校验新任务正文，不把明文写入长期状态。"""
+
+    if not isinstance(value, str):
+        raise ValueError("instruction must be text")
+    if not value.strip():
+        raise ValueError("instruction must be non-empty")
+    if len(value) > _MAX_INSTRUCTION_LENGTH:
+        raise ValueError("instruction exceeds the supported length")
+    if "\x00" in value:
+        raise ValueError("instruction contains a NUL character")
     return value
 
 
@@ -180,6 +196,13 @@ class ClaudeCodeInvocationGrant:
         compare=False,
         hash=False,
     )
+    _instruction_consumed: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
     _lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -258,6 +281,11 @@ class ClaudeCodeInvocationGrant:
         with self._lock:
             return self._reply_consumed
 
+    @property
+    def instruction_consumed(self) -> bool:
+        with self._lock:
+            return self._instruction_consumed
+
     def validate(self, *, now: float | None = None) -> None:
         """验证 grant 的用途、owner、环境和时间范围。"""
 
@@ -314,6 +342,18 @@ class ClaudeCodeInvocationGrant:
                     "Claude Code interaction reply grant has already been consumed",
                 )
             object.__setattr__(self, "_reply_consumed", True)
+
+    def consume_instruction(self, *, now: float | None = None) -> None:
+        """原子消费一次新 round 指令权限，拒绝同一 Grant 的重复提交。"""
+
+        self.validate(now=now)
+        with self._lock:
+            if self._instruction_consumed:
+                raise ClaudeCodeAgentAdapterError(
+                    "grant_reused",
+                    "Claude Code instruction grant has already been consumed",
+                )
+            object.__setattr__(self, "_instruction_consumed", True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +471,95 @@ class ClaudeCodeAgentAdapter:
             process_id=process_id,
             round_id=round_id,
             cancel_checker=cancel_checker,
+        )
+
+    def send_instruction(
+        self,
+        *,
+        grant: ClaudeCodeInvocationGrant,
+        process_id: str,
+        round_id: str,
+        instruction: str,
+    ):
+        """向调用方明确指定的受管 round 提交一次新指令。"""
+
+        self._validate_grant(grant, operation="send_instruction")
+        process_id = _bounded_text(
+            "process_id",
+            process_id,
+            maximum=_MAX_OWNER_LENGTH,
+        )
+        round_id = _bounded_text(
+            "round_id",
+            round_id,
+            maximum=_MAX_TURN_ID_LENGTH,
+        )
+        instruction = _bounded_instruction(instruction)
+        # 与 start 一样在本次受管操作开始前原子消费，避免同一 Grant 在状态变化后重放。
+        grant.consume_instruction(now=self._clock())
+        snapshot_method = getattr(self._controller, "snapshot", None)
+        if not callable(snapshot_method):
+            raise ClaudeCodeAgentAdapterError(
+                "managed_session_reference_required",
+                "Claude Code Controller cannot verify the managed session reference",
+            )
+        snapshot_result = snapshot_method(
+            session_owner=grant.owner.session_owner,
+            process_id=process_id,
+            round_id=round_id,
+        )
+        observed_process_id = getattr(snapshot_result, "process_id", None)
+        observed_round_id = getattr(snapshot_result, "round_id", None)
+        snapshot = getattr(snapshot_result, "snapshot", None)
+        session_ref = getattr(snapshot, "session_ref", None)
+        observed_owner = getattr(session_ref, "session_owner", None)
+        if observed_process_id != process_id:
+            raise ClaudeCodeAgentAdapterError(
+                "managed_session_reference_required",
+                "Claude Code process reference is not managed by this invocation",
+            )
+        if observed_round_id != round_id:
+            raise ClaudeCodeAgentAdapterError(
+                "round_mismatch",
+                "Claude Code round reference is no longer current",
+                details={"process_id": process_id, "round_id": round_id},
+            )
+        if observed_owner != grant.owner.session_owner:
+            raise ClaudeCodeAgentAdapterError(
+                "owner_mismatch",
+                "Claude Code process belongs to another owner",
+                details={"process_id": process_id},
+            )
+        if not bool(getattr(snapshot_result, "process_active", False)):
+            raise ClaudeCodeAgentAdapterError(
+                "session_terminal",
+                "Claude Code session is no longer active",
+                details={"process_id": process_id},
+            )
+        action = getattr(snapshot_result, "action_required", None)
+        action_kind = getattr(
+            getattr(action, "kind", None),
+            "value",
+            getattr(action, "kind", None),
+        )
+        if action is not None and action_kind != "stalled":
+            raise ClaudeCodeAgentAdapterError(
+                "interaction_pending",
+                "Claude Code has an unresolved action requiring explicit handling",
+                details={"process_id": process_id, "round_id": round_id},
+            )
+        submit_method = getattr(self._controller, "send_instruction", None)
+        if not callable(submit_method):
+            raise ClaudeCodeAgentAdapterError(
+                "managed_session_reference_required",
+                "Claude Code Controller cannot submit a managed instruction",
+            )
+        # Controller 会在其 task 锁内再次校验 round，避免 snapshot 与提交之间的并发漂移。
+        return submit_method(
+            session_owner=grant.owner.session_owner,
+            process_id=process_id,
+            round_id=round_id,
+            instruction=instruction,
         )
 
     def request_interrupt(

@@ -87,13 +87,21 @@ class ClaudeCodeWatchRegistrationResult:
 class ClaudeCodeWatchRegistrationSink(Protocol):
     """Gateway 组合层提供、Tool Handler 只依赖的最小注册边界。"""
 
+    def register_submitted_round_result(
+        self,
+        *,
+        result: object,
+        session_owner: str,
+    ) -> ClaudeCodeWatchRegistrationResult:
+        """处理一次已确认提交的 round 结果并返回有限注册状态。"""
+
     def register_start_result(
         self,
         *,
         result: object,
         session_owner: str,
     ) -> ClaudeCodeWatchRegistrationResult:
-        """处理一次成功 start 结果并返回有限注册状态。"""
+        """兼容初始 start round 的既有注册入口。"""
 
 
 def not_applicable_watch_registration() -> ClaudeCodeWatchRegistrationResult:
