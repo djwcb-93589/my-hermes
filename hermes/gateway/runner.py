@@ -635,16 +635,67 @@ class _GatewayAgentResult:
     claude_code_watch_notice_attached: bool = False
 
 
+@dataclass(slots=True)
+class _GatewayClaudeCodeWatchRunState:
+    """当前 Agent run 的最小 Watch 状态，不保存 target 或内部对象内容。"""
+
+    watch_registration_sink: object | None = None
+    watch_registration: dict | None = None
+    watch_notice_attached: bool = False
+
+    def refresh_registration(self) -> dict | None:
+        """从 run-local sink 读取并重新投影安全注册摘要。"""
+
+        sink = self.watch_registration_sink
+        reader = getattr(sink, "safe_registration_result", None)
+        if not callable(reader):
+            return self.watch_registration
+        try:
+            raw = reader()
+        except Exception:
+            return self.watch_registration
+        if not isinstance(raw, dict):
+            return self.watch_registration
+        status = raw.get("status")
+        self.watch_registration = {
+            "status": status[:64] if isinstance(status, str) else None,
+            "registered": raw.get("registered") is True,
+            "task_started": raw.get("task_started") is True,
+        }
+        return self.watch_registration
+
+    def annotate_result(self, result: dict) -> dict:
+        """把当前 run 的安全状态附加到内部结果，不携带原始 Tool 数据。"""
+
+        summary = self.refresh_registration()
+        if summary is None and not self.watch_notice_attached:
+            return result
+        annotated = dict(result)
+        if summary is not None:
+            annotated["claude_code_watch_registration"] = summary
+        annotated["claude_code_watch_notice_attached"] = (
+            self.watch_notice_attached
+        )
+        return annotated
+
+
 class _GatewayAgentRunError(RuntimeError):
     """携带展示控制器，同时保留未预期 Agent 异常的原始类型。"""
 
     def __init__(
         self,
         original: Exception,
-        progressive_controller: ProgressiveReplyController,
+        progressive_controller: ProgressiveReplyController | None,
+        *,
+        claude_code_watch_registration: dict | None = None,
+        claude_code_watch_notice_attached: bool = False,
     ):
         self.original = original
         self.progressive_controller = progressive_controller
+        self.claude_code_watch_registration = claude_code_watch_registration
+        self.claude_code_watch_notice_attached = bool(
+            claude_code_watch_notice_attached
+        )
         super().__init__(type(original).__name__)
 
 
@@ -6836,6 +6887,21 @@ class GatewayRunner:
             if isinstance(exc, _GatewayAgentRunError):
                 original_exc = exc.original
                 progressive_controller = exc.progressive_controller
+                if (
+                    exc.claude_code_watch_registration is not None
+                    or exc.claude_code_watch_notice_attached
+                ):
+                    agent_result = replace(
+                        agent_result,
+                        claude_code_watch_registration=(
+                            exc.claude_code_watch_registration
+                            if exc.claude_code_watch_registration is not None
+                            else agent_result.claude_code_watch_registration
+                        ),
+                        claude_code_watch_notice_attached=(
+                            exc.claude_code_watch_notice_attached
+                        ),
+                    )
                 await self._close_progressive_controller(
                     progressive_controller,
                     abort=False,
@@ -6904,6 +6970,21 @@ class GatewayRunner:
                                 agent_result.claude_code_watch_notice_attached
                             ),
                         )
+                        failure_watch_notice = None
+                        if not failure.claude_code_watch_notice_attached:
+                            failure_watch_notice = (
+                                _format_claude_code_watch_registration_notice(
+                                    failure.claude_code_watch_registration,
+                                )
+                            )
+                            if failure_watch_notice:
+                                failure = replace(
+                                    failure,
+                                    response=(
+                                        f"{failure.response or _SAFE_INTERNAL_REPLY}"
+                                        f"\n\n{failure_watch_notice}"
+                                    ),
+                                )
                         try:
                             outbox = self._build_outbox(
                                 route_key,
@@ -6916,6 +6997,15 @@ class GatewayRunner:
                             delivery_id = await self._enqueue_outbox_async(
                                 outbox
                             )
+                            if failure_watch_notice is not None:
+                                failure = replace(
+                                    failure,
+                                    claude_code_watch_notice_attached=True,
+                                )
+                                agent_result = replace(
+                                    agent_result,
+                                    claude_code_watch_notice_attached=True,
+                                )
                             if (
                                 ctx.delivery_generation == generation
                                 and self._task_cancel_reason(
@@ -7369,6 +7459,7 @@ class GatewayRunner:
     ) -> _GatewayAgentResult:
         """绑定单次运行的渐进式控制器，并保证异常路径回收后台任务。"""
         progressive_holder: list[ProgressiveReplyController] = []
+        watch_state = _GatewayClaudeCodeWatchRunState()
         try:
             result = await self._run_agent_async_impl(
                 event,
@@ -7376,6 +7467,7 @@ class GatewayRunner:
                 resume_from_history=resume_from_history,
                 approval_resume_id=approval_resume_id,
                 progressive_holder=progressive_holder,
+                watch_state=watch_state,
             )
         except asyncio.CancelledError:
             if progressive_holder:
@@ -7385,14 +7477,21 @@ class GatewayRunner:
                     pass
             raise
         except Exception as exc:
-            if not progressive_holder:
-                raise
-            controller = progressive_holder[0]
-            try:
-                await controller.close()
-            except BaseException:
-                pass
-            raise _GatewayAgentRunError(exc, controller) from exc
+            watch_state.refresh_registration()
+            controller = progressive_holder[0] if progressive_holder else None
+            if controller is not None:
+                try:
+                    await controller.close()
+                except BaseException:
+                    pass
+            raise _GatewayAgentRunError(
+                exc,
+                controller,
+                claude_code_watch_registration=watch_state.watch_registration,
+                claude_code_watch_notice_attached=(
+                    watch_state.watch_notice_attached
+                ),
+            ) from exc
         except BaseException:
             if progressive_holder:
                 try:
@@ -7415,6 +7514,7 @@ class GatewayRunner:
         resume_from_history: bool = False,
         approval_resume_id: str | None = None,
         progressive_holder: list[ProgressiveReplyController],
+        watch_state: _GatewayClaudeCodeWatchRunState,
     ) -> _GatewayAgentResult:
         """使用 AsyncOpenAI 跑主会话，数据库 hook 统一在线程执行。"""
         from hermes.db import ensure_session
@@ -7443,9 +7543,6 @@ class GatewayRunner:
         system_prompt = ctx.system_prompt
         task_event = event
         callback_steer_ids: set[str] = set()
-        watch_registration_sink = None
-        watch_registration_summary = None
-        watch_notice_attached = False
 
         def persist_steer_callback(conn, steer_ids) -> None:
             """在工具消息事务内确认对应的原始 Gateway Queue 记录。"""
@@ -7582,26 +7679,21 @@ class GatewayRunner:
 
         def persist_final_message(conn, session_id, msg) -> str | None:
             """最终回答和 outbox 必须在同一个 SQLite 事务中落盘。"""
-            nonlocal delivery_id, watch_notice_attached
+            nonlocal delivery_id
             if self._task_cancel_reason(ctx, generation) is not None:
                 raise asyncio.CancelledError
             content = str(msg.get("content", "") or "")
             if not content:
                 add_messages(conn, session_id, [msg])
                 return
-            if watch_registration_sink is not None:
-                try:
-                    watch_summary = (
-                        watch_registration_sink.safe_registration_result()
-                    )
-                except Exception:
-                    watch_summary = None
-                watch_notice = _format_claude_code_watch_registration_notice(
-                    watch_summary,
-                )
-                if watch_notice and not watch_notice_attached:
-                    content = f"{content}\n\n{watch_notice}"
-                    watch_notice_attached = True
+            notice_for_this_attempt = None
+            watch_summary = watch_state.refresh_registration()
+            watch_notice = _format_claude_code_watch_registration_notice(
+                watch_summary,
+            )
+            if watch_notice and not watch_state.watch_notice_attached:
+                content = f"{content}\n\n{watch_notice}"
+                notice_for_this_attempt = watch_notice
             outbox = self._build_outbox(
                 route_key,
                 task_event,
@@ -7617,6 +7709,8 @@ class GatewayRunner:
                 outbox,
                 **self._runtime_fence_kwargs(),
             )
+            if notice_for_this_attempt is not None:
+                watch_state.watch_notice_attached = True
             delivery_id = actual_delivery_id
             return actual_delivery_id
 
@@ -7686,13 +7780,15 @@ class GatewayRunner:
             # Grant 与动态 ToolPolicy 针对同一个 MessageEvent 一次性注入，
             # 不进入 Gateway history、resume state 或持久化上下文。
             tool_context.update(claude_code_invocation.tool_context)
-            watch_registration_sink = self._build_claude_code_watch_registration_sink(
-                task_event,
-                route_key,
+            watch_state.watch_registration_sink = (
+                self._build_claude_code_watch_registration_sink(
+                    task_event,
+                    route_key,
+                )
             )
             tool_context[
                 CLAUDE_CODE_WATCH_REGISTRATION_SINK_CONTEXT_KEY
-            ] = watch_registration_sink
+            ] = watch_state.watch_registration_sink
         progressive_controller = self._create_progressive_controller(
             task_event,
             ctx,
@@ -7727,25 +7823,8 @@ class GatewayRunner:
                 else None
             ),
         )
-        if watch_registration_sink is not None:
-            try:
-                watch_registration_summary = (
-                    watch_registration_sink.safe_registration_result()
-                )
-            except Exception:
-                watch_registration_summary = None
-            if (
-                watch_registration_summary is not None
-                or watch_notice_attached
-            ):
-                result = dict(result)
-                if watch_registration_summary is not None:
-                    result["claude_code_watch_registration"] = (
-                        watch_registration_summary
-                    )
-                result["claude_code_watch_notice_attached"] = (
-                    watch_notice_attached
-                )
+        watch_state.refresh_registration()
+        result = watch_state.annotate_result(result)
         acknowledged_steer_ids: set[str] = set()
         for steer_id in callback_steer_ids:
             try:
@@ -7786,8 +7865,8 @@ class GatewayRunner:
                     failed=True,
                     failure_type="invalid_approval_request",
                     pending_steer=pending_steer,
-                    claude_code_watch_registration=watch_registration_summary,
-                    claude_code_watch_notice_attached=watch_notice_attached,
+                    claude_code_watch_registration=watch_state.watch_registration,
+                    claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             if not _gateway_approval_request_is_allowed(
                 request,
@@ -7799,8 +7878,8 @@ class GatewayRunner:
                     failed=True,
                     failure_type="invalid_approval_request",
                     pending_steer=pending_steer,
-                    claude_code_watch_registration=watch_registration_summary,
-                    claude_code_watch_notice_attached=watch_notice_attached,
+                    claude_code_watch_registration=watch_state.watch_registration,
+                    claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             try:
                 request = _bind_approval_request_metadata(
@@ -7814,15 +7893,15 @@ class GatewayRunner:
                     failed=True,
                     failure_type="invalid_approval_request",
                     pending_steer=pending_steer,
-                    claude_code_watch_registration=watch_registration_summary,
-                    claude_code_watch_notice_attached=watch_notice_attached,
+                    claude_code_watch_registration=watch_state.watch_registration,
+                    claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             if self._task_cancel_reason(ctx, generation) is not None:
                 return _GatewayAgentResult(
                     None,
                     pending_steer=pending_steer,
-                    claude_code_watch_registration=watch_registration_summary,
-                    claude_code_watch_notice_attached=watch_notice_attached,
+                    claude_code_watch_registration=watch_state.watch_registration,
+                    claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             actor_id = self._stable_actor_id(task_event)
             if actor_id is None:
@@ -7843,22 +7922,22 @@ class GatewayRunner:
                     return self._safe_exception_result(
                         exc,
                         pending_steer=pending_steer,
-                        claude_code_watch_registration=watch_registration_summary,
-                        claude_code_watch_notice_attached=watch_notice_attached,
+                        claude_code_watch_registration=watch_state.watch_registration,
+                        claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                     )
                 return _GatewayAgentResult(
                     "当前平台事件缺少可验证的用户身份，受控操作未执行。",
                     failed=True,
                     failure_type="approval_identity_unavailable",
                     pending_steer=pending_steer,
-                    claude_code_watch_registration=watch_registration_summary,
-                    claude_code_watch_notice_attached=watch_notice_attached,
+                    claude_code_watch_registration=watch_state.watch_registration,
+                    claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             question = _format_approval_question(request)
             approval_watch_notice_attached = False
-            if not watch_notice_attached:
+            if not watch_state.watch_notice_attached:
                 watch_notice = _format_claude_code_watch_registration_notice(
-                    watch_registration_summary,
+                    watch_state.watch_registration,
                 )
                 if watch_notice:
                     question = f"{question}\n\n{watch_notice}"
@@ -7894,8 +7973,8 @@ class GatewayRunner:
                 return self._safe_exception_result(
                     exc,
                     pending_steer=pending_steer,
-                    claude_code_watch_registration=watch_registration_summary,
-                    claude_code_watch_notice_attached=watch_notice_attached,
+                    claude_code_watch_registration=watch_state.watch_registration,
+                    claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             if (
                 getattr(ctx, "delivery_generation", generation) == generation
@@ -7903,12 +7982,12 @@ class GatewayRunner:
             ):
                 ctx.delivery_id = delivery_id
             if approval_watch_notice_attached:
-                watch_notice_attached = True
+                watch_state.watch_notice_attached = True
             return _GatewayAgentResult(
                 question,
                 pending_steer=pending_steer,
-                claude_code_watch_registration=watch_registration_summary,
-                claude_code_watch_notice_attached=watch_notice_attached,
+                claude_code_watch_registration=watch_state.watch_registration,
+                claude_code_watch_notice_attached=watch_state.watch_notice_attached,
             )
         if (
             getattr(ctx, "delivery_generation", generation) == generation
