@@ -606,7 +606,7 @@ class ClaudeCodeController:
         round_id: str,
         instruction: str,
     ) -> ClaudeCodeControllerResult:
-        """提交用户明确给出的补充或延后初始指令，不处理待审批动作。"""
+        """仅基于最近已终结轮次创建一轮新的用户任务。"""
 
         if not isinstance(instruction, str) or not instruction.strip():
             raise ClaudeCodeControllerError(
@@ -623,7 +623,8 @@ class ClaudeCodeController:
             raise self._terminal_error(process_id)
         assert task is not None
         with task.lock:
-            # 在 task 锁内重验调用方已知的 round，避免旧上下文自动落到更新后的 round。
+            # 在 task 锁内重验调用方已知的上一终态 round，避免旧上下文
+            # 自动落到活动 round，或在并发状态变化后向其追加输入。
             self._assert_send_round_matches_locked(task, round_id)
             snapshot = self._current_snapshot_locked(task)
             action = snapshot.action_required
@@ -636,14 +637,9 @@ class ClaudeCodeController:
                         "action_kind": action.kind.value,
                     },
                 )
-            active_round = task.active_round
             initial_submission = not task.initial_instruction_submitted
-            starts_new_round = active_round is None
-            if starts_new_round:
-                self._guard_new_round_input_locked(task, snapshot)
-            else:
-                self._guard_input_locked(task)
-            if starts_new_round and not self._new_round_submission_ready(
+            self._guard_new_round_input_locked(task, snapshot)
+            if not self._new_round_submission_ready(
                 task,
                 snapshot,
             ):
@@ -667,18 +663,10 @@ class ClaudeCodeController:
             if initial_submission:
                 task.initial_instruction_submitted = True
                 task.startup_ready_observation_count = 0
-            if starts_new_round:
-                self._begin_round_locked(
-                    task,
-                    round_start_cursor=snapshot.raw_cursor,
-                )
-            else:
-                assert active_round is not None
-                self._note_round_instruction_locked(
-                    task,
-                    active_round,
-                    instruction_cursor=snapshot.raw_cursor,
-                )
+            self._begin_round_locked(
+                task,
+                round_start_cursor=snapshot.raw_cursor,
+            )
             if action is not None:
                 task.last_snapshot = replace(
                     self._current_snapshot_locked(task),
@@ -2758,21 +2746,53 @@ class ClaudeCodeController:
         task: _ControllerTask,
         round_id: str,
     ) -> None:
-        """仅允许基于当前 active round 或最近已终结 round 创建/补充任务。"""
+        """新指令只能基于紧邻的已终结 round，绝不追加到活动 round。"""
 
         current_round = task.active_round
         if current_round is not None:
-            if current_round.round_id != round_id:
-                if round_id in task.terminal_round_results:
-                    raise self._round_mismatch_error(task.process_id, round_id)
-                raise self._round_not_found_error(task.process_id, round_id)
-            return
+            raise self._round_in_progress_error(
+                task.process_id,
+                round_id,
+                active_round_id=current_round.round_id,
+            )
         if task.latest_terminal_round_id is None:
-            raise self._round_not_found_error(task.process_id, round_id)
+            raise self._previous_round_required_error(task.process_id, round_id)
         if task.latest_terminal_round_id != round_id:
             if round_id in task.terminal_round_results:
                 raise self._round_mismatch_error(task.process_id, round_id)
             raise self._round_not_found_error(task.process_id, round_id)
+
+    @staticmethod
+    def _round_in_progress_error(
+        process_id: str,
+        round_id: str,
+        *,
+        active_round_id: str,
+    ) -> ClaudeCodeControllerError:
+        """活动轮次只能通过其既有交互路径继续，不能接收新任务。"""
+
+        return ClaudeCodeControllerError(
+            "round_in_progress",
+            "Claude Code has an active task round",
+            details={
+                "process_id": process_id,
+                "round_id": round_id,
+                "active_round_id": active_round_id,
+            },
+        )
+
+    @staticmethod
+    def _previous_round_required_error(
+        process_id: str,
+        round_id: str,
+    ) -> ClaudeCodeControllerError:
+        """启动交互尚未形成终态 round 时，禁止借此提交新任务。"""
+
+        return ClaudeCodeControllerError(
+            "previous_round_required",
+            "Claude Code requires a preceding terminal task round",
+            details={"process_id": process_id, "round_id": round_id},
+        )
 
     @staticmethod
     def _round_not_found_error(
