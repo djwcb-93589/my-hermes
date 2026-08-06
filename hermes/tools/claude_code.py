@@ -233,33 +233,58 @@ def _watch_registration_status(
 ) -> dict:
     """把 Gateway 私有注册 Sink 投影成有限 Tool 状态。"""
 
+    def _task_was_started() -> bool:
+        process_id = getattr(result, "process_id", None)
+        round_id = getattr(result, "round_id", None)
+        return (
+            isinstance(process_id, str)
+            and bool(process_id.strip())
+            and isinstance(round_id, str)
+            and bool(round_id.strip())
+            and getattr(result, "initial_instruction_submitted", False)
+            is True
+        )
+
+    def _record(registration: ClaudeCodeWatchRegistrationResult) -> dict:
+        capture = getattr(sink, "capture_registration_result", None)
+        if callable(capture):
+            try:
+                capture(
+                    registration,
+                    task_started=_task_was_started(),
+                )
+            except Exception:
+                # 注册摘要失败不能改变已经返回给 Tool 的注册结果。
+                pass
+        return registration.to_safe_dict()
+
     if action != "start" or grant.environment != "gateway":
         return not_applicable_watch_registration().to_safe_dict()
     register = getattr(sink, "register_start_result", None)
     if not callable(register):
-        return ClaudeCodeWatchRegistrationResult(
+        return _record(ClaudeCodeWatchRegistrationResult(
             status="registration_failed",
             error_type="watch_sink_unavailable",
             retryable=True,
-        ).to_safe_dict()
+        ))
     try:
         registration = register(
             result=result,
             session_owner=grant.owner.session_owner,
         )
     except Exception:
-        return ClaudeCodeWatchRegistrationResult(
+        return _record(ClaudeCodeWatchRegistrationResult(
             status="registration_failed",
             error_type="watch_registration_failed",
             retryable=False,
-        ).to_safe_dict()
+        ))
     if not isinstance(registration, ClaudeCodeWatchRegistrationResult):
-        return ClaudeCodeWatchRegistrationResult(
+        return _record(ClaudeCodeWatchRegistrationResult(
             status="registration_failed",
             error_type="watch_registration_failed",
             retryable=False,
-        ).to_safe_dict()
-    return registration.to_safe_dict()
+        ))
+    return _record(registration)
 
 
 def _default_claude_code_adapter() -> ClaudeCodeAgentAdapter:

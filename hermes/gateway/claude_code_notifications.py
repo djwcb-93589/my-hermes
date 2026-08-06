@@ -93,6 +93,35 @@ class GatewayClaudeCodeWatchRegistrationSink:
         if readiness_provider is not None and not callable(readiness_provider):
             raise TypeError("readiness_provider must be callable")
         self._readiness_provider = readiness_provider
+        # 仅保存当前 Agent run 的最小注册摘要，不复制 Watcher registry。
+        self._last_registration_result: ClaudeCodeWatchRegistrationResult | None = None
+        self._last_task_started = False
+
+    def capture_registration_result(
+        self,
+        result: ClaudeCodeWatchRegistrationResult,
+        *,
+        task_started: bool,
+    ) -> None:
+        """记录当前 run 的安全注册结果，供 Gateway 回合协调层读取。"""
+
+        if not isinstance(result, ClaudeCodeWatchRegistrationResult):
+            return
+        self._last_registration_result = result
+        self._last_task_started = bool(task_started)
+
+    def safe_registration_result(self) -> dict[str, object] | None:
+        """返回不含 target、owner 或 watch id 的 run-local 摘要。"""
+
+        result = self._last_registration_result
+        if result is None:
+            return None
+        return {
+            "status": result.status,
+            "registered": result.registered,
+            "retryable": result.retryable,
+            "task_started": self._last_task_started,
+        }
 
     def register_start_result(
         self,
