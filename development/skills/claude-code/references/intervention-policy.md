@@ -15,7 +15,7 @@ Agent 不得因“进度如何”“继续”“完成了吗”、任务偏离�
 
 ## ActionRequired 优先
 
-当前 ActionRequired 高于新的普通任务输入。Agent 不得替用户回答澄清、批准目录信任/运行时权限、认证、破坏性操作、外部访问、未知 Prompt 或中断菜单；也不得发送 `progress-request.md`、`corrective-instruction.md` 或 `safe-stop.md` 作为自动 PTY 输入。
+当前 ActionRequired 高于新的普通任务输入。Agent 不得替用户回答澄清、批准目录信任/运行时权限、认证、破坏性操作、外部访问、未知 Prompt 或中断菜单；也不得把纠偏、进度或安全停止文本作为自动 PTY 输入。
 
 确定性 Conversation 续接会将用户明确回复原样提交。用户未回复、交互已过期或送达未知时，停止自动输入；不要以相同或改写的消息反复尝试。
 

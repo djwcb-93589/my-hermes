@@ -74,7 +74,7 @@ AgentLoop 继续使用通用 Tool 调度机制；Claude Code 专用状态机封�
 
 不要把“继续”“再试一次”或旧任务正文当作新的 `instruction`。不要通过再次 `start` 模拟同一 Session 的新 round。`current_interaction`、`reply_to_interaction`、`user_confirmed` 和 `action_id` 是内部确定性续接合同，不是模型可填写的 Tool action。
 
-完整字段、结果 envelope、错误投影与 Watch 状态见 [p8-tool-contract.md](references/p8-tool-contract.md)。
+完整字段、结果 envelope、错误投影与 Watch 状态见 [tool-contract.md](references/tool-contract.md)。
 
 ## ActionRequired 与用户回复
 
@@ -112,4 +112,4 @@ Gateway 在成功确认提交一个 round 后会尝试注册 Completion Watch。
 - 在启动 ActionRequired 后保存或自动重放原任务；没有前一终态 round 时，`send_instruction` 不能绕过 `previous_round_required` / `round_not_found` 限制；
 - 裸 CLI one-shot 作为本 Skill 的正常流程或受管 Tool 失败后的 fallback。
 
-本运行时源是 bundled `claude-code` Skill 的规范来源；发布副本只交付本文件、`references/` 与 `templates/`，并与本源保持相同的运行时合同。Bundled 发现不会自动安装到用户 Skill 根，也不会改变用户本地 Skill 的既有优先级。
+开发源与 bundled 副本必须保持相同的运行时合同。Bundled 发布物只交付 `SKILL.md`、`references/`、`templates/` 与系统治理 sidecar。Bundled Skill 的发现不会自动安装到用户 Skill 根，也不会改变用户本地 Skill 的既有优先级。

@@ -43,4 +43,4 @@ Runtime 的绝对 cursor、输出归一化、input echo 隔离和状态检测会
 
 如果 ProcessManager 已登记进程但启动后快照转换、PTY/cwd 校验或 SessionRef 建立失败，受管路径只清理本次 process id；不会清理同 session 的其他后台进程，也不会建立第二套 cleanup。启动或清理失败以安全结构化结果返回，不能触发裸 CLI fallback。
 
-Runtime 的内部 `read`、`write`、`submit`、`wait`、`interrupt` 和 `kill` 保持 Controller/ProcessManager 的职责；它们不是本 Skill 的模型接口。关于公开结果和输入语义，见 [p8-tool-contract.md](p8-tool-contract.md)。
+Runtime 的内部 `read`、`write`、`submit`、`wait`、`interrupt` 和 `kill` 保持 Controller/ProcessManager 的职责；它们不是本 Skill 的模型接口。关于公开结果和输入语义，见 [tool-contract.md](tool-contract.md)。
