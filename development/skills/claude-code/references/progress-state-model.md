@@ -1,81 +1,37 @@
-# 进度状态模型
+# round 与状态模型
 
-这些状态是 Skill 在当前 Agent 上下文中的逻辑判断，用于解释 Claude Code 的活动。它们不写入 ProcessManager，也不替代 ProcessStatus：`starting`、`running`、`exited`、`killed`、`lost`、`failed_start`。
+受管状态由 Controller/Runtime 产生，Agent 只读取 Tool result，不自行把日志文本写回状态机。Process 生命周期与任务 round 是两层不同事实。
 
-P5 `ClaudeCodeSnapshot.state` 使用较粗的运行时集合：`STARTING`、`READY`、`WORKING`、`WAITING_INPUT`、`WAITING_APPROVAL`、`COMPLETED`、`FAILED`、`INTERRUPTED`、`LOST`、`UNKNOWN`。其中 `WORKING` 可以由上层监督根据新增事件细分为下表的 `PLANNING`、`INSPECTING`、`EDITING`、`RUNNING_COMMAND` 或 `RUNNING_TESTS`；`WAITING_INPUT` 对应 `WAITING_USER`，`WAITING_APPROVAL` 对应 `WAITING_PERMISSION`。不要把上层细分写回 ProcessManager 或伪装成 P5 检测器已确认的事实。
+## Snapshot state
 
-## 逻辑状态
-
-| 状态 | 判定含义 |
+| 状态 | 含义 |
 | --- | --- |
-| `PRECHECK` | 正在检查 Backend、Tool、cwd、CLI、模式和用户约束。 |
-| `STARTING` | Terminal Tool 已被请求启动，尚未确认可交互运行。 |
-| `READY` | Process 为 `running`，Claude Code 已表现为可接收初始任务或下一条输入。 |
-| `PLANNING` | 正在形成、说明或调整与目标相关的计划。 |
-| `INSPECTING` | 正在读取或分析相关文件、diff、配置或错误上下文。 |
-| `EDITING` | 正在创建或修改获准范围内的文件。 |
-| `RUNNING_COMMAND` | 正在执行获准的非测试命令。 |
-| `RUNNING_TESTS` | 正在执行用户明确允许的测试或检查。 |
-| `WAITING_PERMISSION` | 明确等待权限或安全确认。 |
-| `WAITING_USER` | 明确提出需要用户或上层 Agent 回答的问题。 |
-| `BLOCKED` | 已识别具体阻塞，Claude Code 无法自行继续。 |
-| `STALLED` | 连续多个监督周期无有效进展，且不能由正常思考、读取或允许的耗时命令解释。 |
-| `COMPLETED` | 满足 Skill 的组合完成条件，正在或已经收尾。 |
-| `FAILED` | 自然失败、启动失败或已确认无法完成。 |
-| `UNKNOWN` | 新增输出不足以可靠分类；暂时保持观察。 |
+| `STARTING` | 受管 Session 正在启动，尚未确认可接收任务。 |
+| `READY` | 活跃 Session 已有可信可输入证据，且没有当前 ActionRequired。 |
+| `WORKING` | 当前 round 已提交，出现真实非 echo 工作活动。 |
+| `WAITING_INPUT` | Claude Code 正在等待澄清或其他用户输入。 |
+| `WAITING_APPROVAL` | Claude Code 正在等待权限、认证或其他确认。 |
+| `COMPLETED` | 已有完成证据并收敛为完成。 |
+| `FAILED` | 已有失败证据或失败进程事实并收敛。 |
+| `INTERRUPTED` | 已确认的协作式中断已按真实证据收敛。 |
+| `LOST` | 进程/所有权事实无法可靠确认。 |
+| `UNKNOWN` | 现有输出不足以可靠分类；不是完成或可输入证据。 |
 
-同一轮可以观察到多种活动，但只保存最能决定下一步的当前状态。ProcessStatus 优先决定能否输入和是否需要收尾；逻辑状态只决定如何理解进展与是否考虑干预。
+`STALLED` 不在 Snapshot state 枚举中。它是 Controller 的 ActionRequired/outcome，表示有界观察中没有足够的新活动；它不等于进程已退出、任务失败、READY 或可以自动发送新指令。
 
-## 允许保存的最小状态
+## round 与 process
 
-当前 Agent 上下文只维护：
+| Tool 字段 | 语义 |
+| --- | --- |
+| `process_active` | 仅表示受管底层 process 仍处于 active ProcessStatus。 |
+| `round_id` | 当前或已保存 round 的不透明身份。 |
+| `round_terminal` | 当前返回的 round 已经 `COMPLETED`、`FAILED` 或 `INTERRUPTED` 等终态。 |
+| `outcome` | 本次 Controller 调用的有界结果，例如 `running`、`action_required`、`terminal`、`interrupt_pending` 或 `stalled`。 |
 
-```text
-process_id
-next_cursor
-logical_state
-last_meaningful_progress
-last_progress_signature
-last_instruction
-last_intervention_reason
-intervention_count
-unknown_count
-```
+一个 Session 可在相同 `process_id` 上顺序拥有多个 round。只有最新终态 round、没有活动 round、没有未消费 ActionRequired 并且 Session READY 时，`send_instruction` 才会创建不同的新 `round_id`。不得使用旧 round、未知 round 或活动 round 追加普通输入。
 
-不要保存 Process Handle、完整重复日志副本、输入历史、用户凭证或 Claude Code 私有 session 文件。`last_instruction` 只保留最近一条必要内容，用于语义去重，不是输入历史。
+## 事件与活动
 
-## 有效进展
+事件使用 [output-observation.md](output-observation.md) 所列的当前生产枚举。`PROGRESS`、新的相关 `OUTPUT`、真实完成/失败信号、进程状态变化或新 ActionRequired 可以更新理解；输入 echo、ANSI 重绘、spinner、`effort` UI、孤立 `$`、重复错误和空读不能单独更新状态或推断成功。
 
-以下事件可以更新 `last_meaningful_progress`：
-
-- 开始读取新的相关文件；
-- 形成或调整与目标相关的计划；
-- 开始修改目标文件；
-- 完成一个明确修改；
-- 执行允许的命令；
-- 得到新的错误并开始处理；
-- 报告测试或检查结果；
-- 主动总结当前阶段；
-- 明确提出需要上层决策的问题。
-
-`last_progress_signature` 应是简短语义摘要，例如“`EDITING` + 目标文件 + 新完成项”或“`BLOCKED` + 新错误类型”，用于识别是否真的变化。不要包含凭证或大段日志。
-
-以下现象不能单独更新有效进展：
-
-- spinner；
-- 重复状态行；
-- ANSI 重绘；
-- 输入 echo；
-- 相同错误重复出现；
-- 同一文件反复读取但没有新结论；
-- 短暂无输出。
-
-## 状态变化规则
-
-- 启动前保持 `PRECHECK`；Terminal Tool 接受启动后进入 `STARTING`。
-- Process 为 `running` 且出现可输入提示时进入 `READY`。
-- 新的计划、检查、编辑、命令或测试证据驱动对应活动状态。
-- 明确权限提示使用 `WAITING_PERMISSION`；明确提问使用 `WAITING_USER`；已知无法继续的原因使用 `BLOCKED`。
-- 只有多周期无进展且排除正常耗时后才使用 `STALLED`，不要设固定秒数作为唯一依据。
-- 无法分类时进入 `UNKNOWN` 并增加 `unknown_count`；一旦出现可分类证据就重置或降低连续未知判断。
-- 只有组合完成条件满足才进入 `COMPLETED`；Process 终态但没有完成证据时根据日志进入 `FAILED` 或 `UNKNOWN`，不要推断成功。
+`raw_cursor` 始终属于 Controller/Runtime；Agent 不保存第二套 cursor、完整日志、输入历史、凭据、Handle 或 Claude 私有 session 文件。

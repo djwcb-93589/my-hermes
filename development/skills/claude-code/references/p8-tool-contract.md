@@ -1,176 +1,84 @@
-# P8 Tool Contract
+# 受管 `claude_code` Tool 合同
 
-本 Skill 只依赖 Terminal Tool 和 Process Tool 的公开返回值，并遵守现有 P8/P7 输入送达语义。不要访问 `ProcessManager`、后台 Handle、PID 或 session registry 的内部实现。
+本文件描述 Agent 面向 Claude Code 的唯一正式受管接口。它不替代可信入站授权，也不公开 Runtime、Controller、ProcessManager、PTY、PID、Handle、owner、Grant 或 Claude CLI 参数。
 
-## Terminal Tool
+## 动态开放与授权
 
-one-shot 使用后台 pipe：
+`claude_code` 默认关闭。只有可信 CLI 或 Gateway 入站链路从当前真实用户消息识别到明确 Claude Code 请求后，才会在当前 Agent 轮次同时注入短生命周期 Grant、可信上下文和 `claude_code` toolset。
 
-```text
-background=true
-pty=false
-```
+模型不能通过 Tool JSON 伪造 Grant、`user_requested`、session owner、route、notification target 或权限绕过参数。缺少可信 Grant 时，Tool 返回 `claude_code_tool_disabled`；Grant 不允许该 action 时返回 `grant_operation_not_authorized`。这些错误不应触发裸 CLI fallback。
 
-只有 supervised PTY 使用：
+## action 与参数
 
-```text
-background=true
-pty=true
-```
+每次调用只接受下表对应字段；未列字段会被拒绝。
 
-Terminal Tool 成功注册后台进程后返回 `process_id` 和公开 `status`；该标识是后续 Process Tool 调用的唯一进程标识。不要从 Backend 实例、session registry、ToolRegistry 或其他私有运行时状态判断能力。
+| action | 必填字段 | 可选字段 | 语义 |
+| --- | --- | --- | --- |
+| `start` | `cwd`、`task` | 无 | 启动新的受管 Claude Code Session。 |
+| `poll` | `process_id` | `round_id` | 执行一次有界 Controller observation。 |
+| `send_instruction` | `process_id`、`round_id`、`instruction` | 无 | 以最新终态 round 为前置条件创建新 round。 |
+| `request_interrupt` | `process_id`、`round_id` | 无 | 对活动 round 请求一次协作式 Ctrl+C。 |
+| `terminate` | `process_id` | 无 | 终止当前 owner 管理的受管 Session。 |
 
-PTY 只受 `LocalBackend` 支持。可信运行时上下文已公开给出 Backend 类型时可以预判；否则直接依赖 Terminal Tool 的公开启动结果。返回 `pty_unsupported` 时不要回退 pipe 交互、切换 Backend 或探查私有状态，应报告 supervised PTY 不可用；这不代表 one-shot pipe 也不可用。Windows LocalBackend 命令遵循 Git Bash/POSIX 语义；不要生成 PowerShell、CMD 或 WSL 命令。
+`cwd`、`task`、`process_id`、`round_id` 和 `instruction` 都是字符串；Tool schema 的最大长度分别为 4096、65535、512、512 和 65535 个字符。Tool 不公开 `wait`、`write`、`submit`、`close`、`log`、`list`、`current_interaction` 或 `reply_to_interaction` action。
 
-## Process Tool
+## `start`
 
-本 Skill 可以使用以下公开 action：
+调用方只传明确 `cwd` 与任务正文。Adapter/Controller 在可信上下文中处理 owner、受管启动、READY 门禁和初始任务提交；模型不提供 `user_requested` 或 CLI command。
 
-- `list`：查看当前 session 拥有的已注册进程；只用于确认归属或清理结果。
-- `poll`：非阻塞读取状态与一页新增日志。
-- `log`：按绝对 cursor 读取追加日志。
-- `wait`：等待状态变化或超时，并读取日志；超时只结束本次等待，不终止进程。
-- `kill`：把终止职责交给 ProcessManager，由其尝试协作式终止并在需要时强制终止。
-- `write`：把 `data` 原样写入 stdin，不附加 Enter。
-- `submit`：写入文本并按当前 transport 提交 Enter；所有普通指示都使用它。
-- `close`：只为普通 pipe stdin 发送真实 EOF；PTY 不支持。
+如果启动阶段先出现 ActionRequired，结果保留 process 身份并报告 `initial_instruction_submitted=false`，不会把任务文本当作 Prompt 回复，也不会自动重放。原生交互只能由确定性 Conversation 续接处理。
 
-## 输入大小
+## `poll` 与结果 envelope
 
-当前 Process `write`/`submit` 的单次 stdin 上限是 64 KiB（65,536 bytes），按 `data` 的 UTF-8 编码字节数校验；`submit` 的 transport Enter 也由 Process Tool 计入。不要使用 Python 字符数、显示字符数或 Markdown 行数代替字节数。
-
-Skill 在发送前负责避免明显超限，Process Tool 仍是最终权威校验，预检查不能替代运行时验证。规则如下：
-
-- one-shot 必须把单次完整 prompt 作为一次 `write`，成功后才 `close`。完整 prompt 超限时在启动前停止，不 `write`、不直接 `close`、不改用 shell 拼接，也不自动拆成多个 write。
-- supervised 初始任务和每条 `submit`/`write` 独立遵守上限。指示保持简短，只发送新增目标、具体偏差、硬约束和下一步动作；不发送巨大日志、完整文件或重复全部历史。
-- 第一版不实现自动分块。多次 write 的边界、delivery unknown、重发和 EOF 需要独立事务协议，不能在本 Skill 中猜测。
-- 运行时仍返回输入过大错误时，不重试、不切换 shell 传输、不自动分块；报告任务未送达，且不回显完整输入。
-
-## Pipe one-shot
-
-one-shot 的 command 固定为 `claude -p`，完整任务不得出现在 command 中。输入和生命周期 action 为：
+所有 action 返回同构的安全 envelope，至少包含：
 
 ```text
-write
-close
-log
-wait
-kill
+ok
+operation
+outcome
+state
+process_id
+cwd
+round_id
+initial_instruction_submitted
+process_active
+round_terminal
+raw_cursor
+events
+normalized_output
+observation_count
+consecutive_empty_reads
+output_used
+deadline_remaining
+action_required
+limits_hit
+error_type
+retryable
+delivery_unknown
+notification_watch
 ```
 
-`poll` 可用于公开状态检查。标准顺序是：
+- `raw_cursor` 直接来自 Controller/Runtime 的绝对 cursor；Tool Handler 不维护、消费或回传 cursor。
+- `events` 只来自本次 Controller observation，每项只包含 `type`、`cursor_start`、`cursor_end`、脱敏有界 `text` 与允许公开的标量 `metadata`。
+- `normalized_output` 是当前有界、脱敏的显示快照，不是完整历史、原始 PTY 或新的日志分页接口。
+- `action_required` 只包含安全投影：`action_id`、`kind`、`summary`、`prompt_text`、`options`、`risk`、cursor 范围和 `requires_user_input`。
 
-```text
-完整任务 UTF-8 编码大小 ≤ 当前 64 KiB 上限
-→
-terminal(command="claude -p", background=true, pty=false)
-→ status=running
-→ process write：data 为完整多行任务
-→ write 明确成功
-→ process close：发送真实 pipe EOF
-→ process log：持续传回 next_cursor
-→ process wait：等待自然退出
-```
+后续调用方必须以返回的 process、round、cursor 和 action identity 为事实来源；不得通过读取 ProcessManager、PTY log 或历史文本建立第二套增量观察。
 
-任务文本只放入 `write.data`，不做 shell 转义或字符串替换，不写入 command、logger 或输入历史。`close` 只结束 stdin，不终止进程，也不适用于 supervised PTY。
+## `send_instruction`：严格 new-round-only
 
-Terminal 返回后按公开状态处理：
+`round_id` 必须是调用方已知的、紧邻的最新终态 round。Controller 在 task 锁内重新验证 owner、process 活跃性、无未消费 ActionRequired、无活动 round、最新终态 round 一致性和 READY 门禁；只有全部通过才单次提交并创建不同的新 round id。
 
-- `running`：允许执行一次任务 `write`，成功后 `close`。
-- `exited`：不调用 `write` 或 `close`；读取最终日志并报告任务提交前提前退出。
-- `killed`、`lost`、`failed_start`：不发送任务，不声称 one-shot 已开始，进入对应恢复流程。
+活动 round 会拒绝提交，通常返回 `round_in_progress`；若当前还有未消费的 `ActionRequired`，相关交互错误会优先。不会追加 stdin、重置活动状态、排队、自动 interrupt 或注册 Watch。已过期的终态 round 返回 `round_mismatch`，未知 round 返回 `round_not_found`；没有可引用前一终态 round 时，Controller 使用 `previous_round_required`，而 Tool 的前置引用校验也可能提前返回等价的 `round_not_found`。`instruction_delivery_unknown` 时不自动重发。
 
-## PTY supervised
+`instruction` 必须是用户当前明确给出的新任务，而非“继续”“完成了吗”或旧任务重放。不得重新 `start` 来模拟同一 Session 的新 round。
 
-supervised PTY 可使用：
+## 中断、终止与通知
 
-```text
-write
-submit
-poll
-log
-wait
-kill
-```
+`request_interrupt` 只发送一次协作式 Ctrl+C；若未确认终止，返回 `interrupt_pending`，不自动发送第二次 Ctrl+C 或 kill。`terminate` 只在用户明确选择时调用受管终止路径；两者都不扫描或操作外部 PID。
 
-行式初始任务、纠偏和 safe-stop 使用 `submit`。`write` 只保留给已有公开协议明确要求的非行式数据，不得用于自行实现进程中断。PTY 不使用 `close`；当前 PTY stdin EOF 不支持，调用会被拒绝。
+Gateway 仅在 `start` 或 `send_instruction` 已成功确认提交新 round 后尝试 Watch 注册。`notification_watch.status=registered` 或 Outbox `accepted` 都不表示平台通知已经送达；注册失败、未知或 target 冲突不改变已提交任务，也不触发重启、终止或重复提交。CLI 的 `notification_watch` 不适用。
 
-## ProcessStatus
+## 内部用户续接
 
-Process Tool 的生命周期状态是：
-
-```text
-starting
-running
-exited
-killed
-lost
-failed_start
-```
-
-这些状态由 ProcessManager 拥有。Skill 的 `PLANNING`、`EDITING`、`STALLED` 等逻辑状态只能解释 Claude Code 的活动，不得覆盖或替换 ProcessStatus。
-
-发送 `write` 或 `submit` 前必须根据 Terminal 返回值或最新的 `poll`/`log` 响应确认 `status=running`。不要仅凭取得 `process_id` 推断正在等待 stdin，也不要向 `starting` 或任何终态发送输入。
-
-## Cursor
-
-第一次读取可以使用 `cursor=0`。之后每次都执行：
-
-```text
-下一次 cursor = 本次 Process Tool 返回的 next_cursor
-```
-
-必须原样保存和传回 `next_cursor`。不得：
-
-- 按脱敏后文本长度计算 cursor；
-- 按 ANSI 或 `\r` 清理后的长度计算 cursor；
-- 根据显示字符数、行数或输入 echo 推算 cursor；
-- 从 `0` 反复读取全部日志；
-- 在 Skill 中建立第二套分页或补偿算法。
-
-如果响应提示输出截断或当前可用起点变化，仍以 Process Tool 返回的 `next_cursor` 和公开字段继续，不自行修复原始位置。
-
-## PTY 输出
-
-PTY `output` 是原始追加流，可能包含：
-
-```text
-ANSI
-\r
-echo
-spinner
-重复重绘
-```
-
-这些内容可以在语义判断时忽略，但不能用于改写 cursor。Process 日志不是当前屏幕快照，也不提供可靠的 terminal resize 或复杂全屏 TUI 重建。
-
-## 输入与 EOF 失败语义
-
-所有 `write`/`submit` 输入都遵守：`process_input_delivery_unknown` 后不自动重发，不假设成功或失败，并先使用 `poll`/`log` 读取新增输出。日志没有立即 echo，或只 echo 了部分文本，都不能证明完整输入是否送达。
-
-one-shot `write` 返回 delivery unknown 时还必须：
-
-1. 不发送第二份任务；
-2. 不立即调用 `close`；
-3. 不根据 echo 猜测完整 prompt；
-4. 无法确认时停止自动输入并报告；
-5. 为避免 Claude Code 执行不完整提示而需要终止时，调用 `process kill`。
-
-`write` 明确失败且公开结果确认未送达时，不统一自动重试。只有返回值明确允许 `retryable`，并且一次受控处理不会重复副作用时，才可以决定是否处理一次。
-
-pipe `close` 未确认时，不声称 EOF 已发送或 Claude Code 已开始处理。只根据公开 `retryable` 语义决定是否重试 `close`；重试 close 时绝不再次 `write` prompt。无法收敛时停止自动操作并报告。
-
-## 终止职责
-
-supervised PTY 在输入安全且进程仍为 `running` 时，先通过 `submit` 发送一次 safe-stop 文字指示，读取新增日志并进行一次有界观察，判断是否出现有效状态变化；自然结束时用 `wait` 收尾，仍需终止时调用 `process(action="kill", process_id=<process_id>)`。one-shot pipe 已关闭 stdin、输入送达未知或继续输入不安全时，跳过 safe-stop，直接使用 `kill`。
-
-`process kill` 由 ProcessManager 负责：
-
-- 尝试协作式终止；
-- 等待 grace period；
-- 必要时强制终止整个 Job/PGID；
-- 记录终止来源和真实信号；
-- 收尾 Handle 与最终输出；
-- 保持 `lost`、`failed_start` 等状态历史。
-
-Skill 不直接发送 Ctrl+C 字节或可视文本，不操作 PID、系统信号、Windows Job 或 Handle，也不在 kill 失败后自行连续重试。
+`current_interaction`、`reply_to_interaction`、`user_confirmed` 和原生 prompt/options 不在模型 Tool schema 中。确定性 Conversation 协调层以当前 owner、process、round 和 `action_id` 复核用户明确回复后，才调用 Controller 的内部续接路径。用户回复、密码、Token 和认证内容不进入普通 Tool result；送达未知时不自动重发。

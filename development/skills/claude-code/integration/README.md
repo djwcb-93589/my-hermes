@@ -26,7 +26,7 @@ python local_skill.py uninstall
 
 安装不会写入 `trusted_skills.json`、生成 `.myhermes.json` 或自动信任、pin、adopt Skill。风险扫描、交互确认和治理决策仍由 my-hermes 现有机制处理。
 
-## P3 发现与选择接入
+## 发现、授权与受管调用
 
 安装器只负责把开发源中的运行时 package 复制和管理到用户安装目录，不注册 Skill、不修改 Agent Prompt，也不通知运行中的 Agent。默认安装目录与现有发现根一致，链路为：
 
@@ -39,7 +39,7 @@ HERMES_HOME
 → Agent 可见的 Skill 名称和 description
 ```
 
-`SkillRepository` 当前合并 bundled 与本地用户两个根目录：先扫描 bundled，再以同目录名的用户 Skill 稳定覆盖。当前没有独立的 workspace Skill 来源；项目上下文文件也不是第三个 Skill 根。P3 沿用这一通用规则，不增加 `claude-code` 特判、第二套 Loader 或 Claude Code 专用 Tool。
+`SkillRepository` 当前合并 bundled 与本地用户两个根目录：先扫描 bundled，再以同目录名的用户 Skill 稳定覆盖。当前没有独立的 workspace Skill 来源；项目上下文文件也不是第三个 Skill 根。发现仍沿用这一通用规则，不增加 `claude-code` 专用 Loader 或第二套 Loader。
 
 ### Skill catalog
 
@@ -61,4 +61,17 @@ Claude Code Skill 不根据仓库规模、多文件修改、任务复杂度或�
 
 使用 `python local_skill.py status` 可以确认安装状态；`ready=true` 只表示安装副本结构、ownership 和 revision 完整，不表示当前 Agent 已发现、具备 `skill_read`、获得用户启用授权、调用过 `skill_view`、通过 preflight，或已经启动 Claude Code。确认这些状态必须留到新 Agent 上下文中的独立 T3；不能从安装器状态推断。
 
-P3 只完成发现和选择接入。它不自动启动 `claude`，不调用 Terminal/Process，不处理真实 Claude Code 输出，也不代表 one-shot 或 supervised PTY 已通过真实任务验收；这些行为留给后续阶段和独立 T3。
+安装与发现本身不构成 Claude Code 授权，也不会把 Tool 热注入已有 Agent run。当前新 run 中，只有可信入站链路从当前真实用户消息识别到明确 Claude Code 请求，才会同时注入短生命周期 Grant、可信 ToolPolicy 上下文并动态开放 `claude_code` Tool。
+
+受管调用链为：
+
+```text
+当前真实用户明确请求
+→ 动态开放 claude_code Tool
+→ ClaudeCodeAgentAdapter
+→ ClaudeCodeController
+→ Runtime / ProcessManager / PTY
+→ Claude Code CLI
+```
+
+AgentLoop 继续通过通用 Tool 调度该能力，不直接嵌入 Controller。安装器不生成 Grant、不伪造 owner、不启动 Claude CLI，也不把旧 Terminal/Process 裸 CLI 设为受管 Tool 失败后的 fallback；完整受管使用规则见 package 的 [SKILL.md](../SKILL.md)。
