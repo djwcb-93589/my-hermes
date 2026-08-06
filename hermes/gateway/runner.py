@@ -79,6 +79,7 @@ from hermes.db import (
     create_gateway_approval_with_outbox,
     delete_gateway_messages,
     deny_gateway_approval,
+    enqueue_gateway_coordination_notice_outbox,
     enqueue_gateway_outbox,
     finish_cron_delivery_preparation,
     enqueue_gateway_message,
@@ -255,6 +256,15 @@ _APPROVAL_RESUME_TERMINAL_FAILURES = frozenset({
     "invalid_approval_resume_state",
     "approval_execution_persistence_failed",
     "approval_resume_fallback_unavailable",
+})
+_CLAUDE_CODE_WATCH_NOTICE_DELIVERY_KIND_PREFIX = (
+    "claude_code_watch_registration_notice:"
+)
+_CLAUDE_CODE_WATCH_NOTICE_CODES = frozenset({
+    "registration_failed",
+    "registration_unknown",
+    "target_conflict",
+    "registration_unconfirmed",
 })
 
 
@@ -713,37 +723,51 @@ def _format_claude_code_watch_registration_notice(
 ) -> str | None:
     """将当前 run 的 Watch 摘要转成一次性、安全的用户提示。"""
 
-    if not isinstance(summary, dict) or summary.get("task_started") is not True:
-        return None
-    status = summary.get("status")
-    if status in {"not_applicable", "not_registered_no_round"}:
-        return None
-    if status == "registration_failed":
+    notice_code = _claude_code_watch_registration_notice_code(summary)
+    if notice_code == "registration_failed":
         return (
             "Claude Code 任务已经启动，但后台终态通知注册失败。\n"
             "你仍可以明确询问“Claude Code 现在运行到哪了？”来查询状态和最新输出。"
         )
-    if status == "registration_unknown":
+    if notice_code == "registration_unknown":
         return (
             "Claude Code 任务已经启动，但后台终态通知的注册状态暂时无法确认。\n"
             "请不要重新启动任务；你可以明确查询 Claude Code 的当前状态。"
         )
-    if status == "target_conflict":
+    if notice_code == "target_conflict":
         return (
             "Claude Code 任务已经启动，但该任务的通知目标与现有绑定冲突，"
             "未重新绑定通知目标。\n"
             "任务仍在运行，可通过显式状态查询继续查看。"
         )
-    if status not in {
-        "registered",
-        "already_registered",
-    }:
+    if notice_code == "registration_unconfirmed":
         # 摘要不完整时只给出保守事实，不暴露内部错误或 target 信息。
         return (
             "Claude Code 任务状态已返回，但后台终态通知状态无法确认，"
             "请显式查询任务状态。"
         )
     return None
+
+
+def _claude_code_watch_registration_notice_code(
+    summary: object,
+) -> str | None:
+    """把安全注册摘要收敛为稳定、有限的协调提示身份。"""
+
+    if not isinstance(summary, dict) or summary.get("task_started") is not True:
+        return None
+    status = summary.get("status")
+    if status in {"not_applicable", "not_registered_no_round"}:
+        return None
+    if status in {
+        "registration_failed",
+        "registration_unknown",
+        "target_conflict",
+    }:
+        return str(status)
+    if status in {"registered", "already_registered"}:
+        return None
+    return "registration_unconfirmed"
 
 
 def _load_gateway_context_values(
@@ -2373,6 +2397,9 @@ class GatewayRunner:
         return (
             delivery_kind.startswith("cron_")
             or delivery_kind == SYSTEM_NOTIFICATION_DELIVERY_KIND
+            or delivery_kind.startswith(
+                _CLAUDE_CODE_WATCH_NOTICE_DELIVERY_KIND_PREFIX,
+            )
         )
 
     async def launch_system_outbox(self, outbox_id: str, route_key: str) -> None:
@@ -4092,6 +4119,132 @@ class GatewayRunner:
             "payloads": payloads,
         }
 
+    @staticmethod
+    def _persisted_outbox_matches_desired_content(
+        persisted: object,
+        expected: dict,
+    ) -> bool:
+        """按完整安全 Outbox 投影确认既有正文属于本次投递。"""
+
+        if not isinstance(persisted, dict) or not isinstance(expected, dict):
+            return False
+        fields = (
+            "route_key",
+            "source_message_id",
+            "queue_message_id",
+            "event_json",
+            "platform",
+            "chat_id",
+            "reply_to_message_id",
+            "thread_id",
+            "delivery_kind",
+            "payloads",
+        )
+        return all(
+            persisted.get(field) == expected.get(field)
+            for field in fields
+        )
+
+    def _build_claude_code_watch_notice_outbox(
+        self,
+        route_key: str,
+        event: MessageEvent,
+        notice: str,
+        summary: object,
+    ) -> dict | None:
+        """构造与原请求绑定、但不接管其 Queue 的协调提示 Outbox。"""
+
+        notice_code = _claude_code_watch_registration_notice_code(summary)
+        if (
+            notice_code not in _CLAUDE_CODE_WATCH_NOTICE_CODES
+            or not isinstance(notice, str)
+            or not notice
+        ):
+            return None
+        source_binding = hashlib.sha256(
+            f"{route_key}\x1f{event.message_id}".encode("utf-8"),
+        ).hexdigest()
+        delivery_kind = (
+            f"{_CLAUDE_CODE_WATCH_NOTICE_DELIVERY_KIND_PREFIX}{notice_code}"
+        )
+        delivery_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes:claude-code-watch-notice:v1:{source_binding}:{notice_code}",
+            )
+        )
+        queue_identity = (
+            f"claude-code-watch-notice:{source_binding}:{notice_code}"
+        )
+        outbox = self._build_outbox(
+            route_key,
+            event,
+            notice,
+            delivery_id,
+            delivery_kind,
+            queue_message_id=queue_identity,
+        )
+        # 只保存固定来源类型、有限状态码和不可逆绑定摘要，避免把目标或 Watch
+        # 内部数据写入这条独立协调提示的事件载荷。
+        outbox["event_json"] = json.dumps(
+            {
+                "origin_kind": "claude_code_watch_registration_notice",
+                "notice_code": notice_code,
+                "source_binding": source_binding,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return outbox
+
+    async def _ensure_claude_code_watch_notice_outbox(
+        self,
+        route_key: str,
+        event: MessageEvent,
+        notice: str | None,
+        summary: object,
+    ) -> str | None:
+        """可靠建立一次性协调提示；持久化失败时不改变主任务生命周期。"""
+
+        if not isinstance(notice, str) or not notice:
+            return None
+        try:
+            outbox = self._build_claude_code_watch_notice_outbox(
+                route_key,
+                event,
+                notice,
+                summary,
+            )
+        except Exception:
+            return None
+        if outbox is None:
+            return None
+        try:
+            result = await self.persistence.call(
+                enqueue_gateway_coordination_notice_outbox,
+                outbox,
+                **self._runtime_fence_kwargs(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        delivery_id = getattr(result, "delivery_id", None)
+        if (
+            getattr(result, "desired_content_persisted", False) is not True
+            or not isinstance(delivery_id, str)
+            or not delivery_id
+        ):
+            return None
+        try:
+            await self.launch_system_outbox(delivery_id, route_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 已可靠入库的协调提示由启动恢复继续投递，不能反向影响主任务。
+            pass
+        return delivery_id
+
     def _enqueue_outbox(self, outbox: dict) -> str:
         return self.persistence.call_sync(
             enqueue_gateway_outbox,
@@ -4222,6 +4375,8 @@ class GatewayRunner:
         outbox_id: str,
         route_key: str,
         source_message_id: str,
+        *,
+        discard_source_message: bool = True,
     ) -> bool:
         completed = await self.persistence.call(
             complete_gateway_delivery,
@@ -4235,7 +4390,7 @@ class GatewayRunner:
             completed = bool(current and current["status"] == "delivered")
             if not completed and self._runtime_lease_acquired:
                 await self._outbox_send_fence_is_valid_async(outbox_id)
-        if completed:
+        if completed and discard_source_message:
             self._accepted_messages.discard((route_key, source_message_id))
         return completed
 
@@ -4669,6 +4824,9 @@ class GatewayRunner:
                         outbox_id,
                         route_key,
                         outbox["source_message_id"],
+                        discard_source_message=not self._is_system_outbox(
+                            outbox,
+                        ),
                     )
                     if delivered and self._outbox_tracks_processing(outbox):
                         await self._finish_processing_best_effort(
@@ -4703,6 +4861,9 @@ class GatewayRunner:
                     outbox_id,
                     route_key,
                     outbox["source_message_id"],
+                    discard_source_message=not self._is_system_outbox(
+                        outbox,
+                    ),
                 )
                 if delivered and self._outbox_tracks_processing(outbox):
                     await self._finish_processing_best_effort(
@@ -6680,6 +6841,40 @@ class GatewayRunner:
                     agent_result.claude_code_watch_registration,
                 )
             )
+            progressive_controller = agent_result.progressive_controller
+            await self._close_progressive_controller(
+                progressive_controller,
+                abort=False,
+            )
+            response = agent_result.response
+            if (
+                ctx.delivery_generation == generation
+                and ctx.delivery_id is not None
+            ):
+                delivery_id = ctx.delivery_id
+            # worker 返回到事件循环后做最后一道取消检查。即使取消恰好
+            # 发生在模型响应检查之后,也不能把旧回复发送给用户。
+            persisted_outbox = await self._load_outbox_async(delivery_id)
+            cancel_reason = self._task_cancel_reason(ctx, generation)
+            if (
+                cancel_reason is None
+                and watch_notice
+                and event.source.platform in self.adapters
+            ):
+                notice_delivery_id = (
+                    await self._ensure_claude_code_watch_notice_outbox(
+                        route_key,
+                        delivery_event,
+                        watch_notice,
+                        agent_result.claude_code_watch_registration,
+                    )
+                )
+                if notice_delivery_id is not None:
+                    agent_result = replace(
+                        agent_result,
+                        claude_code_watch_notice_attached=True,
+                    )
+                    watch_notice = None
             notices = [
                 notice
                 for notice in (interaction_notice, watch_notice)
@@ -6696,21 +6891,7 @@ class GatewayRunner:
                         else f"{response_text}\n\n{notice_text}"
                     ),
                 )
-            progressive_controller = agent_result.progressive_controller
-            await self._close_progressive_controller(
-                progressive_controller,
-                abort=False,
-            )
             response = agent_result.response
-            if (
-                ctx.delivery_generation == generation
-                and ctx.delivery_id is not None
-            ):
-                delivery_id = ctx.delivery_id
-            # worker 返回到事件循环后做最后一道取消检查。即使取消恰好
-            # 发生在模型响应检查之后,也不能把旧回复发送给用户。
-            persisted_outbox = await self._load_outbox_async(delivery_id)
-            cancel_reason = self._task_cancel_reason(ctx, generation)
             approval_resume_failed = (
                 event.message_id.startswith(_APPROVAL_RESUME_MESSAGE_PREFIX)
                 and agent_result.failed
@@ -6978,13 +7159,34 @@ class GatewayRunner:
                                 )
                             )
                             if failure_watch_notice:
-                                failure = replace(
-                                    failure,
-                                    response=(
-                                        f"{failure.response or _SAFE_INTERNAL_REPLY}"
-                                        f"\n\n{failure_watch_notice}"
-                                    ),
-                                )
+                                notice_delivery_id = None
+                                if event.source.platform in self.adapters:
+                                    notice_delivery_id = (
+                                        await self._ensure_claude_code_watch_notice_outbox(
+                                            route_key,
+                                            delivery_event,
+                                            failure_watch_notice,
+                                            failure.claude_code_watch_registration,
+                                        )
+                                    )
+                                if notice_delivery_id is not None:
+                                    failure = replace(
+                                        failure,
+                                        claude_code_watch_notice_attached=True,
+                                    )
+                                    agent_result = replace(
+                                        agent_result,
+                                        claude_code_watch_notice_attached=True,
+                                    )
+                                    failure_watch_notice = None
+                                else:
+                                    failure = replace(
+                                        failure,
+                                        response=(
+                                            f"{failure.response or _SAFE_INTERNAL_REPLY}"
+                                            f"\n\n{failure_watch_notice}"
+                                        ),
+                                    )
                         try:
                             outbox = self._build_outbox(
                                 route_key,
@@ -6998,14 +7200,21 @@ class GatewayRunner:
                                 outbox
                             )
                             if failure_watch_notice is not None:
-                                failure = replace(
-                                    failure,
-                                    claude_code_watch_notice_attached=True,
+                                persisted_failure_outbox = (
+                                    await self._load_outbox_async(delivery_id)
                                 )
-                                agent_result = replace(
-                                    agent_result,
-                                    claude_code_watch_notice_attached=True,
-                                )
+                                if self._persisted_outbox_matches_desired_content(
+                                    persisted_failure_outbox,
+                                    outbox,
+                                ):
+                                    failure = replace(
+                                        failure,
+                                        claude_code_watch_notice_attached=True,
+                                    )
+                                    agent_result = replace(
+                                        agent_result,
+                                        claude_code_watch_notice_attached=True,
+                                    )
                             if (
                                 ctx.delivery_generation == generation
                                 and self._task_cancel_reason(
@@ -7702,17 +7911,21 @@ class GatewayRunner:
                 "final",
                 queue_message_id=event.message_id,
             )
-            actual_delivery_id = add_final_message_with_gateway_outbox(
+            persisted = add_final_message_with_gateway_outbox(
                 conn,
                 session_id,
                 msg,
                 outbox,
                 **self._runtime_fence_kwargs(),
             )
-            if notice_for_this_attempt is not None:
+            actual_delivery_id = getattr(persisted, "delivery_id", persisted)
+            if (
+                notice_for_this_attempt is not None
+                and getattr(persisted, "desired_content_persisted", False) is True
+            ):
                 watch_state.watch_notice_attached = True
-            delivery_id = actual_delivery_id
-            return actual_delivery_id
+            delivery_id = str(actual_delivery_id)
+            return delivery_id
 
         await self.persistence.call(
             ensure_session,
@@ -7934,14 +8147,14 @@ class GatewayRunner:
                     claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
             question = _format_approval_question(request)
-            approval_watch_notice_attached = False
+            approval_notice_for_this_attempt = None
             if not watch_state.watch_notice_attached:
                 watch_notice = _format_claude_code_watch_registration_notice(
                     watch_state.watch_registration,
                 )
                 if watch_notice:
                     question = f"{question}\n\n{watch_notice}"
-                    approval_watch_notice_attached = True
+                    approval_notice_for_this_attempt = watch_notice
             msg = {"role": "assistant", "content": question}
             outbox = self._build_outbox(
                 route_key,
@@ -7952,7 +8165,7 @@ class GatewayRunner:
                 queue_message_id=event.message_id,
             )
             try:
-                delivery_id = await self.persistence.call(
+                persisted = await self.persistence.call(
                     create_gateway_approval_with_outbox,
                     conversation_id,
                     request,
@@ -7976,12 +8189,16 @@ class GatewayRunner:
                     claude_code_watch_registration=watch_state.watch_registration,
                     claude_code_watch_notice_attached=watch_state.watch_notice_attached,
                 )
+            delivery_id = str(getattr(persisted, "delivery_id", persisted))
             if (
                 getattr(ctx, "delivery_generation", generation) == generation
                 and self._task_cancel_reason(ctx, generation) is None
             ):
                 ctx.delivery_id = delivery_id
-            if approval_watch_notice_attached:
+            if (
+                approval_notice_for_this_attempt is not None
+                and getattr(persisted, "desired_content_persisted", False) is True
+            ):
                 watch_state.watch_notice_attached = True
             return _GatewayAgentResult(
                 question,

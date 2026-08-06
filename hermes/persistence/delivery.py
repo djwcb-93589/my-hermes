@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass
 
 from .database import (
     DBError,
@@ -14,6 +15,8 @@ from .database import (
 )
 from .core import _insert_message
 from .gateway import (
+    _gateway_outbox_fence_values,
+    _gateway_outbox_lease_clause,
     _gateway_lease_epoch_value,
     _insert_gateway_outbox,
     _serialize_gateway_json,
@@ -28,6 +31,297 @@ _GATEWAY_FILE_DELIVERY_COLUMNS = (
     "attempt_count, next_attempt_at, last_error, last_error_code, claimed_by, "
     "claim_epoch, created_at, updated_at, outbox_id"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayFinalMessagePersistResult:
+    """最终消息或协调提示的 Outbox 持久化事实。"""
+
+    delivery_id: str
+    created: bool
+    reused_existing: bool
+    desired_content_persisted: bool
+
+
+_GATEWAY_OUTBOX_CONTENT_COLUMNS = (
+    "id, queue_message_id, payloads_json, status, next_chunk_index, "
+    "message_ids_json, attempt_count, next_attempt_at, last_error, "
+    "last_error_code, claimed_by, claim_epoch, event_json, platform, chat_id, "
+    "reply_to_message_id, thread_id, created_at, updated_at"
+)
+
+
+def _validate_gateway_outbox_content(outbox: dict) -> tuple[str, str]:
+    """校验 Outbox 身份并生成用于精确比对的规范化 payload。"""
+
+    if not isinstance(outbox, dict):
+        raise DBError("gateway outbox must be an object")
+    required = (
+        "id",
+        "route_key",
+        "source_message_id",
+        "event_json",
+        "platform",
+        "chat_id",
+        "delivery_kind",
+        "payloads",
+    )
+    missing = [name for name in required if not outbox.get(name)]
+    if missing:
+        raise DBError(f"gateway outbox missing fields: {', '.join(missing)}")
+    if not isinstance(outbox["payloads"], list):
+        raise DBError("gateway outbox payloads must be a list")
+    queue_message_id = str(
+        outbox.get("queue_message_id") or outbox["source_message_id"]
+    )
+    return queue_message_id, _serialize_gateway_json(
+        outbox["payloads"],
+        "gateway outbox payloads",
+    )
+
+
+def _select_gateway_outbox_content_row(
+    conn: sqlite3.Connection,
+    outbox: dict,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+):
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    lease_clause, lease_params = _gateway_outbox_lease_clause(
+        fence,
+        time.time(),
+    )
+    return conn.execute(
+        f"""
+        SELECT {_GATEWAY_OUTBOX_CONTENT_COLUMNS}
+        FROM gateway_outbox
+        WHERE route_key=? AND source_message_id=? AND delivery_kind=?
+        {lease_clause}
+        """,
+        (
+            str(outbox["route_key"]),
+            str(outbox["source_message_id"]),
+            str(outbox["delivery_kind"]),
+            *lease_params,
+        ),
+    ).fetchone()
+
+
+def _outbox_row_is_unclaimed_and_unsent(row) -> bool:
+    """仅接受数据库能明确证明尚未投递的 Outbox 覆盖候选。"""
+
+    if row is None:
+        return False
+    try:
+        message_ids = json.loads(str(row[5]))
+        return (
+            str(row[3]) == "pending"
+            and int(row[4]) == 0
+            and isinstance(message_ids, list)
+            and not message_ids
+            and int(row[6]) == 0
+            and row[7] is None
+            and row[8] is None
+            and row[9] is None
+            and row[10] is None
+            and row[11] is None
+            and float(row[17]) == float(row[18])
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _outbox_row_matches_delivery_identity(row, outbox: dict) -> bool:
+    """确认既有 Outbox 仍属于本次期望的投递目标与事件身份。"""
+
+    return (
+        str(row[12]) == str(outbox["event_json"])
+        and str(row[13]) == str(outbox["platform"])
+        and str(row[14]) == str(outbox["chat_id"])
+        and row[15] == outbox.get("reply_to_message_id")
+        and row[16] == outbox.get("thread_id")
+    )
+
+
+def _replace_gateway_outbox_payloads_if_safe(
+    conn: sqlite3.Connection,
+    outbox: dict,
+    row,
+    desired_payloads_json: str,
+    *,
+    lease_name: str | None,
+    instance_id: str | None,
+    lease_epoch: int | None,
+) -> bool:
+    """只在未领取、未发送的严格状态下以 CAS 更新 Outbox 正文。"""
+
+    if (
+        not _outbox_row_matches_delivery_identity(row, outbox)
+        or not _outbox_row_is_unclaimed_and_unsent(row)
+    ):
+        return False
+    fence = _gateway_outbox_fence_values(
+        lease_name,
+        instance_id,
+        lease_epoch,
+    )
+    now = time.time()
+    lease_clause, lease_params = _gateway_outbox_lease_clause(fence, now)
+    cursor = conn.execute(
+        f"""
+        UPDATE gateway_outbox
+        SET payloads_json=?, updated_at=?
+        WHERE id=?
+          AND route_key=?
+          AND source_message_id=?
+          AND delivery_kind=?
+          AND queue_message_id=?
+          AND event_json=?
+          AND platform=?
+          AND chat_id=?
+          AND reply_to_message_id IS ?
+          AND thread_id IS ?
+          AND payloads_json=?
+          AND status='pending'
+          AND next_chunk_index=0
+          AND message_ids_json=?
+          AND attempt_count=0
+          AND next_attempt_at IS NULL
+          AND last_error IS NULL
+          AND last_error_code IS NULL
+          AND claimed_by IS NULL
+          AND claim_epoch IS NULL
+          AND created_at=updated_at
+          AND updated_at=?
+          {lease_clause}
+        """,
+        (
+            desired_payloads_json,
+            now,
+            str(row[0]),
+            str(outbox["route_key"]),
+            str(outbox["source_message_id"]),
+            str(outbox["delivery_kind"]),
+            str(row[1]),
+            str(outbox["event_json"]),
+            str(outbox["platform"]),
+            str(outbox["chat_id"]),
+            outbox.get("reply_to_message_id"),
+            outbox.get("thread_id"),
+            str(row[2]),
+            str(row[5]),
+            float(row[18]),
+            *lease_params,
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def _persist_gateway_outbox_content_in_transaction(
+    conn: sqlite3.Connection,
+    outbox: dict,
+    *,
+    allow_payload_update: bool,
+    track_source_ownership: bool = True,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+) -> GatewayFinalMessagePersistResult:
+    """在调用方事务内精确确认或安全写入指定的 Outbox 正文。"""
+
+    queue_message_id, desired_payloads_json = _validate_gateway_outbox_content(
+        outbox,
+    )
+    row = _select_gateway_outbox_content_row(
+        conn,
+        outbox,
+        lease_name=lease_name,
+        instance_id=instance_id,
+        lease_epoch=lease_epoch,
+    )
+    if row is None:
+        inserted = _insert_gateway_outbox(
+            conn,
+            outbox,
+            track_source_ownership=track_source_ownership,
+            return_created=True,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
+        delivery_id, created = inserted
+        persisted = _select_gateway_outbox_content_row(
+            conn,
+            outbox,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
+        if persisted is None:
+            raise DBError("gateway outbox insert did not create a row")
+        if str(persisted[1]) != queue_message_id:
+            raise DBError("gateway outbox queue identity mismatch")
+        return GatewayFinalMessagePersistResult(
+            delivery_id=str(delivery_id),
+            created=created,
+            reused_existing=not created,
+            desired_content_persisted=(
+                _outbox_row_matches_delivery_identity(persisted, outbox)
+                and str(persisted[2]) == desired_payloads_json
+            ),
+        )
+
+    if str(row[1]) != queue_message_id:
+        raise DBError("gateway final outbox queue identity mismatch")
+    if (
+        _outbox_row_matches_delivery_identity(row, outbox)
+        and str(row[2]) == desired_payloads_json
+    ):
+        return GatewayFinalMessagePersistResult(
+            delivery_id=str(row[0]),
+            created=False,
+            reused_existing=True,
+            desired_content_persisted=True,
+        )
+
+    if allow_payload_update:
+        _replace_gateway_outbox_payloads_if_safe(
+            conn,
+            outbox,
+            row,
+            desired_payloads_json,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
+        row = _select_gateway_outbox_content_row(
+            conn,
+            outbox,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
+        if row is None:
+            raise DBError("gateway outbox disappeared during content update")
+        if str(row[1]) != queue_message_id:
+            raise DBError("gateway final outbox queue identity mismatch")
+
+    return GatewayFinalMessagePersistResult(
+        delivery_id=str(row[0]),
+        created=False,
+        reused_existing=True,
+        desired_content_persisted=(
+            _outbox_row_matches_delivery_identity(row, outbox)
+            and str(row[2]) == desired_payloads_json
+        ),
+    )
+
 
 def _insert_gateway_message_delivery(
     conn: sqlite3.Connection,
@@ -68,56 +362,31 @@ def add_final_message_with_gateway_outbox(
     lease_name: str | None = None,
     instance_id: str | None = None,
     lease_epoch: int | None = None,
-) -> str:
+) -> GatewayFinalMessagePersistResult:
     """原子写入最终 assistant 消息、outbox 和 reply_pending 状态。"""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
         raise InvalidMessageError(
             "gateway final delivery must reference an assistant message"
         )
     with transaction(conn):
-        queue_message_id = str(
-            outbox.get("queue_message_id") or outbox["source_message_id"]
-        )
-        existing = conn.execute(
-            """
-            SELECT id, queue_message_id
-            FROM gateway_outbox
-            WHERE route_key=? AND source_message_id=? AND delivery_kind=?
-            """,
-            (
-                str(outbox["route_key"]),
-                str(outbox["source_message_id"]),
-                str(outbox["delivery_kind"]),
-            ),
-        ).fetchone()
-        if existing is not None:
-            if str(existing[1]) != queue_message_id:
-                raise DBError("gateway final outbox queue identity mismatch")
-            _set_gateway_queue_status(
-                conn,
-                str(outbox["route_key"]),
-                queue_message_id,
-                "reply_pending",
-                time.time(),
-            )
-            return str(existing[0])
-
-        assistant_message_id = _insert_message(conn, session_id, msg)
-        outbox_id = _insert_gateway_outbox(
+        result = _persist_gateway_outbox_content_in_transaction(
             conn,
             outbox,
+            allow_payload_update=True,
             lease_name=lease_name,
             instance_id=instance_id,
             lease_epoch=lease_epoch,
         )
-        _insert_gateway_message_delivery(
-            conn,
-            delivery_id=outbox_id,
-            session_id=session_id,
-            assistant_message_id=assistant_message_id,
-            route_key=str(outbox["route_key"]),
-            source_message_id=str(outbox["source_message_id"]),
-        )
+        if result.created:
+            assistant_message_id = _insert_message(conn, session_id, msg)
+            _insert_gateway_message_delivery(
+                conn,
+                delivery_id=result.delivery_id,
+                session_id=session_id,
+                assistant_message_id=assistant_message_id,
+                route_key=str(outbox["route_key"]),
+                source_message_id=str(outbox["source_message_id"]),
+            )
         _set_gateway_queue_status(
             conn,
             str(outbox["route_key"]),
@@ -125,7 +394,29 @@ def add_final_message_with_gateway_outbox(
             "reply_pending",
             time.time(),
         )
-    return outbox_id
+    return result
+
+
+def enqueue_gateway_coordination_notice_outbox(
+    conn: sqlite3.Connection,
+    outbox: dict,
+    *,
+    lease_name: str | None = None,
+    instance_id: str | None = None,
+    lease_epoch: int | None = None,
+) -> GatewayFinalMessagePersistResult:
+    """持久化独立协调提示，不接管原入站 Queue 或其 ownership。"""
+
+    with transaction(conn):
+        return _persist_gateway_outbox_content_in_transaction(
+            conn,
+            outbox,
+            allow_payload_update=True,
+            track_source_ownership=False,
+            lease_name=lease_name,
+            instance_id=instance_id,
+            lease_epoch=lease_epoch,
+        )
 
 
 def _gateway_file_delivery_row(row) -> dict | None:

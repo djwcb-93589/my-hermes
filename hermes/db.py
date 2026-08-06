@@ -108,11 +108,13 @@ from hermes.persistence.tool_execution import (
     start_tool_execution,
 )
 from hermes.persistence.delivery import (
+    GatewayFinalMessagePersistResult,
     add_final_message_with_gateway_outbox,
     claim_gateway_file_delivery,
     create_cron_file_delivery,
     create_gateway_file_delivery,
     create_gateway_file_delivery_outbox,
+    enqueue_gateway_coordination_notice_outbox,
     fail_gateway_file_delivery,
     gateway_file_delivery_claim_is_valid,
     get_gateway_file_delivery,

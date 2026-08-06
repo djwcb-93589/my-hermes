@@ -14,7 +14,11 @@ from .database import (
     DBError, InvalidMessageError, _DEFAULT_GATEWAY_APPROVAL_AGENT_STATE, transaction,
 )
 from .core import _insert_message
-from .delivery import _insert_gateway_message_delivery
+from .delivery import (
+    GatewayFinalMessagePersistResult,
+    _insert_gateway_message_delivery,
+    _persist_gateway_outbox_content_in_transaction,
+)
 from .gateway import (
     _enqueue_gateway_message_in_transaction, _insert_gateway_outbox,
     _serialize_gateway_json, _set_gateway_queue_status,
@@ -288,7 +292,7 @@ def create_gateway_approval_with_outbox(
     lease_name: str | None = None,
     instance_id: str | None = None,
     lease_epoch: int | None = None,
-) -> str:
+) -> GatewayFinalMessagePersistResult:
     """原子写入审批请求、审批问题及其 Outbox。"""
     outbox = dict(outbox)
     request_id = str(request.get("id", ""))
@@ -439,22 +443,17 @@ def create_gateway_approval_with_outbox(
                 or existing["expires_at"] != expires_at
             ):
                 raise DBError("gateway approval idempotency identity mismatch")
-            outbox_row = conn.execute(
-                """
-                SELECT id
-                FROM gateway_outbox
-                WHERE route_key=? AND source_message_id=?
-                  AND delivery_kind=?
-                """,
-                (
-                    str(outbox["route_key"]),
-                    source_message_id,
-                    str(outbox["delivery_kind"]),
-                ),
-            ).fetchone()
-            if outbox_row is None:
+            result = _persist_gateway_outbox_content_in_transaction(
+                conn,
+                outbox,
+                allow_payload_update=False,
+                lease_name=lease_name,
+                instance_id=instance_id,
+                lease_epoch=lease_epoch,
+            )
+            if not result.reused_existing:
                 raise DBError("gateway approval is missing its outbox")
-            return str(outbox_row[0])
+            return result
 
         conn.execute(
             """
@@ -487,17 +486,20 @@ def create_gateway_approval_with_outbox(
                 now,
             ),
         )
-        assistant_message_id = _insert_message(conn, session_id, assistant_msg)
-        outbox_id = _insert_gateway_outbox(
+        result = _persist_gateway_outbox_content_in_transaction(
             conn,
             outbox,
+            allow_payload_update=False,
             lease_name=lease_name,
             instance_id=instance_id,
             lease_epoch=lease_epoch,
         )
+        if not result.created:
+            raise DBError("gateway approval outbox idempotency conflict")
+        assistant_message_id = _insert_message(conn, session_id, assistant_msg)
         _insert_gateway_message_delivery(
             conn,
-            delivery_id=outbox_id,
+            delivery_id=result.delivery_id,
             session_id=session_id,
             assistant_message_id=assistant_message_id,
             route_key=str(outbox["route_key"]),
@@ -521,7 +523,7 @@ def create_gateway_approval_with_outbox(
         decision_source=details.get("decision_source", "approval_policy"),
         timestamp=created_at,
     )
-    return outbox_id
+    return result
 
 
 def fail_gateway_approval_identity_unavailable(

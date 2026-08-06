@@ -1337,11 +1337,13 @@ def _insert_gateway_outbox(
     conn: sqlite3.Connection,
     outbox: dict,
     *,
+    track_source_ownership: bool = True,
+    return_created: bool = False,
     lease_name: str | None = None,
     instance_id: str | None = None,
     lease_epoch: int | None = None,
-) -> str:
-    """插入一条 outbox,不 commit,返回实际使用的 delivery id。"""
+) -> str | tuple[str, bool]:
+    """插入一条 outbox；可选返回实际是否新建。"""
     required = (
         "id",
         "route_key",
@@ -1383,7 +1385,7 @@ def _insert_gateway_outbox(
         now,
     )
     if fence is None:
-        conn.execute(
+        insert_cursor = conn.execute(
             """
             INSERT OR IGNORE INTO gateway_outbox (
                 id, route_key, source_message_id, queue_message_id,
@@ -1400,7 +1402,7 @@ def _insert_gateway_outbox(
         fence_clause = ""
         fence_params: tuple = ()
     else:
-        conn.execute(
+        insert_cursor = conn.execute(
             """
             INSERT OR IGNORE INTO gateway_outbox (
                 id, route_key, source_message_id, queue_message_id,
@@ -1449,20 +1451,23 @@ def _insert_gateway_outbox(
     outbox_id = str(row[0])
     if str(row[5]) != queue_message_id:
         raise DBError("gateway outbox queue identity mismatch")
-    source_message_ids = gateway_event_source_message_ids(
-        str(row[1]),
-        str(outbox["source_message_id"]),
-    )
-    _upsert_gateway_source_message_ownership(
-        conn,
-        str(outbox["route_key"]),
-        source_message_ids,
-        owner_kind="outbox",
-        owner_id=outbox_id,
-        status=str(row[2]),
-        created_at=float(row[3]),
-        updated_at=float(row[4]),
-    )
+    if track_source_ownership:
+        source_message_ids = gateway_event_source_message_ids(
+            str(row[1]),
+            str(outbox["source_message_id"]),
+        )
+        _upsert_gateway_source_message_ownership(
+            conn,
+            str(outbox["route_key"]),
+            source_message_ids,
+            owner_kind="outbox",
+            owner_id=outbox_id,
+            status=str(row[2]),
+            created_at=float(row[3]),
+            updated_at=float(row[4]),
+        )
+    if return_created:
+        return outbox_id, insert_cursor.rowcount == 1
     return outbox_id
 
 
