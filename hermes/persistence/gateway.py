@@ -6,6 +6,7 @@ import time
 import uuid
 
 from .database import DBError, _cleanup_batch_limit, _immediate_transaction, transaction
+from .outbox_kinds import non_system_gateway_outbox_sql_clause
 from .schema import LATEST_SCHEMA_VERSION
 
 
@@ -1602,12 +1603,15 @@ def get_gateway_routes_with_pending_outbox(
     conn: sqlite3.Connection,
 ) -> set[str]:
     """返回仍有待投递 Outbox 的 route，供内存会话清理保护。"""
+    system_clause, system_params = non_system_gateway_outbox_sql_clause()
     rows = conn.execute(
-        """
+        f"""
         SELECT DISTINCT route_key
         FROM gateway_outbox
         WHERE status IN ('pending', 'sending', 'retry_wait')
-        """
+        {system_clause}
+        """,
+        system_params,
     ).fetchall()
     return {str(row[0]) for row in rows}
 
@@ -1616,16 +1620,18 @@ def get_next_recoverable_gateway_outbox_for_route(
     conn: sqlite3.Connection,
     route_key: str,
 ) -> dict | None:
-    """读取某一路由下一条可投递 Outbox，供运行期串行 worker 接力。"""
+    """读取某一路由下一条普通 Outbox，system Outbox 不参与 route 接力。"""
+    system_clause, system_params = non_system_gateway_outbox_sql_clause()
     row = conn.execute(
         f"""
         SELECT {_GATEWAY_OUTBOX_COLUMNS}
         FROM gateway_outbox
         WHERE route_key=? AND status IN ('pending', 'sending', 'retry_wait')
+        {system_clause}
         ORDER BY created_at, id
         LIMIT 1
         """,
-        (route_key,),
+        (route_key, *system_params),
     ).fetchone()
     return _gateway_outbox_row(row)
 

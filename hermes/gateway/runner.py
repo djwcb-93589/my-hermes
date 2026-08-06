@@ -62,6 +62,7 @@ from hermes.hooks import (
     build_sync_observation_bridge,
 )
 from hermes.db import (
+    CLAUDE_CODE_WATCH_REGISTRATION_NOTICE_DELIVERY_KIND_PREFIX,
     add_final_message_with_gateway_outbox,
     add_messages,
     cancel_gateway_delivery,
@@ -125,6 +126,7 @@ from hermes.db import (
     reset_gateway_processing_messages,
     reset_gateway_sending_outbox,
     reset_gateway_uploading_file_deliveries,
+    is_gateway_system_outbox_delivery_kind,
 )
 from hermes.approval_policy import (
     TrustedApprovalGrant,
@@ -158,7 +160,6 @@ from hermes.gateway.claude_code_notifications import (
 )
 from hermes.gateway.system_notifications import (
     GatewaySystemNotificationPublisher,
-    SYSTEM_NOTIFICATION_DELIVERY_KIND,
 )
 from hermes.cron.gateway_scheduler import GatewayCronScheduler
 from hermes.cron.artifacts import cron_artifact_base_dir, cron_run_artifact_dir
@@ -257,9 +258,6 @@ _APPROVAL_RESUME_TERMINAL_FAILURES = frozenset({
     "approval_execution_persistence_failed",
     "approval_resume_fallback_unavailable",
 })
-_CLAUDE_CODE_WATCH_NOTICE_DELIVERY_KIND_PREFIX = (
-    "claude_code_watch_registration_notice:"
-)
 _CLAUDE_CODE_WATCH_NOTICE_CODES = frozenset({
     "registration_failed",
     "registration_unknown",
@@ -2393,13 +2391,8 @@ class GatewayRunner:
     def _is_system_outbox(outbox: dict) -> bool:
         """系统投递不属于入站 Queue，恢复时必须绕开普通会话 worker。"""
 
-        delivery_kind = str(outbox.get("delivery_kind", ""))
-        return (
-            delivery_kind.startswith("cron_")
-            or delivery_kind == SYSTEM_NOTIFICATION_DELIVERY_KIND
-            or delivery_kind.startswith(
-                _CLAUDE_CODE_WATCH_NOTICE_DELIVERY_KIND_PREFIX,
-            )
+        return is_gateway_system_outbox_delivery_kind(
+            outbox.get("delivery_kind"),
         )
 
     async def launch_system_outbox(self, outbox_id: str, route_key: str) -> None:
@@ -4165,7 +4158,8 @@ class GatewayRunner:
             f"{route_key}\x1f{event.message_id}".encode("utf-8"),
         ).hexdigest()
         delivery_kind = (
-            f"{_CLAUDE_CODE_WATCH_NOTICE_DELIVERY_KIND_PREFIX}{notice_code}"
+            f"{CLAUDE_CODE_WATCH_REGISTRATION_NOTICE_DELIVERY_KIND_PREFIX}"
+            f"{notice_code}"
         )
         delivery_id = str(
             uuid.uuid5(

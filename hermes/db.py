@@ -189,5 +189,10 @@ from hermes.persistence.gateway import (
     reset_gateway_sending_outbox,
     set_gateway_conversation_id,
 )
+from hermes.persistence.outbox_kinds import (
+    CLAUDE_CODE_WATCH_REGISTRATION_NOTICE_DELIVERY_KIND_PREFIX,
+    SYSTEM_NOTIFICATION_DELIVERY_KIND,
+    is_gateway_system_outbox_delivery_kind,
+)
 
 get_messages = get_session_messages

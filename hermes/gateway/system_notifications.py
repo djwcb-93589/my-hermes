@@ -9,12 +9,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from hermes.db import enqueue_gateway_outbox, get_gateway_outbox
+from hermes.db import (
+    SYSTEM_NOTIFICATION_DELIVERY_KIND,
+    enqueue_gateway_outbox,
+    get_gateway_outbox,
+)
 from hermes.gateway.adapters import BasePlatformAdapter
 from hermes.gateway.persistence import GatewayPersistence
 
 
-SYSTEM_NOTIFICATION_DELIVERY_KIND = "system_notification"
 _MAX_TARGET_ID_CHARS = 512
 _MAX_NOTIFICATION_ID_CHARS = 512
 _MAX_CONTENT_CHARS = 32_768
